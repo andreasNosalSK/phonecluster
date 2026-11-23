@@ -87,11 +87,21 @@ Open `http://<master-phone-ip>:8080` in any browser on your Wi-Fi! Paste your to
 
 ---
 
-## 5. Adding Another Phone Later (Wi-Fi Auto-Discovery)
+## 5. Adding Another Phone Anytime (15 Seconds — Secure Auto-Search!)
 
-1. Install Termux + `install.sh` on the new phone (choose **Worker**).
-2. Open the **Web Control Center → 4. Add Phone & Doctor** tab and click **Scan Wi-Fi Now** (or run `pc discover` in terminal).
-3. Click **+ Add to Cluster**, then run `~/phonecluster/scripts/03_sync_cluster.sh --setup-keys` to push the shared `auth_token` and start its worker.
+PhoneCluster stays **completely silent on Wi-Fi** by default so strangers cannot discover or join your cluster. To add another Android phone safely:
+
+1. **On your Master phone:** Open a temporary 2-minute Pairing Window:
+   - In the Web Control Center → **5. Phones, Safety & Doctor** → click **Open Pairing Window (2 min)**, OR run `pc pair` in terminal.
+   - Note the **6-digit PIN** (e.g. `482-917`) and **Master Fingerprint** (`A4F2-91C8`).
+2. **On the new phone (Termux):** Run the one-line installer (or `pc join` if already installed):
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/andreasNosalSK/phonecluster/main/install.sh | bash
+   ```
+   Choose **2) Worker phone** → accept **Auto-search Wi-Fi for your Master phone** → verify the fingerprint → type the **6-digit PIN**.
+3. **Done!** Under the hood, PhoneCluster runs a 2048-bit Diffie-Hellman encrypted exchange, verifies mutual PIN proofs, mints a **unique least-privilege token** just for that phone, saves its `0600` config, sets up Termux:Boot, starts the worker daemon, and immediately closes the pairing window!
+
+*(If your router blocks Wi-Fi broadcast or you're pairing over Tailscale, run `pc join --master <master-ip>:8080` or `:8767` instead.)*
 
 ---
 

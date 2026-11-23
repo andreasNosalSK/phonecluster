@@ -162,6 +162,27 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                         f"Loaded '{cfg.cluster_name}' with {len(cfg.nodes)} node(s) from {resolved_cfg}",
                     )
                 )
+            worker_nodes = [n for n in cfg.nodes if n.role != "master"]
+            if worker_nodes:
+                isolated = [n for n in worker_nodes if n.auth_token and n.auth_token != cfg.auth_token]
+                if len(isolated) == len(worker_nodes):
+                    checks.append(
+                        CheckResult(
+                            "Per-Node Token Isolation",
+                            "ok",
+                            f"All {len(worker_nodes)} worker(s) use unique least-privilege tokens",
+                        )
+                    )
+                else:
+                    shared_ids = [n.id for n in worker_nodes if not n.auth_token or n.auth_token == cfg.auth_token]
+                    checks.append(
+                        CheckResult(
+                            "Per-Node Token Isolation",
+                            "warn",
+                            f"Worker(s) sharing master token: {', '.join(shared_ids)}",
+                            "Re-pair workers with `pc pair` + `pc join` so each phone gets its own isolated token.",
+                        )
+                    )
             try:
                 mode = stat.S_IMODE(os.stat(resolved_cfg).st_mode)
                 if mode & 0o077:

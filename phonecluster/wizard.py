@@ -200,6 +200,7 @@ def run_interactive_menu(
     """Friendly numbered terminal menu so users never need to memorize flags."""
     from .cli import _cmd_jobs, _cmd_status
     from .dashboard import serve_dashboard
+    from .pairing import DEFAULT_PAIR_PORT, run_cli_pairing_host
     from .tui import run_top_tui
     import argparse
 
@@ -213,8 +214,8 @@ def run_interactive_menu(
         print("  2) Cluster Status (Quick Summary Table)")
         print("  3) Run a Command (Best Phone or All Phones)")
         print("  4) Run Parallel Jobs (Ship & Run a Script / File)")
-        print("  5) Scan Wi-Fi for Phones (Auto-Discover)")
-        print("  6) Cluster Doctor (Health & Battery Safety Check)")
+        print("  5) Pair a New Phone (Secure 6-Digit PIN Window)")
+        print("  6) Cluster Doctor (Health, Security & Battery Check)")
         print("  7) Start Web Control Center (Browser btop + Terminal)")
         print("  8) Workloads Helper (distcc / llama.cpp / OpenMPI)")
         print("  9) Guided Setup Wizard (Create/Edit cluster.json)")
@@ -230,18 +231,6 @@ def run_interactive_menu(
         elif choice == "9":
             run_setup_wizard(cfg_path, input_fn=input_fn)
             continue
-        elif choice == "5":
-            print("Scanning Wi-Fi for PhoneCluster workers (2s)...")
-            found = discover_lan_nodes(timeout_sec=2.0)
-            if not found:
-                print("No phones responded on UDP 8766. Make sure worker daemons are running.")
-            else:
-                for n in found:
-                    print(
-                        f"  - {n['host']}:{n['worker_port']}  id={n['node_id']} role={n['role']} "
-                        f"os={n['os_env']} cores={n['cpu_cores']} ram={n['mem_total_mb']}MB"
-                    )
-            continue
         elif choice == "6":
             report = run_doctor(cfg_path)
             _print_doctor_report(report)
@@ -252,7 +241,10 @@ def run_interactive_menu(
             run_setup_wizard(cfg_path, input_fn=input_fn)
             continue
 
-        if choice == "1":
+        if choice == "5":
+            cfg = load_config(cfg_path)
+            run_cli_pairing_host(cfg, cfg_path, port=DEFAULT_PAIR_PORT, ttl_sec=120, max_devices=1)
+        elif choice == "1":
             cfg = load_config(cfg_path)
             run_top_tui(MasterController(cfg))
         elif choice == "2":

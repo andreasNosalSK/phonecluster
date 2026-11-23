@@ -29,6 +29,7 @@ class NodeConfig:
     weight: float = 1.0
     tags: list[str] = field(default_factory=list)
     notes: str = ""
+    auth_token: str = ""  # Optional per-node least-privilege token (recommended for workers)
 
     @property
     def base_url(self) -> str:
@@ -58,6 +59,7 @@ class NodeConfig:
             weight=weight,
             tags=[str(t) for t in data.get("tags", [])],
             notes=str(data.get("notes", "")),
+            auth_token=str(data.get("auth_token", "")).strip(),
         )
 
 
@@ -106,6 +108,7 @@ class ClusterConfig:
     default_job_timeout_sec: int = 600
     health_timeout_sec: float = 3.0
     dashboard_port: int = 8080
+    dashboard_require_auth: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ClusterConfig":
@@ -133,10 +136,15 @@ class ClusterConfig:
             default_job_timeout_sec=int(data.get("default_job_timeout_sec", 600)),
             health_timeout_sec=float(data.get("health_timeout_sec", 3.0)),
             dashboard_port=int(data.get("dashboard_port", 8080)),
+            dashboard_require_auth=bool(data.get("dashboard_require_auth", False)),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def token_for_node(self, node: NodeConfig) -> str:
+        """Return the least-privilege per-node token if set, else the cluster token."""
+        return node.auth_token or self.auth_token
 
     def get_node(self, node_id: str) -> NodeConfig:
         for node in self.nodes:

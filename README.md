@@ -22,11 +22,11 @@ PhoneCluster gives you **one entry point** (Web UI + interactive terminal menu +
   - **Accessible by design**: Midnight Dark / Daylight Light / **High-Contrast** themes + **Normal / Large / XL** text scaling + full keyboard navigation + color-blind safe badges. Works 100% offline on your LAN.
 - **Shared Multi-Device `btop` Terminal Control** (`pc top`):
   - Gorgeous ANSI 256-color full-screen terminal UI with Unicode rounded panels, sparklines (`▁▂▃▄▅▆▇█`), per-core heat bars, live running tasks & shared processes, and interactive keyboard controls (`↑/↓` select phone, `r` run, `a` broadcast, `s` instant SSH shell, `c` cancel job, `d` toggle tasks/processes).
-- **Easy & Automated Setup**:
-  - One-click **PC USB Fleet Provisioner** ([`scripts/setup_all_via_adb.sh`](scripts/setup_all_via_adb.sh)) audits phones, picks the best Master, disables Android 12/13 Phantom Process Killer, whitelists Termux from Doze, and writes `config/cluster.json`.
-  - One-command **Universal Installer** ([`install.sh`](install.sh)) installs global `phonecluster` and short `pc` commands + Termux:Boot auto-start.
-  - **Zero-Config Wi-Fi Auto-Discovery** (`pc discover`) finds new phones on your LAN automatically.
-  - **Guided Setup Wizard** (`pc wizard`), **Numbered Terminal Menu** (`pc`), and **Cluster Doctor** (`pc doctor`).
+- **Security-First Zero-Config Pairing (`pc pair` + `pc join`)**:
+  - Cluster is **completely silent on UDP by default** — strangers on Wi-Fi cannot scan or sneak into your cluster.
+  - Opening a temporary **2-minute Pairing Window** lets new phones auto-find your Master on Wi-Fi and join with a **6-digit PIN**, protected by **2048-bit Ephemeral Diffie-Hellman + PBKDF2-HMAC-SHA256 + Mutual Proof + Encrypt-then-MAC** (zero pip dependencies!).
+  - Every paired phone gets its **own unique per-node 256-bit token** (least-privilege isolation), 5-attempt lockout, brute-force `429` rate limiting, and optional `pc dashboard --require-auth` lockdown for shared Wi-Fi.
+  - Also includes a PC USB Fleet Provisioner ([`scripts/setup_all_via_adb.sh`](scripts/setup_all_via_adb.sh)), One-Line Installer ([`install.sh`](install.sh)), Guided Setup Wizard (`pc wizard`), and Cluster Doctor (`pc doctor`).
 - **Smart Parallel Scheduling & Hardware Safety**:
   - Dynamically ships & runs local Python/Bash scripts across all cool, ready phones (`pc map --script ...`) with automatic retry/failover if a phone throttles or disconnects.
   - **Thermal Gate with hysteresis** pauses jobs at `40 °C` and resumes at `37 °C`.
@@ -67,43 +67,28 @@ curl -fsSL https://raw.githubusercontent.com/andreasNosalSK/phonecluster/main/in
 ```
 The installer clones/updates PhoneCluster, installs `openssh`, `termux-api`, `python`, sets up `~/.termux/boot/` auto-start, and creates global `pc` / `phonecluster` commands. Choose **Master** on `node0` and **Worker** on the others.
 
-### Step 3 — Sync, verify, and open the Control Center
-From your Master phone (or over SSH: `ssh -p 8022 <user>@<master-ip>`):
-```bash
-# Push SSH keys + sync config + start workers on all phones:
-pc sync --setup-keys
-
-# Run automated health & safety audit:
-pc doctor
-
-# Print your unlock token for the browser UI:
-pc token
-
-# Launch the accessible Web Control Center (open http://<master-ip>:8080):
-pc dashboard
-
-# Or open the friendly interactive terminal menu:
-pc
-```
-
----
-
-## Everyday Commands
+### Step 3 — Add more phones in 15 seconds (Secure Auto-Search Pairing!)
+1. On your **Master phone**, open a temporary 2-minute Pairing Window:
+   - Either click **Tab 5 → Open Pairing Window (2 min)** in the Web Control Center (`pc dashboard`), OR run `pc pair` in terminal → note the **6-digit PIN** (e.g. `482-917`).
+2. On your **new Worker phone**, run `pc join` (or `curl -fsSL https://raw.githubusercontent.com/andreasNosalSK/phonecluster/main/install.sh | bash` → pick Worker):
+   - It automatically finds your Master on Wi-Fi, verifies the fingerprint & 6-digit PIN over **2048-bit Diffie-Hellman**, saves its own unique least-privilege token, configures Termux:Boot, and starts the worker!
+   - The pairing window immediately auto-closes so strangers on Wi-Fi can never join.
 
 ```bash
 pc                                    # Open interactive numbered menu
 pc top                                # Pretty multi-device shared btop + Terminal Control!
-pc dashboard                          # Start Web Control Center (btop + Web Terminal :8080)
+pc dashboard                          # Start Web Control Center (--require-auth for shared Wi-Fi)
+pc pair                               # (Master) Open 2-min encrypted Pairing Window (6-digit PIN)
+pc join                               # (New phone) Auto-find Master on Wi-Fi & securely join
 pc status --watch                     # Quick live-refreshing status table
 pc jobs                               # See active & recent jobs across all phones
 pc cancel node1 <job_id>              # Cancel a runaway job on any phone
 pc ssh node1                          # Instant SSH into a phone by node name
 pc copy model.gguf ~/models/          # Copy datasets/models to all worker phones via SCP
 pc token                              # Show unlock token for Web UI (`--rotate` to renew)
-pc sync                               # Sync code & config to all phones and restart workers
+pc sync                               # Sync code & scoped least-privilege configs to workers
 pc update --sync                      # Pull latest updates from GitHub & push to workers
-pc doctor                             # Check SSH, Termux:API, temps, 24/7 battery safety
-pc discover                           # Auto-find new phones on Wi-Fi (UDP 8766)
+pc doctor                             # Check SSH, security isolation, temps, 24/7 battery safety
 pc wizard                             # Guided interactive setup wizard
 
 # Run commands & parallel scripts across all phones
@@ -131,7 +116,8 @@ pc mpi-hostfile -o hosts.mpi          # OpenMPI: generate hostfile from ready ph
 
 ## Documentation
 
-- **[Complete Step-by-Step Setup Guide](docs/SETUP_GUIDE.md)** — Android settings, ADB fleet setup, Wi-Fi auto-discovery, and troubleshooting.
+- **[Security Architecture & Pairing Protocol](docs/SECURITY.md)** — Threat model, 2048-bit DH + PIN pairing, per-node token isolation, stealth LAN posture, and shared Wi-Fi lockdown.
+- **[Complete Step-by-Step Setup Guide](docs/SETUP_GUIDE.md)** — Android settings, ADB fleet setup, secure pairing, and troubleshooting.
 - **[Debian 13 & Docker Upgrade Guide](docs/DEBIAN13_AND_DOCKER.md)** — Upgrading to Tier 2 rooted Debian 13 ARM64 chroot, ACC battery protection, Home Assistant, and Tier 3 Docker/Droidspaces.
 - **[Workloads & Automation Cookbook](docs/WORKLOADS.md)** — Recipes for Parallel Python/Bash, `distcc` Compiler PC, Local AI (`llama.cpp`), OpenMPI, and Home Assistant smart-plug battery protection.
 - **[REST & Discovery API Reference](docs/API.md)** — Worker endpoints, Dashboard API, and UDP LAN discovery schema.

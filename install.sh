@@ -179,12 +179,13 @@ echo "  PhoneCluster Installed!"
 echo "============================================================"
 echo "Commands ready anywhere:"
 echo "  pc                  -> Open friendly interactive menu"
-echo "  pc wizard           -> Guided setup wizard (auto-discovers phones on Wi-Fi)"
-echo "  pc status --watch   -> Live unified 'one PC' cluster monitor"
-echo "  pc doctor           -> Health, SSH & 24/7 battery safety check"
-echo "  pc dashboard        -> Accessible Web Control Center (port 8080)"
+echo "  pc top              -> Pretty multi-device shared btop Terminal UI"
+echo "  pc dashboard        -> Accessible Web Control Center + Web Terminal (:8080)"
+echo "  pc pair             -> (Master) Open temporary 2-min encrypted Pairing Window"
+echo "  pc join             -> (New phone) Auto-find Master on Wi-Fi & join with 6-digit PIN"
+echo "  pc doctor           -> Health, security & 24/7 battery safety check"
 echo "  pc token            -> Print unlock token for the Web UI"
-echo "  pc sync             -> Push code & config to all worker phones"
+echo "  pc sync             -> Push code & scoped configs to all worker phones"
 echo
 
 if [[ "${ROLE}" == "master" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR}/config/cluster.json" ]]; then
@@ -194,6 +195,17 @@ if [[ "${ROLE}" == "master" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR
       "${BIN_DIR}/phonecluster" wizard < /dev/tty
     else
       "${BIN_DIR}/phonecluster" wizard
+    fi
+  fi
+elif [[ "${ROLE}" == "worker" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR}/config/cluster.json" ]]; then
+  echo "Ready to join your cluster securely!"
+  echo "  -> On your Master phone, open Pairing first (Web UI Tab 5 or run: pc pair)"
+  RUN_JOIN="$(ask "Auto-search Wi-Fi for your Master phone and pair now? [Y/n]: " "y")"
+  if [[ "${RUN_JOIN,,}" == "y" || "${RUN_JOIN,,}" == "yes" ]]; then
+    if [[ -r /dev/tty ]]; then
+      "${BIN_DIR}/phonecluster" join < /dev/tty
+    else
+      "${BIN_DIR}/phonecluster" join
     fi
   fi
 fi

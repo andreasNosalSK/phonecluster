@@ -26,6 +26,12 @@ from .dashboard import serve_dashboard
 from .discovery import discover_lan_nodes
 from .doctor import run_doctor
 from .master import JobOutcome, JobSpec, MasterController
+from .pairing import (
+    DEFAULT_PAIR_PORT,
+    discover_pairing_masters,
+    join_cluster_via_pairing,
+    run_cli_pairing_host,
+)
 from .tui import run_top_tui
 from .wizard import _print_doctor_report, run_interactive_menu, run_setup_wizard
 from .worker import WorkerState, serve_worker
@@ -85,7 +91,7 @@ def _cmd_worker(args: argparse.Namespace) -> int:
     state = WorkerState(
         node_id=node.id,
         role=node.role,
-        auth_token=cfg.auth_token,
+        auth_token=cfg.token_for_node(node),
         safety=cfg.safety,
         max_concurrency=max_conc,
         workdir=Path(args.workdir),
@@ -96,7 +102,7 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         state,
         ssh_port=node.ssh_port,
         ssh_user=node.ssh_user,
-        enable_discovery=not args.no_discover,
+        enable_discovery=bool(args.discover),
     )
     return 0
 
@@ -424,9 +430,138 @@ def _cmd_mpi_hostfile(args: argparse.Namespace) -> int:
 def _cmd_dashboard(args: argparse.Namespace) -> int:
     cfg_path = resolve_config_path(args.config)
     cfg = load_config(cfg_path)
+    if args.require_auth:
+        cfg.dashboard_require_auth = True
     ctrl = MasterController(cfg)
     port = args.port or cfg.dashboard_port
     serve_dashboard(args.bind, port, ctrl, config_path=cfg_path)
+    return 0
+
+
+def _cmd_pair(args: argparse.Namespace) -> int:
+    cfg_path = resolve_config_path(args.config)
+    cfg = load_config(cfg_path)
+    return run_cli_pairing_host(
+        config=cfg,
+        config_path=cfg_path,
+        port=args.port,
+        ttl_sec=args.ttl,
+        max_devices=args.count,
+    )
+
+
+def _cmd_join(args: argparse.Namespace) -> int:
+    cfg_path = resolve_config_path(args.config)
+    master_host = ""
+    pair_port = DEFAULT_PAIR_PORT
+    fingerprint = ""
+    cluster_name = ""
+
+    if args.master:
+        if ":" in args.master:
+            master_host, p_str = args.master.rsplit(":", 1)
+            pair_port = int(p_str)
+        else:
+            master_host = args.master
+    else:
+        print("Searching local Wi-Fi for a Master phone with an open Pairing Window...")
+        found = discover_pairing_masters(timeout_sec=args.timeout)
+        if not found:
+            print(
+                "No Master phone with an open Pairing Window was found on Wi-Fi.\n"
+                "  1. On your Master phone, open Pairing first (`pc pair` or Web UI -> Tab 5 -> Open Pairing Window).\n"
+                "  2. If your router blocks Wi-Fi broadcast (or you use Tailscale), pass `--master <ip>:<port>`.",
+                file=sys.stderr,
+            )
+            return 1
+        if len(found) == 1:
+            chosen = found[0]
+        else:
+            print("Found multiple Masters with open pairing windows:")
+            for i, m in enumerate(found, start=1):
+                print(
+                    f"  {i}) {m['cluster_name']} at {m['host']}:{m['pair_port']} "
+                    f"(fingerprint: {m['fingerprint']}, {m['expires_in_sec']}s left)"
+                )
+            sel = input("Select Master [1]: ").strip() or "1"
+            idx = max(0, min(len(found) - 1, int(sel) - 1)) if sel.isdigit() else 0
+            chosen = found[idx]
+        master_host = chosen["host"]
+        pair_port = int(chosen["pair_port"])
+        fingerprint = chosen["fingerprint"]
+        cluster_name = chosen["cluster_name"]
+        print(
+            f"\nFound Master on Wi-Fi:\n"
+            f"  Cluster     : {cluster_name}\n"
+            f"  Address     : {master_host}:{pair_port}\n"
+            f"  Fingerprint : {fingerprint}  (verify this matches your Master screen!)\n"
+        )
+
+    pin = args.pin or input("Enter the 6-digit Pairing PIN shown on Master: ").strip()
+    if not pin:
+        print("Pairing cancelled (no PIN entered).", file=sys.stderr)
+        return 1
+
+    trust_ssh = bool(args.trust_ssh)
+    if not trust_ssh and not args.no_ssh_key and sys.stdin.isatty():
+        ans = input("Trust Master's SSH public key for passwordless `pc ssh` / `pc sync`? [Y/n]: ").strip().lower()
+        trust_ssh = ans in {"", "y", "yes"}
+
+    try:
+        res = join_cluster_via_pairing(
+            master_host=master_host,
+            pair_port=pair_port,
+            pin=pin,
+            config_out=cfg_path,
+            worker_port=args.worker_port,
+            max_concurrency=args.max_concurrency,
+            trust_ssh_key=trust_ssh,
+        )
+    except RuntimeError as exc:
+        print(f"Pairing failed: {exc}", file=sys.stderr)
+        return 1
+
+    print("\n" + "=" * 58)
+    print(f"  ✓ Securely Joined Cluster '{res['cluster_name']}'!")
+    print("=" * 58)
+    print(f"  Assigned Node ID : {res['node_id']} ({res['node_host']})")
+    print(f"  Scoped Config    : {res['config_path']} (0600, unique per-node token)")
+    if res["ssh_key_trusted"]:
+        print("  Master SSH Key   : Added to ~/.ssh/authorized_keys")
+
+    # Configure Termux:Boot automatically if running inside Termux
+    if "com.termux" in os.environ.get("PREFIX", ""):
+        setup_sh = REPO_ROOT / "scripts" / "02_termux_node_setup.sh"
+        if setup_sh.exists():
+            print("  Updating Termux:Boot startup script for your new node ID...")
+            subprocess.call(["bash", str(setup_sh), "--node-id", res["node_id"], "--repo-dir", str(REPO_ROOT)])
+
+    if not args.no_start:
+        log_dir = REPO_ROOT / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"worker-{res['node_id']}.log"
+        pid_file = log_dir / f"worker-{res['node_id']}.pid"
+        with log_file.open("a", encoding="utf-8") as lf:
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "phonecluster_cli.py"),
+                    "--config",
+                    str(cfg_path),
+                    "worker",
+                    "--node-id",
+                    res["node_id"],
+                ],
+                stdout=lf,
+                stderr=lf,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        pid_file.write_text(f"{proc.pid}\n", encoding="utf-8")
+        print(f"  Worker Daemon    : Started in background (PID {proc.pid})")
+        print(f"  Worker Log       : {log_file}")
+
+    print("\nYour phone is now live in the Master Web Control Center & `pc top`!")
     return 0
 
 
@@ -619,6 +754,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="subcommand", required=False)
 
+    # pair & join (security-first zero-config phone onboarding)
+    p_pair = sub.add_parser(
+        "pair",
+        help="Open a temporary 2-minute encrypted pairing window on Master to add a new phone",
+    )
+    p_pair.add_argument("--ttl", type=int, default=120, help="Pairing window duration in seconds (default: 120)")
+    p_pair.add_argument("--count", type=int, default=1, help="Number of phones allowed to pair (default: 1)")
+    p_pair.add_argument("--port", type=int, default=DEFAULT_PAIR_PORT, help=f"Temporary pairing port (default: {DEFAULT_PAIR_PORT})")
+    p_pair.set_defaults(func=_cmd_pair)
+
+    p_join = sub.add_parser(
+        "join",
+        help="Auto-search Wi-Fi for your Master phone and securely join the cluster using its 6-digit PIN",
+    )
+    p_join.add_argument("--master", default="", help="Manual Master host:port (e.g. 192.168.1.201:8080) if Wi-Fi blocks broadcast")
+    p_join.add_argument("--pin", default="", help="6-digit Pairing PIN (prompted interactively if omitted)")
+    p_join.add_argument("--timeout", type=float, default=2.5, help="Wi-Fi search timeout in seconds (default: 2.5)")
+    p_join.add_argument("--worker-port", type=int, default=8765, help="Local worker HTTP port (default: 8765)")
+    p_join.add_argument("--max-concurrency", type=int, default=2, help="Max parallel jobs on this phone (default: 2)")
+    p_join.add_argument("--trust-ssh", action="store_true", help="Automatically trust Master's SSH public key")
+    p_join.add_argument("--no-ssh-key", action="store_true", help="Do not install Master's SSH public key")
+    p_join.add_argument("--no-start", action="store_true", help="Save config only; do not auto-start worker daemon")
+    p_join.set_defaults(func=_cmd_join)
+
     # wizard
     p_wiz = sub.add_parser("wizard", help="Guided interactive setup wizard (easiest way to configure)")
     p_wiz.set_defaults(func=_cmd_wizard)
@@ -661,9 +820,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument("--max-concurrency", type=int, default=0, help="Override max concurrent jobs")
     p_worker.add_argument("--workdir", default=".", help="Default working directory for jobs")
     p_worker.add_argument(
-        "--no-discover",
+        "--discover",
         action="store_true",
-        help="Disable UDP LAN auto-discovery responder (port 8766)",
+        help="Opt-in: broadcast presence on UDP port 8766 (OFF by default for LAN privacy)",
     )
     p_worker.set_defaults(func=_cmd_worker)
 
@@ -796,6 +955,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_dash = sub.add_parser("dashboard", help="Start the Master web dashboard UI")
     p_dash.add_argument("--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     p_dash.add_argument("--port", type=int, default=0, help="Dashboard HTTP port (default from config: 8080)")
+    p_dash.add_argument(
+        "--require-auth",
+        action="store_true",
+        help="Require Bearer auth_token even for read-only stats (recommended on shared/dorm Wi-Fi)",
+    )
     p_dash.set_defaults(func=_cmd_dashboard)
 
     return parser

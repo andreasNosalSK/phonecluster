@@ -68,15 +68,38 @@ while IFS=$'\t' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
     ssh-copy-id -p "${SSH_PORT}" "${TARGET}"
   fi
 
-  # Stream project files via tar over SSH (works cleanly without rsync)
+  # Stream project code via tar over SSH (without shipping Master's full cluster.json to workers)
   tar -cf - \
     phonecluster \
     phonecluster_cli.py \
     scripts \
     examples \
-    "${CONFIG_PATH}" \
     | ssh -p "${SSH_PORT}" "${TARGET}" \
-      "mkdir -p ${REMOTE_DIR}/config ${REMOTE_DIR}/logs && tar -xf - -C ${REMOTE_DIR} && cp -f ${REMOTE_DIR}/${CONFIG_PATH} ${REMOTE_DIR}/config/cluster.json 2>/dev/null || true"
+      "mkdir -p ${REMOTE_DIR}/config ${REMOTE_DIR}/logs && tar -xf - -C ${REMOTE_DIR}"
+
+  # Push least-privilege scoped config (workers ONLY receive their own node token, never Master's admin token)
+  python3 - "${CONFIG_PATH}" "${NODE_ID}" "${ROLE}" <<'PY' \
+    | ssh -p "${SSH_PORT}" "${TARGET}" \
+      "umask 077 && cat > ${REMOTE_DIR}/config/cluster.json && chmod 600 ${REMOTE_DIR}/config/cluster.json"
+import json, sys
+cfg_path, node_id, role = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(cfg_path, "r", encoding="utf-8") as fh:
+    cfg = json.load(fh)
+if role == "master":
+    out = cfg
+else:
+    node = next(n for n in cfg["nodes"] if n["id"] == node_id)
+    tok = node.get("auth_token") or cfg["auth_token"]
+    scoped_node = dict(node)
+    scoped_node["auth_token"] = tok
+    out = {
+        "cluster_name": cfg.get("cluster_name", "phonecluster"),
+        "auth_token": tok,
+        "safety": cfg.get("safety", {}),
+        "nodes": [scoped_node],
+    }
+print(json.dumps(out, indent=2))
+PY
 
   # Restart worker daemon cleanly on remote node
   ssh -p "${SSH_PORT}" "${TARGET}" bash -s -- "${NODE_ID}" "${REMOTE_DIR}" <<'REMOTE'

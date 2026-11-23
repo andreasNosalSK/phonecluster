@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from .auth import verify_token
+from .auth import AuthRateLimiter, verify_token
 from .config import SafetyConfig
 from .discovery import DISCOVERY_PORT, DiscoveryResponder
 from .telemetry import CpuSampler, NetSampler, ThermalGate, collect_node_health
@@ -63,6 +63,7 @@ class WorkerState:
         )
         self.cpu_sampler = CpuSampler()
         self.net_sampler = NetSampler()
+        self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
         self.lock = threading.Lock()
         self.active_jobs: dict[str, ActiveJob] = {}
         self.recent_jobs: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
@@ -488,9 +489,19 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _check_auth(self) -> bool:
+        client_ip = self.client_address[0]
+        blocked, retry_after = self.server.state.rate_limiter.is_blocked(client_ip)
+        if blocked:
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "too many failed auth attempts", "retry_after_sec": retry_after},
+            )
+            return False
         if not verify_token(self.headers, self.server.state.auth_token):
+            self.server.state.rate_limiter.record_failure(client_ip)
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return False
+        self.server.state.rate_limiter.record_success(client_ip)
         return True
 
     def _read_json_body(self) -> dict[str, Any] | None:
@@ -572,10 +583,10 @@ def serve_worker(
     state: WorkerState,
     ssh_port: int = 8022,
     ssh_user: str = "",
-    enable_discovery: bool = True,
+    enable_discovery: bool = False,
     discovery_port: int = DISCOVERY_PORT,
 ) -> None:
-    """Run the worker HTTP daemon (plus optional UDP LAN discovery) until interrupted."""
+    """Run the worker HTTP daemon (stealth on UDP by default) until interrupted."""
     server, guard, stop_event = create_worker_server(bind_host, port, state)
     guard.start()
 

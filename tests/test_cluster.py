@@ -12,7 +12,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from phonecluster.auth import build_auth_headers, extract_bearer_token, verify_token
+from phonecluster.auth import (
+    AuthRateLimiter,
+    build_auth_headers,
+    extract_bearer_token,
+    verify_token,
+)
 from phonecluster.config import (
     ClusterConfig,
     NodeConfig,
@@ -29,6 +34,17 @@ from phonecluster.master import (
     MasterController,
     NodeSnapshot,
     score_node,
+)
+from phonecluster.pairing import (
+    DH_P,
+    PairingManager,
+    StandalonePairingServer,
+    decrypt_bundle,
+    derive_pairing_keys,
+    discover_pairing_masters,
+    encrypt_bundle,
+    join_cluster_via_pairing,
+    validate_dh_public,
 )
 from phonecluster.telemetry import (
     CpuSampler,
@@ -693,6 +709,213 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
             new_tok = load_config(cfg_path).auth_token
             self.assertNotEqual(old_tok, new_tok)
             self.assertGreaterEqual(len(new_tok), 24)
+
+
+class TestSecurePairingAndSecurity(unittest.TestCase):
+    def test_dh_subgroup_validation_and_encrypt_then_mac_tamper_detection(self) -> None:
+        self.assertFalse(validate_dh_public(0))
+        self.assertFalse(validate_dh_public(1))
+        self.assertFalse(validate_dh_public(DH_P - 1))
+        self.assertFalse(validate_dh_public(DH_P))
+
+        _ka, ke, km = derive_pairing_keys("482-917", b"\x42" * 256, "00" * 16, "sid1", iterations=1000)
+        env = encrypt_bundle(ke, km, {"node_token": "secret-123"}, aad="sid1|node3")
+        dec = decrypt_bundle(ke, km, env, aad="sid1|node3")
+        self.assertEqual(dec["node_token"], "secret-123")
+
+        # Tampering with ciphertext, tag, or AAD must fail MAC check before decrypting
+        bad_ct = dict(env, ciphertext="AAAA" + env["ciphertext"][4:])
+        with self.assertRaises(ValueError):
+            decrypt_bundle(ke, km, bad_ct, aad="sid1|node3")
+        with self.assertRaises(ValueError):
+            decrypt_bundle(ke, km, env, aad="sid1|wrong-node")
+
+    def test_e2e_secure_pairing_beacon_isolation_and_auto_close(self) -> None:
+        master_cfg = create_default_config(
+            cluster_name="sec-cluster",
+            master_host="127.0.0.1",
+            worker_hosts=[],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            master_cfg_path = Path(tmp) / "master_cluster.json"
+            worker_cfg_path = Path(tmp) / "worker_cluster.json"
+            save_config(master_cfg, master_cfg_path)
+
+            ctrl = MasterController(master_cfg)
+            dash = DashboardHTTPServer(
+                ("127.0.0.1", 0),
+                ctrl,
+                config_path=master_cfg_path,
+                enable_pairing_beacon=True,
+                pairing_fail_delay_sec=0.0,
+            )
+            dash.pairing_manager.discovery_port = 0  # Ephemeral UDP port for isolated test
+            port = dash.server_address[1]
+            t = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            t.start()
+            worker_srv = None
+            try:
+                # 1. Closed by default: /api/pair/hello MUST fail with 403
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/pair/hello", timeout=3.0)
+                try:
+                    self.assertEqual(ctx.exception.code, 403)
+                finally:
+                    ctx.exception.close()
+
+                # 2. Authenticated Master opens a 1-slot pairing window
+                req_open = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/pair/open",
+                    data=json.dumps({"ttl_sec": 60, "max_devices": 1}).encode("utf-8"),
+                    headers=build_auth_headers(master_cfg.auth_token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_open, timeout=3.0) as resp:
+                    pinfo = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(pinfo["active"])
+                pin = pinfo["pin"]
+
+                # 3. New phone auto-searches Wi-Fi for Master's temporary UDP beacon
+                found = discover_pairing_masters(
+                    timeout_sec=0.6,
+                    discovery_port=dash.pairing_manager.beacon_port,
+                    targets=["127.0.0.1"],
+                )
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0]["cluster_name"], "sec-cluster")
+                self.assertEqual(found[0]["fingerprint"], pinfo["fingerprint"])
+
+                # 4. Join securely via 2048-bit DH + PIN mutual proof
+                # Start a real worker HTTP server first on an ephemeral port so Master can talk to it!
+                res = join_cluster_via_pairing(
+                    master_host=found[0]["host"],
+                    pair_port=found[0]["pair_port"],
+                    pin=pin,
+                    config_out=worker_cfg_path,
+                    worker_port=0,
+                    trust_ssh_key=False,
+                )
+                self.assertEqual(res["node_id"], "node1")
+
+                # 5. Pairing window MUST auto-close after single-use join!
+                with self.assertRaises(urllib.error.HTTPError) as ctx2:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/pair/hello", timeout=3.0)
+                try:
+                    self.assertEqual(ctx2.exception.code, 403)
+                finally:
+                    ctx2.exception.close()
+
+                # 6. Least-privilege check: worker got its OWN unique token != master admin token
+                worker_cfg = load_config(worker_cfg_path)
+                self.assertNotEqual(worker_cfg.auth_token, master_cfg.auth_token)
+                self.assertEqual(
+                    master_cfg.get_node("node1").auth_token, worker_cfg.auth_token
+                )
+
+                # Worker token MUST NOT unlock Master's admin API!
+                req_bad_admin = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/auth/verify",
+                    headers=build_auth_headers(worker_cfg.auth_token),
+                    method="GET",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx3:
+                    urllib.request.urlopen(req_bad_admin, timeout=3.0)
+                try:
+                    self.assertEqual(ctx3.exception.code, 401)
+                finally:
+                    ctx3.exception.close()
+
+                # 7. MasterController CAN communicate with the paired worker using its per-node token!
+                w_state = WorkerState(
+                    node_id="node1",
+                    role="worker",
+                    auth_token=worker_cfg.auth_token,
+                    safety=worker_cfg.safety,
+                )
+                worker_srv, _g, stop_ev = create_worker_server("127.0.0.1", 0, w_state)
+                w_port = worker_srv.server_address[1]
+                master_cfg.get_node("node1").worker_port = w_port
+                wt = threading.Thread(
+                    target=worker_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+                )
+                wt.start()
+                snap = ctrl.check_node_health(master_cfg.get_node("node1"))
+                self.assertTrue(snap.online, snap.error)
+                self.assertEqual(snap.health["node_id"], "node1")
+                stop_ev.set()
+            finally:
+                if worker_srv is not None:
+                    worker_srv.shutdown()
+                    worker_srv.server_close()
+                dash.shutdown()
+                dash.server_close()
+
+    def test_wrong_pin_5_attempt_lockout(self) -> None:
+        cfg = create_default_config(master_host="127.0.0.1", worker_hosts=[])
+        mgr = PairingManager(
+            config=cfg,
+            config_path=None,
+            pair_port=0,
+            fail_delay_sec=0.0,
+            enable_beacon=False,
+        )
+        srv = StandalonePairingServer(("127.0.0.1", 0), mgr)
+        port = srv.server_address[1]
+        info = mgr.open_session(ttl_sec=60, max_devices=1, pair_port=port)
+        real_pin = info["pin"]
+        wrong_pin = "000000" if real_pin.replace("-", "") != "000000" else "999999"
+
+        t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        t.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / "w.json"
+                # 5 failed PIN attempts must destroy the session
+                for _ in range(5):
+                    with self.assertRaises(RuntimeError):
+                        join_cluster_via_pairing("127.0.0.1", port, wrong_pin, out)
+                self.assertFalse(mgr.admin_status()["active"])
+                # Even the real PIN must fail now because the window self-destructed!
+                with self.assertRaises(RuntimeError):
+                    join_cluster_via_pairing("127.0.0.1", port, real_pin, out)
+        finally:
+            mgr.close_session()
+            srv.shutdown()
+            srv.server_close()
+
+    def test_dashboard_require_auth_and_rate_limit_429(self) -> None:
+        cfg = create_default_config(master_host="127.0.0.1", worker_hosts=[])
+        cfg.dashboard_require_auth = True
+        ctrl = MasterController(cfg)
+        dash = DashboardHTTPServer(
+            ("127.0.0.1", 0),
+            ctrl,
+            enable_pairing_beacon=False,
+        )
+        dash.rate_limiter = AuthRateLimiter(max_failures=3, window_sec=60.0, block_sec=30.0)
+        port = dash.server_address[1]
+        t = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        t.start()
+        try:
+            # Read endpoint /api/live blocked without token when dashboard_require_auth=True
+            for _ in range(3):
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/live", timeout=3.0)
+                try:
+                    self.assertEqual(ctx.exception.code, 401)
+                finally:
+                    ctx.exception.close()
+
+            # 4th attempt from same IP must hit 429 Too Many Requests!
+            with self.assertRaises(urllib.error.HTTPError) as ctx429:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/api/live", timeout=3.0)
+            try:
+                self.assertEqual(ctx429.exception.code, 429)
+            finally:
+                ctx429.exception.close()
+        finally:
+            dash.shutdown()
+            dash.server_close()
 
 
 if __name__ == "__main__":

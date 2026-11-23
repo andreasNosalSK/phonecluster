@@ -241,6 +241,9 @@ class MasterController:
         self.headers = build_auth_headers(config.auth_token)
         self.metrics_history = MetricsHistory(maxlen=60)
 
+    def _headers_for(self, node: NodeConfig) -> dict[str, str]:
+        return build_auth_headers(self.config.token_for_node(node))
+
     def _filter_nodes(self, tags: list[str] | None = None) -> list[NodeConfig]:
         if not tags:
             return list(self.config.nodes)
@@ -250,7 +253,7 @@ class MasterController:
     def check_node_health(self, node: NodeConfig) -> NodeSnapshot:
         """Query GET /health on a single worker node."""
         url = f"{node.base_url}/health"
-        req = urllib.request.Request(url, headers=self.headers, method="GET")
+        req = urllib.request.Request(url, headers=self._headers_for(node), method="GET")
         t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=self.config.health_timeout_sec) as resp:
@@ -295,7 +298,7 @@ class MasterController:
         """
         url = f"{node.base_url}/exec"
         body = json.dumps(spec.to_payload()).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers=self.headers, method="POST")
+        req = urllib.request.Request(url, data=body, headers=self._headers_for(node), method="POST")
         http_timeout = max(spec.timeout_sec + 15.0, 30.0)
         try:
             with urllib.request.urlopen(req, timeout=http_timeout) as resp:
@@ -740,7 +743,7 @@ class MasterController:
     def get_node_jobs(self, node: NodeConfig) -> dict[str, Any]:
         """Fetch active and recent jobs from one worker node."""
         url = f"{node.base_url}/jobs"
-        req = urllib.request.Request(url, headers=self.headers, method="GET")
+        req = urllib.request.Request(url, headers=self._headers_for(node), method="GET")
         try:
             with urllib.request.urlopen(req, timeout=self.config.health_timeout_sec) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -771,7 +774,7 @@ class MasterController:
         node = self.config.get_node(node_id)
         url = f"{node.base_url}/cancel"
         body = json.dumps({"job_id": job_id}).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers=self.headers, method="POST")
+        req = urllib.request.Request(url, data=body, headers=self._headers_for(node), method="POST")
         try:
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 return json.loads(resp.read().decode("utf-8"))

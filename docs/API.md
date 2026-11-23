@@ -86,6 +86,11 @@ Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
 | `POST /api/workloads/action` | Bearer | Start/stop `distcc` or `llama-rpc` across all ready phones |
 | `POST /api/nodes/add` | Bearer | Add a discovered or manual worker phone directly into `config/cluster.json` |
 | `POST /api/nodes/remove` | Bearer | Remove a worker phone from `config/cluster.json` (Master protected) |
+| `GET /api/pair/hello` | Open Window | Public DH hello (`dh_pub`, `salt`, `session_id`, `fingerprint`) ONLY while a pairing window is open (`403` when closed) |
+| `POST /api/pair/complete` | Open Window | Completes 2048-bit DH + PIN mutual-proof handshake and returns Encrypt-then-MAC enrollment bundle (5-attempt lockout) |
+| `GET /api/pair/status` | Bearer | Returns active pairing window PIN, fingerprint, countdown, attempts left, and recently paired nodes |
+| `POST /api/pair/open` | Bearer | Opens a temporary pairing window (`ttl_sec`, `max_devices`) and starts the temporary UDP `8766` pairing beacon |
+| `POST /api/pair/close` | Bearer | Immediately closes any active pairing window and stops the UDP beacon |
 | `POST /api/settings` | Bearer | Update thermal & 24/7 battery safety settings and save atomically |
 | `POST /api/settings/test-webhook` | Bearer | Send a test JSON POST to the configured battery/smart-plug webhook URL |
 

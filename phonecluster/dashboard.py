@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .auth import verify_token
+from .auth import AuthRateLimiter, verify_token
 from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
@@ -25,6 +25,7 @@ from .config import (
 from .discovery import detect_local_ip, discover_lan_nodes
 from .doctor import run_doctor
 from .master import JobSpec, MasterController
+from .pairing import PairingManager
 
 LOG = logging.getLogger("phonecluster.dashboard")
 
@@ -628,28 +629,54 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
     <section id="panel-setup" class="panel" role="tabpanel" aria-labelledby="tab-setup">
       <div class="col-grid">
         <div class="card">
-          <h2>1. Auto-Discover or Add Phone</h2>
-          <p class="hint">Scan Wi-Fi for phones running PhoneCluster, or add an IP / Tailscale IP manually.</p>
-          <div class="row">
-            <button class="primary" onclick="scanLan()">Scan Wi-Fi Now (2s)</button>
+          <h2>1. Secure One-Tap Phone Pairing (Recommended)</h2>
+          <p class="hint">Cluster is completely silent to strangers on Wi-Fi until you open a temporary 2-minute pairing window.</p>
+          <div class="chips" style="margin-bottom:12px;">
+            <span class="pill ok">✓ 2048-bit DH Encrypted</span>
+            <span class="pill ok">✓ Unique Per-Phone Token</span>
+            <span class="pill neutral">5-Attempt Lockout</span>
+            <span class="pill neutral">Auto-Closes</span>
           </div>
-          <div id="discover-list" aria-live="polite" class="hint">Click "Scan Wi-Fi Now" to find nearby phones.</div>
+          <div class="row">
+            <label for="pair-slots" class="sr-only">How many phones to pair</label>
+            <select id="pair-slots" aria-label="How many phones to pair">
+              <option value="1" selected>Pair 1 Phone (Single-Use)</option>
+              <option value="2">Pair up to 2 Phones</option>
+              <option value="3">Pair up to 3 Phones</option>
+            </select>
+            <button id="btn-pair-open" class="primary" onclick="openPairingWindow()">Open Pairing Window (2 min)</button>
+            <button id="btn-pair-close" class="small danger" onclick="closePairingWindow()" style="display:none">Close Window Now</button>
+          </div>
+          <div id="pair-active-box" class="check-item" style="display:none; border-color:var(--ok);">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+              <div>
+                <div class="stat-label">Type this 6-Digit Code on the New Phone (<code class="mono">pc join</code>)</div>
+                <div id="pair-pin" class="mono" style="font-size:2rem; font-weight:800; letter-spacing:0.12em; color:var(--ok); margin:4px 0;">--- ---</div>
+                <div class="hint">Master Fingerprint: <strong id="pair-fp" class="mono">-</strong> · Attempts left: <strong id="pair-att">5</strong> · Slots left: <strong id="pair-rem">1</strong></div>
+              </div>
+              <span id="pair-timer" class="pill warn mono" style="font-size:0.95rem;">120s</span>
+            </div>
+          </div>
 
-          <h3 style="margin-top:16px;">Add Phone Manually</h3>
+          <h3 style="margin-top:16px;">One-Line Termux Phone Installer</h3>
+          <div class="row" style="margin-bottom:4px;">
+            <span class="hint" style="margin:0;">Run in Termux on your new phone (auto-finds Master when pairing is open):</span>
+            <button class="small" onclick="copyEl('install-snippet')">Copy</button>
+          </div>
+          <pre id="install-snippet" class="code">curl -fsSL https://raw.githubusercontent.com/andreasNosalSK/phonecluster/main/install.sh | bash</pre>
+
+          <h3 style="margin-top:16px;">Add Phone Manually (Tailscale / Static IP)</h3>
           <div class="form-grid">
             <div class="field"><label for="add-host">IP or Tailscale IP</label><input id="add-host" placeholder="192.168.1.204" /></div>
             <div class="field"><label for="add-user">SSH User</label><input id="add-user" placeholder="u0_a250" /></div>
             <div class="field"><label for="add-ssh-port">SSH Port</label><input id="add-ssh-port" type="number" value="8022" /></div>
             <div class="field"><label for="add-conc">Max Parallel Jobs</label><input id="add-conc" type="number" min="1" max="8" value="2" /></div>
           </div>
-          <button class="small primary" onclick="addManualNode()">+ Add Phone to Cluster</button>
-
-          <h3 style="margin-top:16px;">One-Line Termux Phone Installer</h3>
-          <div class="row" style="margin-bottom:4px;">
-            <span class="hint" style="margin:0;">Run in Termux on any Android 7+ phone:</span>
-            <button class="small" onclick="copyEl('install-snippet')">Copy</button>
+          <div class="row">
+            <button class="small primary" onclick="addManualNode()">+ Add Phone Manually</button>
+            <button class="small" onclick="scanLan()">Scan Opt-In Workers</button>
           </div>
-          <pre id="install-snippet" class="code">curl -fsSL https://raw.githubusercontent.com/andreasNosalSK/phonecluster/main/install.sh | bash</pre>
+          <div id="discover-list" aria-live="polite" class="hint"></div>
         </div>
 
         <div class="card">
@@ -780,6 +807,7 @@ async function verifyAndSaveToken() {
     }
     updateAuthBadge();
     loadSafetySettings();
+    refreshLive();
     showToast('Token verified — Terminal & Cluster controls unlocked!', 'ok');
   } catch (e) {
     showToast('Could not reach Master to verify token: ' + e, 'bad');
@@ -870,7 +898,7 @@ function selectTab(name) {
   }
   if (name === 'terminal') document.getElementById('term-input').focus();
   if (name === 'workloads') loadWorkloads();
-  if (name === 'setup' && getToken()) loadSafetySettings();
+  if (name === 'setup' && getToken()) { loadSafetySettings(); pollPairingStatus(); }
 }
 
 document.querySelector('nav.tabs').addEventListener('keydown', e => {
@@ -954,9 +982,19 @@ function renderTasksBoard(live) {
     + '</tbody></table></div>';
 }
 
+async function apiFetch(url) {
+  const token = getToken();
+  const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
+  return await fetch(url, { headers });
+}
+
 async function refreshLive() {
   try {
-    const r = await fetch('/api/live');
+    const r = await apiFetch('/api/live');
+    if (r.status === 401) {
+      document.getElementById('last-updated').textContent = 'Dashboard locked — paste auth_token above and click Unlock.';
+      return;
+    }
     const live = await r.json();
     lastLive = live;
     const d = live.summary;
@@ -1364,7 +1402,8 @@ function downloadLastMapJson() {
 
 async function loadWorkloads() {
   try {
-    const r = await fetch('/api/workloads');
+    const r = await apiFetch('/api/workloads');
+    if (r.status === 401) return;
     const d = await r.json();
     document.getElementById('wl-distcc').textContent = d.distcc_hosts
       ? 'export DISTCC_HOSTS="' + d.distcc_hosts + '"'
@@ -1400,11 +1439,75 @@ async function workloadAction(action) {
   setTimeout(loadWorkloads, 800);
 }
 
+let pairPollTimer = null;
+let knownPairedCount = 0;
+
+function renderPairingState(st) {
+  const box = document.getElementById('pair-active-box');
+  const btnClose = document.getElementById('btn-pair-close');
+  if (!st || !st.active) {
+    box.style.display = 'none';
+    btnClose.style.display = 'none';
+    if (pairPollTimer) { clearInterval(pairPollTimer); pairPollTimer = null; }
+    return;
+  }
+  box.style.display = 'block';
+  btnClose.style.display = 'inline-block';
+  document.getElementById('pair-pin').textContent = st.pin;
+  document.getElementById('pair-fp').textContent = st.fingerprint;
+  document.getElementById('pair-att').textContent = st.attempts_left + '/5';
+  document.getElementById('pair-rem').textContent = String(st.remaining_slots);
+  document.getElementById('pair-timer').textContent = st.expires_in_sec + 's left';
+
+  const recents = st.recent_paired || [];
+  if (recents.length > knownPairedCount) {
+    const latest = recents[recents.length - 1];
+    knownPairedCount = recents.length;
+    showToast('✓ Securely paired ' + latest.id + ' (' + latest.host + ') with its own unique token!', 'ok');
+    refreshLive();
+  }
+}
+
+async function openPairingWindow() {
+  const max_devices = Number(document.getElementById('pair-slots').value || 1);
+  const data = await authPost('/api/pair/open', { ttl_sec: 120, max_devices });
+  if (data.error) { showToast('Could not open pairing: ' + data.error, 'bad'); return; }
+  knownPairedCount = (data.recent_paired || []).length;
+  renderPairingState(data);
+  showToast('Pairing window open for 2 minutes! Run `pc join` on your new phone.', 'ok');
+  if (pairPollTimer) clearInterval(pairPollTimer);
+  pairPollTimer = setInterval(pollPairingStatus, 1500);
+}
+
+async function closePairingWindow() {
+  const data = await authPost('/api/pair/close', {});
+  if (data.error) { showToast(data.error, 'bad'); return; }
+  renderPairingState(data);
+  showToast('Pairing window closed — cluster is silent on Wi-Fi.', 'neutral');
+}
+
+async function pollPairingStatus() {
+  if (!getToken()) return;
+  try {
+    const r = await apiFetch('/api/pair/status');
+    if (!r.ok) return;
+    const st = await r.json();
+    const recents = st.recent_paired || [];
+    if (recents.length > knownPairedCount) {
+      const latest = recents[recents.length - 1];
+      knownPairedCount = recents.length;
+      showToast('✓ Securely paired ' + latest.id + ' (' + latest.host + ') with its own unique token!', 'ok');
+      refreshLive();
+    }
+    renderPairingState(st);
+  } catch (e) {}
+}
+
 async function scanLan() {
   const box = document.getElementById('discover-list');
   box.innerHTML = 'Scanning Wi-Fi (2 seconds)...';
   try {
-    const r = await fetch('/api/discover');
+    const r = await apiFetch('/api/discover');
     const d = await r.json();
     if (!d.discovered || !d.discovered.length) {
       box.innerHTML = '<p class="hint">No phones answered UDP discovery on port 8766. Make sure workers are running on the same Wi-Fi, or use Manual Add below.</p>';
@@ -1492,7 +1595,7 @@ async function runDoctorUi() {
   const box = document.getElementById('doctor-list');
   box.innerHTML = 'Running diagnostics...';
   try {
-    const r = await fetch('/api/doctor');
+    const r = await apiFetch('/api/doctor');
     const d = await r.json();
     const icons = { ok: '✓ OK', warn: '⚠ WARN', fail: '✕ FAIL' };
     const cls = { ok: 'ok', warn: 'warn', fail: 'bad' };
@@ -1540,10 +1643,27 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         addr: tuple[str, int],
         controller: MasterController,
         config_path: Path | None = None,
+        enable_pairing_beacon: bool = True,
+        pairing_fail_delay_sec: float = 1.0,
     ) -> None:
         self.controller = controller
         self.config_path = config_path
+        self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
         super().__init__(addr, DashboardRequestHandler)
+        self.pairing_manager = PairingManager(
+            config=controller.config,
+            config_path=config_path,
+            pair_port=self.server_address[1],
+            listen_host=addr[0],
+            fail_delay_sec=pairing_fail_delay_sec,
+            enable_beacon=enable_pairing_beacon,
+        )
+
+    def server_close(self) -> None:
+        try:
+            self.pairing_manager.close_session()
+        finally:
+            super().server_close()
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -1578,26 +1698,36 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return None
 
     def _require_auth(self) -> bool:
+        client_ip = self.client_address[0]
+        blocked, retry_after = self.server.rate_limiter.is_blocked(client_ip)
+        if blocked:
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": f"too many failed auth attempts; retry in {retry_after}s", "retry_after_sec": retry_after},
+            )
+            return False
         if not verify_token(self.headers, self.server.controller.config.auth_token):
+            self.server.rate_limiter.record_failure(client_ip)
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized (invalid or missing auth_token)"})
             return False
+        self.server.rate_limiter.record_success(client_ip)
+        return True
+
+    def _require_read_auth_if_locked(self) -> bool:
+        if self.server.controller.config.dashboard_require_auth:
+            return self._require_auth()
         return True
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path in {"/", "/index.html"}:
             self._send(HTTPStatus.OK, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"))
-        elif path == "/api/status":
-            self._send_json(HTTPStatus.OK, self.server.controller.cluster_summary())
-        elif path == "/api/metrics":
-            self._send_json(HTTPStatus.OK, self.server.controller.metrics_history.snapshot())
-        elif path == "/api/live":
-            summary = self.server.controller.cluster_summary()
-            jobs = self.server.controller.get_all_jobs()
-            history = self.server.controller.metrics_history.snapshot()
-            self._send_json(HTTPStatus.OK, {"summary": summary, "jobs": jobs, "history": history})
-        elif path == "/api/jobs":
-            self._send_json(HTTPStatus.OK, {"nodes": self.server.controller.get_all_jobs()})
+        elif path == "/api/pair/hello":
+            status, data = self.server.pairing_manager.public_hello()
+            self._send_json(status, data)
+        elif path == "/api/pair/status":
+            if self._require_auth():
+                self._send_json(HTTPStatus.OK, self.server.pairing_manager.admin_status())
         elif path == "/api/auth/verify":
             if self._require_auth():
                 self._send_json(HTTPStatus.OK, {"valid": True})
@@ -1616,42 +1746,64 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "battery_webhook_url": s.battery_webhook_url,
                 },
             )
-        elif path == "/api/doctor":
-            report = run_doctor(config_path=self.server.config_path, check_remote=True)
-            self._send_json(HTTPStatus.OK, report)
-        elif path == "/api/workloads":
-            ctrl = self.server.controller
-            snaps = ctrl.poll_health()
-            ha_urls: list[str] = []
-            docker_nodes: list[str] = []
-            for s in snaps:
-                if not s.online:
-                    continue
-                if s.health.get("services", {}).get("homeassistant_8123"):
-                    ha_urls.append(f"http://{s.node.host}:8123")
-                if s.health.get("tools", {}).get("docker"):
-                    docker_nodes.append(s.node.id)
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "distcc_hosts": ctrl.build_distcc_hosts(),
-                    "llama_rpc": ctrl.build_llama_rpc_arg(),
-                    "mpi_hostfile": ctrl.build_mpi_hostfile(),
-                    "home_assistant_urls": ha_urls,
-                    "docker_nodes": docker_nodes,
-                },
-            )
-        elif path == "/api/discover":
-            existing_hosts = {n.host for n in self.server.controller.config.nodes}
-            found = discover_lan_nodes(timeout_sec=2.0)
-            for item in found:
-                item["already_configured"] = item["host"] in existing_hosts
-            self._send_json(HTTPStatus.OK, {"discovered": found})
+        elif path in {"/api/status", "/api/metrics", "/api/live", "/api/jobs", "/api/doctor", "/api/workloads", "/api/discover"}:
+            if not self._require_read_auth_if_locked():
+                return
+            if path == "/api/status":
+                self._send_json(HTTPStatus.OK, self.server.controller.cluster_summary())
+            elif path == "/api/metrics":
+                self._send_json(HTTPStatus.OK, self.server.controller.metrics_history.snapshot())
+            elif path == "/api/live":
+                summary = self.server.controller.cluster_summary()
+                jobs = self.server.controller.get_all_jobs()
+                history = self.server.controller.metrics_history.snapshot()
+                self._send_json(HTTPStatus.OK, {"summary": summary, "jobs": jobs, "history": history})
+            elif path == "/api/jobs":
+                self._send_json(HTTPStatus.OK, {"nodes": self.server.controller.get_all_jobs()})
+            elif path == "/api/doctor":
+                report = run_doctor(config_path=self.server.config_path, check_remote=True)
+                self._send_json(HTTPStatus.OK, report)
+            elif path == "/api/workloads":
+                ctrl = self.server.controller
+                snaps = ctrl.poll_health()
+                ha_urls: list[str] = []
+                docker_nodes: list[str] = []
+                for s in snaps:
+                    if not s.online:
+                        continue
+                    if s.health.get("services", {}).get("homeassistant_8123"):
+                        ha_urls.append(f"http://{s.node.host}:8123")
+                    if s.health.get("tools", {}).get("docker"):
+                        docker_nodes.append(s.node.id)
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "distcc_hosts": ctrl.build_distcc_hosts(),
+                        "llama_rpc": ctrl.build_llama_rpc_arg(),
+                        "mpi_hostfile": ctrl.build_mpi_hostfile(),
+                        "home_assistant_urls": ha_urls,
+                        "docker_nodes": docker_nodes,
+                    },
+                )
+            elif path == "/api/discover":
+                existing_hosts = {n.host for n in self.server.controller.config.nodes}
+                found = discover_lan_nodes(timeout_sec=2.0)
+                for item in found:
+                    item["already_configured"] = item["host"] in existing_hosts
+                self._send_json(HTTPStatus.OK, {"discovered": found})
         else:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
+        if path == "/api/pair/complete":
+            body = self._read_json()
+            if body is None:
+                return
+            status, data = self.server.pairing_manager.complete_pairing(self.client_address[0], body)
+            self._send_json(status, data)
+            return
+
         valid_paths = {
             "/api/exec",
             "/api/terminal/exec",
@@ -1662,6 +1814,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/workloads/action",
             "/api/settings",
             "/api/settings/test-webhook",
+            "/api/pair/open",
+            "/api/pair/close",
         }
         if path not in valid_paths:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -1673,6 +1827,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         ctrl = self.server.controller
+
+        if path == "/api/pair/open":
+            ttl = int(body.get("ttl_sec", 120))
+            slots = int(body.get("max_devices", 1))
+            data = self.server.pairing_manager.open_session(ttl_sec=ttl, max_devices=slots)
+            self._send_json(HTTPStatus.OK, data)
+            return
+        if path == "/api/pair/close":
+            data = self.server.pairing_manager.close_session()
+            self._send_json(HTTPStatus.OK, data)
+            return
 
         if path == "/api/exec":
             command = str(body.get("command", "")).strip()
