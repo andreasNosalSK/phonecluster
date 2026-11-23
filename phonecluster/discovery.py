@@ -13,8 +13,10 @@ import json
 import logging
 import os
 import socket
+import struct
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from .telemetry import detect_os_environment, read_memory_info
@@ -25,22 +27,69 @@ DISCOVERY_PORT = 8766
 PROBE_TYPE = "phonecluster_discover_v1"
 REPLY_TYPE = "phonecluster_announce_v1"
 
+_SIOCGIFADDR = 0x8915
 
-def detect_local_ip() -> str:
-    """Best-effort detection of this device's LAN IPv4 address."""
+
+def _detect_ipv4_via_sys_net() -> str | None:
+    """Linux zero-dependency fallback using `SIOCGIFADDR` for air-gapped LANs without a default route."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    net_dir = Path("/sys/class/net")
+    if not net_dir.exists():
+        return None
+    try:
+        ifaces = sorted(p.name for p in net_dir.iterdir() if p.is_dir())
+    except OSError:
+        return None
+
+    def _iface_priority(name: str) -> tuple[int, str]:
+        if name.startswith(("wlan", "wl", "eth", "en")):
+            return (0, name)
+        if name.startswith(("tailscale", "wg", "usb", "rndis")):
+            return (1, name)
+        if name.startswith(("docker", "br-", "veth", "virbr", "cni", "flannel")):
+            return (3, name)
+        return (2, name)
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.connect(("192.0.2.1", 80))
-        ip = sock.getsockname()[0]
-        if ip and not ip.startswith("127."):
-            return ip
-    except OSError:
-        pass
+        for name in sorted(ifaces, key=_iface_priority):
+            if name == "lo" or name.startswith("dummy"):
+                continue
+            try:
+                req = struct.pack("256s", name[:15].encode("utf-8"))
+                res = fcntl.ioctl(sock.fileno(), _SIOCGIFADDR, req)
+                ip = socket.inet_ntoa(res[20:24])
+                if ip and not ip.startswith(("127.", "169.254.")):
+                    return ip
+            except OSError:
+                continue
     finally:
         sock.close()
+    return None
+
+
+def detect_local_ip() -> str:
+    """Best-effort detection of this device's LAN IPv4 address (works even on air-gapped LANs)."""
+    for probe_ip in ("192.0.2.1", "192.168.0.1", "10.255.255.255", "172.16.0.1"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect((probe_ip, 80))
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith(("127.", "169.254.")):
+                return ip
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    iface_ip = _detect_ipv4_via_sys_net()
+    if iface_ip:
+        return iface_ip
     try:
         ip = socket.gethostbyname(socket.gethostname())
-        if ip and not ip.startswith("127."):
+        if ip and not ip.startswith(("127.", "169.254.")):
             return ip
     except OSError:
         pass
@@ -171,14 +220,21 @@ def discover_lan_nodes(
 
     found: dict[tuple[str, int], dict[str, Any]] = {}
     try:
-        for dest in dests:
-            try:
-                sock.sendto(probe, (dest, discovery_port))
-            except OSError as exc:
-                LOG.debug("Broadcast to %s:%d failed: %s", dest, discovery_port, exc)
+        def _send_probes() -> None:
+            for dest in dests:
+                try:
+                    sock.sendto(probe, (dest, discovery_port))
+                except OSError as exc:
+                    LOG.debug("Broadcast to %s:%d failed: %s", dest, discovery_port, exc)
 
-        deadline = time.monotonic() + max(0.2, timeout_sec)
+        _send_probes()
+        started = time.monotonic()
+        deadline = started + max(0.2, timeout_sec)
+        resent = False
         while time.monotonic() < deadline:
+            if not resent and timeout_sec >= 0.8 and (time.monotonic() - started) >= (timeout_sec * 0.45):
+                _send_probes()
+                resent = True
             try:
                 data, addr = sock.recvfrom(4096)
             except socket.timeout:

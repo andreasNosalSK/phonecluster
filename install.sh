@@ -199,7 +199,7 @@ if [[ "${ROLE}" == "master" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR
   fi
 elif [[ "${ROLE}" == "worker" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR}/config/cluster.json" ]]; then
   echo "Ready to join your cluster securely!"
-  echo "  -> On your Master phone, open Pairing first (Web UI Tab 5 or run: pc pair)"
+  echo "  -> On your Master phone, open Pairing first (Web UI Tab 6 or run: pc pair)"
   RUN_JOIN="$(ask "Auto-search Wi-Fi for your Master phone and pair now? [Y/n]: " "y")"
   if [[ "${RUN_JOIN,,}" == "y" || "${RUN_JOIN,,}" == "yes" ]]; then
     if [[ -r /dev/tty ]]; then

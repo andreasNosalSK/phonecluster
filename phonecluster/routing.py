@@ -14,7 +14,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import ClusterConfig, NodeConfig
+from .config import ClusterConfig, NodeConfig, format_host_for_url, format_host_port, is_loopback_or_unspecified_host
 
 TIER_LABELS: dict[int, str] = {
     1: "Tier 1 · Termux Compute",
@@ -266,6 +266,7 @@ _SERVICE_SPEC: list[tuple[str, str, int, str]] = [
     # (logical_name, telemetry_service_key, port, scheme)
     ("mqtt", "mosquitto_1883", 1883, "mqtt"),
     ("homeassistant", "homeassistant_8123", 8123, "http"),
+    ("adguard", "adguard_80", 80, "http"),
     ("adguard", "adguard_3000", 3000, "http"),
     ("dns", "dns_53", 53, "dns"),
     ("llama_api", "llama_api_8081", 8081, "http"),
@@ -281,6 +282,7 @@ def build_service_registry(
 ) -> list[dict[str, Any]]:
     """Discover all live cross-tier services running across every online phone."""
     entries: list[dict[str, Any]] = []
+    has_auto_adguard = False
     for snap in snapshots:
         if not snap.online:
             continue
@@ -288,23 +290,41 @@ def build_service_registry(
         tier, pool = resolve_node_tier_and_pool(snap.node, h)
         svcs = h.get("services") or {}
         tools = h.get("tools") or {}
+        # Build port -> exposed map if telemetry included `/proc/net/tcp*` listening ports
+        lp_exposed: dict[int, bool] = {}
+        for item in h.get("listening_ports") or []:
+            if isinstance(item, dict) and "port" in item:
+                try:
+                    lp_exposed[int(item["port"])] = bool(item.get("exposed", True))
+                except (TypeError, ValueError):
+                    pass
+        node_is_local = is_loopback_or_unspecified_host(snap.node.host)
+        seen_on_node: set[str] = set()
 
         for name, key, port, scheme in _SERVICE_SPEC:
-            if svcs.get(key):
-                url = f"{scheme}://{snap.node.host}:{port}"
-                entries.append(
-                    {
-                        "name": name,
-                        "node_id": snap.node.id,
-                        "host": snap.node.host,
-                        "port": port,
-                        "url": url,
-                        "tier": tier,
-                        "pool": pool,
-                        "ready": snap.ready_for_jobs,
-                        "source": "auto",
-                    }
-                )
+            if not svcs.get(key) or name in seen_on_node:
+                continue
+            seen_on_node.add(name)
+            if name == "adguard":
+                has_auto_adguard = True
+            url = f"{scheme}://{format_host_port(snap.node.host, port)}"
+            loopback_only = (not node_is_local) and (port in lp_exposed) and (not lp_exposed[port])
+            entries.append(
+                {
+                    "name": name,
+                    "node_id": snap.node.id,
+                    "host": snap.node.host,
+                    "port": port,
+                    "url": url,
+                    "tier": tier,
+                    "pool": pool,
+                    "ready": snap.ready_for_jobs,
+                    "loopback_only": loopback_only,
+                    "cpu_cores": max(1, int(h.get("cpu_cores", 4))),
+                    "role": snap.node.role,
+                    "source": "auto",
+                }
+            )
         if tools.get("docker") or tier == 3:
             entries.append(
                 {
@@ -312,13 +332,37 @@ def build_service_registry(
                     "node_id": snap.node.id,
                     "host": snap.node.host,
                     "port": 0,
-                    "url": f"ssh://{snap.node.host}:{snap.node.ssh_port}",
+                    "url": f"ssh://{format_host_port(snap.node.host, snap.node.ssh_port)}",
                     "tier": tier,
                     "pool": pool,
                     "ready": snap.ready_for_jobs,
+                    "loopback_only": False,
                     "source": "auto",
                 }
             )
+
+    if config.network.adguard_url and not has_auto_adguard:
+        ag_url = config.network.adguard_url
+        parsed_ag = urllib.parse.urlparse(ag_url)
+        ag_host = parsed_ag.hostname or ""
+        try:
+            ag_port = parsed_ag.port or (443 if parsed_ag.scheme == "https" else 80)
+        except ValueError:
+            ag_port = 80
+        entries.append(
+            {
+                "name": "adguard",
+                "node_id": "configured",
+                "host": ag_host,
+                "port": ag_port,
+                "url": ag_url,
+                "tier": 0,
+                "pool": "network",
+                "ready": True,
+                "loopback_only": False,
+                "source": "network_config",
+            }
+        )
 
     for cname, curl in sorted(config.custom_services.items()):
         parsed = urllib.parse.urlparse(curl)
@@ -337,6 +381,7 @@ def build_service_registry(
                 "tier": 0,
                 "pool": "custom",
                 "ready": True,
+                "loopback_only": False,
                 "source": "config",
             }
         )
@@ -344,11 +389,15 @@ def build_service_registry(
 
 
 def _pick_primary_service(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Prefer a cool/ready service instance over an overheated or busy one."""
-    for item in items:
-        if item.get("ready"):
-            return item
-    return items[0]
+    """Prefer an externally reachable, cool/ready service instance over loopback-only or busy ones."""
+    ranked = sorted(
+        items,
+        key=lambda e: (
+            1 if e.get("loopback_only") else 0,
+            0 if e.get("ready") else 1,
+        ),
+    )
+    return ranked[0]
 
 
 def build_cross_tier_env(
@@ -383,9 +432,25 @@ def build_cross_tier_env(
     if "llama_api" in by_name:
         env["PHONECLUSTER_LLAMA_API_URL"] = _pick_primary_service(by_name["llama_api"])["url"]
     if "llama_rpc" in by_name:
-        rpc_eps = [f"{e['host']}:{e['port']}" for e in by_name["llama_rpc"] if e.get("ready")]
+        rpc_eps = [
+            format_host_port(e["host"], int(e["port"]))
+            for e in by_name["llama_rpc"]
+            if e.get("ready") and not e.get("loopback_only")
+        ]
         if rpc_eps:
             env["PHONECLUSTER_LLAMA_RPC"] = ",".join(rpc_eps)
+    if "distcc" in by_name:
+        distcc_entries: list[str] = []
+        for e in by_name["distcc"]:
+            if not e.get("ready") or e.get("loopback_only"):
+                continue
+            cores = max(1, int(e.get("cpu_cores", 4)))
+            if e.get("role") == "master" or e.get("host") in {"127.0.0.1", "localhost"}:
+                distcc_entries.append(f"localhost/{max(1, cores - 2)}")
+            else:
+                distcc_entries.append(f"{format_host_for_url(e['host'])}/{cores},lzo")
+        if distcc_entries:
+            env["PHONECLUSTER_DISTCC_HOSTS"] = " ".join(distcc_entries)
     if "redis" in by_name:
         env["PHONECLUSTER_REDIS_URL"] = _pick_primary_service(by_name["redis"])["url"]
     if "postgres" in by_name:
@@ -433,8 +498,15 @@ def build_cluster_dns_hosts(
         lines.append(f"{snap.node.host:<16s} {snap.node.id}.{domain}  # Tier {tier} ({pool})")
 
     registry = build_service_registry(snapshots, config)
-    # Prefer cool/ready auto-discovered services before busy/warm duplicates
-    ordered_registry = sorted(registry, key=lambda e: (0 if e.get("ready") else 1, 0 if e.get("source") == "auto" else 1))
+    # Prefer externally reachable, cool/ready auto-discovered services before loopback/warm duplicates
+    ordered_registry = sorted(
+        registry,
+        key=lambda e: (
+            1 if e.get("loopback_only") else 0,
+            0 if e.get("ready") else 1,
+            0 if e.get("source") == "auto" else 1,
+        ),
+    )
     seen_aliases: set[str] = set()
     alias_map = {
         "mqtt": "mqtt",

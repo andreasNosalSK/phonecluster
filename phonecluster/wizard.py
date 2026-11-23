@@ -314,12 +314,24 @@ def run_interactive_menu(
             print(f"OpenMPI   :\n{mpi or '(no healthy nodes)'}")
             if _prompt_yes_no("Start distccd compiler workers on all ready phones now?", default=False, input_fn=input_fn):
                 cidr = _prompt("Allowed LAN subnet CIDR", "192.168.1.0/24", input_fn=input_fn)
-                spec = JobSpec(
-                    index=0,
-                    job_id="menu-distcc",
-                    command=f"bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-start {cidr}",
-                    timeout_sec=30.0,
-                )
+                helper_sh = Path(__file__).resolve().parent.parent / "scripts" / "05_workload_helpers.sh"
+                if helper_sh.exists():
+                    spec = JobSpec(
+                        index=0,
+                        job_id="menu-distcc",
+                        script_content=helper_sh.read_text(encoding="utf-8"),
+                        script_name="05_workload_helpers.sh",
+                        interpreter="bash",
+                        args=["distcc-start", cidr],
+                        timeout_sec=30.0,
+                    )
+                else:
+                    spec = JobSpec(
+                        index=0,
+                        job_id="menu-distcc",
+                        command=f"bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-start {cidr}",
+                        timeout_sec=30.0,
+                    )
                 for o in ctrl.run_single(spec, target="all"):
                     print(f"[{o.node_id}] {'OK' if o.ok else 'FAIL'}: {(o.stdout or o.stderr or o.error).strip()}")
         elif choice == "t":

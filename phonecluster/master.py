@@ -17,7 +17,7 @@ from http import HTTPStatus
 from typing import Any, Callable
 
 from .auth import build_auth_headers
-from .config import ClusterConfig, NodeConfig
+from .config import ClusterConfig, NodeConfig, format_host_for_url, format_host_port
 from .gateway import build_worker_proxy_env
 from .routing import (
     build_cluster_dns_hosts,
@@ -30,6 +30,9 @@ from .routing import (
 )
 
 LOG = logging.getLogger("phonecluster.master")
+
+# Direct LAN opener: Master <-> Worker traffic must NEVER be hijacked by host HTTP_PROXY env vars
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 @dataclass
@@ -254,6 +257,7 @@ class MasterController:
 
     def __init__(self, config: ClusterConfig) -> None:
         self.config = config
+        self.config_lock = threading.RLock()
         self.headers = build_auth_headers(config.auth_token)
         self.metrics_history = MetricsHistory(maxlen=60)
         self.gateway_port_override: int | None = None
@@ -262,10 +266,12 @@ class MasterController:
         return build_auth_headers(self.config.token_for_node(node))
 
     def _filter_nodes(self, tags: list[str] | None = None) -> list[NodeConfig]:
+        with self.config_lock:
+            nodes = list(self.config.nodes)
         if not tags:
-            return list(self.config.nodes)
+            return nodes
         want = set(tags)
-        return [n for n in self.config.nodes if want.issubset(set(n.tags))]
+        return [n for n in nodes if want.issubset(set(n.tags))]
 
     def check_node_health(self, node: NodeConfig) -> NodeSnapshot:
         """Query GET /health on a single worker node."""
@@ -273,7 +279,7 @@ class MasterController:
         req = urllib.request.Request(url, headers=self._headers_for(node), method="GET")
         t0 = time.monotonic()
         try:
-            with urllib.request.urlopen(req, timeout=self.config.health_timeout_sec) as resp:
+            with _DIRECT_OPENER.open(req, timeout=self.config.health_timeout_sec) as resp:
                 raw = resp.read().decode("utf-8")
                 data = json.loads(raw)
                 latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
@@ -318,7 +324,7 @@ class MasterController:
         req = urllib.request.Request(url, data=body, headers=self._headers_for(node), method="POST")
         http_timeout = max(spec.timeout_sec + 15.0, 30.0)
         try:
-            with urllib.request.urlopen(req, timeout=http_timeout) as resp:
+            with _DIRECT_OPENER.open(req, timeout=http_timeout) as resp:
                 raw = resp.read().decode("utf-8")
                 return "ok", json.loads(raw)
         except urllib.error.HTTPError as exc:
@@ -437,27 +443,42 @@ class MasterController:
                 key=lambda s: score_node(s, max_temp_c=self.config.safety.max_temp_c),
                 reverse=True,
             )
-            best_snap = candidates[0]
-            tier, pool_name = resolve_node_tier_and_pool(best_snap.node, best_snap.health)
-            kind, data = self.exec_on_node(
-                best_snap.node, self._with_node_env(spec, best_snap.node, cross_env)
+            # Fail over automatically across remaining ranked candidates on transient 503/disconnect
+            last_snap = candidates[0]
+            last_kind = "retryable"
+            last_data: dict[str, Any] = {}
+            attempts = 0
+            for cand in candidates:
+                attempts += 1
+                last_snap = cand
+                last_kind, last_data = self.exec_on_node(
+                    cand.node, self._with_node_env(spec, cand.node, cross_env)
+                )
+                if last_kind != "retryable":
+                    break
+            tier, pool_name = resolve_node_tier_and_pool(last_snap.node, last_snap.health)
+            eff_reason = (
+                f"{reason} (failover after {attempts - 1} retry)"
+                if attempts > 1 and last_kind == "ok"
+                else reason
             )
             return [
                 self._to_outcome(
                     spec,
-                    best_snap.node.id,
-                    kind,
-                    data,
-                    attempts=1,
+                    last_snap.node.id,
+                    last_kind,
+                    last_data,
+                    attempts=attempts,
                     node_tier=tier,
                     node_pool=pool_name,
-                    routing_reason=reason,
+                    routing_reason=eff_reason,
                 )
             ]
 
         # Specific node id
         try:
-            node = self.config.get_node(target)
+            with self.config_lock:
+                node = self.config.get_node(target)
         except KeyError:
             return [
                 JobOutcome(
@@ -517,14 +538,26 @@ class MasterController:
         outcomes_by_index: dict[int, JobOutcome] = {}
         last_reason_by_index: dict[int, str] = {}
         in_flight_per_node: dict[str, int] = collections.defaultdict(int)
+        external_active: dict[str, int] = collections.defaultdict(int)
         running_futures: dict[
             concurrent.futures.Future[tuple[str, dict[str, Any]]],
             tuple[JobSpec, NodeSnapshot, int, set[str], str],
         ] = {}
 
-        snapshots = self.poll_health(tags=tags)
-        cross_env = build_cross_tier_env(snapshots, self.config)
-        last_poll = time.monotonic()
+        snapshots: list[NodeSnapshot] = []
+        cross_env: dict[str, str] = {}
+        last_poll = 0.0
+
+        def _refresh_health() -> None:
+            nonlocal snapshots, cross_env, last_poll
+            snapshots = self.poll_health(tags=tags)
+            cross_env = build_cross_tier_env(snapshots, self.config)
+            last_poll = time.monotonic()
+            for s in snapshots:
+                # Account for jobs already running on this phone outside this map_jobs() batch
+                external_active[s.node.id] = max(0, s.active_jobs - in_flight_per_node[s.node.id])
+
+        _refresh_health()
         no_ready_since: float | None = None
         completed_count = 0
         total_jobs = len(jobs)
@@ -538,9 +571,7 @@ class MasterController:
             while pending or running_futures:
                 now = time.monotonic()
                 if now - last_poll >= health_refresh_sec:
-                    snapshots = self.poll_health(tags=tags)
-                    cross_env = build_cross_tier_env(snapshots, self.config)
-                    last_poll = time.monotonic()
+                    _refresh_health()
 
                 dispatched_any = False
                 # Dispatch as many pending jobs as there are free compatible healthy slots
@@ -559,7 +590,7 @@ class MasterController:
                     eligible = [
                         s
                         for s in pool_matched
-                        if in_flight_per_node[s.node.id] < s.max_concurrency
+                        if (external_active[s.node.id] + in_flight_per_node[s.node.id]) < s.max_concurrency
                     ]
                     if not eligible:
                         # Continue inspecting remaining jobs so busy Tier X does not block Tier Y
@@ -572,7 +603,7 @@ class MasterController:
                     pool_candidates.sort(
                         key=lambda s: score_node(
                             s,
-                            in_flight_local=in_flight_per_node[s.node.id],
+                            in_flight_local=external_active[s.node.id] + in_flight_per_node[s.node.id],
                             max_temp_c=self.config.safety.max_temp_c,
                         ),
                         reverse=True,
@@ -605,9 +636,7 @@ class MasterController:
                             failed_nodes.add(snap.node.id)
                             pending.appendleft((spec, attempt, failed_nodes))
                             # Refresh health immediately since a node likely throttled or dropped
-                            snapshots = self.poll_health(tags=tags)
-                            cross_env = build_cross_tier_env(snapshots, self.config)
-                            last_poll = time.monotonic()
+                            _refresh_health()
                             continue
 
                         tier, pool_name = resolve_node_tier_and_pool(snap.node, snap.health)
@@ -660,9 +689,7 @@ class MasterController:
                                 on_result(outcome, completed_count, total_jobs)
                         break
                     time.sleep(min(1.0, max(0.1, wait_for_ready_sec - elapsed_wait)))
-                    snapshots = self.poll_health(tags=tags)
-                    cross_env = build_cross_tier_env(snapshots, self.config)
-                    last_poll = time.monotonic()
+                    _refresh_health()
 
         return [outcomes_by_index[i] for i in sorted(outcomes_by_index.keys())]
 
@@ -914,7 +941,7 @@ class MasterController:
                 slots = max(1, cores - 2)
                 entries.append(f"localhost/{slots}")
             else:
-                entries.append(f"{snap.node.host}/{cores},lzo")
+                entries.append(f"{format_host_for_url(snap.node.host)}/{cores},lzo")
         return " ".join(entries)
 
     def build_llama_rpc_arg(
@@ -931,8 +958,15 @@ class MasterController:
                 continue
             if not include_master and snap.node.role == "master":
                 continue
-            if snap.health.get("services", {}).get("llama_rpc_50052"):
-                endpoints.append(f"{snap.node.host}:{port}")
+            svcs = snap.health.get("services", {})
+            lp_ports = {
+                int(p["port"])
+                for p in (snap.health.get("listening_ports") or [])
+                if isinstance(p, dict) and "port" in p
+            }
+            active = (port == 50052 and bool(svcs.get("llama_rpc_50052"))) or (port in lp_ports)
+            if active:
+                endpoints.append(format_host_port(snap.node.host, port))
         return ",".join(endpoints)
 
     def build_mpi_hostfile(self, snapshots: list[NodeSnapshot] | None = None) -> str:
@@ -1092,7 +1126,8 @@ class MasterController:
         Runs a raw TCP probe directly from each online worker (bypassing any proxy).
         If the direct connection fails/times out, that worker is air-gapped from WAN.
         """
-        workers = [n for n in self.config.nodes if n.role != "master"]
+        with self.config_lock:
+            workers = [n for n in self.config.nodes if n.role != "master"]
         if not workers:
             return []
         probe_code = (
@@ -1177,6 +1212,14 @@ class MasterController:
             timeout_sec=float(timeout_sec or self.config.default_job_timeout_sec),
         )
         outcomes = self.run_single(spec, target=target, workload_hint=workload_hint)
+        # Self-heal stale tracked `cwd` (e.g. directory removed or worker phone rebooted)
+        if cwd and outcomes and all(
+            (not o.ok) and "workdir does not exist" in (o.error or "").lower()
+            for o in outcomes
+        ):
+            spec_fallback = replace(spec, workdir=None)
+            outcomes = self.run_single(spec_fallback, target=target, workload_hint=workload_hint)
+            cwd = None
         results: list[dict[str, Any]] = []
         for o in outcomes:
             out_text = o.stdout
@@ -1200,7 +1243,7 @@ class MasterController:
         url = f"{node.base_url}/jobs"
         req = urllib.request.Request(url, headers=self._headers_for(node), method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=self.config.health_timeout_sec) as resp:
+            with _DIRECT_OPENER.open(req, timeout=self.config.health_timeout_sec) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 return {"node_id": node.id, "online": True, **data}
         except urllib.error.HTTPError as exc:
@@ -1214,7 +1257,8 @@ class MasterController:
 
     def get_all_jobs(self) -> list[dict[str, Any]]:
         """Query active & recent jobs across all configured nodes in parallel."""
-        nodes = list(self.config.nodes)
+        with self.config_lock:
+            nodes = list(self.config.nodes)
         if not nodes:
             return []
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes))) as pool:
@@ -1226,12 +1270,13 @@ class MasterController:
 
     def cancel_node_job(self, node_id: str, job_id: str) -> dict[str, Any]:
         """Cancel a running job on a specific node."""
-        node = self.config.get_node(node_id)
+        with self.config_lock:
+            node = self.config.get_node(node_id)
         url = f"{node.base_url}/cancel"
         body = json.dumps({"job_id": job_id}).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=self._headers_for(node), method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
+            with _DIRECT_OPENER.open(req, timeout=5.0) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             try:

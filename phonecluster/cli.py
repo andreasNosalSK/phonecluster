@@ -16,9 +16,12 @@ from typing import Any
 from . import __version__
 from .config import (
     DEFAULT_CONFIG_PATH,
+    DEFAULT_SSH_PORT,
     create_default_config,
+    format_host_for_url,
     generate_auth_token,
     load_config,
+    normalize_host,
     resolve_config_path,
     save_config,
 )
@@ -69,6 +72,7 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
         master_host=args.master_host,
         worker_hosts=workers,
         ssh_user=args.ssh_user,
+        ssh_port=args.ssh_port,
     )
     saved = save_config(cfg, out_path)
     print(f"Created cluster config at: {saved}")
@@ -531,6 +535,9 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
 def _cmd_net_audit(args: argparse.Namespace) -> int:
     cfg_path = resolve_config_path(args.config)
     cfg = load_config(cfg_path)
+    if getattr(args, "lan_subnet", ""):
+        cfg.network.lan_subnet = str(args.lan_subnet).strip()
+        save_config(cfg, cfg_path)
     if args.profile:
         res = apply_security_profile(cfg, args.profile)
         save_config(cfg, cfg_path)
@@ -615,18 +622,28 @@ def _cmd_join(args: argparse.Namespace) -> int:
     cluster_name = ""
 
     if args.master:
-        if ":" in args.master:
-            master_host, p_str = args.master.rsplit(":", 1)
+        raw_m = args.master.strip()
+        if raw_m.startswith("["):
+            if "]:" in raw_m:
+                h_part, p_str = raw_m.rsplit("]:", 1)
+                master_host = normalize_host(h_part.lstrip("["))
+                pair_port = int(p_str)
+            else:
+                master_host = normalize_host(raw_m)
+        elif raw_m.count(":") == 1:
+            h_part, p_str = raw_m.rsplit(":", 1)
+            master_host = normalize_host(h_part)
             pair_port = int(p_str)
         else:
-            master_host = args.master
+            # Hostname, IPv4 without port, or bare IPv6 literal (multiple ':')
+            master_host = normalize_host(raw_m)
     else:
         print("Searching local Wi-Fi for a Master phone with an open Pairing Window...")
         found = discover_pairing_masters(timeout_sec=args.timeout)
         if not found:
             print(
                 "No Master phone with an open Pairing Window was found on Wi-Fi.\n"
-                "  1. On your Master phone, open Pairing first (`pc pair` or Web UI -> Tab 5 -> Open Pairing Window).\n"
+                "  1. On your Master phone, open Pairing first (`pc pair` or Web UI -> Tab 6 -> Open Pairing Window).\n"
                 "  2. If your router blocks Wi-Fi broadcast (or you use Tailscale), pass `--master <ip>:<port>`.",
                 file=sys.stderr,
             )
@@ -697,8 +714,24 @@ def _cmd_join(args: argparse.Namespace) -> int:
             subprocess.call(["bash", str(setup_sh), "--node-id", res["node_id"], "--repo-dir", str(REPO_ROOT)])
 
     if not args.no_start:
+        import signal as _sig
+
         log_dir = REPO_ROOT / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
+        # Stop any previously running local worker PID (e.g. when re-pairing) so port 8765 is free
+        for old_pid_file in log_dir.glob("worker-*.pid"):
+            try:
+                old_pid = int(old_pid_file.read_text(encoding="utf-8").strip())
+                if old_pid > 1 and old_pid != os.getpid():
+                    os.kill(old_pid, _sig.SIGTERM)
+                    for _ in range(15):
+                        time.sleep(0.1)
+                        try:
+                            os.kill(old_pid, 0)
+                        except OSError:
+                            break
+            except (OSError, ValueError):
+                pass
         log_file = log_dir / f"worker-{res['node_id']}.log"
         pid_file = log_dir / f"worker-{res['node_id']}.pid"
         with log_file.open("a", encoding="utf-8") as lf:
@@ -856,7 +889,8 @@ def _cmd_copy(args: argparse.Namespace) -> int:
 
     rc_all = 0
     for node in nodes:
-        target = f"{node.ssh_user}@{node.host}" if node.ssh_user else node.host
+        host_scp = format_host_for_url(node.host)
+        target = f"{node.ssh_user}@{host_scp}" if node.ssh_user else host_scp
         scp_cmd = ["scp", "-P", str(node.ssh_port)]
         if src.is_dir():
             scp_cmd.append("-r")
@@ -1081,6 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated static LAN IPs of Worker phones",
     )
     p_init.add_argument("--ssh-user", default="", help="Default Termux/Debian SSH username (from `whoami`)")
+    p_init.add_argument("--ssh-port", type=int, default=DEFAULT_SSH_PORT, help=f"Default SSH port (default: {DEFAULT_SSH_PORT}; use 22 for Raspberry Pi/Debian)")
     p_init.add_argument("-o", "--output", default=str(DEFAULT_CONFIG_PATH), help="Output JSON path")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing config file")
     p_init.set_defaults(func=_cmd_init_config)
@@ -1287,6 +1322,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["standard", "airgap_workers", "lockdown"],
         default="",
         help="Apply a 1-click security profile to cluster.json",
+    )
+    p_net.add_argument(
+        "--lan-subnet",
+        default="",
+        help="Save a custom LAN CIDR (e.g. 192.168.1.0/24) to cluster.json before generating rules",
     )
     p_net.add_argument("--firewall", action="store_true", help="Print hardened nftables rules for Raspberry Pi / Debian Master")
     p_net.add_argument("--ufw", action="store_true", help="Print hardened UFW commands for Raspberry Pi / Debian Master")

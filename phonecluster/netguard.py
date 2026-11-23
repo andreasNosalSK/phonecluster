@@ -12,10 +12,10 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .config import ClusterConfig
+from .config import ClusterConfig, format_host_for_url, format_host_port
 from .discovery import detect_local_ip
 from .routing import build_service_registry, resolve_node_tier_and_pool
-from .telemetry import detect_os_environment, is_local_port_open, read_memory_info
+from .telemetry import _read_listening_tcp_map, detect_os_environment, is_local_port_open, read_memory_info
 
 KNOWN_CLUSTER_PORTS: set[int] = {
     22,
@@ -32,6 +32,7 @@ KNOWN_CLUSTER_PORTS: set[int] = {
     8081,
     8123,
     8765,
+    8767,
     8888,
     50052,
 }
@@ -85,9 +86,15 @@ def detect_controller_host_info(config: ClusterConfig) -> dict[str, Any]:
     adguard_bin = bool(
         shutil.which("AdGuardHome") or Path("/opt/AdGuardHome/AdGuardHome").exists()
     )
-    adguard_local_3000 = is_local_port_open(3000)
-    adguard_local_53 = is_local_port_open(53)
-    adguard_local_80 = adguard_bin and is_local_port_open(80)
+    lmap = _read_listening_tcp_map()
+    if lmap is not None:
+        adguard_local_3000 = 3000 in lmap
+        adguard_local_53 = 53 in lmap
+        adguard_local_80 = adguard_bin and (80 in lmap)
+    else:
+        adguard_local_3000 = is_local_port_open(3000)
+        adguard_local_53 = is_local_port_open(53)
+        adguard_local_80 = adguard_bin and is_local_port_open(80)
 
     if is_pi:
         kind = "raspberry_pi"
@@ -218,7 +225,33 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
     gw_port = int(config.gateway.port or 8888)
     master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
     workers = [n for n in config.nodes if n.role != "master"]
-    ssh_port = int(master_node.ssh_port or 22)
+    ssh_ports: list[int] = []
+    if not host_info.get("is_termux"):
+        ssh_ports.append(22)
+    cfg_ssh = int(master_node.ssh_port or 22)
+    if cfg_ssh not in ssh_ports:
+        ssh_ports.append(cfg_ssh)
+
+    tcp_ports = sorted(
+        set(ssh_ports)
+        | {
+            dash_port,
+            int(master_node.worker_port),
+            gw_port,
+            53,
+            80,
+            1883,
+            3000,
+            3632,
+            8081,
+            8123,
+            8767,
+            50052,
+        }
+    )
+    tcp_port_list = ", ".join(str(p) for p in tcp_ports)
+    is_v6_subnet = ":" in subnet
+    addr_match = f"ip6 saddr {subnet}" if is_v6_subnet else f"ip saddr {subnet}"
 
     nft_rules = "\n".join(
         [
@@ -238,9 +271,9 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
             "    # Allow Tailscale / WireGuard overlay if used",
             '    iifname { "tailscale0", "wg0" } accept',
             "",
-            f"    # Allow LAN ({subnet}) access to SSH, Dashboard, Worker, Network Guard & AdGuard DNS",
-            f"    ip saddr {subnet} tcp dport {{ {ssh_port}, {dash_port}, {master_node.worker_port}, {gw_port}, 53, 80, 3000 }} accept",
-            f"    ip saddr {subnet} udp dport {{ 53, 8766 }} accept",
+            f"    # Allow LAN ({subnet}) access to SSH, Dashboard, Worker, Pairing, Network Guard, AdGuard & Shared Services",
+            f"    {addr_match} tcp dport {{ {tcp_port_list} }} accept",
+            f"    {addr_match} udp dport {{ 53, 8766 }} accept",
             "  }",
             "  chain forward {",
             "    type filter hook forward priority 0; policy drop;",
@@ -252,19 +285,27 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
         ]
     )
 
-    ufw_cmds = "\n".join(
+    ufw_lines = [
+        f"# Quick UFW Hardening for Raspberry Pi / Debian 13 Master (LAN: {subnet})",
+        "sudo ufw default deny incoming",
+        "sudo ufw default allow outgoing",
+    ]
+    for sp in ssh_ports:
+        ufw_lines.append(f"sudo ufw allow from {subnet} to any port {sp} proto tcp comment 'PhoneCluster SSH'")
+    ufw_lines.extend(
         [
-            f"# Quick UFW Hardening for Raspberry Pi / Debian 13 Master (LAN: {subnet})",
-            "sudo ufw default deny incoming",
-            "sudo ufw default allow outgoing",
-            f"sudo ufw allow from {subnet} to any port {ssh_port} proto tcp comment 'PhoneCluster SSH'",
             f"sudo ufw allow from {subnet} to any port {dash_port} proto tcp comment 'PhoneCluster Web UI'",
+            f"sudo ufw allow from {subnet} to any port {master_node.worker_port} proto tcp comment 'PhoneCluster Master Worker'",
+            f"sudo ufw allow from {subnet} to any port 8767 proto tcp comment 'PhoneCluster Pairing Window'",
+            f"sudo ufw allow from {subnet} to any port 8766 proto udp comment 'PhoneCluster LAN Discovery/Pairing Beacon'",
             f"sudo ufw allow from {subnet} to any port {gw_port} proto tcp comment 'PhoneCluster Network Guard Proxy'",
             f"sudo ufw allow from {subnet} to any port 53 comment 'Native AdGuard Home DNS'",
+            f"sudo ufw allow from {subnet} to any port 80 proto tcp comment 'AdGuard Home Web UI'",
             f"sudo ufw allow from {subnet} to any port 3000 proto tcp comment 'AdGuard Home Setup UI'",
             "sudo ufw enable && sudo ufw status verbose",
         ]
     )
+    ufw_cmds = "\n".join(ufw_lines)
 
     router_lines = [
         "# Home Router Firewall / Parental Control Checklist (Air-Gap Old Worker Phones)",
@@ -339,23 +380,23 @@ def audit_cluster_network(
     adguard_url = config.network.adguard_url
     adguard_node = "custom" if adguard_url else ""
     if not adguard_url:
-        if host_info["local_adguard"]["port_3000"]:
-            adguard_url = f"http://{host_info['master_host']}:3000"
+        if host_info["local_adguard"]["port_80"]:
+            adguard_url = f"http://{format_host_for_url(host_info['master_host'])}"
             adguard_node = "master (local)"
-        elif host_info["local_adguard"]["port_80"]:
-            adguard_url = f"http://{host_info['master_host']}"
+        elif host_info["local_adguard"]["port_3000"]:
+            adguard_url = f"http://{format_host_port(host_info['master_host'], 3000)}"
             adguard_node = "master (local)"
         else:
             for s in snaps:
                 if not s.online:
                     continue
                 svcs = (s.health or {}).get("services") or {}
-                if svcs.get("adguard_3000"):
-                    adguard_url = f"http://{s.node.host}:3000"
+                if svcs.get("adguard_80"):
+                    adguard_url = f"http://{format_host_for_url(s.node.host)}"
                     adguard_node = s.node.id
                     break
-                if svcs.get("adguard_80"):
-                    adguard_url = f"http://{s.node.host}"
+                if svcs.get("adguard_3000"):
+                    adguard_url = f"http://{format_host_port(s.node.host, 3000)}"
                     adguard_node = s.node.id
                     break
 

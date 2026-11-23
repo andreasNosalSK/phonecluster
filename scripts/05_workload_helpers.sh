@@ -15,7 +15,16 @@ case "${CMD}" in
       exit 1
     fi
     pkill -x distccd 2>/dev/null || true
-    distccd --daemon --allow "${ALLOW_CIDR}" --jobs "${JOBS}" --listen 0.0.0.0 --port 3632
+    sleep 0.2
+    EXTRA_USER_ARGS=()
+    if [[ "$(id -u)" -eq 0 ]]; then
+      if id distccd >/dev/null 2>&1; then
+        EXTRA_USER_ARGS=(--user distccd)
+      else
+        EXTRA_USER_ARGS=(--user nobody)
+      fi
+    fi
+    distccd --daemon --allow "${ALLOW_CIDR}" --jobs "${JOBS}" --listen 0.0.0.0 --port 3632 "${EXTRA_USER_ARGS[@]}" </dev/null >/dev/null 2>&1
     echo "Started distccd (allow=${ALLOW_CIDR}, jobs=${JOBS}, port=3632)"
     ;;
 
@@ -26,22 +35,60 @@ case "${CMD}" in
   llama-rpc-start)
     LLAMA_DIR="${1:-${HOME}/llama.cpp}"
     PORT="${2:-50052}"
-    BIN="${LLAMA_DIR}/build/bin/rpc-server"
-    if [[ ! -x "${BIN}" ]]; then
-      echo "Error: rpc-server binary not found at '${BIN}'." >&2
+    BIN=""
+    for CAND in "${LLAMA_DIR}/build/bin/rpc-server" "${LLAMA_DIR}/rpc-server" "$(command -v rpc-server 2>/dev/null || true)"; do
+      if [[ -n "${CAND}" && -x "${CAND}" ]]; then
+        BIN="${CAND}"
+        break
+      fi
+    done
+    if [[ -z "${BIN}" ]]; then
+      echo "Error: rpc-server binary not found (checked '${LLAMA_DIR}/build/bin/rpc-server' and PATH)." >&2
       echo "Build llama.cpp with:" >&2
       echo "  git clone https://github.com/ggml-org/llama.cpp ${LLAMA_DIR}" >&2
       echo "  cmake -S ${LLAMA_DIR} -B ${LLAMA_DIR}/build -DGGML_RPC=ON && cmake --build ${LLAMA_DIR}/build -j" >&2
       exit 1
     fi
-    pkill -f "rpc-server.*-p ${PORT}" 2>/dev/null || true
-    mkdir -p "${HOME}/phonecluster/logs"
-    nohup "${BIN}" -H 0.0.0.0 -p "${PORT}" >> "${HOME}/phonecluster/logs/llama-rpc.log" 2>&1 < /dev/null &
-    echo "Started llama.cpp rpc-server on 0.0.0.0:${PORT} (PID $!)"
+    LOG_DIR="${HOME}/phonecluster/logs"
+    mkdir -p "${LOG_DIR}" 2>/dev/null || LOG_DIR="${TMPDIR:-/tmp}"
+    PID_FILE="${LOG_DIR}/llama-rpc-${PORT}.pid"
+    if [[ -f "${PID_FILE}" ]]; then
+      OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
+      [[ -n "${OLD_PID}" ]] && kill "${OLD_PID}" 2>/dev/null || true
+    fi
+    pkill -x rpc-server 2>/dev/null || true
+    sleep 0.2
+    nohup "${BIN}" -H 0.0.0.0 -p "${PORT}" >> "${LOG_DIR}/llama-rpc.log" 2>&1 < /dev/null &
+    NEW_PID=$!
+    echo "${NEW_PID}" > "${PID_FILE}"
+    sleep 0.3
+    if ! kill -0 "${NEW_PID}" 2>/dev/null; then
+      echo "Error: llama.cpp rpc-server exited immediately. Log:" >&2
+      tail -n 10 "${LOG_DIR}/llama-rpc.log" >&2 || true
+      exit 1
+    fi
+    echo "Started llama.cpp rpc-server on 0.0.0.0:${PORT} (PID ${NEW_PID}, bin=${BIN})"
     ;;
 
   llama-rpc-stop)
-    pkill -f "rpc-server" 2>/dev/null && echo "Stopped llama.cpp rpc-server" || echo "rpc-server was not running"
+    STOPPED=0
+    for PF in "${HOME}/phonecluster/logs"/llama-rpc-*.pid "${TMPDIR:-/tmp}"/llama-rpc-*.pid; do
+      if [[ -f "${PF}" ]]; then
+        OLD_PID="$(cat "${PF}" 2>/dev/null || true)"
+        if [[ -n "${OLD_PID}" ]] && kill "${OLD_PID}" 2>/dev/null; then
+          STOPPED=1
+        fi
+        rm -f "${PF}"
+      fi
+    done
+    if pkill -x rpc-server 2>/dev/null; then
+      STOPPED=1
+    fi
+    if [[ "${STOPPED}" -eq 1 ]]; then
+      echo "Stopped llama.cpp rpc-server"
+    else
+      echo "rpc-server was not running"
+    fi
     ;;
 
   help|-h|--help|*)

@@ -45,7 +45,10 @@ from .config import (
     NetworkHardeningConfig,
     NodeConfig,
     SafetyConfig,
+    format_host_port,
     generate_auth_token,
+    is_loopback_or_unspecified_host,
+    normalize_host,
     save_config,
 )
 from .discovery import DISCOVERY_PORT, _candidate_broadcast_addresses, detect_local_ip
@@ -57,6 +60,8 @@ from .telemetry import (
 )
 
 LOG = logging.getLogger("phonecluster.pairing")
+
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 PAIR_SEARCH_TYPE = "phonecluster_pair_search_v1"
 PAIR_BEACON_TYPE = "phonecluster_pair_beacon_v1"
@@ -302,14 +307,21 @@ def discover_pairing_masters(
 
     found: dict[tuple[str, int], dict[str, Any]] = {}
     try:
-        for dest in dests:
-            try:
-                sock.sendto(probe, (dest, discovery_port))
-            except OSError:
-                pass
+        def _send_probes() -> None:
+            for dest in dests:
+                try:
+                    sock.sendto(probe, (dest, discovery_port))
+                except OSError:
+                    pass
 
-        deadline = time.monotonic() + max(0.2, timeout_sec)
+        _send_probes()
+        started = time.monotonic()
+        deadline = started + max(0.2, timeout_sec)
+        resent = False
         while time.monotonic() < deadline:
+            if not resent and timeout_sec >= 0.8 and (time.monotonic() - started) >= (timeout_sec * 0.45):
+                _send_probes()
+                resent = True
             try:
                 data, addr = sock.recvfrom(4096)
             except socket.timeout:
@@ -384,6 +396,7 @@ class PairingManager:
         listen_host: str = "0.0.0.0",
         fail_delay_sec: float = 1.0,
         enable_beacon: bool = True,
+        config_lock: threading.RLock | None = None,
     ) -> None:
         self.config = config
         self.config_path = config_path
@@ -392,6 +405,7 @@ class PairingManager:
         self.listen_host = listen_host
         self.fail_delay_sec = fail_delay_sec
         self.enable_beacon = enable_beacon
+        self.config_lock = config_lock or threading.RLock()
         self._lock = threading.Lock()
         self._session: PairingSession | None = None
         self._beacon: PairingBeaconResponder | None = None
@@ -511,9 +525,11 @@ class PairingManager:
             }
 
     def complete_pairing(
-        self, client_ip: str, body: dict[str, Any]
+        self, client_ip: str, body: dict[str, Any], local_ip: str = ""
     ) -> tuple[int, dict[str, Any]]:
         """Verify DH + PIN proof, mint a unique per-node token, and return encrypted bundle."""
+        client_ip = normalize_host(client_ip)
+        local_ip = normalize_host(local_ip)
         with self._lock:
             self._cleanup_expired_locked()
             if self._session is None:
@@ -578,17 +594,18 @@ class PairingManager:
         node_pool = str(metadata.get("pool", "auto")).strip().lower() or "auto"
         node_token = generate_auth_token()
 
-        with self._lock:
+        with self._lock, self.config_lock:
             self._cleanup_expired_locked()
             if self._session is None or self._session.session_id != session_id:
                 return HTTPStatus.FORBIDDEN, {"error": "Pairing session closed before completion."}
 
             # If this exact worker IP was previously paired, rotate its token & refresh metadata
             existing = next(
-                (n for n in self.config.nodes if n.host == client_ip and n.role != "master"),
+                (n for n in self.config.nodes if normalize_host(n.host) == client_ip and n.role != "master"),
                 None,
             )
             if existing is not None:
+                existing.host = client_ip
                 existing.worker_port = worker_port
                 existing.ssh_port = ssh_port
                 existing.ssh_user = ssh_user or existing.ssh_user
@@ -624,6 +641,18 @@ class PairingManager:
                 save_config(self.config, self.config_path)
 
             master_node = next((n for n in self.config.nodes if n.role == "master"), self.config.nodes[0])
+            effective_master_host = normalize_host(master_node.host)
+            if is_loopback_or_unspecified_host(effective_master_host) and not is_loopback_or_unspecified_host(client_ip):
+                if local_ip and not is_loopback_or_unspecified_host(local_ip):
+                    effective_master_host = local_ip
+                else:
+                    detected = normalize_host(detect_local_ip())
+                    if detected and not is_loopback_or_unspecified_host(detected):
+                        effective_master_host = detected
+            allowed_master_set = {normalize_host(ip) for ip in self.config.network.allowed_master_ips if ip}
+            for cand_ip in (effective_master_host, local_ip, normalize_host(master_node.host)):
+                if cand_ip and (not is_loopback_or_unspecified_host(cand_ip) or is_loopback_or_unspecified_host(client_ip)):
+                    allowed_master_set.add(cand_ip)
             bundle = {
                 "cluster_name": self.config.cluster_name,
                 "node_id": assigned_node.id,
@@ -633,7 +662,7 @@ class PairingManager:
                 "ssh_port": ssh_port,
                 "ssh_user": ssh_user,
                 "max_concurrency": max_conc,
-                "master_host": master_node.host,
+                "master_host": effective_master_host,
                 "safety": {
                     "max_temp_c": self.config.safety.max_temp_c,
                     "resume_temp_c": self.config.safety.resume_temp_c,
@@ -646,9 +675,7 @@ class PairingManager:
                 },
                 "network": {
                     "enforce_worker_source_ip": self.config.network.enforce_worker_source_ip,
-                    "allowed_master_ips": sorted(
-                        set(self.config.network.allowed_master_ips) | {master_node.host}
-                    ),
+                    "allowed_master_ips": sorted(allowed_master_set),
                 },
                 "master_ssh_pubkey": _read_master_ssh_pubkey(),
             }
@@ -730,7 +757,13 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return
-        status, data = self.server.manager.complete_pairing(self.client_address[0], body)
+        try:
+            local_ip = str(self.connection.getsockname()[0])
+        except OSError:
+            local_ip = ""
+        status, data = self.server.manager.complete_pairing(
+            self.client_address[0], body, local_ip=local_ip
+        )
         self._send_json(status, data)
 
 
@@ -803,7 +836,7 @@ def _http_json(url: str, method: str = "GET", body: dict[str, Any] | None = None
     headers = {"Content-Type": "application/json"} if data is not None else {}
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _DIRECT_OPENER.open(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
@@ -857,7 +890,8 @@ def join_cluster_via_pairing(
     pool: str = "auto",
 ) -> dict[str, Any]:
     """Perform authenticated DH pairing with Master and save a scoped worker config."""
-    base_url = f"http://{master_host}:{pair_port}"
+    clean_master = normalize_host(master_host)
+    base_url = f"http://{format_host_port(clean_master, pair_port)}"
     status, hello = _http_json(f"{base_url}/api/pair/hello", method="GET")
     if status != HTTPStatus.OK:
         raise RuntimeError(hello.get("error", f"Master refused pairing hello (HTTP {status})"))

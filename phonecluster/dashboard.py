@@ -24,18 +24,22 @@ from .config import (
     NetworkHardeningConfig,
     NodeConfig,
     SafetyConfig,
+    format_host_port,
+    normalize_host,
     save_config,
 )
 from .discovery import detect_local_ip, discover_lan_nodes
 from .doctor import run_doctor
 from .gateway import GatewayManager
 from .master import JobSpec, MasterController
-from .netguard import apply_security_profile, audit_cluster_network
+from .netguard import apply_security_profile, audit_cluster_network, infer_lan_subnet
 from .pairing import PairingManager
+from .routing import resolve_node_tier_and_pool
 
 LOG = logging.getLogger("phonecluster.dashboard")
 
 MAX_DASHBOARD_BODY = 2 * 1024 * 1024
+WORKLOAD_HELPER_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "05_workload_helpers.sh"
 
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en" data-theme="dark" data-scale="normal">
@@ -823,7 +827,7 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
       </div>
     </section>
 
-    <!-- TAB 5: PHONES, SAFETY & DOCTOR -->
+    <!-- TAB 6: PHONES, SAFETY & DOCTOR -->
     <section id="panel-setup" class="panel" role="tabpanel" aria-labelledby="tab-setup">
       <div class="col-grid">
         <div class="card">
@@ -1383,6 +1387,14 @@ function setBoardView(mode) {
   if (lastLive) renderTasksBoard(lastLive);
 }
 
+let lastTaskCommands = [];
+
+function rerunTask(idx) {
+  const item = lastTaskCommands[idx];
+  if (!item) return;
+  openNodeTerminal(item.node_id, item.command);
+}
+
 function renderTasksBoard(live) {
   const wrap = document.getElementById('tasks-board-wrap');
   if (boardView === 'procs') {
@@ -1428,12 +1440,13 @@ function renderTasksBoard(live) {
     wrap.innerHTML = '<p class="hint">No active or recent cluster tasks yet. Try running a command in Terminal Control or Parallel Batch!</p>';
     return;
   }
+  lastTaskCommands = rows.map(r => ({ node_id: r.node_id, command: r.command }));
   wrap.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Phone</th><th>Job ID</th><th>Status</th><th>Duration</th><th>Command</th><th>Action</th></tr></thead><tbody>'
-    + rows.map(r => {
+    + rows.map((r, idx) => {
       const tone = r.state === 'OK' ? 'ok' : (r.state === 'RUNNING' ? 'warn' : 'bad');
       const btn = r.active
         ? '<button class="small danger" onclick="cancelJob(\'' + esc(r.node_id) + '\',\'' + esc(r.job_id) + '\')">Cancel</button>'
-        : '<button class="small" onclick="openNodeTerminal(\'' + esc(r.node_id) + '\', \'' + esc(r.command).replace(/'/g, '&#39;') + '\')">Re-run</button>';
+        : '<button class="small" onclick="rerunTask(' + idx + ')">Re-run</button>';
       return '<tr><td><b>' + esc(r.node_id) + '</b></td><td class="mono">' + esc(r.job_id) + '</td>'
         + '<td><span class="pill ' + tone + '">' + esc(r.state) + '</span></td>'
         + '<td class="mono">' + esc(r.duration) + '</td><td class="mono">' + esc(r.command) + '</td><td>' + btn + '</td></tr>';
@@ -1541,7 +1554,7 @@ async function refreshLive() {
     const banner = document.getElementById('battery-banner');
     if (batWarnings.length) {
       document.getElementById('battery-banner-text').textContent = batWarnings.join('; ')
-        + '. Avoid leaving Li-Po batteries pinned at 100% 24/7 (configure a smart-plug webhook in Tab 5 or use rooted ACC).';
+        + '. Avoid leaving Li-Po batteries pinned at 100% 24/7 (configure a smart-plug webhook in Tab 6 or use rooted ACC).';
       banner.classList.remove('hidden');
     } else {
       banner.classList.add('hidden');
@@ -2269,6 +2282,11 @@ async function loadWorkloads() {
     const r = await apiFetch('/api/workloads');
     if (r.status === 401) return;
     const d = await r.json();
+    const cidrInput = document.getElementById('distcc-cidr');
+    if (cidrInput && d.lan_subnet && (!cidrInput.dataset.edited || cidrInput.value === '192.168.1.0/24')) {
+      cidrInput.value = d.lan_subnet;
+      cidrInput.dataset.edited = 'auto';
+    }
     document.getElementById('wl-distcc').textContent = d.distcc_hosts
       ? 'export DISTCC_HOSTS="' + d.distcc_hosts + '"'
       : '# No running distccd workers detected (click Start All above).';
@@ -2333,9 +2351,11 @@ async function loadWorkloads() {
               if (s.source === 'config') {
                 actions += '<button class="small danger" onclick="removeCustomService(\'' + esc(s.name) + '\')">Remove</button>';
               }
+              const stCls = s.loopback_only ? 'warn' : (s.ready ? 'ok' : 'warn');
+              const stLbl = s.loopback_only ? '⚠ Localhost-Only' : (s.ready ? '✓ Live' : 'Warm/Busy');
               return '<tr><td><strong>' + esc(s.name) + '</strong></td><td class="mono">' + esc(s.node_id) + '</td>'
                 + '<td>' + tp + '</td><td>' + link + '</td>'
-                + '<td><span id="probe-st-' + idx + '" class="pill ' + (s.ready ? 'ok' : 'warn') + '">' + (s.ready ? '✓ Live' : 'Warm/Busy') + '</span></td>'
+                + '<td><span id="probe-st-' + idx + '" class="pill ' + stCls + '">' + stLbl + '</span></td>'
                 + '<td>' + (actions || '<span class="hint">-</span>') + '</td></tr>';
             }).join('')
           + '</tbody></table></div>';
@@ -2895,6 +2915,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             listen_host=addr[0],
             fail_delay_sec=pairing_fail_delay_sec,
             enable_beacon=enable_pairing_beacon,
+            config_lock=controller.config_lock,
         )
         self.gateway_manager = GatewayManager(controller.config)
         if controller.config.gateway.enabled:
@@ -2964,7 +2985,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return None
 
     def _require_auth(self) -> bool:
-        client_ip = self.client_address[0]
+        client_ip = normalize_host(str(self.client_address[0]))
         blocked, retry_after = self.server.rate_limiter.is_blocked(client_ip)
         if blocked:
             self._send_json(
@@ -3061,9 +3082,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     if not s.online:
                         continue
                     if s.health.get("services", {}).get("homeassistant_8123"):
-                        ha_urls.append(f"http://{s.node.host}:8123")
-                    if s.health.get("tools", {}).get("docker"):
+                        ha_urls.append(f"http://{format_host_port(s.node.host, 8123)}")
+                    if s.health.get("tools", {}).get("docker") or resolve_node_tier_and_pool(s.node, s.health)[0] == 3:
                         docker_nodes.append(s.node.id)
+                master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
+                lan_subnet = infer_lan_subnet(
+                    master_node.host or detect_local_ip(), ctrl.config.network.lan_subnet
+                )
                 self._send_json(
                     HTTPStatus.OK,
                     {
@@ -3072,6 +3097,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         "mpi_hostfile": ctrl.build_mpi_hostfile(snapshots=snaps),
                         "home_assistant_urls": ha_urls,
                         "docker_nodes": docker_nodes,
+                        "lan_subnet": lan_subnet,
                         "services_info": ctrl.get_services_info(snapshots=snaps),
                     },
                 )
@@ -3090,7 +3116,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if body is None:
                 return
-            status, data = self.server.pairing_manager.complete_pairing(self.client_address[0], body)
+            try:
+                local_ip = str(self.connection.getsockname()[0])
+            except OSError:
+                local_ip = ""
+            status, data = self.server.pairing_manager.complete_pairing(
+                self.client_address[0], body, local_ip=local_ip
+            )
             self._send_json(status, data)
             return
 
@@ -3133,8 +3165,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         ctrl = self.server.controller
 
         if path == "/api/pair/open":
-            ttl = int(body.get("ttl_sec", 120))
-            slots = int(body.get("max_devices", 1))
+            try:
+                ttl = int(body.get("ttl_sec", 120))
+                slots = int(body.get("max_devices", 1))
+            except (TypeError, ValueError):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "ttl_sec and max_devices must be integers"})
+                return
             data = self.server.pairing_manager.open_session(ttl_sec=ttl, max_devices=slots)
             self._send_json(HTTPStatus.OK, data)
             return
@@ -3216,6 +3252,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "provide script_content and non-empty args_lines"})
                     return
                 for idx, line in enumerate(args_lines):
+                    try:
+                        parsed_args = shlex.split(str(line))
+                    except ValueError as exc:
+                        self._send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": f"Invalid arguments on line {idx + 1}: {exc}"},
+                        )
+                        return
                     jobs.append(
                         JobSpec(
                             index=idx,
@@ -3223,7 +3267,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                             script_content=script_content,
                             script_name="web_job.py" if "python" in interpreter else "web_job.sh",
                             interpreter=interpreter,
-                            args=shlex.split(str(line)),
+                            args=parsed_args,
                             timeout_sec=timeout,
                             env={"PHONECLUSTER_TASK_INDEX": str(idx)},
                         )
@@ -3291,22 +3335,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     {"error": "url must start with http://, https://, mqtt://, tcp://, redis://, postgresql://, or ssh://"},
                 )
                 return
-            ctrl.config.custom_services[raw_name] = url
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
+            with ctrl.config_lock:
+                ctrl.config.custom_services[raw_name] = url
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
+                custom_copy = dict(ctrl.config.custom_services)
             self._send_json(
                 HTTPStatus.OK,
-                {"name": raw_name, "url": url, "custom_services": dict(ctrl.config.custom_services)},
+                {"name": raw_name, "url": url, "custom_services": custom_copy},
             )
 
         elif path == "/api/services/custom/remove":
             raw_name = str(body.get("name", "")).strip().lower()
-            if not raw_name or raw_name not in ctrl.config.custom_services:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"custom service '{raw_name}' not found"})
-                return
-            ctrl.config.custom_services.pop(raw_name, None)
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
+            with ctrl.config_lock:
+                if not raw_name or raw_name not in ctrl.config.custom_services:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"custom service '{raw_name}' not found"})
+                    return
+                ctrl.config.custom_services.pop(raw_name, None)
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
             self._send_json(HTTPStatus.OK, {"removed": raw_name})
 
         elif path == "/api/services/probe":
@@ -3333,41 +3380,51 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, ctrl.probe_tcp_endpoint(host, port))
 
         elif path == "/api/gateway/settings":
-            cur = ctrl.config.gateway
-            merged = {
-                "enabled": body.get("enabled", cur.enabled),
-                "bind_host": body.get("bind_host", cur.bind_host),
-                "port": body.get("port", cur.port),
-                "mode": body.get("mode", cur.mode),
-                "allowed_domains": body.get("allowed_domains", cur.allowed_domains),
-                "blocked_domains": body.get("blocked_domains", cur.blocked_domains),
-                "allowed_ports": body.get("allowed_ports", cur.allowed_ports),
-                "block_private_ips": body.get("block_private_ips", cur.block_private_ips),
-                "inject_proxy_env": body.get("inject_proxy_env", cur.inject_proxy_env),
-                "max_connections": body.get("max_connections", cur.max_connections),
-                "idle_timeout_sec": body.get("idle_timeout_sec", cur.idle_timeout_sec),
-                "quarantined_nodes": body.get("quarantined_nodes", cur.quarantined_nodes),
-                "max_requests_per_min_per_node": body.get(
-                    "max_requests_per_min_per_node", cur.max_requests_per_min_per_node
-                ),
-            }
-            try:
-                updated_gw = GatewayConfig.from_dict(merged)
-            except (ValueError, TypeError) as exc:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                return
-            ctrl.config.gateway = updated_gw
-            ok, msg = self.server.gateway_manager.sync_with_config()
-            if not ok:
-                ctrl.config.gateway.enabled = False
-                ctrl.gateway_port_override = None
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": msg})
-                return
-            ctrl.gateway_port_override = (
-                self.server.gateway_manager.bound_port if updated_gw.enabled else None
-            )
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
+            with ctrl.config_lock:
+                prev_gw = ctrl.config.gateway
+                merged = {
+                    "enabled": body.get("enabled", prev_gw.enabled),
+                    "bind_host": body.get("bind_host", prev_gw.bind_host),
+                    "port": body.get("port", prev_gw.port),
+                    "mode": body.get("mode", prev_gw.mode),
+                    "allowed_domains": body.get("allowed_domains", prev_gw.allowed_domains),
+                    "blocked_domains": body.get("blocked_domains", prev_gw.blocked_domains),
+                    "allowed_ports": body.get("allowed_ports", prev_gw.allowed_ports),
+                    "block_private_ips": body.get("block_private_ips", prev_gw.block_private_ips),
+                    "inject_proxy_env": body.get("inject_proxy_env", prev_gw.inject_proxy_env),
+                    "max_connections": body.get("max_connections", prev_gw.max_connections),
+                    "idle_timeout_sec": body.get("idle_timeout_sec", prev_gw.idle_timeout_sec),
+                    "quarantined_nodes": body.get("quarantined_nodes", prev_gw.quarantined_nodes),
+                    "max_requests_per_min_per_node": body.get(
+                        "max_requests_per_min_per_node", prev_gw.max_requests_per_min_per_node
+                    ),
+                }
+                try:
+                    updated_gw = GatewayConfig.from_dict(merged)
+                except (ValueError, TypeError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                ctrl.config.gateway = updated_gw
+                ok, msg = self.server.gateway_manager.sync_with_config()
+                if not ok:
+                    # Roll back to previous working gateway config so a bad port doesn't break a running proxy
+                    ctrl.config.gateway = prev_gw
+                    if prev_gw.enabled:
+                        self.server.gateway_manager.sync_with_config()
+                        ctrl.gateway_port_override = (
+                            self.server.gateway_manager.bound_port
+                            if self.server.gateway_manager.is_running
+                            else None
+                        )
+                    else:
+                        ctrl.gateway_port_override = None
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": msg})
+                    return
+                ctrl.gateway_port_override = (
+                    self.server.gateway_manager.bound_port if updated_gw.enabled else None
+                )
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
             self._send_json(HTTPStatus.OK, self.server.gateway_manager.status())
 
         elif path == "/api/gateway/logs/clear":
@@ -3379,88 +3436,103 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not dom or len(dom) > 253 or any(c.isspace() for c in dom):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid domain"})
                 return
-            if dom not in ctrl.config.gateway.allowed_domains:
-                ctrl.config.gateway.allowed_domains.append(dom)
-            ctrl.config.gateway.blocked_domains = [
-                d for d in ctrl.config.gateway.blocked_domains if d != dom
-            ]
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
-            self._send_json(HTTPStatus.OK, {"allowed": dom, "allowed_domains": ctrl.config.gateway.allowed_domains})
+            with ctrl.config_lock:
+                if dom not in ctrl.config.gateway.allowed_domains:
+                    ctrl.config.gateway.allowed_domains.append(dom)
+                ctrl.config.gateway.blocked_domains = [
+                    d for d in ctrl.config.gateway.blocked_domains if d != dom
+                ]
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
+                allowed_copy = list(ctrl.config.gateway.allowed_domains)
+            self._send_json(HTTPStatus.OK, {"allowed": dom, "allowed_domains": allowed_copy})
 
         elif path == "/api/gateway/quarantine":
             node_id = str(body.get("node_id", "")).strip()
             quarantine = bool(body.get("quarantine", True))
-            if not node_id or not any(n.id == node_id for n in ctrl.config.nodes):
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
-                return
-            target_n = ctrl.config.get_node(node_id)
-            if target_n.role == "master":
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot quarantine the master node"})
-                return
-            q_set = set(ctrl.config.gateway.quarantined_nodes)
-            if quarantine:
-                q_set.add(node_id)
-            else:
-                q_set.discard(node_id)
-            ctrl.config.gateway.quarantined_nodes = sorted(q_set)
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
+            with ctrl.config_lock:
+                if not node_id or not any(n.id == node_id for n in ctrl.config.nodes):
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
+                    return
+                target_n = ctrl.config.get_node(node_id)
+                if target_n.role == "master":
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot quarantine the master node"})
+                    return
+                q_set = set(ctrl.config.gateway.quarantined_nodes)
+                if quarantine:
+                    q_set.add(node_id)
+                else:
+                    q_set.discard(node_id)
+                ctrl.config.gateway.quarantined_nodes = sorted(q_set)
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
+                q_copy = list(ctrl.config.gateway.quarantined_nodes)
             self._send_json(
                 HTTPStatus.OK,
-                {"node_id": node_id, "quarantined": quarantine, "quarantined_nodes": ctrl.config.gateway.quarantined_nodes},
+                {"node_id": node_id, "quarantined": quarantine, "quarantined_nodes": q_copy},
             )
 
         elif path == "/api/network/profile":
             profile = str(body.get("profile", "")).strip()
-            try:
-                res = apply_security_profile(ctrl.config, profile)
-            except ValueError as exc:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                return
-            ok, msg = self.server.gateway_manager.sync_with_config()
-            if not ok:
-                ctrl.config.gateway.enabled = False
-                ctrl.gateway_port_override = None
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": msg})
-                return
-            ctrl.gateway_port_override = (
-                self.server.gateway_manager.bound_port if ctrl.config.gateway.enabled else None
-            )
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
+            with ctrl.config_lock:
+                prev_gw = GatewayConfig.from_dict(ctrl.config.to_dict().get("gateway"))
+                prev_req_auth = ctrl.config.dashboard_require_auth
+                prev_net = NetworkHardeningConfig.from_dict(ctrl.config.to_dict().get("network"))
+                try:
+                    res = apply_security_profile(ctrl.config, profile)
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                ok, msg = self.server.gateway_manager.sync_with_config()
+                if not ok:
+                    ctrl.config.gateway = prev_gw
+                    ctrl.config.dashboard_require_auth = prev_req_auth
+                    ctrl.config.network = prev_net
+                    if prev_gw.enabled:
+                        self.server.gateway_manager.sync_with_config()
+                    ctrl.gateway_port_override = (
+                        self.server.gateway_manager.bound_port
+                        if self.server.gateway_manager.is_running
+                        else None
+                    )
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": msg})
+                    return
+                ctrl.gateway_port_override = (
+                    self.server.gateway_manager.bound_port if ctrl.config.gateway.enabled else None
+                )
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
             self._send_json(HTTPStatus.OK, {**res, "gateway": self.server.gateway_manager.status()})
 
         elif path == "/api/network/hardening":
-            if "dashboard_require_auth" in body:
-                ctrl.config.dashboard_require_auth = bool(body["dashboard_require_auth"])
-            cur_net = ctrl.config.network
-            master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
-            raw_ips = body.get("allowed_master_ips", cur_net.allowed_master_ips)
-            ips = [str(i).strip() for i in raw_ips if str(i).strip()] if isinstance(raw_ips, list) else list(cur_net.allowed_master_ips)
-            if master_node.host and master_node.host not in ips:
-                ips.append(master_node.host)
-            ag_url = str(body.get("adguard_url", cur_net.adguard_url)).strip()
-            if ag_url and not ag_url.startswith(("http://", "https://")):
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https://"})
-                return
-            ctrl.config.network = NetworkHardeningConfig(
-                enforce_worker_source_ip=bool(body.get("enforce_worker_source_ip", cur_net.enforce_worker_source_ip)),
-                allowed_master_ips=ips,
-                adguard_url=ag_url,
-                lan_subnet=str(body.get("lan_subnet", cur_net.lan_subnet)).strip(),
-            )
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
-            self._send_json(
-                HTTPStatus.OK,
-                {
+            with ctrl.config_lock:
+                if "dashboard_require_auth" in body:
+                    ctrl.config.dashboard_require_auth = bool(body["dashboard_require_auth"])
+                cur_net = ctrl.config.network
+                master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
+                raw_ips = body.get("allowed_master_ips", cur_net.allowed_master_ips)
+                ips = [str(i).strip() for i in raw_ips if str(i).strip()] if isinstance(raw_ips, list) else list(cur_net.allowed_master_ips)
+                if master_node.host and master_node.host not in ips:
+                    ips.append(master_node.host)
+                ag_url = str(body.get("adguard_url", cur_net.adguard_url)).strip()
+                if ag_url and not ag_url.startswith(("http://", "https://")):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https://"})
+                    return
+                ctrl.config.network = NetworkHardeningConfig(
+                    enforce_worker_source_ip=bool(body.get("enforce_worker_source_ip", cur_net.enforce_worker_source_ip)),
+                    allowed_master_ips=ips,
+                    adguard_url=ag_url,
+                    lan_subnet=str(body.get("lan_subnet", cur_net.lan_subnet)).strip(),
+                )
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
+                resp_hardening = {
                     "saved": True,
                     "dashboard_require_auth": ctrl.config.dashboard_require_auth,
                     "enforce_worker_source_ip": ctrl.config.network.enforce_worker_source_ip,
-                    "allowed_master_ips": ctrl.config.network.allowed_master_ips,
-                },
-            )
+                    "allowed_master_ips": list(ctrl.config.network.allowed_master_ips),
+                }
+            self._send_json(HTTPStatus.OK, resp_hardening)
 
         elif path == "/api/gateway/check-isolation":
             results = ctrl.check_workers_wan_isolation()
@@ -3482,60 +3554,130 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/workloads/action":
             action = str(body.get("action", "")).strip()
-            cidr = str(body.get("cidr", "192.168.1.0/24")).strip()
-            allowed_actions = {
-                "distcc-start": f"bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-start {shlex.quote(cidr)}",
-                "distcc-stop": "bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-stop",
-                "llama-rpc-start": "bash ~/phonecluster/scripts/05_workload_helpers.sh llama-rpc-start",
-                "llama-rpc-stop": "bash ~/phonecluster/scripts/05_workload_helpers.sh llama-rpc-stop",
+            cidr = str(body.get("cidr", "")).strip()
+            if not cidr:
+                master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
+                cidr = infer_lan_subnet(master_node.host or detect_local_ip(), ctrl.config.network.lan_subnet)
+            action_args_map = {
+                "distcc-start": ["distcc-start", cidr],
+                "distcc-stop": ["distcc-stop"],
+                "llama-rpc-start": ["llama-rpc-start"],
+                "llama-rpc-stop": ["llama-rpc-stop"],
             }
-            cmd = allowed_actions.get(action)
-            if not cmd:
+            script_args = action_args_map.get(action)
+            if not script_args:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"unsupported action '{action}'"})
                 return
-            spec = JobSpec(index=0, job_id=f"wl-{action}", command=cmd, timeout_sec=30.0)
+            # Ship 05_workload_helpers.sh inline so it works regardless of install directory on each phone!
+            if WORKLOAD_HELPER_SCRIPT.exists():
+                spec = JobSpec(
+                    index=0,
+                    job_id=f"wl-{action}",
+                    script_content=WORKLOAD_HELPER_SCRIPT.read_text(encoding="utf-8"),
+                    script_name="05_workload_helpers.sh",
+                    interpreter="bash",
+                    args=script_args,
+                    timeout_sec=30.0,
+                )
+            else:
+                quoted_args = " ".join(shlex.quote(a) for a in script_args)
+                spec = JobSpec(
+                    index=0,
+                    job_id=f"wl-{action}",
+                    command=f"bash ~/phonecluster/scripts/05_workload_helpers.sh {quoted_args}",
+                    timeout_sec=30.0,
+                )
+            # For llama-rpc-start, prefer worker phones if any exist so a 512 MB Pi Master doesn't OOM
+            if action == "llama-rpc-start":
+                with ctrl.config_lock:
+                    has_workers = any(n.role != "master" for n in ctrl.config.nodes)
+                if has_workers:
+                    import concurrent.futures as _cf
+                    from .routing import build_cross_tier_env as _build_env
+
+                    snaps = ctrl.poll_health()
+                    ready_workers = [s for s in snaps if s.online and s.ready_for_jobs and s.node.role != "master"]
+                    if ready_workers:
+                        cross_env = _build_env(snaps, ctrl.config)
+                        outcomes = []
+                        with _cf.ThreadPoolExecutor(max_workers=len(ready_workers)) as pool:
+                            fut_map = {
+                                pool.submit(
+                                    ctrl.exec_on_node,
+                                    ws.node,
+                                    ctrl._with_node_env(spec, ws.node, cross_env),
+                                ): ws
+                                for ws in ready_workers
+                            }
+                            for fut in _cf.as_completed(fut_map):
+                                ws = fut_map[fut]
+                                kind, data = fut.result()
+                                t_num, p_name = resolve_node_tier_and_pool(ws.node, ws.health)
+                                outcomes.append(
+                                    ctrl._to_outcome(
+                                        spec,
+                                        ws.node.id,
+                                        kind,
+                                        data,
+                                        attempts=1,
+                                        node_tier=t_num,
+                                        node_pool=p_name,
+                                        routing_reason="Broadcast llama-rpc-start to ready worker phones",
+                                    )
+                                )
+                        outcomes.sort(key=lambda o: o.node_id)
+                        self._send_json(HTTPStatus.OK, {"action": action, "results": [o.to_dict() for o in outcomes]})
+                        return
             outcomes = ctrl.run_single(spec, target="all")
             self._send_json(HTTPStatus.OK, {"action": action, "results": [o.to_dict() for o in outcomes]})
 
         elif path == "/api/nodes/add":
-            host = str(body.get("host", "")).strip()
+            host = normalize_host(str(body.get("host", "")))
             if not host:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing host"})
                 return
-            existing_ids = {n.id for n in ctrl.config.nodes}
-            idx = len(ctrl.config.nodes)
-            while f"node{idx}" in existing_ids:
-                idx += 1
-            node_id = str(body.get("id") or f"node{idx}").strip()
-            if node_id in existing_ids:
-                self._send_json(HTTPStatus.CONFLICT, {"error": f"node id '{node_id}' already exists"})
-                return
             try:
                 tier = int(body.get("tier", 0))
+                worker_port = int(body.get("worker_port", DEFAULT_WORKER_PORT))
+                ssh_port = int(body.get("ssh_port", DEFAULT_SSH_PORT))
+                max_conc = max(1, int(body.get("max_concurrency", 2)))
+                weight = max(0.1, float(body.get("weight", 1.0)))
             except (TypeError, ValueError):
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid numeric node parameter"})
                 return
             if tier not in {0, 1, 2, 3}:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
                 return
+            if not (1 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "ports must be between 1 and 65535"})
+                return
             pool_name = str(body.get("pool", "auto")).strip().lower() or "auto"
-            new_node = NodeConfig(
-                id=node_id,
-                host=host,
-                role="worker",
-                worker_port=int(body.get("worker_port", DEFAULT_WORKER_PORT)),
-                ssh_port=int(body.get("ssh_port", DEFAULT_SSH_PORT)),
-                ssh_user=str(body.get("ssh_user", "")),
-                max_concurrency=max(1, int(body.get("max_concurrency", 2))),
-                weight=max(0.1, float(body.get("weight", 1.0))),
-                tier=tier,
-                pool=pool_name,
-                tags=["worker"],
-                notes="Added via Web Control Center",
-            )
-            ctrl.config.nodes.append(new_node)
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
+            with ctrl.config_lock:
+                existing_ids = {n.id for n in ctrl.config.nodes}
+                idx = len(ctrl.config.nodes)
+                while f"node{idx}" in existing_ids:
+                    idx += 1
+                node_id = str(body.get("id") or f"node{idx}").strip()
+                if node_id in existing_ids:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": f"node id '{node_id}' already exists"})
+                    return
+                new_node = NodeConfig(
+                    id=node_id,
+                    host=host,
+                    role="worker",
+                    worker_port=worker_port,
+                    ssh_port=ssh_port,
+                    ssh_user=str(body.get("ssh_user", "")),
+                    max_concurrency=max_conc,
+                    weight=weight,
+                    tier=tier,
+                    pool=pool_name,
+                    tags=["worker"],
+                    notes="Added via Web Control Center",
+                )
+                ctrl.config.nodes.append(new_node)
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
             self._send_json(
                 HTTPStatus.OK,
                 {"node": {"id": new_node.id, "host": new_node.host, "tier": new_node.tier, "pool": new_node.pool}},
@@ -3546,90 +3688,89 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not node_id:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing node id"})
                 return
-            target_node = next((n for n in ctrl.config.nodes if n.id == node_id), None)
-            if target_node is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
-                return
-            if "tier" in body:
-                try:
-                    t_val = int(body["tier"])
-                except (TypeError, ValueError):
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+            with ctrl.config_lock:
+                target_node = next((n for n in ctrl.config.nodes if n.id == node_id), None)
+                if target_node is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
                     return
-                if t_val not in {0, 1, 2, 3}:
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
-                    return
-                target_node.tier = t_val
-            if "pool" in body:
-                target_node.pool = str(body["pool"]).strip().lower() or "auto"
-            if "max_concurrency" in body:
-                try:
-                    target_node.max_concurrency = max(1, int(body["max_concurrency"]))
-                except (TypeError, ValueError):
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid max_concurrency"})
-                    return
-            if "weight" in body:
-                try:
-                    target_node.weight = max(0.1, float(body["weight"]))
-                except (TypeError, ValueError):
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid weight"})
-                    return
-            if "notes" in body:
-                target_node.notes = str(body["notes"])[:240]
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "node": {
-                        "id": target_node.id,
-                        "tier": target_node.tier,
-                        "pool": target_node.pool,
-                        "max_concurrency": target_node.max_concurrency,
-                        "weight": target_node.weight,
-                    }
-                },
-            )
+                if "tier" in body:
+                    try:
+                        t_val = int(body["tier"])
+                    except (TypeError, ValueError):
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+                        return
+                    if t_val not in {0, 1, 2, 3}:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+                        return
+                    target_node.tier = t_val
+                if "pool" in body:
+                    target_node.pool = str(body["pool"]).strip().lower() or "auto"
+                if "max_concurrency" in body:
+                    try:
+                        target_node.max_concurrency = max(1, int(body["max_concurrency"]))
+                    except (TypeError, ValueError):
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid max_concurrency"})
+                        return
+                if "weight" in body:
+                    try:
+                        target_node.weight = max(0.1, float(body["weight"]))
+                    except (TypeError, ValueError):
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid weight"})
+                        return
+                if "notes" in body:
+                    target_node.notes = str(body["notes"])[:240]
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
+                updated_rec = {
+                    "id": target_node.id,
+                    "tier": target_node.tier,
+                    "pool": target_node.pool,
+                    "max_concurrency": target_node.max_concurrency,
+                    "weight": target_node.weight,
+                }
+            self._send_json(HTTPStatus.OK, {"node": updated_rec})
 
         elif path == "/api/nodes/remove":
             node_id = str(body.get("id", "")).strip()
             if not node_id:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing node id"})
                 return
-            target_node = next((n for n in ctrl.config.nodes if n.id == node_id), None)
-            if target_node is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
-                return
-            if target_node.role == "master":
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot remove the master node"})
-                return
-            ctrl.config.nodes = [n for n in ctrl.config.nodes if n.id != node_id]
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
+            with ctrl.config_lock:
+                target_node = next((n for n in ctrl.config.nodes if n.id == node_id), None)
+                if target_node is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
+                    return
+                if target_node.role == "master":
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot remove the master node"})
+                    return
+                ctrl.config.nodes = [n for n in ctrl.config.nodes if n.id != node_id]
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
             self._send_json(HTTPStatus.OK, {"removed": node_id})
 
         elif path == "/api/settings":
-            try:
-                updated = SafetyConfig.from_dict(
-                    {
-                        "max_temp_c": body.get("max_temp_c", ctrl.config.safety.max_temp_c),
-                        "resume_temp_c": body.get("resume_temp_c", ctrl.config.safety.resume_temp_c),
-                        "min_free_ram_mb": body.get("min_free_ram_mb", ctrl.config.safety.min_free_ram_mb),
-                        "battery_low_pct": body.get("battery_low_pct", ctrl.config.safety.battery_low_pct),
-                        "battery_high_pct": body.get("battery_high_pct", ctrl.config.safety.battery_high_pct),
-                        "battery_poll_sec": ctrl.config.safety.battery_poll_sec,
-                        "webhook_cooldown_sec": ctrl.config.safety.webhook_cooldown_sec,
-                        "battery_webhook_url": body.get(
-                            "battery_webhook_url", ctrl.config.safety.battery_webhook_url
-                        ),
-                    }
-                )
-            except (ValueError, TypeError) as exc:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                return
-            ctrl.config.safety = updated
-            if self.server.config_path is not None:
-                save_config(ctrl.config, self.server.config_path)
+            with ctrl.config_lock:
+                try:
+                    updated = SafetyConfig.from_dict(
+                        {
+                            "max_temp_c": body.get("max_temp_c", ctrl.config.safety.max_temp_c),
+                            "resume_temp_c": body.get("resume_temp_c", ctrl.config.safety.resume_temp_c),
+                            "min_free_ram_mb": body.get("min_free_ram_mb", ctrl.config.safety.min_free_ram_mb),
+                            "battery_low_pct": body.get("battery_low_pct", ctrl.config.safety.battery_low_pct),
+                            "battery_high_pct": body.get("battery_high_pct", ctrl.config.safety.battery_high_pct),
+                            "battery_poll_sec": ctrl.config.safety.battery_poll_sec,
+                            "webhook_cooldown_sec": ctrl.config.safety.webhook_cooldown_sec,
+                            "battery_webhook_url": body.get(
+                                "battery_webhook_url", ctrl.config.safety.battery_webhook_url
+                            ),
+                        }
+                    )
+                except (ValueError, TypeError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                ctrl.config.safety = updated
+                if self.server.config_path is not None:
+                    save_config(ctrl.config, self.server.config_path)
             self._send_json(HTTPStatus.OK, {"saved": True})
 
         elif path == "/api/settings/test-webhook":

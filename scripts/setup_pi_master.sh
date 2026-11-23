@@ -78,7 +78,7 @@ EOF
 chmod 0755 /usr/local/bin/phonecluster
 ln -sf /usr/local/bin/phonecluster /usr/local/bin/pc
 
-# 3. Ensure cluster.json exists (owned by RUN_USER, 0600)
+# 3. Ensure cluster.json exists (owned by RUN_USER, 0600, with Linux SSH port 22!)
 CFG_PATH="${REPO_DIR}/config/cluster.json"
 if [[ ! -f "${CFG_PATH}" ]]; then
   sudo -u "${RUN_USER}" python3 "${REPO_DIR}/phonecluster_cli.py" init-config \
@@ -86,19 +86,44 @@ if [[ ! -f "${CFG_PATH}" ]]; then
     --master-host "${MASTER_IP}" \
     --workers "" \
     --ssh-user "${RUN_USER}" \
+    --ssh-port 22 \
     --output "${CFG_PATH}"
 fi
+
+# Persist chosen LAN subnet so firewall & distcc guides match this exact network
+sudo -u "${RUN_USER}" python3 "${REPO_DIR}/phonecluster_cli.py" \
+  --config "${CFG_PATH}" net-audit --lan-subnet "${LAN_SUBNET}" --json >/dev/null
 
 if [[ "${ENABLE_GATEWAY}" -eq 1 ]]; then
   sudo -u "${RUN_USER}" python3 "${REPO_DIR}/phonecluster_cli.py" \
     --config "${CFG_PATH}" gateway --enable --mode allowlist
 fi
 
-# 4. Install systemd service for PhoneCluster Master Dashboard (+ optional Network Guard)
+# 4. Install systemd services for Master Dashboard (+ optional Network Guard) AND local node0 Worker
+cat > /etc/systemd/system/phonecluster-worker.service <<EOF
+[Unit]
+Description=PhoneCluster Master Local Worker Agent (node0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${RUN_USER}
+WorkingDirectory=${REPO_DIR}
+ExecStart=/usr/bin/python3 ${REPO_DIR}/phonecluster_cli.py --config ${CFG_PATH} worker --node-id node0 --bind 0.0.0.0
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 cat > /etc/systemd/system/phonecluster-master.service <<EOF
 [Unit]
 Description=PhoneCluster Master Control Center & Optional Network Guard
-After=network-online.target
+After=network-online.target phonecluster-worker.service
 Wants=network-online.target
 
 [Service]
@@ -116,8 +141,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now phonecluster-master.service
-echo "[OK] Installed & started phonecluster-master.service (http://${MASTER_IP}:8080)"
+systemctl enable --now phonecluster-worker.service phonecluster-master.service
+echo "[OK] Installed & started phonecluster-worker.service + phonecluster-master.service (http://${MASTER_IP}:8080)"
 
 # 5. Optional: Native AdGuard Home (NO Docker required — single ~12 MB Go binary!)
 if [[ "${WITH_ADGUARD}" -eq 1 ]]; then
@@ -131,14 +156,18 @@ if [[ "${WITH_ADGUARD}" -eq 1 ]]; then
   echo "     Then paste DNS rewrites from: pc net-audit --adguard"
 fi
 
-# 6. Optional: Hardened LAN-only nftables firewall
+# 6. Optional: Hardened LAN-only nftables firewall (persisted to /etc/nftables.conf so rules survive reboot)
 if [[ "${WITH_FIREWALL}" -eq 1 ]]; then
   echo "Applying hardened LAN-only nftables rules (${LAN_SUBNET})..."
   sudo -u "${RUN_USER}" python3 "${REPO_DIR}/phonecluster_cli.py" \
     --config "${CFG_PATH}" net-audit --firewall > /etc/nftables.phonecluster.conf
-  nft -f /etc/nftables.phonecluster.conf
+  if [[ -f /etc/nftables.conf && ! -f /etc/nftables.conf.pre-phonecluster.bak ]]; then
+    cp /etc/nftables.conf /etc/nftables.conf.pre-phonecluster.bak
+  fi
+  cp /etc/nftables.phonecluster.conf /etc/nftables.conf
+  nft -f /etc/nftables.conf
   systemctl enable nftables || true
-  echo "[OK] Hardened nftables rules active (saved to /etc/nftables.phonecluster.conf)."
+  echo "[OK] Hardened nftables rules active & persisted in /etc/nftables.conf (backup: /etc/nftables.conf.pre-phonecluster.bak)."
 fi
 
 echo

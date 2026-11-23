@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import secrets
@@ -14,6 +15,46 @@ DEFAULT_WORKER_PORT = 8765
 DEFAULT_SSH_PORT = 8022
 DEFAULT_GATEWAY_PORT = 8888
 DEFAULT_CONFIG_PATH = Path("config/cluster.json")
+
+
+def normalize_host(host: str) -> str:
+    """Normalize a host/IP string (strip whitespace, brackets, and `::ffff:` IPv4-mapped prefix)."""
+    h = str(host or "").strip()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1].strip()
+    if h.lower().startswith("::ffff:"):
+        mapped = h[7:]
+        try:
+            ipaddress.IPv4Address(mapped)
+            return mapped
+        except ValueError:
+            pass
+    return h
+
+
+def is_loopback_or_unspecified_host(host: str) -> bool:
+    """Return True if `host` refers to localhost, loopback, or an unspecified bind address."""
+    h = normalize_host(host).lower()
+    if not h or h in {"localhost", "0.0.0.0", "::"}:
+        return True
+    try:
+        addr = ipaddress.ip_address(h)
+        return bool(addr.is_loopback or addr.is_unspecified)
+    except ValueError:
+        return False
+
+
+def format_host_for_url(host: str) -> str:
+    """Format a hostname, IPv4, or IPv6 literal safely for URLs (brackets IPv6)."""
+    h = normalize_host(host)
+    if ":" in h:
+        return f"[{h}]"
+    return h
+
+
+def format_host_port(host: str, port: int) -> str:
+    """Format `host:port` safely for both IPv4/hostnames and IPv6 (`[addr]:port`)."""
+    return f"{format_host_for_url(host)}:{int(port)}"
 
 DEFAULT_GATEWAY_ALLOWED_DOMAINS: list[str] = [
     "github.com",
@@ -48,7 +89,7 @@ class NodeConfig:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.worker_port}"
+        return f"http://{format_host_port(self.host, self.worker_port)}"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "NodeConfig":
@@ -322,6 +363,7 @@ def create_default_config(
     master_host: str = "192.168.1.201",
     worker_hosts: list[str] | None = None,
     ssh_user: str = "",
+    ssh_port: int = DEFAULT_SSH_PORT,
 ) -> ClusterConfig:
     """Generate a ready-to-edit default cluster config with a fresh secret token."""
     workers = worker_hosts if worker_hosts is not None else [
@@ -333,6 +375,7 @@ def create_default_config(
             id="node0",
             host=master_host,
             role="master",
+            ssh_port=ssh_port,
             ssh_user=ssh_user,
             max_concurrency=2,
             weight=1.2,
@@ -346,6 +389,7 @@ def create_default_config(
                 id=f"node{idx}",
                 host=host,
                 role="worker",
+                ssh_port=ssh_port,
                 ssh_user=ssh_user,
                 max_concurrency=2,
                 weight=1.0,

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import collections
+import ipaddress
 import json
 import logging
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -22,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .auth import AuthRateLimiter, verify_token
-from .config import SafetyConfig
+from .config import SafetyConfig, normalize_host
 from .discovery import DISCOVERY_PORT, DiscoveryResponder
 from .telemetry import CpuSampler, NetSampler, ThermalGate, collect_node_health
 
@@ -70,6 +72,58 @@ class WorkerState:
         self.recent_jobs: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
         self.recent_alerts: collections.deque[dict[str, Any]] = collections.deque(maxlen=25)
         self._last_alert_ts: dict[str, float] = {}
+        self._allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        self._allowed_exact_ips: set[str] = set()
+        self._compile_allowed_clients()
+
+    def _compile_allowed_clients(self) -> None:
+        """Expand configured `allowed_client_ips` (exact IPs, CIDRs, or hostnames) cleanly."""
+        self._allowed_exact_ips = set()
+        self._allowed_networks = []
+        for raw in self.allowed_client_ips:
+            entry = normalize_host(raw)
+            if not entry:
+                continue
+            if "/" in entry:
+                try:
+                    self._allowed_networks.append(ipaddress.ip_network(entry, strict=False))
+                    continue
+                except ValueError:
+                    pass
+            try:
+                addr = ipaddress.ip_address(entry)
+                if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+                    self._allowed_exact_ips.add(str(addr.ipv4_mapped))
+                self._allowed_exact_ips.add(str(addr))
+                continue
+            except ValueError:
+                pass
+            # Best-effort hostname resolution (e.g. `raspberrypi.local`, Tailscale MagicDNS)
+            self._allowed_exact_ips.add(entry)
+            try:
+                for _fam, _st, _pr, _cn, sa in socket.getaddrinfo(entry, None, type=socket.SOCK_STREAM):
+                    self._allowed_exact_ips.add(normalize_host(str(sa[0])))
+            except OSError:
+                pass
+
+    def is_client_ip_allowed(self, client_ip: str) -> bool:
+        """Return True if `client_ip` satisfies the optional Master source-IP allowlist."""
+        if not self.allowed_client_ips:
+            return True
+        norm = normalize_host(client_ip)
+        if norm in self._allowed_exact_ips or client_ip in self._allowed_exact_ips:
+            return True
+        if self._allowed_networks:
+            try:
+                addr = ipaddress.ip_address(norm)
+                if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+                    addr = addr.ipv4_mapped
+                for net in self._allowed_networks:
+                    if addr.version == net.version and addr in net:
+                        return True
+            except ValueError:
+                pass
+        return False
 
     def get_health(self) -> dict[str, Any]:
         """Collect current node health and active job details."""
@@ -135,8 +189,22 @@ class WorkerState:
             )
 
         if not force:
-            # Evaluate thermal/RAM health outside the lock (may invoke termux-battery-status)
-            health = self.get_health()
+            # Evaluate thermal/RAM safety outside the lock (fast path skips `ps`/port probes/CPU sampler!)
+            if self.health_provider is not None:
+                health = self.get_health()
+            else:
+                with self.lock:
+                    cur_active = len(self.active_jobs)
+                health = collect_node_health(
+                    node_id=self.node_id,
+                    role=self.role,
+                    safety=self.safety,
+                    thermal_gate=self.thermal_gate,
+                    active_jobs=cur_active,
+                    max_concurrency=self.max_concurrency,
+                    workdir=self.workdir,
+                    safety_only=True,
+                )
             # Exclude our own newly reserved slot when checking busy state
             non_busy_reasons = [
                 r for r in health.get("not_ready_reasons", []) if not r.startswith("busy")
@@ -155,10 +223,14 @@ class WorkerState:
         return True, {}
 
     def attach_process(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
+        already_cancelled = False
         with self.lock:
             job = self.active_jobs.get(job_id)
             if job is not None:
                 job.process = proc
+                already_cancelled = job.cancelled
+        if already_cancelled and proc.poll() is None:
+            _terminate_process_group(proc)
 
     def finish_job(self, job_id: str, record: dict[str, Any]) -> None:
         with self.lock:
@@ -475,6 +547,8 @@ class WorkerHTTPServer(ThreadingHTTPServer):
         state: WorkerState,
     ) -> None:
         self.state = state
+        if ":" in str(server_address[0]):
+            self.address_family = socket.AF_INET6
         super().__init__(server_address, WorkerRequestHandler)
 
 
@@ -499,9 +573,8 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
 
     def _check_auth(self) -> bool:
         client_ip = str(self.client_address[0])
-        norm_ip = client_ip[7:] if client_ip.startswith("::ffff:") else client_ip
-        allowed_ips = self.server.state.allowed_client_ips
-        if allowed_ips and norm_ip not in allowed_ips and client_ip not in allowed_ips:
+        norm_ip = normalize_host(client_ip)
+        if not self.server.state.is_client_ip_allowed(client_ip):
             LOG.warning("Rejected worker HTTP request from non-Master IP %s", client_ip)
             self._send_json(
                 HTTPStatus.FORBIDDEN,

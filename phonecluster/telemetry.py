@@ -8,11 +8,13 @@ Works seamlessly on:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import platform
 import shutil
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -485,29 +487,49 @@ def read_top_processes(limit: int = 5, timeout_sec: float = 1.5) -> list[dict[st
 
 
 def is_local_port_open(port: int, timeout: float = 0.15) -> bool:
-    """Return True if a local TCP daemon is accepting connections on `port`."""
+    """Return True if a local TCP daemon is accepting connections on `port` (IPv4 or IPv6 loopback)."""
+    for host in ("127.0.0.1", "::1"):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _is_proc_addr_loopback(addr_hex: str, is_v6: bool) -> bool:
+    """Decode `/proc/net/tcp*` host-endian hex IP cleanly without `.127` false positives."""
+    clean = addr_hex.strip().upper()
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-            return True
-    except OSError:
+        if is_v6:
+            if len(clean) != 32:
+                return False
+            words = [int(clean[i : i + 8], 16) for i in range(0, 32, 8)]
+            addr6 = ipaddress.IPv6Address(struct.pack("=4I", *words))
+            if addr6.ipv4_mapped is not None:
+                return bool(addr6.ipv4_mapped.is_loopback)
+            return bool(addr6.is_loopback)
+        if len(clean) != 8:
+            return False
+        addr4 = ipaddress.IPv4Address(struct.pack("=I", int(clean, 16)))
+        return bool(addr4.is_loopback)
+    except (ValueError, struct.error):
         return False
 
 
-def read_listening_tcp_ports(
+def _read_listening_tcp_map(
     tcp_path: Path = Path("/proc/net/tcp"),
     tcp6_path: Path = Path("/proc/net/tcp6"),
-) -> list[dict[str, Any]]:
-    """List listening TCP ports from `/proc/net/tcp*` (zero deps, works unrooted on Linux/Termux).
-
-    Returns sorted dicts: `{"port": int, "exposed": bool}` where `exposed=True` means bound
-    to a non-loopback address (e.g. `0.0.0.0`, `::`, or a LAN interface).
-    """
+) -> dict[int, bool] | None:
+    """Parse `/proc/net/tcp*` into `{port: exposed}`. Returns `None` if unreadable."""
     ports: dict[int, bool] = {}
+    read_any = False
     for path, is_v6 in ((tcp_path, False), (tcp6_path, True)):
         if not path.exists():
             continue
         try:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[1:]
+            read_any = True
         except OSError:
             continue
         for line in lines:
@@ -524,22 +546,34 @@ def read_listening_tcp_ports(
                 continue
             if port <= 0:
                 continue
-            if is_v6:
-                is_loop = addr_hex.upper() in {
-                    "00000000000000000000000001000000",  # ::1 little-endian
-                    "00000000000000000000000000000001",  # ::1 big-endian
-                    "0000000000000000FFFF00000100007F",  # ::ffff:127.0.0.1
-                }
-            else:
-                # Little-endian 127.x.x.x ends with 7F (e.g. 0100007F)
-                is_loop = addr_hex.upper().endswith("7F") or addr_hex.upper().startswith("7F")
-            exposed = not is_loop
+            exposed = not _is_proc_addr_loopback(addr_hex, is_v6=is_v6)
             ports[port] = ports.get(port, False) or exposed
+    return ports if read_any else None
+
+
+def read_listening_tcp_ports(
+    tcp_path: Path = Path("/proc/net/tcp"),
+    tcp6_path: Path = Path("/proc/net/tcp6"),
+) -> list[dict[str, Any]]:
+    """List listening TCP ports from `/proc/net/tcp*` (zero deps, works unrooted on Linux/Termux).
+
+    Returns sorted dicts: `{"port": int, "exposed": bool}` where `exposed=True` means bound
+    to a non-loopback address (e.g. `0.0.0.0`, `::`, or a LAN interface).
+    """
+    ports = _read_listening_tcp_map(tcp_path=tcp_path, tcp6_path=tcp6_path)
+    if not ports:
+        return []
     return [{"port": p, "exposed": exp} for p, exp in sorted(ports.items())][:64]
 
 
-def detect_capabilities() -> dict[str, Any]:
-    """Detect installed tools and live local services across Tier 1/2/3 nodes."""
+def detect_capabilities(listening_map: dict[int, bool] | None = None) -> dict[str, Any]:
+    """Detect installed tools and live local services across Tier 1/2/3 nodes.
+
+    Uses `/proc/net/tcp*` when readable (detecting services bound to `0.0.0.0`, `::`,
+    `127.0.0.1`, `::1`, OR a specific LAN IP without spamming daemon logs with dummy TCP
+    probes), and falls back to `is_local_port_open()` on platforms where `/proc/net/tcp*`
+    is restricted (e.g. strict Android SELinux).
+    """
     adguard_installed = bool(
         shutil.which("AdGuardHome")
         or Path("/opt/AdGuardHome/AdGuardHome").exists()
@@ -568,19 +602,26 @@ def detect_capabilities() -> dict[str, Any]:
         "apt": bool(shutil.which("apt-get")),
         "tmux": bool(shutil.which("tmux")),
     }
+    lmap = listening_map if listening_map is not None else _read_listening_tcp_map()
+
+    def _port_active(port: int) -> bool:
+        if lmap is not None:
+            return port in lmap
+        return is_local_port_open(port)
+
     services = {
-        "sshd_8022": is_local_port_open(8022),
-        "sshd_22": is_local_port_open(22),
-        "distccd_3632": is_local_port_open(3632),
-        "llama_rpc_50052": is_local_port_open(50052),
-        "llama_api_8081": is_local_port_open(8081),
-        "homeassistant_8123": is_local_port_open(8123),
-        "mosquitto_1883": is_local_port_open(1883),
-        "adguard_3000": is_local_port_open(3000),
-        "adguard_80": adguard_installed and is_local_port_open(80),
-        "dns_53": is_local_port_open(53),
-        "redis_6379": is_local_port_open(6379),
-        "postgres_5432": is_local_port_open(5432),
+        "sshd_8022": _port_active(8022),
+        "sshd_22": _port_active(22),
+        "distccd_3632": _port_active(3632),
+        "llama_rpc_50052": _port_active(50052),
+        "llama_api_8081": _port_active(8081),
+        "homeassistant_8123": _port_active(8123),
+        "mosquitto_1883": _port_active(1883),
+        "adguard_3000": _port_active(3000),
+        "adguard_80": adguard_installed and _port_active(80),
+        "dns_53": _port_active(53),
+        "redis_6379": _port_active(6379),
+        "postgres_5432": _port_active(5432),
     }
     return {"tools": tools, "services": services}
 
@@ -621,37 +662,19 @@ def collect_node_health(
     net_sampler: NetSampler | None = None,
     active_job_list: list[dict[str, Any]] | None = None,
     include_processes: bool = True,
+    safety_only: bool = False,
 ) -> dict[str, Any]:
-    """Assemble full btop-grade node health payload for `/health` and master scheduling."""
+    """Assemble full btop-grade node health payload for `/health` and master scheduling.
+
+    When `safety_only=True` (used by `/exec` slot reservation), evaluates thermal & RAM
+    safety fast without spawning `ps`, probing ports, or disturbing `cpu_sampler`/`net_sampler`.
+    """
     battery = read_battery_info()
     mem = read_memory_info()
-    l1, l5, l15 = read_load_average()
-    cpu_cores = os.cpu_count() or 1
-    if cpu_sampler is not None:
-        cpu_pct, per_core_pct = cpu_sampler.sample(load_1m=l1, cpu_cores=cpu_cores)
-    else:
-        cpu_pct = min(100.0, round((max(0.0, l1) / cpu_cores) * 100.0, 1))
-        per_core_pct = []
-
-    net_rx_kbps, net_tx_kbps = (
-        net_sampler.sample() if net_sampler is not None else (None, None)
-    )
     overheated = thermal_gate.evaluate(battery.temperature_c)
-
-    try:
-        disk = shutil.disk_usage(workdir)
-        disk_free_gb = round(disk.free / (1024**3), 2)
-        disk_total_gb = round(disk.total / (1024**3), 2)
-    except OSError:
-        disk_free_gb = 0.0
-        disk_total_gb = 0.0
-
     low_ram = (
         mem["total_mb"] > 0 and mem["available_mb"] < safety.min_free_ram_mb
     )
-    caps = detect_capabilities()
-    os_env = detect_os_environment()
-    detected_tier, detected_pool = detect_node_tier(os_env, caps["tools"])
 
     reasons: list[str] = []
     if overheated:
@@ -666,6 +689,54 @@ def collect_node_health(
         reasons.append(f"busy ({active_jobs}/{max_concurrency})")
 
     ready_for_jobs = (not overheated) and (not low_ram) and (active_jobs < max_concurrency)
+
+    if safety_only:
+        return {
+            "node_id": node_id,
+            "role": role,
+            "mem_total_mb": mem["total_mb"],
+            "mem_available_mb": mem["available_mb"],
+            "mem_used_mb": mem["used_mb"],
+            "battery_pct": battery.percentage,
+            "temp_c": battery.temperature_c,
+            "battery_status": battery.status,
+            "overheated": overheated,
+            "ready_for_jobs": ready_for_jobs,
+            "not_ready_reasons": reasons,
+            "active_jobs": active_jobs,
+            "max_concurrency": max_concurrency,
+            "timestamp": int(time.time()),
+        }
+
+    l1, l5, l15 = read_load_average()
+    cpu_cores = os.cpu_count() or 1
+    if cpu_sampler is not None:
+        cpu_pct, per_core_pct = cpu_sampler.sample(load_1m=l1, cpu_cores=cpu_cores)
+    else:
+        cpu_pct = min(100.0, round((max(0.0, l1) / cpu_cores) * 100.0, 1))
+        per_core_pct = []
+
+    net_rx_kbps, net_tx_kbps = (
+        net_sampler.sample() if net_sampler is not None else (None, None)
+    )
+
+    try:
+        disk = shutil.disk_usage(workdir)
+        disk_free_gb = round(disk.free / (1024**3), 2)
+        disk_total_gb = round(disk.total / (1024**3), 2)
+    except OSError:
+        disk_free_gb = 0.0
+        disk_total_gb = 0.0
+
+    listening_map = _read_listening_tcp_map()
+    listening_ports = (
+        [{"port": p, "exposed": exp} for p, exp in sorted(listening_map.items())][:64]
+        if listening_map
+        else []
+    )
+    caps = detect_capabilities(listening_map=listening_map)
+    os_env = detect_os_environment()
+    detected_tier, detected_pool = detect_node_tier(os_env, caps["tools"])
 
     return {
         "node_id": node_id,
@@ -701,7 +772,7 @@ def collect_node_health(
         "active_job_list": list(active_job_list) if active_job_list else [],
         "max_concurrency": max_concurrency,
         "top_processes": read_top_processes(limit=5) if include_processes else [],
-        "listening_ports": read_listening_tcp_ports(),
+        "listening_ports": listening_ports,
         "tools": caps["tools"],
         "services": caps["services"],
         "timestamp": int(time.time()),

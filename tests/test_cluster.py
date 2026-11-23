@@ -1938,5 +1938,507 @@ class TestMasterNetworkGuard(unittest.TestCase):
             srv_ok.server_close()
 
 
+class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
+    """Regression tests for connectivity, IPv6, proxy, Service Mesh, scheduler, and firewall fixes."""
+
+    def test_proc_net_tcp_dot127_and_ipv6_loopback_detection(self) -> None:
+        import struct
+        from phonecluster.telemetry import detect_capabilities
+
+        # Build host-endian hex strings matching real Linux /proc/net/tcp & /proc/net/tcp6
+        ip_192_127_hex = f"{struct.unpack('=I', socket.inet_aton('192.168.1.127'))[0]:08X}"
+        ip_127_0_0_1_hex = f"{struct.unpack('=I', socket.inet_aton('127.0.0.1'))[0]:08X}"
+        v6_loop_words = struct.unpack("=4I", socket.inet_pton(socket.AF_INET6, "::1"))
+        v6_loop_hex = "".join(f"{w:08X}" for w in v6_loop_words)
+        v6_ula_words = struct.unpack("=4I", socket.inet_pton(socket.AF_INET6, "fd00::1"))
+        v6_ula_hex = "".join(f"{w:08X}" for w in v6_ula_words)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t4 = Path(tmp) / "tcp"
+            t6 = Path(tmp) / "tcp6"
+            t4.write_text(
+                "  sl  local_address rem_address st\n"
+                f"   0: {ip_192_127_hex}:075B 00000000:0000 0A\n"  # 192.168.1.127:1883 (LAN -> exposed=True!)
+                f"   1: {ip_127_0_0_1_hex}:18EB 00000000:0000 0A\n",  # 127.0.0.1:6379 (loopback -> exposed=False)
+                encoding="utf-8",
+            )
+            t6.write_text(
+                "  sl  local_address rem_address st\n"
+                f"   0: {v6_loop_hex}:1F90 00000000000000000000000000000000:0000 0A\n"  # [::1]:8080 -> False
+                f"   1: {v6_ula_hex}:1FBB 00000000000000000000000000000000:0000 0A\n",  # [fd00::1]:8123 -> True
+                encoding="utf-8",
+            )
+            parsed = {p["port"]: p["exposed"] for p in read_listening_tcp_ports(tcp_path=t4, tcp6_path=t6)}
+            self.assertTrue(parsed[1883], "192.168.1.127 must NOT be misclassified as loopback!")
+            self.assertFalse(parsed[6379])
+            self.assertFalse(parsed[8080])
+            self.assertTrue(parsed[8123])
+
+        # detect_capabilities uses listening_map directly without dummy TCP connects
+        caps = detect_capabilities(listening_map={1883: True, 3632: True, 50052: True})
+        self.assertTrue(caps["services"]["mosquitto_1883"])
+        self.assertTrue(caps["services"]["distccd_3632"])
+        self.assertTrue(caps["services"]["llama_rpc_50052"])
+        self.assertFalse(caps["services"]["redis_6379"])
+
+    def test_ipv6_urls_adguard80_distcc_env_and_loopback_service_preference(self) -> None:
+        from phonecluster.config import NetworkHardeningConfig
+        from phonecluster.netguard import build_firewall_guides
+        from phonecluster.routing import build_cluster_dns_hosts, build_cross_tier_env, build_service_registry
+
+        n_v6 = NodeConfig(id="node0", host="fd7a:115c:a1e0::1", role="master", worker_port=8765, ssh_port=8022, tier=2)
+        n_lan_loop = NodeConfig(id="node1", host="192.168.1.202", role="worker", worker_port=8765, tier=2)
+        n_lan_pub = NodeConfig(id="node2", host="192.168.1.203", role="worker", worker_port=8765, tier=2)
+        self.assertEqual(n_v6.base_url, "http://[fd7a:115c:a1e0::1]:8765")
+
+        cfg = ClusterConfig(
+            cluster_name="v6-mesh",
+            auth_token="tok-v6-mesh-1234567890",
+            nodes=[n_v6, n_lan_loop, n_lan_pub],
+            network=NetworkHardeningConfig(adguard_url="http://192.168.1.200:3000"),
+            custom_services={"ollama": "http://192.168.1.50:11434"},
+        )
+        snaps = [
+            NodeSnapshot(
+                node=n_v6,
+                online=True,
+                health={
+                    "ready_for_jobs": True,
+                    "cpu_cores": 8,
+                    "services": {"adguard_80": True, "distccd_3632": True, "llama_rpc_50052": True},
+                    "listening_ports": [
+                        {"port": 80, "exposed": True},
+                        {"port": 3632, "exposed": True},
+                        {"port": 50052, "exposed": True},
+                        {"port": 50055, "exposed": True},
+                    ],
+                },
+            ),
+            NodeSnapshot(
+                node=n_lan_loop,
+                online=True,
+                health={
+                    "ready_for_jobs": True,
+                    "cpu_cores": 4,
+                    "services": {"mosquitto_1883": True, "distccd_3632": True},
+                    "listening_ports": [
+                        {"port": 1883, "exposed": False},  # Localhost-only MQTT!
+                        {"port": 3632, "exposed": True},
+                    ],
+                },
+            ),
+            NodeSnapshot(
+                node=n_lan_pub,
+                online=True,
+                health={
+                    "ready_for_jobs": True,
+                    "cpu_cores": 4,
+                    "services": {"mosquitto_1883": True, "llama_rpc_50052": True},
+                    "listening_ports": [
+                        {"port": 1883, "exposed": True},  # Externally reachable MQTT!
+                        {"port": 50052, "exposed": True},
+                        {"port": 50055, "exposed": True},
+                    ],
+                },
+            ),
+        ]
+
+        reg = build_service_registry(snaps, cfg)
+        ag_entries = [e for e in reg if e["name"] == "adguard"]
+        self.assertEqual(len(ag_entries), 1)
+        self.assertEqual(ag_entries[0]["url"], "http://[fd7a:115c:a1e0::1]:80")
+
+        env = build_cross_tier_env(snaps, cfg)
+        # Must prefer externally reachable node2 over loopback-only node1 for MQTT!
+        self.assertEqual(env["PHONECLUSTER_MQTT_HOST"], "192.168.1.203")
+        self.assertEqual(env["PHONECLUSTER_ADGUARD_URL"], "http://[fd7a:115c:a1e0::1]:80")
+        self.assertIn("[fd7a:115c:a1e0::1]:50052", env["PHONECLUSTER_LLAMA_RPC"])
+        self.assertIn("192.168.1.202/4,lzo", env["PHONECLUSTER_DISTCC_HOSTS"])
+
+        hosts = build_cluster_dns_hosts(snaps, cfg)
+        self.assertIn("adguard.cluster", hosts)
+        self.assertIn("192.168.1.203    mqtt.cluster", hosts)
+
+        ctrl = MasterController(cfg)
+        self.assertIn("192.168.1.203:50055", ctrl.build_llama_rpc_arg(port=50055, snapshots=snaps))
+        self.assertIn("[fd7a:115c:a1e0::1]:50055", ctrl.build_llama_rpc_arg(port=50055, include_master=True, snapshots=snaps))
+
+        # Firewall rules on non-Termux host MUST always keep port 22 open & handle IPv6 CIDR!
+        fw_v4 = build_firewall_guides(cfg, {"lan_subnet": "192.168.1.0/24", "is_termux": False})
+        self.assertIn("22,", fw_v4["nftables"])
+        self.assertIn("8767", fw_v4["nftables"])
+        self.assertIn("port 22", fw_v4["ufw"])
+        fw_v6 = build_firewall_guides(cfg, {"lan_subnet": "fd00::/64", "is_termux": False})
+        self.assertIn("ip6 saddr fd00::/64", fw_v6["nftables"])
+
+    def test_direct_lan_opener_ignores_broken_host_http_proxy_env(self) -> None:
+        import os
+
+        tok = "direct-lan-tok-123456"
+        state = WorkerState(
+            node_id="node0",
+            role="master",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            health_provider=lambda: {
+                "node_id": "node0",
+                "role": "master",
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "cpu_cores": 4,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 2048,
+                "tools": {},
+                "services": {},
+            },
+        )
+        srv, _g, ev = create_worker_server("127.0.0.1", 0, state)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        cfg = ClusterConfig(
+            cluster_name="proxy-bypass",
+            auth_token=tok,
+            nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=port)],
+        )
+        ctrl = MasterController(cfg)
+
+        old_http = os.environ.get("HTTP_PROXY")
+        old_http_l = os.environ.get("http_proxy")
+        os.environ["HTTP_PROXY"] = "http://127.0.0.1:1"
+        os.environ["http_proxy"] = "http://127.0.0.1:1"
+        try:
+            snap = ctrl.check_node_health(cfg.get_node("node0"))
+            self.assertTrue(snap.online, f"LAN health check was hijacked by HTTP_PROXY: {snap.error}")
+            out = ctrl.run_single(JobSpec(index=0, job_id="direct-1", command="echo direct-ok"), target="node0")[0]
+            self.assertTrue(out.ok, out.error)
+            self.assertIn("direct-ok", out.stdout)
+        finally:
+            if old_http is None:
+                os.environ.pop("HTTP_PROXY", None)
+            else:
+                os.environ["HTTP_PROXY"] = old_http
+            if old_http_l is None:
+                os.environ.pop("http_proxy", None)
+            else:
+                os.environ["http_proxy"] = old_http_l
+            ev.set()
+            srv.shutdown()
+            srv.server_close()
+
+    def test_gateway_chunked_post_half_close_rebind_rollback_and_no_proxy_custom_services(self) -> None:
+        from phonecluster.config import NetworkHardeningConfig
+
+        # 1. NO_PROXY includes custom LAN services + AdGuard + brackets IPv6 Master
+        cfg_np = ClusterConfig(
+            cluster_name="np-test",
+            auth_token="tok-np-1234567890",
+            nodes=[
+                NodeConfig(id="node0", host="fd00::1", role="master"),
+                NodeConfig(id="node1", host="192.168.1.202", role="worker", auth_token="w1-tok"),
+            ],
+            gateway=GatewayConfig(enabled=True, port=8888, inject_proxy_env=True),
+            network=NetworkHardeningConfig(adguard_url="http://192.168.1.250:3000"),
+            custom_services={"ollama": "http://192.168.1.50:11434"},
+        )
+        penv = build_worker_proxy_env(cfg_np, cfg_np.get_node("node1"))
+        self.assertIn("@[fd00::1]:8888", penv["HTTP_PROXY"])
+        self.assertIn("192.168.1.50", penv["NO_PROXY"])
+        self.assertIn("192.168.1.250", penv["NO_PROXY"])
+        self.assertIn("fd00::1", penv["NO_PROXY"])
+
+        # 2. Live HTTP POST with Transfer-Encoding: chunked + Expect: 100-continue + CONNECT half-close
+        class _ChunkedEchoHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                pass
+
+            def do_POST(self) -> None:  # noqa: N802
+                chunks: list[bytes] = []
+                if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+                    while True:
+                        line = self.rfile.readline()
+                        sz = int(line.split(b";", 1)[0].strip(), 16)
+                        if sz == 0:
+                            self.rfile.readline()
+                            break
+                        chunks.append(self.rfile.read(sz))
+                        self.rfile.readline()
+                else:
+                    n = int(self.headers.get("Content-Length", "0"))
+                    chunks.append(self.rfile.read(n))
+                body = b"ECHO:" + b"".join(chunks)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                time.sleep(0.08)  # Reply arrives AFTER client half-closes write side!
+                body = b"HALFCLOSE_OK"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _ChunkedEchoHandler)
+        up_port = upstream.server_address[1]
+        threading.Thread(target=upstream.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        cfg = create_default_config(master_host="127.0.0.1", worker_hosts=["127.0.0.1"])
+        cfg.get_node("node1").auth_token = "chunk-worker-tok"
+        cfg.gateway = GatewayConfig(
+            enabled=True,
+            bind_host="127.0.0.1",
+            port=0,
+            mode="allowlist",
+            allowed_domains=["localhost"],
+            allowed_ports=[80, 443, up_port],
+            block_private_ips=False,
+            max_connections=8,
+        )
+        mgr = GatewayManager(cfg)
+        ok, msg = mgr.start()
+        self.assertTrue(ok, msg)
+        gw_port = mgr.bound_port
+        pw = derive_proxy_password("chunk-worker-tok", "node1")
+        auth_b64 = base64.b64encode(f"node1:{pw}".encode("utf-8")).decode("ascii")
+
+        try:
+            # 2a. Chunked POST + Expect: 100-continue
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"POST http://localhost:{up_port}/upload HTTP/1.1\r\n"
+                    f"Host: localhost:{up_port}\r\n"
+                    f"Expect: 100-continue\r\n"
+                    f"Transfer-Encoding: chunked\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode()
+                )
+                cont = s.recv(1024)
+                self.assertIn(b"100 Continue", cont)
+                s.sendall(b"5\r\nhello\r\n6\r\n-world\r\n0\r\n\r\n")
+                resp = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                self.assertIn(b"ECHO:hello-world", resp)
+
+            # 2b. CONNECT tunnel half-close: client sends GET then SHUT_WR before upstream responds
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"CONNECT localhost:{up_port} HTTP/1.1\r\n"
+                    f"Host: localhost:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode()
+                )
+                est = s.recv(1024)
+                self.assertIn(b"200 Connection Established", est)
+                s.sendall(f"GET /slow HTTP/1.1\r\nHost: localhost:{up_port}\r\nConnection: close\r\n\r\n".encode())
+                s.shutdown(socket.SHUT_WR)
+                tun_resp = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    tun_resp += chunk
+                self.assertIn(b"HALFCLOSE_OK", tun_resp)
+
+            # 2c. sync_with_config rebinds when max_connections changes
+            old_srv = mgr._server
+            cfg.gateway.max_connections = 16
+            ok2, _ = mgr.sync_with_config()
+            self.assertTrue(ok2)
+            self.assertIsNot(mgr._server, old_srv)
+        finally:
+            mgr.stop()
+            upstream.shutdown()
+            upstream.server_close()
+
+        # 3. Dashboard /api/gateway/settings rolls back cleanly when new port fails to bind
+        busy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        busy_sock.bind(("127.0.0.1", 0))
+        busy_sock.listen(1)
+        busy_port = busy_sock.getsockname()[1]
+        cfg_rb = create_default_config(master_host="127.0.0.1", worker_hosts=[])
+        cfg_rb.gateway = GatewayConfig(enabled=True, bind_host="127.0.0.1", port=0, mode="allowlist")
+        ctrl_rb = MasterController(cfg_rb)
+        dash_rb = DashboardHTTPServer(("127.0.0.1", 0), ctrl_rb, enable_pairing_beacon=False)
+        d_port = dash_rb.server_address[1]
+        threading.Thread(target=dash_rb.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        try:
+            self.assertTrue(dash_rb.gateway_manager.is_running)
+            req_bad = urllib.request.Request(
+                f"http://127.0.0.1:{d_port}/api/gateway/settings",
+                data=json.dumps({"enabled": True, "bind_host": "127.0.0.1", "port": busy_port}).encode("utf-8"),
+                headers=build_auth_headers(cfg_rb.auth_token),
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_bad, timeout=5.0)
+            try:
+                self.assertEqual(ctx.exception.code, 400)
+            finally:
+                ctx.exception.close()
+            # Previous working gateway MUST still be enabled and running after rollback!
+            self.assertTrue(ctrl_rb.config.gateway.enabled)
+            self.assertTrue(dash_rb.gateway_manager.is_running)
+        finally:
+            dash_rb.shutdown()
+            dash_rb.server_close()
+            busy_sock.close()
+
+    def test_scheduler_preexisting_jobs_failover_stale_cwd_cidr_and_pairing_local_ip(self) -> None:
+        tok = "sched-fix-tok-1234"
+        overheat_w1 = {"hot": False}
+
+        def _make_prov(nid: str):
+            def _p():
+                hot = overheat_w1["hot"] if nid == "w1" else False
+                return {
+                    "node_id": nid,
+                    "role": "worker",
+                    "os_env": "termux",
+                    "cpu_cores": 4,
+                    "load_1m": 0.1,
+                    "mem_total_mb": 4096,
+                    "mem_available_mb": 2048,
+                    "temp_c": 45.0 if hot else 32.0,
+                    "overheated": hot,
+                    "ready_for_jobs": not hot,
+                    "not_ready_reasons": ["overheated"] if hot else [],
+                    "tools": {"python3": True},
+                    "services": {},
+                }
+            return _p
+
+        # 1. Worker CIDR / hostname / ::ffff: allowlist check
+        st1 = WorkerState(
+            node_id="w1",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=1,
+            allowed_client_ips={"127.0.0.0/8", "localhost"},
+            health_provider=_make_prov("w1"),
+        )
+        self.assertTrue(st1.is_client_ip_allowed("127.0.0.1"))
+        self.assertTrue(st1.is_client_ip_allowed("::ffff:127.0.0.1"))
+        self.assertFalse(st1.is_client_ip_allowed("10.0.0.9"))
+
+        st2 = WorkerState(
+            node_id="w2",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=1,
+            health_provider=_make_prov("w2"),
+        )
+        srv1, _g1, ev1 = create_worker_server("127.0.0.1", 0, st1)
+        srv2, _g2, ev2 = create_worker_server("127.0.0.1", 0, st2)
+        p1, p2 = srv1.server_address[1], srv2.server_address[1]
+        threading.Thread(target=srv1.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        threading.Thread(target=srv2.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        cfg = ClusterConfig(
+            cluster_name="sched-fix",
+            auth_token=tok,
+            nodes=[
+                NodeConfig(id="w1", host="127.0.0.1", role="worker", worker_port=p1, max_concurrency=1, weight=2.0),
+                NodeConfig(id="w2", host="127.0.0.1", role="worker", worker_port=p2, max_concurrency=1, weight=1.0),
+            ],
+        )
+        ctrl = MasterController(cfg)
+
+        try:
+            # 2. Pre-existing job occupies w1's 1 slot -> map_jobs with retries=0 MUST route to w2 without 503!
+            bg_done = threading.Event()
+            def _occupy_w1() -> None:
+                ctrl.exec_on_node(
+                    cfg.get_node("w1"),
+                    JobSpec(index=0, job_id="ext-busy", command="sleep 1.2", timeout_sec=5.0),
+                )
+                bg_done.set()
+
+            t_bg = threading.Thread(target=_occupy_w1, daemon=True)
+            t_bg.start()
+            for _ in range(30):
+                if len(st1.active_jobs) == 1:
+                    break
+                time.sleep(0.03)
+            self.assertEqual(len(st1.active_jobs), 1)
+
+            batch_outcomes = ctrl.map_jobs(
+                [
+                    JobSpec(index=0, job_id="b0", command="echo ok0", timeout_sec=5.0),
+                    JobSpec(index=1, job_id="b1", command="echo ok1", timeout_sec=5.0),
+                ],
+                retries=0,
+            )
+            self.assertTrue(all(o.ok for o in batch_outcomes), [o.to_dict() for o in batch_outcomes])
+            self.assertTrue(all(o.node_id == "w2" for o in batch_outcomes))
+            t_bg.join(timeout=5.0)
+
+            # 3. run_single(target="best") auto-failover when top-ranked w1 rejects with 503 after /health!
+            orig_poll = ctrl.poll_health
+            def _poll_then_overheat(tags=None):
+                snaps = orig_poll(tags=tags)
+                overheat_w1["hot"] = True  # Simulates thermal spike between /health and /exec!
+                return snaps
+
+            ctrl.poll_health = _poll_then_overheat  # type: ignore[method-assign]
+            try:
+                res_fo = ctrl.run_single(JobSpec(index=0, job_id="fo-1", command="echo survived-fo"), target="best")[0]
+            finally:
+                ctrl.poll_health = orig_poll  # type: ignore[method-assign]
+                overheat_w1["hot"] = False
+            self.assertTrue(res_fo.ok, res_fo.error)
+            self.assertEqual(res_fo.node_id, "w2")
+            self.assertEqual(res_fo.attempts, 2)
+
+            # 4. Web Terminal self-heals when tracked cwd no longer exists
+            term_res = ctrl.exec_terminal_command(
+                command="echo recovered-cwd",
+                target="w2",
+                cwd="/nonexistent_dir_phonecluster_test_99999",
+            )[0]
+            self.assertTrue(term_res["ok"], term_res)
+            self.assertIn("recovered-cwd", term_res["stdout"])
+            self.assertNotEqual(term_res["cwd"], "/nonexistent_dir_phonecluster_test_99999")
+
+            # 5. Pairing with ::ffff: client IP and loopback master_host resolves real local_ip in bundle!
+            p_cfg = create_default_config(master_host="127.0.0.1", worker_hosts=[])
+            p_cfg.network.enforce_worker_source_ip = True
+            pm = PairingManager(p_cfg, config_path=None, pair_port=8080, fail_delay_sec=0.0, enable_beacon=False)
+            p_info = pm.open_session(ttl_sec=60, max_devices=1)
+            _, hello = pm.public_hello()
+            from phonecluster.pairing import compute_proof, compute_shared_secret, generate_dh_keypair
+            priv_b, pub_b = generate_dh_keypair()
+            pub_b_hex = format(pub_b, "x")
+            shared = compute_shared_secret(priv_b, int(hello["dh_pub"], 16))
+            ka, ke, km = derive_pairing_keys(p_info["pin"], shared, hello["salt"], hello["session_id"])
+            meta = {"worker_port": 8765, "ssh_port": 8022, "os_env": "termux", "cpu_cores": 8, "mem_total_mb": 4096}
+            meta_c = json.dumps(meta, sort_keys=True, separators=(",", ":"))
+            c_proof = compute_proof(ka, "client", hello["session_id"], hello["dh_pub"], pub_b_hex, meta_c)
+            st_code, reply = pm.complete_pairing(
+                "::ffff:192.168.1.205",
+                {"session_id": hello["session_id"], "dh_pub": pub_b_hex, "client_proof": c_proof, "metadata": meta},
+                local_ip="::ffff:192.168.1.200",
+            )
+            self.assertEqual(st_code, 200, reply)
+            aad = f"{hello['session_id']}|{reply['node_id']}|{hello['dh_pub'][:16]}|{pub_b_hex[:16]}"
+            bundle = decrypt_bundle(ke, km, reply["encrypted_bundle"], aad=aad)
+            self.assertEqual(bundle["node_host"], "192.168.1.205")
+            self.assertEqual(bundle["master_host"], "192.168.1.200")
+            self.assertIn("192.168.1.200", bundle["network"]["allowed_master_ips"])
+            self.assertEqual(p_cfg.get_node(reply["node_id"]).host, "192.168.1.205")
+        finally:
+            ev1.set()
+            ev2.set()
+            srv1.shutdown()
+            srv1.server_close()
+            srv2.shutdown()
+            srv2.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()
