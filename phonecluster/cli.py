@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -15,6 +17,7 @@ from . import __version__
 from .config import (
     DEFAULT_CONFIG_PATH,
     create_default_config,
+    generate_auth_token,
     load_config,
     resolve_config_path,
     save_config,
@@ -26,9 +29,16 @@ from .master import JobOutcome, JobSpec, MasterController
 from .wizard import _print_doctor_report, run_interactive_menu, run_setup_wizard
 from .worker import WorkerState, serve_worker
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
-def _configure_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
+
+def _configure_logging(verbose: bool, is_daemon: bool = False) -> None:
+    if verbose:
+        level = logging.DEBUG
+    elif is_daemon:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -105,13 +115,11 @@ def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(out)
 
 
-def _cmd_status(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-    ctrl = MasterController(cfg)
+def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
     summary = ctrl.cluster_summary()
-    if args.json:
+    if as_json:
         print(json.dumps(summary, indent=2))
-        return 0
+        return
 
     print(
         f"Cluster: {summary['cluster_name']}  |  "
@@ -164,6 +172,24 @@ def _cmd_status(args: argparse.Namespace) -> int:
             rows,
         )
     )
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
+    watch_sec = getattr(args, "watch", 0.0) or 0.0
+    if watch_sec <= 0:
+        _render_status_once(ctrl, args.json)
+        return 0
+    try:
+        while True:
+            if sys.stdout.isatty():
+                print("\033[2J\033[H", end="")
+            print(f"Live Cluster Monitor (every {watch_sec:g}s · Ctrl+C to exit) — {time.strftime('%H:%M:%S')}\n")
+            _render_status_once(ctrl, args.json)
+            time.sleep(max(0.5, watch_sec))
+    except KeyboardInterrupt:
+        print()
     return 0
 
 
@@ -445,6 +471,131 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if report["overall"] != "fail" else 1
 
 
+def _cmd_jobs(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
+    all_nodes = ctrl.get_all_jobs()
+    if args.json:
+        print(json.dumps({"nodes": all_nodes}, indent=2))
+        return 0
+    rows: list[list[str]] = []
+    for n in all_nodes:
+        nid = n["node_id"]
+        for j in n.get("active", []):
+            rows.append([nid, j["job_id"], "RUNNING", f"{j['running_sec']}s", j["command"][:50]])
+        for j in n.get("recent", [])[: args.limit]:
+            st = (
+                "CANCELLED"
+                if j.get("cancelled")
+                else ("TIMEOUT" if j.get("timed_out") else ("OK" if j.get("returncode") == 0 else f"FAIL({j.get('returncode')})"))
+            )
+            rows.append([nid, j["job_id"], st, f"{j['duration_sec']}s", str(j.get("command", ""))[:50]])
+    if not rows:
+        print("No active or recent jobs across the cluster.")
+        return 0
+    print(_fmt_table(["NODE", "JOB ID", "STATUS", "DURATION", "COMMAND"], rows))
+    return 0
+
+
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
+    try:
+        res = ctrl.cancel_node_job(args.node_id, args.job_id)
+    except KeyError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    if res.get("cancelled"):
+        print(f"Cancelled job '{args.job_id}' on '{args.node_id}'.")
+        return 0
+    print(f"Could not cancel job '{args.job_id}' on '{args.node_id}': {res.get('error', res)}", file=sys.stderr)
+    return 1
+
+
+def _cmd_token(args: argparse.Namespace) -> int:
+    cfg_path = resolve_config_path(args.config)
+    cfg = load_config(cfg_path)
+    if args.rotate:
+        cfg.auth_token = generate_auth_token()
+        save_config(cfg, cfg_path)
+        print(f"Rotated auth_token in {cfg_path}. Run `pc sync` to update worker phones.", file=sys.stderr)
+    print(cfg.auth_token)
+    return 0
+
+
+def _cmd_ssh(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    try:
+        node = cfg.get_node(args.node_id)
+    except KeyError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    target = f"{node.ssh_user}@{node.host}" if node.ssh_user else node.host
+    cmd = ["ssh", "-p", str(node.ssh_port), target] + (args.remote_cmd or [])
+    return subprocess.call(cmd)
+
+
+def _cmd_copy(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    src = Path(args.source)
+    if not src.exists():
+        print(f"Error: local path not found: {src}", file=sys.stderr)
+        return 2
+    if args.target == "all":
+        nodes = list(cfg.nodes)
+    elif args.target == "workers":
+        nodes = [n for n in cfg.nodes if n.role != "master"]
+    else:
+        try:
+            nodes = [cfg.get_node(args.target)]
+        except KeyError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
+    rc_all = 0
+    for node in nodes:
+        target = f"{node.ssh_user}@{node.host}" if node.ssh_user else node.host
+        scp_cmd = ["scp", "-P", str(node.ssh_port)]
+        if src.is_dir():
+            scp_cmd.append("-r")
+        scp_cmd.extend([str(src), f"{target}:{args.dest}"])
+        print(f"Copying {src} -> {node.id} ({target}:{args.dest})...")
+        rc = subprocess.call(scp_cmd)
+        if rc != 0:
+            print(f"  FAILED on {node.id} (exit {rc})", file=sys.stderr)
+            rc_all = 1
+    return rc_all
+
+
+def _cmd_sync(args: argparse.Namespace) -> int:
+    cfg_path = resolve_config_path(args.config)
+    script = REPO_ROOT / "scripts" / "03_sync_cluster.sh"
+    if not script.exists():
+        print(f"Error: sync script not found at {script}", file=sys.stderr)
+        return 2
+    cmd = ["bash", str(script), "--config", str(cfg_path)]
+    if args.setup_keys:
+        cmd.append("--setup-keys")
+    if args.skip_node:
+        cmd.extend(["--skip-node", args.skip_node])
+    return subprocess.call(cmd, cwd=str(REPO_ROOT))
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    print(f"Updating PhoneCluster in {REPO_ROOT}...")
+    rc = subprocess.call(["git", "-C", str(REPO_ROOT), "pull", "--ff-only"])
+    if rc != 0:
+        return rc
+    if args.sync:
+        cfg_path = resolve_config_path(args.config)
+        if cfg_path.exists():
+            return subprocess.call(
+                ["bash", str(REPO_ROOT / "scripts" / "03_sync_cluster.sh"), "--config", str(cfg_path)],
+                cwd=str(REPO_ROOT),
+            )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="phonecluster",
@@ -512,7 +663,54 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     p_status = sub.add_parser("status", help="Show unified 'one PC' cluster health & telemetry")
     p_status.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_status.add_argument(
+        "-w",
+        "--watch",
+        nargs="?",
+        const=3.0,
+        type=float,
+        default=0.0,
+        help="Live-refresh every N seconds (default 3s when flag is given)",
+    )
     p_status.set_defaults(func=_cmd_status)
+
+    # jobs & cancel
+    p_jobs = sub.add_parser("jobs", help="Show active and recent jobs across all phones")
+    p_jobs.add_argument("--limit", type=int, default=5, help="Recent finished jobs per phone (default: 5)")
+    p_jobs.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_jobs.set_defaults(func=_cmd_jobs)
+
+    p_cancel = sub.add_parser("cancel", help="Cancel a running job on a specific phone")
+    p_cancel.add_argument("node_id", help="Node ID (e.g. node1)")
+    p_cancel.add_argument("job_id", help="Job ID from `pc jobs`")
+    p_cancel.set_defaults(func=_cmd_cancel)
+
+    # token
+    p_tok = sub.add_parser("token", help="Show (or rotate) the cluster auth_token for unlocking the Web UI")
+    p_tok.add_argument("--rotate", action="store_true", help="Generate and save a fresh auth_token")
+    p_tok.set_defaults(func=_cmd_token)
+
+    # ssh & copy
+    p_ssh = sub.add_parser("ssh", help="Open an SSH session to a phone by node ID (e.g. `pc ssh node1`)")
+    p_ssh.add_argument("node_id", help="Node ID from cluster.json")
+    p_ssh.add_argument("remote_cmd", nargs="*", help="Optional command to run over SSH")
+    p_ssh.set_defaults(func=_cmd_ssh)
+
+    p_cp = sub.add_parser("copy", help="Copy a file or folder (e.g. dataset or AI model) to phones via SCP")
+    p_cp.add_argument("source", help="Local file or folder path")
+    p_cp.add_argument("dest", help="Remote destination path (e.g. ~/models/)")
+    p_cp.add_argument("--target", default="workers", help="'workers' (default), 'all', or a node_id")
+    p_cp.set_defaults(func=_cmd_copy)
+
+    # sync & update
+    p_sync = sub.add_parser("sync", help="Push code & cluster.json to all phones and restart workers")
+    p_sync.add_argument("--setup-keys", action="store_true", help="Copy SSH keys with ssh-copy-id first")
+    p_sync.add_argument("--skip-node", default="", help="Skip syncing one node ID (e.g. node0)")
+    p_sync.set_defaults(func=_cmd_sync)
+
+    p_upd = sub.add_parser("update", help="Pull latest PhoneCluster updates from GitHub")
+    p_upd.add_argument("--sync", action="store_true", help="Also sync the update to all worker phones")
+    p_upd.set_defaults(func=_cmd_update)
 
     # run
     p_run = sub.add_parser("run", help="Run one command or script on best/all/specific phone")
@@ -583,8 +781,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    _configure_logging(args.verbose)
-    if not getattr(args, "subcommand", None):
+    subcmd = getattr(args, "subcommand", None)
+    _configure_logging(args.verbose, is_daemon=subcmd in {"worker", "dashboard"})
+    if not subcmd:
         if sys.stdin.isatty():
             return run_interactive_menu(args.config)
         parser.print_help()

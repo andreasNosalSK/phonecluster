@@ -45,18 +45,17 @@ What this script automates for you:
 
 ---
 
-## 3. One-Command Termux Install on Each Phone
+## 3. One-Line Termux Install on Each Phone
 
 Open Termux on each phone and run:
 
 ```bash
-pkg install -y git
-git clone https://github.com/<your-user>/phonecluster.git ~/phonecluster
-bash ~/phonecluster/install.sh
+curl -fsSL https://raw.githubusercontent.com/andreasNosalSK/phonecluster/main/install.sh | bash
 ```
 
 The installer:
-- Installs `openssh`, `termux-api`, `python`, `jq`, `tmux`, `git` (add `--with-compute` for `clang`, `cmake`, `distcc`, `openmpi`, `htop`).
+- Clones (or updates) PhoneCluster into `~/phonecluster`.
+- Installs `openssh`, `termux-api`, `python`, `jq`, `tmux`, `git` (pass `--with-compute` for `clang`, `cmake`, `distcc`, `openmpi`, `htop`).
 - Creates global `phonecluster` and short `pc` commands in PATH.
 - Starts `sshd` on port `8022` and sets up `~/.termux/boot/00-start-cluster.sh` (with `termux-wake-lock`).
 - Offers to run `pc wizard` on your Master phone.
@@ -69,19 +68,22 @@ Copy your generated `config/cluster.json` to your Master phone (or run `pc wizar
 
 ```bash
 # Push SSH keys + sync PhoneCluster code & config to all phones + start workers
-~/phonecluster/scripts/03_sync_cluster.sh --setup-keys
+pc sync --setup-keys
 
 # Run automated diagnostics
 pc doctor
 
-# Check unified "one PC" resources
-pc status
+# Check unified "one PC" resources (add --watch for live refresh)
+pc status --watch
+
+# Print your auth_token to unlock controls in the browser
+pc token
 
 # Start the accessible Web Control Center
 pc dashboard
 ```
 
-Open `http://<master-phone-ip>:8080` in any browser on your Wi-Fi! To unlock command execution in the Web UI, paste your `auth_token` from `config/cluster.json` into the top bar and click **Unlock**.
+Open `http://<master-phone-ip>:8080` in any browser on your Wi-Fi! Paste your token from `pc token` into the top bar and click **Unlock** (check **Remember** if you're on your own personal device).
 
 ---
 

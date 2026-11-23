@@ -70,14 +70,21 @@ Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
 | Endpoint | Auth | Purpose |
 | :--- | :--- | :--- |
 | `GET /` | None | Accessible offline-first HTML/CSS/JS Control Center |
-| `GET /api/status` | None | Unified cluster summary + per-node health (never exposes `auth_token`) |
+| `GET /api/status` | None | Unified cluster summary + per-node health + non-secret safety thresholds |
+| `GET /api/jobs` | None | Live active & recent jobs across every configured phone |
 | `GET /api/doctor` | None | Live local + remote diagnostic & battery safety audit |
 | `GET /api/workloads` | None | Live `distcc_hosts`, `llama_rpc`, `mpi_hostfile`, Home Assistant URLs, Docker nodes |
 | `GET /api/discover` | None | Runs a 2-second UDP LAN scan and returns discovered phones |
+| `GET /api/auth/verify` | Bearer | Validates an `auth_token` before unlocking UI controls |
+| `GET /api/settings` | Bearer | Returns full safety settings including `battery_webhook_url` |
 | `POST /api/exec` | Bearer | Run a single command on `best`, `all`, or a specific `node_id` |
 | `POST /api/map` | Bearer | Run a parallel batch of shell commands or inline script + args across all ready phones |
+| `POST /api/jobs/cancel` | Bearer | Cancel a running job on a specific `node_id` |
 | `POST /api/workloads/action` | Bearer | Start/stop `distcc` or `llama-rpc` across all ready phones |
 | `POST /api/nodes/add` | Bearer | Add a discovered or manual worker phone directly into `config/cluster.json` |
+| `POST /api/nodes/remove` | Bearer | Remove a worker phone from `config/cluster.json` (Master protected) |
+| `POST /api/settings` | Bearer | Update thermal & 24/7 battery safety settings and save atomically |
+| `POST /api/settings/test-webhook` | Bearer | Send a test JSON POST to the configured battery/smart-plug webhook URL |
 
 ---
 

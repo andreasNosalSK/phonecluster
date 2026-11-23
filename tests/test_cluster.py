@@ -359,7 +359,28 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
                     self.assertEqual(mres["ok_count"], 4)
                     self.assertEqual(mres["fail_count"], 0)
 
-                # 5. Authenticated POST /api/nodes/add persists to cluster.json
+                # 5. Authenticated GET /api/auth/verify (rejects bad token, accepts good token)
+                bad_req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/auth/verify",
+                    headers=build_auth_headers("wrong-token"),
+                    method="GET",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as bad_ctx:
+                    urllib.request.urlopen(bad_req, timeout=3.0)
+                try:
+                    self.assertEqual(bad_ctx.exception.code, 401)
+                finally:
+                    bad_ctx.exception.close()
+
+                ok_req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/auth/verify",
+                    headers=build_auth_headers(self.token),
+                    method="GET",
+                )
+                with urllib.request.urlopen(ok_req, timeout=3.0) as resp:
+                    self.assertTrue(json.loads(resp.read().decode("utf-8"))["valid"])
+
+                # 6. Authenticated POST /api/nodes/add & /api/nodes/remove
                 req_add = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/nodes/add",
                     data=json.dumps({"host": "192.168.1.210", "ssh_user": "u0_a999"}).encode("utf-8"),
@@ -372,6 +393,87 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
                 reloaded = load_config(cfg_path)
                 self.assertEqual(len(reloaded.nodes), 4)
                 self.assertEqual(reloaded.get_node("node3").host, "192.168.1.210")
+
+                # Removing master node must fail with 400
+                req_rm_master = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/nodes/remove",
+                    data=json.dumps({"id": "node0"}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as rm_ctx:
+                    urllib.request.urlopen(req_rm_master, timeout=3.0)
+                try:
+                    self.assertEqual(rm_ctx.exception.code, 400)
+                finally:
+                    rm_ctx.exception.close()
+
+                # Removing worker node3 succeeds and persists
+                req_rm = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/nodes/remove",
+                    data=json.dumps({"id": "node3"}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_rm, timeout=3.0) as resp:
+                    self.assertEqual(json.loads(resp.read().decode("utf-8"))["removed"], "node3")
+                self.assertEqual(len(load_config(cfg_path).nodes), 3)
+
+                # 7. Authenticated safety settings update & non-leakage on /api/status
+                req_set = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/settings",
+                    data=json.dumps(
+                        {
+                            "max_temp_c": 39.0,
+                            "resume_temp_c": 36.0,
+                            "battery_low_pct": 40,
+                            "battery_high_pct": 55,
+                            "battery_webhook_url": "http://127.0.0.1:9999/secret-hook",
+                        }
+                    ).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_set, timeout=3.0) as resp:
+                    self.assertTrue(json.loads(resp.read().decode("utf-8"))["saved"])
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=3.0) as resp:
+                    st = json.loads(resp.read().decode("utf-8"))
+                    self.assertNotIn("battery_webhook_url", st["safety"])
+                    self.assertTrue(st["safety"]["battery_webhook_configured"])
+                    self.assertEqual(st["safety"]["max_temp_c"], 39.0)
+
+                # 8. Live job inspection (/api/jobs) and cancellation (/api/jobs/cancel)
+                slow_result: list[dict] = []
+
+                def _run_slow() -> None:
+                    spec = JobSpec(index=0, job_id="slow-cancel-1", command="sleep 10", timeout_sec=15.0)
+                    _kind, res_data = self.controller.exec_on_node(self.config.get_node("node0"), spec)
+                    slow_result.append(res_data)
+
+                bg = threading.Thread(target=_run_slow, daemon=True)
+                bg.start()
+                # Wait briefly until slow-cancel-1 shows up as active
+                found_active = False
+                for _ in range(30):
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/jobs", timeout=3.0) as resp:
+                        jdata = json.loads(resp.read().decode("utf-8"))
+                    n0 = next(n for n in jdata["nodes"] if n["node_id"] == "node0")
+                    if any(j["job_id"] == "slow-cancel-1" for j in n0["active"]):
+                        found_active = True
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(found_active)
+
+                req_cancel = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/jobs/cancel",
+                    data=json.dumps({"node_id": "node0", "job_id": "slow-cancel-1"}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_cancel, timeout=3.0) as resp:
+                    self.assertTrue(json.loads(resp.read().decode("utf-8"))["cancelled"])
+                bg.join(timeout=5.0)
+                self.assertTrue(slow_result and slow_result[0].get("cancelled"))
             finally:
                 dash.shutdown()
                 dash.server_close()
@@ -449,6 +551,8 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
             save_config(self.config, cfg_path)
 
             self.assertEqual(cli.main(["--config", str(cfg_path), "status"]), 0)
+            self.assertEqual(cli.main(["--config", str(cfg_path), "jobs"]), 0)
+            self.assertEqual(cli.main(["--config", str(cfg_path), "token"]), 0)
             self.assertEqual(
                 cli.main(["--config", str(cfg_path), "run", "--target", "best", "echo hello"]),
                 0,
@@ -477,6 +581,13 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
                 self.assertTrue(rec["ok"], rec)
                 self.assertIn("primes=", rec["stdout"])
                 self.assertNotEqual(rec["node_id"], "node2")  # hot node excluded
+
+            # Token rotation updates cluster.json atomically
+            old_tok = load_config(cfg_path).auth_token
+            self.assertEqual(cli.main(["--config", str(cfg_path), "token", "--rotate"]), 0)
+            new_tok = load_config(cfg_path).auth_token
+            self.assertNotEqual(old_tok, new_tok)
+            self.assertGreaterEqual(len(new_tok), 24)
 
 
 if __name__ == "__main__":

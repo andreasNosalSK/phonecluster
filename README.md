@@ -2,6 +2,7 @@
 
 **Turn spare Android 7+ phones into one unified, thermally safe Linux computer — with an accessible Web Control Center, Wi-Fi auto-discovery, and zero pip dependencies.**
 
+[![CI](https://github.com/andreasNosalSK/phonecluster/actions/workflows/ci.yml/badge.svg)](https://github.com/andreasNosalSK/phonecluster/actions/workflows/ci.yml)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Zero Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
@@ -58,22 +59,23 @@ Enable **USB Debugging**, connect your phones to your PC, and run:
 ```
 This audits every connected phone, ranks your best Master (`node0`), disables Android 12/13's Phantom Process Killer, whitelists Termux from Doze, and auto-generates `config/cluster.json`. Reboot each phone when done.
 
-### Step 2 — One-command install inside Termux on each phone
+### Step 2 — One-line install inside Termux on each phone
 ```bash
-pkg install -y git
-git clone https://github.com/<your-user>/phonecluster.git ~/phonecluster
-bash ~/phonecluster/install.sh
+curl -fsSL https://raw.githubusercontent.com/andreasNosalSK/phonecluster/main/install.sh | bash
 ```
-The installer sets up `openssh`, `termux-api`, `python`, `~/.termux/boot/` auto-start, and creates the global `pc` / `phonecluster` commands. Choose **Master** on `node0` and **Worker** on the others.
+The installer clones/updates PhoneCluster, installs `openssh`, `termux-api`, `python`, sets up `~/.termux/boot/` auto-start, and creates global `pc` / `phonecluster` commands. Choose **Master** on `node0` and **Worker** on the others.
 
 ### Step 3 — Sync, verify, and open the Control Center
 From your Master phone (or over SSH: `ssh -p 8022 <user>@<master-ip>`):
 ```bash
 # Push SSH keys + sync config + start workers on all phones:
-~/phonecluster/scripts/03_sync_cluster.sh --setup-keys
+pc sync --setup-keys
 
 # Run automated health & safety audit:
 pc doctor
+
+# Print your unlock token for the browser UI:
+pc token
 
 # Launch the accessible Web Control Center (open http://<master-ip>:8080):
 pc dashboard
@@ -89,6 +91,14 @@ pc
 ```bash
 pc                                    # Open interactive numbered menu
 pc status                             # Unified "one PC" cluster view
+pc status --watch                     # Live auto-refreshing terminal monitor (like htop)
+pc jobs                               # See active & recent jobs across all phones
+pc cancel node1 <job_id>              # Cancel a runaway job on any phone
+pc ssh node1                          # Instant SSH into a phone by node name
+pc copy model.gguf ~/models/          # Copy datasets/models to all worker phones via SCP
+pc token                              # Show unlock token for Web UI (`--rotate` to renew)
+pc sync                               # Sync code & config to all phones and restart workers
+pc update --sync                      # Pull latest updates from GitHub & push to workers
 pc doctor                             # Check SSH, Termux:API, temps, 24/7 battery safety
 pc discover                           # Auto-find new phones on Wi-Fi (UDP 8766)
 pc wizard                             # Guided interactive setup wizard

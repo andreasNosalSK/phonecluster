@@ -555,7 +555,13 @@ class MasterController:
                     "id": snap.node.id,
                     "host": snap.node.host,
                     "role": snap.node.role,
+                    "worker_port": snap.node.worker_port,
+                    "ssh_port": snap.node.ssh_port,
+                    "ssh_user": snap.node.ssh_user,
+                    "max_concurrency": snap.node.max_concurrency,
+                    "weight": snap.node.weight,
                     "tags": snap.node.tags,
+                    "notes": snap.node.notes,
                     "online": snap.online,
                     "ready_for_jobs": snap.ready_for_jobs,
                     "latency_ms": snap.latency_ms,
@@ -573,6 +579,65 @@ class MasterController:
             "mem_total_mb": total_ram_mb,
             "mem_available_mb": avail_ram_mb,
             "max_temp_c": max(temps) if temps else None,
+            "safety": {
+                "max_temp_c": self.config.safety.max_temp_c,
+                "resume_temp_c": self.config.safety.resume_temp_c,
+                "min_free_ram_mb": self.config.safety.min_free_ram_mb,
+                "battery_low_pct": self.config.safety.battery_low_pct,
+                "battery_high_pct": self.config.safety.battery_high_pct,
+                "battery_webhook_configured": bool(self.config.safety.battery_webhook_url),
+            },
             "timestamp": int(time.time()),
             "nodes": node_dicts,
         }
+
+    def get_node_jobs(self, node: NodeConfig) -> dict[str, Any]:
+        """Fetch active and recent jobs from one worker node."""
+        url = f"{node.base_url}/jobs"
+        req = urllib.request.Request(url, headers=self.headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.health_timeout_sec) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return {"node_id": node.id, "online": True, **data}
+        except urllib.error.HTTPError as exc:
+            try:
+                err = exc.read().decode("utf-8", errors="replace")[:200]
+            finally:
+                exc.close()
+            return {"node_id": node.id, "online": False, "error": f"HTTP {exc.code}: {err}", "active": [], "recent": []}
+        except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+            return {"node_id": node.id, "online": False, "error": str(exc), "active": [], "recent": []}
+
+    def get_all_jobs(self) -> list[dict[str, Any]]:
+        """Query active & recent jobs across all configured nodes in parallel."""
+        nodes = list(self.config.nodes)
+        if not nodes:
+            return []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes))) as pool:
+            futs = {pool.submit(self.get_node_jobs, n): idx for idx, n in enumerate(nodes)}
+            out: list[dict[str, Any] | None] = [None] * len(nodes)
+            for fut in concurrent.futures.as_completed(futs):
+                out[futs[fut]] = fut.result()
+        return [item for item in out if item is not None]
+
+    def cancel_node_job(self, node_id: str, job_id: str) -> dict[str, Any]:
+        """Cancel a running job on a specific node."""
+        node = self.config.get_node(node_id)
+        url = f"{node.base_url}/cancel"
+        body = json.dumps({"job_id": job_id}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=self.headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {"error": raw[:200]}
+            return {"cancelled": False, "http_status": exc.code, **data}
+        except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+            return {"cancelled": False, "error": str(exc)}

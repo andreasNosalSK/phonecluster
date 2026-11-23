@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -211,14 +212,35 @@ def create_default_config(
     )
 
 
+def generate_auth_token() -> str:
+    """Return a cryptographically strong URL-safe cluster bearer token."""
+    return secrets.token_urlsafe(32)
+
+
 def save_config(config: ClusterConfig, path: str | Path) -> Path:
-    """Write a ClusterConfig to disk with restrictive permissions (0600)."""
+    """Atomically write a ClusterConfig to disk with restrictive permissions (0600)."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(config.to_dict(), indent=2) + "\n"
-    out.write_text(payload, encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=str(out.parent))
+    tmp_path = Path(tmp_name)
     try:
-        os.chmod(out, 0o600)
-    except OSError:
-        pass
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, out)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return out

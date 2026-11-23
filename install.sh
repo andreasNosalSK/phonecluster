@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# PhoneCluster Universal One-Command Installer
+# PhoneCluster Universal One-Command Installer & Updater
 # Works on: Android Termux (unrooted), Debian 13 ARM64 chroot, and Linux/macOS PCs.
 #
-# Quick run:
-#   bash install.sh
+# True one-line remote install:
+#   curl -fsSL https://raw.githubusercontent.com/andreasNosalSK/phonecluster/main/install.sh | bash
+#
+# Local install / flags:
 #   bash install.sh --master --with-compute
 #   bash install.sh --worker --node-id node1 --with-compute
 set -euo pipefail
@@ -13,11 +15,11 @@ NODE_ID=""
 WITH_COMPUTE=0
 NON_INTERACTIVE=0
 INSTALL_DIR="${PHONECLUSTER_DIR:-${HOME}/phonecluster}"
-REPO_URL="${PHONECLUSTER_REPO_URL:-}"
+REPO_URL="${PHONECLUSTER_REPO_URL:-https://github.com/andreasNosalSK/phonecluster.git}"
 
 usage() {
   cat <<'EOF'
-PhoneCluster Easy Installer
+PhoneCluster Easy Installer & Updater
 
 Usage: bash install.sh [options]
 
@@ -30,6 +32,19 @@ Options:
   --non-interactive   Skip prompts and use flags/defaults
   -h, --help          Show this help
 EOF
+}
+
+# Read safely from /dev/tty even when invoked via `curl ... | bash`
+ask() {
+  local prompt="$1"
+  local default_val="$2"
+  local reply=""
+  if [[ -r /dev/tty ]]; then
+    read -r -p "${prompt}" reply < /dev/tty || reply=""
+  elif [[ -t 0 ]]; then
+    read -r -p "${prompt}" reply || reply=""
+  fi
+  printf '%s' "${reply:-${default_val}}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -62,21 +77,23 @@ fi
 
 if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/phonecluster_cli.py" ]]; then
   INSTALL_DIR="${SCRIPT_DIR}"
-elif [[ ! -f "${INSTALL_DIR}/phonecluster_cli.py" ]]; then
-  if [[ -z "${REPO_URL}" ]]; then
-    echo "Error: Run install.sh from the cloned repo folder, or set PHONECLUSTER_REPO_URL=<git-url>." >&2
-    exit 1
-  fi
+else
   if ! command -v git >/dev/null 2>&1; then
     if [[ "${IS_TERMUX}" -eq 1 ]]; then
+      echo "Installing git in Termux..."
       pkg update -y && pkg install -y git
     else
-      echo "Error: 'git' is required to clone ${REPO_URL}." >&2
+      echo "Error: 'git' is required to download PhoneCluster from ${REPO_URL}." >&2
       exit 1
     fi
   fi
-  echo "Cloning PhoneCluster into ${INSTALL_DIR}..."
-  git clone "${REPO_URL}" "${INSTALL_DIR}"
+  if [[ -d "${INSTALL_DIR}/.git" ]]; then
+    echo "Existing installation found at ${INSTALL_DIR} — updating..."
+    git -C "${INSTALL_DIR}" pull --ff-only || echo "Warning: git pull skipped (local changes?)."
+  else
+    echo "Cloning PhoneCluster into ${INSTALL_DIR}..."
+    git clone "${REPO_URL}" "${INSTALL_DIR}"
+  fi
 fi
 
 echo "Install path : ${INSTALL_DIR}"
@@ -128,8 +145,8 @@ if [[ -z "${ROLE}" && "${NON_INTERACTIVE}" -eq 0 ]]; then
   echo "  1) Master phone (Controls the cluster + runs Web Dashboard + runs jobs)"
   echo "  2) Worker phone (Joins the cluster and runs jobs)"
   echo "  3) Just install CLI tools (configure later)"
-  read -r -p "Choose [1/2/3] (default 1): " CHOICE || CHOICE="1"
-  case "${CHOICE:-1}" in
+  CHOICE="$(ask "Choose [1/2/3] (default 1): " "1")"
+  case "${CHOICE}" in
     1) ROLE="master" ;;
     2) ROLE="worker" ;;
     *) ROLE="cli-only" ;;
@@ -140,7 +157,7 @@ if [[ "${ROLE}" == "master" && -z "${NODE_ID}" ]]; then
   NODE_ID="node0"
 elif [[ "${ROLE}" == "worker" && -z "${NODE_ID}" ]]; then
   if [[ "${NON_INTERACTIVE}" -eq 0 ]]; then
-    read -r -p "Enter Worker node ID [node1]: " NODE_ID || NODE_ID="node1"
+    NODE_ID="$(ask "Enter Worker node ID [node1]: " "node1")"
   fi
   NODE_ID="${NODE_ID:-node1}"
 fi
@@ -163,14 +180,20 @@ echo "============================================================"
 echo "Commands ready anywhere:"
 echo "  pc                  -> Open friendly interactive menu"
 echo "  pc wizard           -> Guided setup wizard (auto-discovers phones on Wi-Fi)"
-echo "  pc status           -> Unified 'one PC' cluster view"
+echo "  pc status --watch   -> Live unified 'one PC' cluster monitor"
 echo "  pc doctor           -> Health, SSH & 24/7 battery safety check"
 echo "  pc dashboard        -> Accessible Web Control Center (port 8080)"
+echo "  pc token            -> Print unlock token for the Web UI"
+echo "  pc sync             -> Push code & config to all worker phones"
 echo
 
 if [[ "${ROLE}" == "master" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR}/config/cluster.json" ]]; then
-  read -r -p "Launch the Guided Setup Wizard right now? [Y/n]: " RUN_WIZ || RUN_WIZ="y"
-  if [[ -z "${RUN_WIZ}" || "${RUN_WIZ,,}" == "y" || "${RUN_WIZ,,}" == "yes" ]]; then
-    "${BIN_DIR}/phonecluster" wizard
+  RUN_WIZ="$(ask "Launch the Guided Setup Wizard right now? [Y/n]: " "y")"
+  if [[ "${RUN_WIZ,,}" == "y" || "${RUN_WIZ,,}" == "yes" ]]; then
+    if [[ -r /dev/tty ]]; then
+      "${BIN_DIR}/phonecluster" wizard < /dev/tty
+    else
+      "${BIN_DIR}/phonecluster" wizard
+    fi
   fi
 fi

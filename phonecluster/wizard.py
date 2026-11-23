@@ -184,11 +184,11 @@ def run_setup_wizard(
     print("  (Copy this token when unlocking controls in the Web Dashboard!)")
     print("\nNext easy steps:")
     print("  1. Sync code & start workers on all phones:")
-    print(f"       ./scripts/03_sync_cluster.sh --config {saved} --setup-keys")
+    print(f"       pc --config {saved} sync --setup-keys")
     print("  2. Check your cluster health:")
-    print(f"       phonecluster --config {saved} doctor")
+    print(f"       pc --config {saved} doctor")
     print("  3. Open the friendly Web Control Center:")
-    print(f"       phonecluster --config {saved} dashboard")
+    print(f"       pc --config {saved} dashboard")
     print(f"       -> http://{master_host}:{cfg.dashboard_port}")
     return 0
 
@@ -198,7 +198,7 @@ def run_interactive_menu(
     input_fn: Callable[[str], str] = input,
 ) -> int:
     """Friendly numbered terminal menu so users never need to memorize flags."""
-    from .cli import _cmd_status
+    from .cli import _cmd_jobs, _cmd_status
     from .dashboard import serve_dashboard
     import argparse
 
@@ -216,6 +216,7 @@ def run_interactive_menu(
         print("  6) Start Accessible Web Dashboard (Browser UI)")
         print("  7) Workloads Helper (distcc / llama.cpp / OpenMPI)")
         print("  8) Guided Setup Wizard (Create/Edit cluster.json)")
+        print("  9) View Active/Recent Jobs & Show Auth Token")
         print("  0) Exit")
         print("-" * 52)
 
@@ -324,8 +325,12 @@ def run_interactive_menu(
                 )
                 for o in ctrl.run_single(spec, target="all"):
                     print(f"[{o.node_id}] {'OK' if o.ok else 'FAIL'}: {(o.stdout or o.stderr or o.error).strip()}")
+        elif choice == "9":
+            cfg = load_config(cfg_path)
+            print(f"\nCluster auth_token (for Web UI Unlock): {cfg.auth_token}\n")
+            _cmd_jobs(argparse.Namespace(config=str(cfg_path), limit=5, json=False))
         else:
-            print("Please enter a number from 0 to 8.")
+            print("Please enter a number from 0 to 9.")
 
 
 def _print_doctor_report(report: dict[str, Any]) -> None:
