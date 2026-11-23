@@ -198,13 +198,25 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                 pass
 
             if cfg.gateway.enabled:
-                checks.append(
-                    CheckResult(
-                        "Master Network Guard",
-                        "ok",
-                        f"Enabled (mode={cfg.gateway.mode}, port={cfg.gateway.port}, SSRF guard={'ON' if cfg.gateway.block_private_ips else 'OFF'})",
+                gw_port = int(cfg.gateway.port or 0)
+                gw_live = True if gw_port <= 0 else is_local_port_open(gw_port)
+                if gw_live:
+                    checks.append(
+                        CheckResult(
+                            "Master Network Guard",
+                            "ok",
+                            f"Enabled & listening (mode={cfg.gateway.mode}, port={gw_port}, SSRF guard={'ON' if cfg.gateway.block_private_ips else 'OFF'})",
+                        )
                     )
-                )
+                else:
+                    checks.append(
+                        CheckResult(
+                            "Master Network Guard",
+                            "warn",
+                            f"Enabled in config (mode={cfg.gateway.mode}, port={gw_port}) but proxy is NOT currently listening on port {gw_port}",
+                            "Start Master Dashboard (`pc dashboard`) or standalone proxy (`pc gateway`) so worker jobs can reach allowlisted sites.",
+                        )
+                    )
             else:
                 checks.append(
                     CheckResult(

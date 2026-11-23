@@ -177,6 +177,8 @@ def select_snapshots_for_target(
     target: str,
     route: WorkloadRoute | None = None,
     force: bool = False,
+    busy_node_ids: set[str] | None = None,
+    excluded_node_ids: set[str] | None = None,
 ) -> tuple[list[Any], str]:
     """Select eligible `NodeSnapshot` objects for `target` + optional `WorkloadRoute`.
 
@@ -186,8 +188,21 @@ def select_snapshots_for_target(
     - `"pool:<name>"`  : restrict to phones in that Pool (e.g. `pool:compute`, `pool:docker`)
     - `"best"` / `"all"`: any ready node across all tiers
     - `"<node_id>"`    : specific node
+
+    `excluded_node_ids` (e.g. quarantined phones) are never picked for automatic/pool/broadcast
+    routing. `busy_node_ids` allows parallel `map_jobs()` to spill non-strict compute jobs
+    immediately onto idle Tier 2/3 phones once Tier 1 slots are saturated.
     """
-    ready = [s for s in snapshots if s.online and (s.ready_for_jobs or force)]
+    excluded = excluded_node_ids or set()
+    busy = busy_node_ids or set()
+    ready = [
+        s
+        for s in snapshots
+        if s.online
+        and (s.ready_for_jobs or force)
+        and (s.node.id not in excluded or (force and target == s.node.id))
+        and s.node.id not in busy
+    ]
 
     if target.startswith("tier:"):
         raw_t = target.split(":", 1)[1].strip()
@@ -280,11 +295,12 @@ _SERVICE_SPEC: list[tuple[str, str, int, str]] = [
 def build_service_registry(
     snapshots: list[Any], config: ClusterConfig
 ) -> list[dict[str, Any]]:
-    """Discover all live cross-tier services running across every online phone."""
+    """Discover all live cross-tier services running across every non-quarantined online phone."""
     entries: list[dict[str, Any]] = []
+    quarantined = set(config.gateway.quarantined_nodes)
     has_auto_adguard = False
     for snap in snapshots:
-        if not snap.online:
+        if not snap.online or snap.node.id in quarantined:
             continue
         h = snap.health or {}
         tier, pool = resolve_node_tier_and_pool(snap.node, h)
@@ -456,10 +472,11 @@ def build_cross_tier_env(
     if "postgres" in by_name:
         env["PHONECLUSTER_POSTGRES_HOST"] = _pick_primary_service(by_name["postgres"])["host"]
 
-    # Pool host lists so any node can reach peers in other tiers (ready nodes listed first)
+    # Pool host lists so any node can reach peers in other tiers (ready non-quarantined nodes listed first)
+    quarantined = set(config.gateway.quarantined_nodes)
     pool_hosts: dict[str, list[str]] = {}
     ordered_snaps = sorted(
-        (s for s in snapshots if s.online),
+        (s for s in snapshots if s.online and s.node.id not in quarantined),
         key=lambda s: (0 if s.ready_for_jobs else 1, s.node.id),
     )
     for snap in ordered_snaps:
@@ -492,8 +509,11 @@ def build_cluster_dns_hosts(
     snapshots: list[Any], config: ClusterConfig, domain: str = "cluster"
 ) -> str:
     """Generate an `/etc/hosts` or AdGuard Home DNS rewrite list for friendly cross-tier names."""
+    quarantined = set(config.gateway.quarantined_nodes)
     lines: list[str] = [f"# PhoneCluster friendly DNS names (.{domain}) — paste into /etc/hosts or AdGuard Home"]
     for snap in snapshots:
+        if snap.node.id in quarantined:
+            continue
         tier, pool = resolve_node_tier_and_pool(snap.node, snap.health if snap.online else None)
         lines.append(f"{snap.node.host:<16s} {snap.node.id}.{domain}  # Tier {tier} ({pool})")
 
@@ -530,8 +550,11 @@ def build_cluster_dns_hosts(
     return "\n".join(lines) + "\n"
 
 
-def summarize_pools(snapshots: list[Any]) -> list[dict[str, Any]]:
+def summarize_pools(
+    snapshots: list[Any], quarantined_nodes: set[str] | None = None
+) -> list[dict[str, Any]]:
     """Aggregate cores, RAM, and readiness grouped by Tier & Pool for unified UI display."""
+    quarantined = quarantined_nodes or set()
     groups: dict[tuple[int, str], dict[str, Any]] = {}
     for snap in snapshots:
         tier, pool = resolve_node_tier_and_pool(snap.node, snap.health if snap.online else None)
@@ -556,7 +579,7 @@ def summarize_pools(snapshots: list[Any]) -> list[dict[str, Any]]:
         if snap.online:
             h = snap.health or {}
             g["nodes_online"] += 1
-            if snap.ready_for_jobs:
+            if snap.ready_for_jobs and snap.node.id not in quarantined:
                 g["nodes_ready"] += 1
             g["total_cores"] += int(h.get("cpu_cores", 0))
             g["mem_total_mb"] += int(h.get("mem_total_mb", 0))

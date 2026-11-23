@@ -287,7 +287,9 @@ def render_top_frame(
             )
             continue
 
-        if n.get("ready_for_jobs"):
+        if n.get("quarantined"):
+            st_badge = pal.bad("✕ QUARANTINED")
+        elif n.get("ready_for_jobs"):
             st_badge = pal.ok(f"✓ READY {h.get('active_jobs', 0)}/{h.get('max_concurrency', n.get('max_concurrency', 2))}")
         else:
             reasons = ",".join(h.get("not_ready_reasons", ["paused"]))

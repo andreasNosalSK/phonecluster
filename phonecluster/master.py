@@ -17,7 +17,13 @@ from http import HTTPStatus
 from typing import Any, Callable
 
 from .auth import build_auth_headers
-from .config import ClusterConfig, NodeConfig, format_host_for_url, format_host_port
+from .config import (
+    ClusterConfig,
+    NodeConfig,
+    format_host_for_url,
+    format_host_port,
+    is_loopback_or_unspecified_host,
+)
 from .gateway import build_worker_proxy_env
 from .routing import (
     build_cluster_dns_hosts,
@@ -265,6 +271,19 @@ class MasterController:
     def _headers_for(self, node: NodeConfig) -> dict[str, str]:
         return build_auth_headers(self.config.token_for_node(node))
 
+    def _quarantined_ids(self) -> set[str]:
+        with self.config_lock:
+            return set(self.config.gateway.quarantined_nodes)
+
+    @staticmethod
+    def _is_remote_port_loopback_only(snap: NodeSnapshot, port: int) -> bool:
+        if is_loopback_or_unspecified_host(snap.node.host):
+            return False
+        for item in snap.health.get("listening_ports") or []:
+            if isinstance(item, dict) and item.get("port") == port:
+                return not bool(item.get("exposed", True))
+        return False
+
     def _filter_nodes(self, tags: list[str] | None = None) -> list[NodeConfig]:
         with self.config_lock:
             nodes = list(self.config.nodes)
@@ -372,9 +391,14 @@ class MasterController:
         snapshots = self.poll_health(tags=tags)
         cross_env = build_cross_tier_env(snapshots, self.config)
         snap_by_id = {s.node.id: s for s in snapshots}
+        quarantined = self._quarantined_ids()
 
         if target == "all":
-            chosen = [s for s in snapshots if s.online and (s.ready_for_jobs or spec.force)]
+            chosen = [
+                s
+                for s in snapshots
+                if s.online and (s.ready_for_jobs or spec.force) and s.node.id not in quarantined
+            ]
             if not chosen:
                 return [
                     JobOutcome(
@@ -424,7 +448,11 @@ class MasterController:
                 else None
             )
             candidates, reason = select_snapshots_for_target(
-                snapshots, target=target, route=route, force=spec.force
+                snapshots,
+                target=target,
+                route=route,
+                force=spec.force,
+                excluded_node_ids=quarantined,
             )
             if not candidates:
                 return [
@@ -490,6 +518,22 @@ class MasterController:
                     duration_sec=0.0,
                     error=f"Unknown node id '{target}'. Check cluster.json or `pc status`.",
                     routing_reason=f"Node '{target}' not found in cluster config",
+                )
+            ]
+        if node.id in quarantined and not spec.force:
+            return [
+                JobOutcome(
+                    index=spec.index,
+                    job_id=spec.job_id,
+                    label=spec.label,
+                    node_id=node.id,
+                    returncode=-1,
+                    duration_sec=0.0,
+                    error=(
+                        f"Node '{node.id}' is quarantined by Master. "
+                        "Unblock it in Network & Pi Guard (Tab 5) or pass --force for inspection."
+                    ),
+                    routing_reason=f"Blocked: node '{node.id}' is quarantined",
                 )
             ]
         snap = snap_by_id.get(node.id)
@@ -574,6 +618,7 @@ class MasterController:
                     _refresh_health()
 
                 dispatched_any = False
+                quarantined = self._quarantined_ids()
                 # Dispatch as many pending jobs as there are free compatible healthy slots
                 deferred: list[tuple[JobSpec, int, set[str]]] = []
                 while pending:
@@ -583,15 +628,20 @@ class MasterController:
                         if target == "auto"
                         else None
                     )
-                    pool_matched, reason = select_snapshots_for_target(
-                        snapshots, target=target, route=route, force=spec.force
+                    busy_ids = {
+                        s.node.id
+                        for s in snapshots
+                        if (external_active[s.node.id] + in_flight_per_node[s.node.id]) >= s.max_concurrency
+                    }
+                    eligible, reason = select_snapshots_for_target(
+                        snapshots,
+                        target=target,
+                        route=route,
+                        force=spec.force,
+                        busy_node_ids=busy_ids,
+                        excluded_node_ids=quarantined,
                     )
                     last_reason_by_index[spec.index] = reason
-                    eligible = [
-                        s
-                        for s in pool_matched
-                        if (external_active[s.node.id] + in_flight_per_node[s.node.id]) < s.max_concurrency
-                    ]
                     if not eligible:
                         # Continue inspecting remaining jobs so busy Tier X does not block Tier Y
                         deferred.append((spec, attempt, failed_nodes))
@@ -924,17 +974,20 @@ class MasterController:
     def build_distcc_hosts(
         self, include_stopped: bool = False, snapshots: list[NodeSnapshot] | None = None
     ) -> str:
-        """Build a `DISTCC_HOSTS` string from currently healthy cluster nodes."""
+        """Build a `DISTCC_HOSTS` string from currently healthy, non-quarantined cluster nodes."""
         snaps = snapshots if snapshots is not None else self.poll_health()
+        quarantined = self._quarantined_ids()
         entries: list[str] = []
         for snap in snaps:
-            if not snap.ready_for_jobs:
+            if not snap.ready_for_jobs or snap.node.id in quarantined:
                 continue
             services = snap.health.get("services", {})
             tools = snap.health.get("tools", {})
             running = bool(services.get("distccd_3632"))
             installed = bool(tools.get("distccd"))
             if not running and not (include_stopped and installed):
+                continue
+            if running and self._is_remote_port_loopback_only(snap, 3632):
                 continue
             cores = max(1, int(snap.health.get("cpu_cores", 4)))
             if snap.node.role == "master" or snap.node.host in {"127.0.0.1", "localhost"}:
@@ -950,11 +1003,12 @@ class MasterController:
         include_master: bool = False,
         snapshots: list[NodeSnapshot] | None = None,
     ) -> str:
-        """Build a comma-separated `--rpc` endpoint list for healthy llama.cpp workers."""
+        """Build a comma-separated `--rpc` endpoint list for healthy, non-quarantined llama.cpp workers."""
         snaps = snapshots if snapshots is not None else self.poll_health()
+        quarantined = self._quarantined_ids()
         endpoints: list[str] = []
         for snap in snaps:
-            if not snap.ready_for_jobs:
+            if not snap.ready_for_jobs or snap.node.id in quarantined:
                 continue
             if not include_master and snap.node.role == "master":
                 continue
@@ -965,17 +1019,19 @@ class MasterController:
                 if isinstance(p, dict) and "port" in p
             }
             active = (port == 50052 and bool(svcs.get("llama_rpc_50052"))) or (port in lp_ports)
-            if active:
+            if active and not self._is_remote_port_loopback_only(snap, port):
                 endpoints.append(format_host_port(snap.node.host, port))
         return ",".join(endpoints)
 
     def build_mpi_hostfile(self, snapshots: list[NodeSnapshot] | None = None) -> str:
-        """Generate an OpenMPI hostfile containing all currently healthy nodes."""
+        """Generate an OpenMPI hostfile containing healthy, non-quarantined nodes (prefers mpirun-capable)."""
         snaps = snapshots if snapshots is not None else self.poll_health()
+        quarantined = self._quarantined_ids()
+        ready_snaps = [s for s in snaps if s.ready_for_jobs and s.node.id not in quarantined]
+        mpi_snaps = [s for s in ready_snaps if (s.health.get("tools") or {}).get("mpirun")]
+        chosen = mpi_snaps if mpi_snaps else ready_snaps
         lines: list[str] = []
-        for snap in snaps:
-            if not snap.ready_for_jobs:
-                continue
+        for snap in chosen:
             cores = max(1, int(snap.health.get("cpu_cores", 4)))
             lines.append(f"{snap.node.host} slots={cores}")
         return "\n".join(lines) + ("\n" if lines else "")
@@ -983,6 +1039,7 @@ class MasterController:
     def cluster_summary(self, record_history: bool = True) -> dict[str, Any]:
         """Return an aggregate 'one PC' resource summary across all nodes."""
         snapshots = self.poll_health()
+        quarantined = self._quarantined_ids()
         total_cores = 0
         total_ram_mb = 0
         avail_ram_mb = 0
@@ -997,6 +1054,7 @@ class MasterController:
         node_dicts: list[dict[str, Any]] = []
 
         for snap in snapshots:
+            is_q = snap.node.id in quarantined
             if snap.online:
                 online_count += 1
                 cores = int(snap.health.get("cpu_cores", 0))
@@ -1005,7 +1063,7 @@ class MasterController:
                 avail_ram_mb += int(snap.health.get("mem_available_mb", 0))
                 total_active_jobs += int(snap.health.get("active_jobs", 0))
                 latencies.append(float(snap.latency_ms))
-                if snap.ready_for_jobs:
+                if snap.ready_for_jobs and not is_q:
                     ready_count += 1
                 cpu_pct = snap.health.get("cpu_pct")
                 if cpu_pct is None:
@@ -1036,7 +1094,8 @@ class MasterController:
                     "tags": snap.node.tags,
                     "notes": snap.node.notes,
                     "online": snap.online,
-                    "ready_for_jobs": snap.ready_for_jobs,
+                    "quarantined": is_q,
+                    "ready_for_jobs": snap.ready_for_jobs and not is_q,
                     "latency_ms": snap.latency_ms,
                     "error": snap.error,
                     "health": snap.health,
@@ -1066,7 +1125,7 @@ class MasterController:
             "total_active_jobs": total_active_jobs,
             "total_net_rx_kbps": round(total_net_rx, 1),
             "total_net_tx_kbps": round(total_net_tx, 1),
-            "pools": summarize_pools(snapshots),
+            "pools": summarize_pools(snapshots, quarantined_nodes=quarantined),
             "services_registry": build_service_registry(snapshots, self.config),
             "safety": {
                 "max_temp_c": self.config.safety.max_temp_c,
@@ -1089,7 +1148,7 @@ class MasterController:
         """Return live cross-tier service registry, `.env` vars, and DNS hosts block."""
         snaps = snapshots if snapshots is not None else self.poll_health()
         return {
-            "pools": summarize_pools(snaps),
+            "pools": summarize_pools(snaps, quarantined_nodes=self._quarantined_ids()),
             "services": build_service_registry(snaps, self.config),
             "env": build_cross_tier_env(snaps, self.config),
             "dns_hosts": build_cluster_dns_hosts(snaps, self.config),
@@ -1267,6 +1326,74 @@ class MasterController:
             for fut in concurrent.futures.as_completed(futs):
                 out[futs[fut]] = fut.result()
         return [item for item in out if item is not None]
+
+    def push_config_to_node(self, node: NodeConfig, timeout_sec: float = 3.0) -> dict[str, Any]:
+        """Push Master's live safety, concurrency, and Master-IP allowlist settings to one worker."""
+        with self.config_lock:
+            s = self.config.safety
+            net = self.config.network
+            master_node = next((n for n in self.config.nodes if n.role == "master"), self.config.nodes[0])
+            allowed_ips = list(net.allowed_master_ips)
+            if master_node.host and master_node.host not in allowed_ips:
+                allowed_ips.append(master_node.host)
+            payload = {
+                "target_node_id": node.id,
+                "max_concurrency": node.max_concurrency,
+                "safety": {
+                    "max_temp_c": s.max_temp_c,
+                    "resume_temp_c": s.resume_temp_c,
+                    "min_free_ram_mb": s.min_free_ram_mb,
+                    "battery_low_pct": s.battery_low_pct,
+                    "battery_high_pct": s.battery_high_pct,
+                    "battery_poll_sec": s.battery_poll_sec,
+                    "webhook_cooldown_sec": s.webhook_cooldown_sec,
+                    "battery_webhook_url": s.battery_webhook_url,
+                },
+                "network": {
+                    "enforce_worker_source_ip": net.enforce_worker_source_ip,
+                    "allowed_master_ips": allowed_ips,
+                },
+            }
+        url = f"{node.base_url}/config"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=self._headers_for(node),
+            method="POST",
+        )
+        try:
+            with _DIRECT_OPENER.open(req, timeout=timeout_sec) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return {"node_id": node.id, "ok": True, **data}
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")[:200]
+            finally:
+                exc.close()
+            return {"node_id": node.id, "ok": False, "error": f"HTTP {exc.code}: {raw}"}
+        except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+            return {"node_id": node.id, "ok": False, "error": str(exc)}
+
+    def push_config_to_all(
+        self, node_ids: list[str] | None = None, timeout_sec: float = 3.0
+    ) -> dict[str, Any]:
+        """Push live Master policy (safety, concurrency, source-IP lock) to online workers in parallel."""
+        with self.config_lock:
+            if node_ids is not None:
+                want = set(node_ids)
+                nodes = [n for n in self.config.nodes if n.id in want]
+            else:
+                nodes = list(self.config.nodes)
+        if not nodes:
+            return {"ok_count": 0, "total": 0, "results": []}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes))) as pool:
+            futs = {pool.submit(self.push_config_to_node, n, timeout_sec): idx for idx, n in enumerate(nodes)}
+            ordered: list[dict[str, Any] | None] = [None] * len(nodes)
+            for fut in concurrent.futures.as_completed(futs):
+                ordered[futs[fut]] = fut.result()
+        results = [r for r in ordered if r is not None]
+        ok_count = sum(1 for r in results if r.get("ok"))
+        return {"ok_count": ok_count, "total": len(results), "results": results}
 
     def cancel_node_job(self, node_id: str, job_id: str) -> dict[str, Any]:
         """Cancel a running job on a specific node."""

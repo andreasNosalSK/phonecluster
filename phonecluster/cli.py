@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -85,7 +86,8 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
 
 
 def _cmd_worker(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
+    cfg_path = resolve_config_path(args.config)
+    cfg = load_config(cfg_path)
     try:
         node = cfg.get_node(args.node_id)
     except KeyError as exc:
@@ -108,6 +110,7 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         max_concurrency=max_conc,
         workdir=Path(args.workdir),
         allowed_client_ips=allowed_ips,
+        config_path=cfg_path,
     )
     serve_worker(
         args.bind,
@@ -159,7 +162,9 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
             state_str = f"OFFLINE ({n['error'][:28]})"
             rows.append([n["id"], n["role"], tp_str, n["host"], "-", state_str, "-", "-", "-", "-", "-"])
             continue
-        if n["ready_for_jobs"]:
+        if n.get("quarantined"):
+            state_str = "QUARANTINED"
+        elif n["ready_for_jobs"]:
             state_str = f"READY ({h.get('active_jobs', 0)}/{h.get('max_concurrency', '?')})"
         else:
             reasons = ",".join(h.get("not_ready_reasons", ["paused"]))
@@ -235,7 +240,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     spec = JobSpec(
         index=0,
-        job_id=f"run-{int(time.time())}",
+        job_id=f"run-{int(time.time())}-{uuid.uuid4().hex[:6]}",
         command=" ".join(args.command) if args.command else None,
         script_content=script_content,
         script_name=script_name,
@@ -903,6 +908,30 @@ def _cmd_copy(args: argparse.Namespace) -> int:
     return rc_all
 
 
+def _cmd_push_config(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
+    node_ids = [args.node_id] if args.node_id else None
+    res = ctrl.push_config_to_all(node_ids=node_ids)
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok_count"] == res["total"] else 1
+    rows = [
+        [
+            r["node_id"],
+            "OK" if r.get("ok") else "FAIL",
+            str(r.get("max_concurrency", "-")),
+            f"{r.get('max_temp_c', '-')}C" if r.get("ok") else "-",
+            "ON" if r.get("source_ip_allowlist_active") else ("off" if r.get("ok") else "-"),
+            "saved" if r.get("persisted") else (r.get("error", "memory-only")[:42]),
+        ]
+        for r in res["results"]
+    ]
+    print(_fmt_table(["NODE", "STATUS", "MAX-JOBS", "TEMP-LIMIT", "IP-LOCK", "DETAIL"], rows))
+    print(f"\nLive policy pushed to {res['ok_count']}/{res['total']} node(s) over authenticated HTTP.")
+    return 0 if res["ok_count"] == res["total"] else 1
+
+
 def _cmd_sync(args: argparse.Namespace) -> int:
     cfg_path = resolve_config_path(args.config)
     script = REPO_ROOT / "scripts" / "03_sync_cluster.sh"
@@ -1191,6 +1220,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_cp.add_argument("dest", help="Remote destination path (e.g. ~/models/)")
     p_cp.add_argument("--target", default="workers", help="'workers' (default), 'all', or a node_id")
     p_cp.set_defaults(func=_cmd_copy)
+
+    # push-config (live HTTP policy push to workers without SSH)
+    p_push = sub.add_parser(
+        "push-config",
+        help="Push live safety, concurrency, and Master-IP allowlist policy to online workers over HTTP (no SSH needed)",
+    )
+    p_push.add_argument("--node-id", default="", help="Optional single node ID to push to (default: all)")
+    p_push.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_push.set_defaults(func=_cmd_push_config)
 
     # sync & update
     p_sync = sub.add_parser("sync", help="Push code & cluster.json to all phones and restart workers")

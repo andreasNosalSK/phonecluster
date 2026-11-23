@@ -24,7 +24,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .auth import AuthRateLimiter, verify_token
-from .config import SafetyConfig, normalize_host
+from .config import (
+    NetworkHardeningConfig,
+    SafetyConfig,
+    load_config,
+    normalize_host,
+    save_config,
+)
 from .discovery import DISCOVERY_PORT, DiscoveryResponder
 from .telemetry import CpuSampler, NetSampler, ThermalGate, collect_node_health
 
@@ -57,6 +63,7 @@ class WorkerState:
     workdir: Path = field(default_factory=lambda: Path.cwd())
     health_provider: Callable[[], dict[str, Any]] | None = None
     allowed_client_ips: set[str] = field(default_factory=set)
+    config_path: Path | None = None
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).resolve()
@@ -172,6 +179,14 @@ class WorkerState:
     ) -> tuple[bool, dict[str, Any]]:
         """Atomically check capacity & thermal safety, then reserve a job slot."""
         with self.lock:
+            if job_id in self.active_jobs:
+                return (
+                    False,
+                    {
+                        "error": "duplicate_job_id",
+                        "reasons": [f"job '{job_id}' is already running on '{self.node_id}'"],
+                    },
+                )
             active_count = len(self.active_jobs)
             if active_count >= self.max_concurrency:
                 return (
@@ -247,6 +262,133 @@ class WorkerState:
         if proc is not None and proc.poll() is None:
             _terminate_process_group(proc)
         return True
+
+    def cancel_all_jobs(self) -> int:
+        """Terminate all running child process groups cleanly (called on worker shutdown)."""
+        procs: list[subprocess.Popen[bytes]] = []
+        with self.lock:
+            for job in self.active_jobs.values():
+                job.cancelled = True
+                if job.process is not None and job.process.poll() is None:
+                    procs.append(job.process)
+        for proc in procs:
+            _terminate_process_group(proc)
+        return len(procs)
+
+    def apply_live_config(
+        self, payload: dict[str, Any], requester_ip: str = ""
+    ) -> tuple[int, dict[str, Any]]:
+        """Apply live policy updates pushed by Master (safety, max_concurrency, source-IP lock).
+
+        Never modifies `auth_token` or `node_id`. When enabling `enforce_worker_source_ip`,
+        always includes the authenticated Master's current source IP + loopback so Master
+        cannot lock itself out. Persists atomically to `self.config_path` when available.
+        """
+        target_id = str(payload.get("target_node_id") or "").strip()
+        if target_id and target_id != self.node_id:
+            return HTTPStatus.CONFLICT, {
+                "error": f"node_id mismatch (expected '{self.node_id}', got '{target_id}') — check for DHCP IP swap"
+            }
+
+        new_safety: SafetyConfig | None = None
+        if "safety" in payload:
+            raw_s = payload.get("safety")
+            if not isinstance(raw_s, dict):
+                return HTTPStatus.BAD_REQUEST, {"error": "'safety' must be a JSON object"}
+            try:
+                cur_s = self.safety
+                merged_s = {
+                    "max_temp_c": raw_s.get("max_temp_c", cur_s.max_temp_c),
+                    "resume_temp_c": raw_s.get("resume_temp_c", cur_s.resume_temp_c),
+                    "min_free_ram_mb": raw_s.get("min_free_ram_mb", cur_s.min_free_ram_mb),
+                    "battery_low_pct": raw_s.get("battery_low_pct", cur_s.battery_low_pct),
+                    "battery_high_pct": raw_s.get("battery_high_pct", cur_s.battery_high_pct),
+                    "battery_poll_sec": raw_s.get("battery_poll_sec", cur_s.battery_poll_sec),
+                    "webhook_cooldown_sec": raw_s.get("webhook_cooldown_sec", cur_s.webhook_cooldown_sec),
+                    "battery_webhook_url": raw_s.get("battery_webhook_url", cur_s.battery_webhook_url),
+                }
+                new_safety = SafetyConfig.from_dict(merged_s)
+            except (ValueError, TypeError) as exc:
+                return HTTPStatus.BAD_REQUEST, {"error": f"invalid safety config: {exc}"}
+
+        new_max_conc: int | None = None
+        if "max_concurrency" in payload:
+            try:
+                mc = int(payload["max_concurrency"])
+                if not (1 <= mc <= 32):
+                    raise ValueError("must be between 1 and 32")
+                new_max_conc = mc
+            except (ValueError, TypeError) as exc:
+                return HTTPStatus.BAD_REQUEST, {"error": f"invalid max_concurrency: {exc}"}
+
+        new_net_cfg: NetworkHardeningConfig | None = None
+        new_allowed_ips: set[str] | None = None
+        if "network" in payload:
+            raw_n = payload.get("network")
+            if not isinstance(raw_n, dict):
+                return HTTPStatus.BAD_REQUEST, {"error": "'network' must be a JSON object"}
+            try:
+                new_net_cfg = NetworkHardeningConfig.from_dict(raw_n)
+            except (ValueError, TypeError) as exc:
+                return HTTPStatus.BAD_REQUEST, {"error": f"invalid network config: {exc}"}
+            if new_net_cfg.enforce_worker_source_ip:
+                allowed = {"127.0.0.1", "::1"} | {
+                    normalize_host(ip) for ip in new_net_cfg.allowed_master_ips if normalize_host(ip)
+                }
+                norm_req = normalize_host(requester_ip)
+                if norm_req:
+                    allowed.add(norm_req)
+                new_allowed_ips = allowed
+                new_net_cfg.allowed_master_ips = sorted(allowed - {"127.0.0.1", "::1"})
+            else:
+                new_allowed_ips = set()
+
+        persisted = False
+        with self.lock:
+            if new_safety is not None:
+                self.safety = new_safety
+                self.thermal_gate.update_limits(new_safety.max_temp_c, new_safety.resume_temp_c)
+            if new_max_conc is not None:
+                self.max_concurrency = new_max_conc
+            if new_allowed_ips is not None:
+                self.allowed_client_ips = new_allowed_ips
+                self._compile_allowed_clients()
+
+            if self.config_path is not None and self.config_path.exists():
+                try:
+                    disk_cfg = load_config(self.config_path)
+                    if new_safety is not None:
+                        disk_cfg.safety = new_safety
+                    if new_max_conc is not None:
+                        for n in disk_cfg.nodes:
+                            if n.id == self.node_id:
+                                n.max_concurrency = new_max_conc
+                    if new_net_cfg is not None:
+                        disk_cfg.network.enforce_worker_source_ip = new_net_cfg.enforce_worker_source_ip
+                        if new_net_cfg.allowed_master_ips:
+                            disk_cfg.network.allowed_master_ips = list(new_net_cfg.allowed_master_ips)
+                    save_config(disk_cfg, self.config_path)
+                    persisted = True
+                except Exception as exc:
+                    LOG.warning("Live config applied in memory but disk save failed: %s", exc)
+
+        LOG.info(
+            "[%s] Applied live Master config push (max_conc=%d, max_temp=%.1fC, ip_lock=%s, persisted=%s)",
+            self.node_id,
+            self.max_concurrency,
+            self.safety.max_temp_c,
+            bool(self.allowed_client_ips),
+            persisted,
+        )
+        return HTTPStatus.OK, {
+            "updated": True,
+            "node_id": self.node_id,
+            "max_concurrency": self.max_concurrency,
+            "max_temp_c": self.safety.max_temp_c,
+            "resume_temp_c": self.safety.resume_temp_c,
+            "source_ip_allowlist_active": bool(self.allowed_client_ips),
+            "persisted": persisted,
+        }
 
     def is_cancelled(self, job_id: str) -> bool:
         with self.lock:
@@ -330,13 +472,74 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> No
         LOG.warning("Safety webhook POST to %s failed: %s", url, exc)
 
 
-def _decode_capped(data: bytes | None, limit: int = MAX_OUTPUT_BYTES) -> str:
-    if not data:
+def _decode_capped(data: bytes | None, limit: int = MAX_OUTPUT_BYTES, overflow_bytes: int = 0) -> str:
+    if not data and overflow_bytes <= 0:
         return ""
-    if len(data) <= limit:
-        return data.decode("utf-8", errors="replace")
-    kept = data[:limit].decode("utf-8", errors="replace")
-    return f"{kept}\n...[truncated {len(data) - limit} bytes]"
+    raw = data or b""
+    extra = overflow_bytes
+    if len(raw) > limit:
+        extra += len(raw) - limit
+        raw = raw[:limit]
+    text = raw.decode("utf-8", errors="replace")
+    if extra > 0:
+        return f"{text}\n...[truncated {extra} bytes]"
+    return text
+
+
+def _run_process_bounded(
+    proc: subprocess.Popen[bytes],
+    timeout_sec: float,
+    max_bytes: int = MAX_OUTPUT_BYTES,
+) -> tuple[int, str, str, bool]:
+    """Wait for `proc` while draining stdout/stderr with a hard RAM cap (OOM protection for phones)."""
+    out_buf = bytearray()
+    err_buf = bytearray()
+    overflow = [0, 0]
+
+    def _drain(stream: Any, target: bytearray, idx: int) -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(32768)
+                if not chunk:
+                    break
+                rem = max_bytes - len(target)
+                if rem > 0:
+                    target.extend(chunk[:rem])
+                    if len(chunk) > rem:
+                        overflow[idx] += len(chunk) - rem
+                else:
+                    overflow[idx] += len(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, out_buf, 0), daemon=True)
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, err_buf, 1), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_sec)
+        returncode = int(proc.returncode if proc.returncode is not None else -1)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process_group(proc)
+        returncode = -9
+
+    t_out.join(timeout=2.0)
+    t_err.join(timeout=2.0)
+    stdout_text = _decode_capped(bytes(out_buf), limit=max_bytes, overflow_bytes=overflow[0])
+    stderr_text = _decode_capped(bytes(err_buf), limit=max_bytes, overflow_bytes=overflow[1])
+    if timed_out:
+        stderr_text = stderr_text + f"\n[Job timed out after {timeout_sec}s]"
+    return returncode, stdout_text, stderr_text, timed_out
 
 
 def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -371,7 +574,12 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
 
     reserved, reject_info = state.try_reserve_slot(job_id, preview, force=force)
     if not reserved:
-        return HTTPStatus.SERVICE_UNAVAILABLE, reject_info
+        code = (
+            HTTPStatus.CONFLICT
+            if reject_info.get("error") == "duplicate_job_id"
+            else HTTPStatus.SERVICE_UNAVAILABLE
+        )
+        return code, reject_info
 
     started = time.monotonic()
     temp_script_path: Path | None = None
@@ -432,21 +640,9 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             )
 
         state.attach_process(job_id, proc)
-        try:
-            out_bytes, err_bytes = proc.communicate(timeout=timeout_sec)
-            returncode = proc.returncode
-            stdout_text = _decode_capped(out_bytes)
-            stderr_text = _decode_capped(err_bytes)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_process_group(proc)
-            try:
-                out_bytes, err_bytes = proc.communicate(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                out_bytes, err_bytes = b"", b""
-            returncode = -9
-            stdout_text = _decode_capped(out_bytes)
-            stderr_text = _decode_capped(err_bytes) + f"\n[Job timed out after {timeout_sec}s]"
+        returncode, stdout_text, stderr_text, timed_out = _run_process_bounded(
+            proc, timeout_sec=timeout_sec, max_bytes=MAX_OUTPUT_BYTES
+        )
     except (OSError, ValueError) as exc:
         stderr_text = f"Execution error: {exc}"
         returncode = 127
@@ -492,7 +688,17 @@ class BatteryGuardLoop(threading.Thread):
         self.stop_event = stop_event
 
     def check_once(self) -> None:
-        health = self.state.get_health()
+        if self.state.health_provider is not None:
+            health = self.state.get_health()
+        else:
+            health = collect_node_health(
+                node_id=self.state.node_id,
+                role=self.state.role,
+                safety=self.state.safety,
+                thermal_gate=self.state.thermal_gate,
+                workdir=self.state.workdir,
+                safety_only=True,
+            )
         safety = self.state.safety
         pct = health.get("battery_pct")
         status = str(health.get("battery_status", "UNKNOWN")).upper()
@@ -652,6 +858,11 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {"job_id": job_id, "cancelled": True})
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": f"job '{job_id}' not active"})
+        elif path == "/config":
+            status, body = self.server.state.apply_live_config(
+                payload, requester_ip=str(self.client_address[0])
+            )
+            self._send_json(status, body)
         else:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -726,4 +937,5 @@ def serve_worker(
         stop_event.set()
         if responder is not None:
             responder.stop()
+        state.cancel_all_jobs()
         server.server_close()

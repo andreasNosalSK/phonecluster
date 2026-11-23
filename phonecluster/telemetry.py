@@ -47,28 +47,37 @@ class BatteryInfo:
 
 
 class ThermalGate:
-    """Thermal throttle gate with hysteresis to avoid rapid on/off flapping."""
+    """Thread-safe thermal throttle gate with hysteresis to avoid rapid on/off flapping."""
 
     def __init__(self, max_temp_c: float = 40.0, resume_temp_c: float = 37.0) -> None:
+        self._lock = threading.Lock()
         self.max_temp_c = max_temp_c
         self.resume_temp_c = resume_temp_c
         self._overheated = False
 
+    def update_limits(self, max_temp_c: float, resume_temp_c: float) -> None:
+        """Update thermal thresholds live (e.g. from Master `/config` push)."""
+        with self._lock:
+            self.max_temp_c = float(max_temp_c)
+            self.resume_temp_c = float(resume_temp_c)
+
     def evaluate(self, temp_c: float | None) -> bool:
         """Update state and return True if the node is currently overheated."""
-        if temp_c is None:
+        with self._lock:
+            if temp_c is None:
+                return self._overheated
+            if self._overheated:
+                if temp_c <= self.resume_temp_c:
+                    self._overheated = False
+            else:
+                if temp_c >= self.max_temp_c:
+                    self._overheated = True
             return self._overheated
-        if self._overheated:
-            if temp_c <= self.resume_temp_c:
-                self._overheated = False
-        else:
-            if temp_c >= self.max_temp_c:
-                self._overheated = True
-        return self._overheated
 
     @property
     def is_overheated(self) -> bool:
-        return self._overheated
+        with self._lock:
+            return self._overheated
 
 
 def detect_os_environment() -> str:

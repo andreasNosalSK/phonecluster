@@ -439,21 +439,36 @@ def audit_cluster_network(
             "fix": "Toggle ON below if on shared/dorm Wi-Fi.",
         })
 
-    # 3. Worker Source-IP Master Allowlist (15 pts)
+    # 3. Worker Source-IP Master Allowlist (15 pts — verifies live enforcement on online workers!)
+    online_workers = [s for s in snaps if s.online and s.node.role != "master"]
     if config.network.enforce_worker_source_ip:
-        score += 15
-        checks.append({
-            "name": "Worker Master-IP Firewall Allowlist",
-            "status": "ok",
-            "detail": "Workers reject HTTP :8765 connections from any IP except your Master.",
-            "fix": "Run `pc sync` after changing Master IP so workers reload the allowlist.",
-        })
+        unsynced = [
+            s.node.id
+            for s in online_workers
+            if not bool((s.health or {}).get("source_ip_allowlist_active", False))
+        ]
+        if unsynced:
+            score += 7
+            checks.append({
+                "name": "Worker Master-IP Firewall Allowlist",
+                "status": "warn",
+                "detail": f"Enabled in Master config, but not yet active on online worker(s): {', '.join(unsynced)}",
+                "fix": "Click 'Push Live Policy to All Workers' below (or run `pc push-config`) to activate immediately without SSH.",
+            })
+        else:
+            score += 15
+            checks.append({
+                "name": "Worker Master-IP Firewall Allowlist",
+                "status": "ok",
+                "detail": "Active — online workers reject HTTP :8765 connections from any IP except your Master.",
+                "fix": "",
+            })
     else:
         checks.append({
             "name": "Worker Master-IP Firewall Allowlist",
             "status": "info",
             "detail": "Disabled (workers accept token-authenticated requests from any LAN IP).",
-            "fix": "Enable below once Master has a static DHCP IP, then run `pc sync`.",
+            "fix": "Enable below once Master has a static DHCP IP — Master pushes it live to all online workers automatically.",
         })
 
     # 4. Master Network Guard (20 pts)

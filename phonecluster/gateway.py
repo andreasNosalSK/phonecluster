@@ -206,20 +206,14 @@ def evaluate_policy(host: str, port: int, gw: GatewayConfig) -> tuple[bool, str]
 
 
 def _is_disallowed_ip(ip_str: str) -> bool:
+    """Block all non-public/internal IPs including LAN, loopback, link-local, Tailscale/CGNAT (100.64.0.0/10)."""
     try:
         addr = ipaddress.ip_address(ip_str)
     except ValueError:
         return True
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
-    return bool(
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_multicast
-        or addr.is_reserved
-        or addr.is_unspecified
-    )
+    return bool((not addr.is_global) or addr.is_multicast or addr.is_unspecified)
 
 
 def resolve_and_validate_target(
@@ -592,11 +586,14 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
         leftover = raw[sep_idx + 4 :]
 
         lines = head_bytes.decode("iso-8859-1", errors="replace").split("\r\n")
-        if not lines or len(lines[0].split()) < 3:
+        req_parts = lines[0].split()
+        if len(req_parts) != 3:
             _send_proxy_error(conn, 400, "Bad Request", "malformed HTTP proxy request")
             return
-
-        method, target, version = lines[0].split(" ", 2)
+        method, target, version = req_parts
+        if any(c in "\r\n" for c in (method + target + version)) or not version.upper().startswith("HTTP/1."):
+            _send_proxy_error(conn, 400, "Bad Request", "unsupported or malformed HTTP version")
+            return
         method_u = method.upper()
         header_pairs: list[tuple[str, str]] = []
         headers_lower: dict[str, str] = {}
@@ -741,6 +738,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
         upstream: socket.socket | None = None
         bytes_in = 0
         bytes_out = 0
+        response_started = False
         try:
             last_conn_err: OSError | None = None
             for family, sockaddr in candidates:
@@ -763,6 +761,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
 
             if method_u == "CONNECT":
                 conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                response_started = True
                 if leftover:
                     upstream.sendall(leftover)
                     bytes_out += len(leftover)
@@ -842,6 +841,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     resp_chunk = upstream.recv(RELAY_CHUNK_BYTES)
                     if not resp_chunk:
                         break
+                    response_started = True
                     conn.sendall(resp_chunk)
                     bytes_in += len(resp_chunk)
 
@@ -863,12 +863,13 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 method=method_u,
                 host=dest_host,
                 port=dest_port,
-                action="block",
-                reason=f"upstream connect/relay error: {exc}",
+                action="allow" if response_started else "block",
+                reason=f"relay closed: {exc}" if response_started else f"upstream connect/relay error: {exc}",
                 bytes_in=bytes_in,
                 bytes_out=bytes_out,
             )
-            _send_proxy_error(conn, 502, "Bad Gateway", str(exc))
+            if not response_started:
+                _send_proxy_error(conn, 502, "Bad Gateway", str(exc))
         finally:
             if upstream is not None:
                 try:

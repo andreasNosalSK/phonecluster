@@ -2439,6 +2439,355 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
             srv2.shutdown()
             srv2.server_close()
 
+    def test_live_master_to_slave_config_push_and_audit_enforcement(self) -> None:
+        from phonecluster.netguard import audit_cluster_network
+
+        m_tok = "master-push-tok-1234"
+        w_tok = "worker-push-tok-5678"
+        with tempfile.TemporaryDirectory() as tmp:
+            master_cfg_path = Path(tmp) / "master.json"
+            worker_cfg_path = Path(tmp) / "worker.json"
+
+            # Save scoped worker config on disk first
+            w_disk_cfg = ClusterConfig(
+                cluster_name="push-test",
+                auth_token=w_tok,
+                nodes=[NodeConfig(id="node1", host="127.0.0.1", role="worker", max_concurrency=2, auth_token=w_tok)],
+                safety=SafetyConfig(max_temp_c=40.0, resume_temp_c=37.0),
+            )
+            save_config(w_disk_cfg, worker_cfg_path)
+
+            w_state = WorkerState(
+                node_id="node1",
+                role="worker",
+                auth_token=w_tok,
+                safety=w_disk_cfg.safety,
+                max_concurrency=2,
+                config_path=worker_cfg_path,
+                health_provider=lambda: {
+                    "node_id": "node1",
+                    "role": "worker",
+                    "os_env": "termux",
+                    "cpu_cores": 8,
+                    "load_1m": 0.1,
+                    "mem_total_mb": 4096,
+                    "mem_available_mb": 2048,
+                    "temp_c": 32.0,
+                    "overheated": False,
+                    "ready_for_jobs": True,
+                    "not_ready_reasons": [],
+                    "tools": {"python3": True},
+                    "services": {},
+                },
+            )
+            w_srv, _g, ev = create_worker_server("127.0.0.1", 0, w_state)
+            w_port = w_srv.server_address[1]
+            threading.Thread(target=w_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+            m_cfg = ClusterConfig(
+                cluster_name="push-test",
+                auth_token=m_tok,
+                nodes=[
+                    NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=59996),
+                    NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=w_port, max_concurrency=2, auth_token=w_tok),
+                ],
+            )
+            save_config(m_cfg, master_cfg_path)
+            ctrl = MasterController(m_cfg)
+            dash = DashboardHTTPServer(("127.0.0.1", 0), ctrl, config_path=master_cfg_path, enable_pairing_beacon=False)
+            d_port = dash.server_address[1]
+            threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+            try:
+                # 1. If Master enables source-IP lock in config ONLY (before push), audit warns worker isn't enforcing yet!
+                m_cfg.network.enforce_worker_source_ip = True
+                audit_before = audit_cluster_network(ctrl, gateway_manager=dash.gateway_manager)
+                ip_chk_before = next(c for c in audit_before["checks"] if c["name"] == "Worker Master-IP Firewall Allowlist")
+                self.assertEqual(ip_chk_before["status"], "warn")
+                self.assertIn("node1", ip_chk_before["detail"])
+
+                # 2. Save hardening via Dashboard -> automatically pushes live to worker over HTTP (no SSH)!
+                req_h = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/network/hardening",
+                    data=json.dumps({"enforce_worker_source_ip": True}).encode("utf-8"),
+                    headers=build_auth_headers(m_tok),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_h, timeout=5.0) as resp:
+                    h_res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(h_res["pushed"]["ok_count"], 1)
+                self.assertTrue(w_state.allowed_client_ips)
+                self.assertTrue(w_state.is_client_ip_allowed("127.0.0.1"))
+                self.assertFalse(w_state.is_client_ip_allowed("10.99.99.99"))
+
+                # Audit now reports OK because live worker is ACTUALLY enforcing!
+                audit_after = audit_cluster_network(ctrl, gateway_manager=dash.gateway_manager)
+                ip_chk_after = next(c for c in audit_after["checks"] if c["name"] == "Worker Master-IP Firewall Allowlist")
+                self.assertEqual(ip_chk_after["status"], "ok")
+
+                # 3. Updating max_concurrency & safety pushes live AND persists to worker's cluster.json without changing token!
+                req_u = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/nodes/update",
+                    data=json.dumps({"id": "node1", "max_concurrency": 4}).encode("utf-8"),
+                    headers=build_auth_headers(m_tok),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_u, timeout=5.0) as resp:
+                    u_res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(u_res["pushed"]["ok_count"], 1)
+                self.assertEqual(w_state.max_concurrency, 4)
+
+                req_s = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/settings",
+                    data=json.dumps({"max_temp_c": 38.0, "resume_temp_c": 35.0}).encode("utf-8"),
+                    headers=build_auth_headers(m_tok),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_s, timeout=5.0) as resp:
+                    s_res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(s_res["pushed"]["ok_count"], 1)
+                self.assertEqual(w_state.safety.max_temp_c, 38.0)
+                self.assertEqual(w_state.thermal_gate.max_temp_c, 38.0)
+
+                # Verify disk persistence on worker & immutable unique token
+                w_reloaded = load_config(worker_cfg_path)
+                self.assertEqual(w_reloaded.auth_token, w_tok)
+                self.assertEqual(w_reloaded.get_node("node1").max_concurrency, 4)
+                self.assertEqual(w_reloaded.safety.max_temp_c, 38.0)
+                self.assertTrue(w_reloaded.network.enforce_worker_source_ip)
+
+                # 4. Target node_id mismatch protection (guards against DHCP IP swap!)
+                bad_push = ctrl.push_config_to_node(
+                    NodeConfig(id="wrong_node", host="127.0.0.1", role="worker", worker_port=w_port, auth_token=w_tok)
+                )
+                self.assertFalse(bad_push["ok"])
+                self.assertIn("409", bad_push["error"])
+
+                # CLI `pc push-config --node-id node1` succeeds cleanly
+                self.assertEqual(cli_main(["--config", str(master_cfg_path), "push-config", "--node-id", "node1"]), 0)
+            finally:
+                dash.shutdown()
+                dash.server_close()
+                ev.set()
+                w_srv.shutdown()
+                w_srv.server_close()
+
+    def test_cluster_wide_quarantine_isolates_jobs_workloads_and_service_mesh(self) -> None:
+        tok = "quar-iso-tok-1234"
+        servers = []
+        evs = []
+        nodes: list[NodeConfig] = []
+        for nid, role, has_mpi in [("node0", "master", True), ("node1", "worker", False)]:
+            def _make_h(n_id: str, r_name: str, mpi_ok: bool):
+                return lambda: {
+                    "node_id": n_id,
+                    "role": r_name,
+                    "os_env": "termux",
+                    "cpu_cores": 8,
+                    "load_1m": 0.1,
+                    "mem_total_mb": 4096,
+                    "mem_available_mb": 2048,
+                    "temp_c": 32.0,
+                    "overheated": False,
+                    "ready_for_jobs": True,
+                    "not_ready_reasons": [],
+                    "tools": {"python3": True, "distccd": True, "mpirun": mpi_ok},
+                    "services": {
+                        "distccd_3632": True,
+                        "llama_rpc_50052": n_id == "node1",
+                        "mosquitto_1883": n_id == "node1",
+                    },
+                }
+
+            st = WorkerState(node_id=nid, role=role, auth_token=tok, safety=SafetyConfig(), health_provider=_make_h(nid, role, has_mpi))
+            srv, _g, ev = create_worker_server("127.0.0.1", 0, st)
+            threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+            servers.append(srv)
+            evs.append(ev)
+            nodes.append(NodeConfig(id=nid, host="127.0.0.1", role=role, worker_port=srv.server_address[1]))
+
+        cfg = ClusterConfig(
+            cluster_name="quar-cluster",
+            auth_token=tok,
+            nodes=nodes,
+            gateway=GatewayConfig(quarantined_nodes=["node1"]),
+        )
+        ctrl = MasterController(cfg)
+        try:
+            # 1. Broadcast & pinned run exclude quarantined node1 (unless forced)
+            all_outs = ctrl.run_single(JobSpec(index=0, job_id="q-all", command="echo hi"), target="all")
+            self.assertEqual([o.node_id for o in all_outs], ["node0"])
+
+            pin_out = ctrl.run_single(JobSpec(index=0, job_id="q-pin", command="echo hi"), target="node1")[0]
+            self.assertFalse(pin_out.ok)
+            self.assertIn("quarantined", pin_out.error.lower())
+
+            # 2. Shared resources & Service Mesh exclude quarantined node1 completely!
+            self.assertEqual(ctrl.build_llama_rpc_arg(), "")
+            svc_info = ctrl.get_services_info()
+            self.assertFalse(any(e["node_id"] == "node1" for e in svc_info["services"]))
+            self.assertNotIn("node1.cluster", svc_info["dns_hosts"])
+            self.assertNotIn("PHONECLUSTER_MQTT_HOST", svc_info["env"])
+
+            # 3. OpenMPI hostfile excludes nodes without mpirun even when unquarantined!
+            cfg.gateway.quarantined_nodes = []
+            mpi_lines = [ln for ln in ctrl.build_mpi_hostfile().splitlines() if ln.strip()]
+            self.assertEqual(len(mpi_lines), 1)  # Only node0 has mpirun=True
+
+            # 4. Summary & btop TUI clearly show QUARANTINED badge
+            cfg.gateway.quarantined_nodes = ["node1"]
+            summary = ctrl.cluster_summary()
+            self.assertEqual(summary["nodes_ready"], 1)
+            n1 = next(n for n in summary["nodes"] if n["id"] == "node1")
+            self.assertTrue(n1["quarantined"])
+            self.assertFalse(n1["ready_for_jobs"])
+            frame = render_top_frame(summary, ctrl.metrics_history.snapshot(), [], width=100, use_color=False)
+            self.assertIn("QUARANTINED", frame)
+        finally:
+            for ev in evs:
+                ev.set()
+            for srv in servers:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_heterogeneous_parallel_map_immediate_spillover_across_tiers(self) -> None:
+        tok = "spill-tok-1234"
+        servers = []
+        evs = []
+        nodes: list[NodeConfig] = []
+        for nid, tier, pool, max_c in [("t1", 1, "compute", 1), ("t2", 2, "services", 2)]:
+            def _mh(n_id: str, t_num: int, p_name: str):
+                return lambda: {
+                    "node_id": n_id,
+                    "role": "worker",
+                    "os_env": "termux" if t_num == 1 else "debian-13",
+                    "tier": t_num,
+                    "pool": p_name,
+                    "cpu_cores": 4,
+                    "load_1m": 0.1,
+                    "mem_total_mb": 4096,
+                    "mem_available_mb": 2048,
+                    "temp_c": 32.0,
+                    "overheated": False,
+                    "ready_for_jobs": True,
+                    "not_ready_reasons": [],
+                    "tools": {"python3": True},
+                    "services": {},
+                }
+
+            st = WorkerState(
+                node_id=nid,
+                role="worker",
+                auth_token=tok,
+                safety=SafetyConfig(),
+                max_concurrency=max_c,
+                health_provider=_mh(nid, tier, pool),
+            )
+            srv, _g, ev = create_worker_server("127.0.0.1", 0, st)
+            threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+            servers.append(srv)
+            evs.append(ev)
+            nodes.append(NodeConfig(id=nid, host="127.0.0.1", role="worker", worker_port=srv.server_address[1], max_concurrency=max_c, tier=tier, pool=pool))
+
+        ctrl = MasterController(ClusterConfig(cluster_name="spill", auth_token=tok, nodes=nodes))
+        try:
+            jobs = [
+                JobSpec(index=i, job_id=f"sp-{i}", command="sleep 0.3 && echo ok", timeout_sec=5.0)
+                for i in range(3)
+            ]
+            t0 = time.monotonic()
+            outs = ctrl.map_jobs(jobs, target="auto", retries=0)
+            elapsed = time.monotonic() - t0
+            self.assertTrue(all(o.ok for o in outs), [o.to_dict() for o in outs])
+            # Job 0 lands on Tier 1 (max_conc=1), Jobs 1 & 2 IMMEDIATELY spill over to Tier 2 in parallel!
+            used = {o.node_id for o in outs}
+            self.assertEqual(used, {"t1", "t2"})
+            self.assertLess(elapsed, 0.85, f"Expected parallel spillover (<0.85s), took {elapsed:.2f}s")
+        finally:
+            for ev in evs:
+                ev.set()
+            for srv in servers:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_worker_oom_bounded_output_duplicate_job_id_cgnat_ssrf_and_doctor_gateway_check(self) -> None:
+        # 1. CGNAT / Tailscale (100.64.0.0/10) MUST be blocked by SSRF guard!
+        for cgnat in ("100.64.0.1", "100.100.100.100", "::ffff:100.64.0.1", "169.254.169.254"):
+            res, why = resolve_and_validate_target(cgnat, 443, block_private_ips=True)
+            self.assertIsNone(res, f"SSRF guard failed to block {cgnat}")
+            self.assertIn("SSRF", why)
+
+        # 2. Bounded streaming output cap (OOM protection) & duplicate active job_id rejection (409)
+        tok = "oom-dup-tok-1234"
+        st = WorkerState(
+            node_id="w_cap",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=2,
+            health_provider=lambda: {
+                "node_id": "w_cap",
+                "role": "worker",
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "cpu_cores": 4,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 2048,
+                "tools": {},
+                "services": {},
+            },
+        )
+        srv, _g, ev = create_worker_server("127.0.0.1", 0, st)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        cfg = ClusterConfig(
+            cluster_name="cap-test",
+            auth_token=tok,
+            nodes=[NodeConfig(id="w_cap", host="127.0.0.1", role="worker", worker_port=port, max_concurrency=2)],
+            gateway=GatewayConfig(enabled=True, port=59997),  # Unused port -> doctor should warn!
+        )
+        ctrl = MasterController(cfg)
+        try:
+            # 2a. 1.2 MB stdout is cleanly capped & annotated with truncation count
+            big_cmd = f"{sys.executable} -c \"import sys; sys.stdout.write('A' * 1200000)\""
+            big_out = ctrl.run_single(JobSpec(index=0, job_id="big-1", command=big_cmd, timeout_sec=10.0), target="w_cap")[0]
+            self.assertTrue(big_out.ok, big_out.error)
+            self.assertIn("...[truncated ", big_out.stdout)
+            self.assertLess(len(big_out.stdout.encode("utf-8")), 540 * 1024)
+
+            # 2b. Duplicate active job_id returns HTTP 409 instead of overwriting active_jobs!
+            slow_t = threading.Thread(
+                target=ctrl.exec_on_node,
+                args=(cfg.get_node("w_cap"), JobSpec(index=0, job_id="dup-id-1", command="sleep 0.8", timeout_sec=5.0)),
+                daemon=True,
+            )
+            slow_t.start()
+            for _ in range(30):
+                if "dup-id-1" in st.active_jobs:
+                    break
+                time.sleep(0.02)
+            self.assertIn("dup-id-1", st.active_jobs)
+            kind, err_data = ctrl.exec_on_node(
+                cfg.get_node("w_cap"),
+                JobSpec(index=0, job_id="dup-id-1", command="echo collide", timeout_sec=5.0),
+            )
+            self.assertEqual(kind, "error")
+            self.assertEqual(err_data.get("http_status"), 409)
+            self.assertEqual(err_data.get("error"), "duplicate_job_id")
+            slow_t.join(timeout=5.0)
+
+            # 3. Doctor warns when gateway.enabled=True but nothing is listening on gateway.port
+            with tempfile.TemporaryDirectory() as tmp:
+                cp = Path(tmp) / "c.json"
+                save_config(cfg, cp)
+                doc = run_doctor(cp, check_remote=False)
+                gw_chk = next(c for c in doc["checks"] if c["name"] == "Master Network Guard")
+                self.assertEqual(gw_chk["status"], "warn")
+        finally:
+            ev.set()
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

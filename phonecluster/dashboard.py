@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1063,11 +1064,12 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
           </div>
           <div class="row" style="margin-bottom:10px;">
             <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:5px;">
-              <input id="hard-src-ip" type="checkbox" style="width:auto; padding:0;" /> Workers accept HTTP <code class="mono">:8765</code> ONLY from Master IP (run <code class="mono">pc sync</code> after enabling)
+              <input id="hard-src-ip" type="checkbox" style="width:auto; padding:0;" /> Workers accept HTTP <code class="mono">:8765</code> ONLY from Master IP (pushed live to online workers automatically)
             </label>
           </div>
           <div class="row">
-            <button class="primary small" onclick="saveHardeningSettings()">Save Hardening Settings</button>
+            <button class="primary small" onclick="saveHardeningSettings()">Save &amp; Push Hardening</button>
+            <button class="small" onclick="pushLivePolicyToWorkers()">📡 Push Live Policy to All Workers</button>
           </div>
 
           <h3 style="margin:12px 0 6px;">Hardening Checklist</h3>
@@ -1594,7 +1596,10 @@ function renderNodesGrid(live) {
       const nHist = (hist.nodes && hist.nodes[n.id]) ? hist.nodes[n.id] : [];
       let badge = '<span class="pill bad">✕ OFFLINE</span>';
       let cardCls = 'node-card offline';
-      if (n.online && n.ready_for_jobs) {
+      if (n.online && n.quarantined) {
+        badge = '<span class="pill bad">🔒 QUARANTINED</span>';
+        cardCls = 'node-card offline';
+      } else if (n.online && n.ready_for_jobs) {
         badge = '<span class="pill ok">✓ READY (' + (h.active_jobs || 0) + '/' + (h.max_concurrency || n.max_concurrency || 2) + ')</span>';
         cardCls = 'node-card';
       } else if (n.online) {
@@ -2570,7 +2575,8 @@ async function saveSafetySettings() {
   };
   const data = await authPost('/api/settings', payload);
   if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
-  showToast('Safety settings saved! Run `pc sync` to push to worker phones.', 'ok');
+  const pushed = data.pushed ? (' (live-synced to ' + data.pushed.ok_count + '/' + data.pushed.total + ' phone(s))') : '';
+  showToast('Safety settings saved!' + pushed, 'ok');
   refreshLive();
 }
 
@@ -2715,15 +2721,17 @@ async function loadNetworkAudit() {
 async function applySecurityProfile(profile) {
   const data = await authPost('/api/network/profile', { profile });
   if (data.error) { showToast('Profile error: ' + data.error, 'bad'); return; }
-  showToast('Applied profile: ' + data.description, 'ok');
+  const pushed = data.pushed ? (' · synced live to ' + data.pushed.ok_count + '/' + data.pushed.total + ' phone(s)') : '';
+  showToast('Applied profile: ' + data.description + pushed, 'ok');
   loadNetworkCenter();
 }
 
 async function toggleQuarantine(nodeId, quarantine) {
   const data = await authPost('/api/gateway/quarantine', { node_id: nodeId, quarantine });
   if (data.error) { showToast('Quarantine failed: ' + data.error, 'bad'); return; }
-  showToast(quarantine ? ('🔒 Quarantined ' + nodeId + ' (outbound proxy blocked!)') : ('✓ Unblocked ' + nodeId), quarantine ? 'warn' : 'ok');
+  showToast(quarantine ? ('🔒 Quarantined ' + nodeId + ' (proxy, jobs & service mesh isolated!)') : ('✓ Unblocked ' + nodeId), quarantine ? 'warn' : 'ok');
   loadNetworkCenter();
+  refreshLive();
 }
 
 async function saveHardeningSettings() {
@@ -2735,8 +2743,17 @@ async function saveHardeningSettings() {
   };
   const data = await authPost('/api/network/hardening', payload);
   if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
-  showToast('Network hardening saved! Run `pc sync` to push Master-IP allowlist to workers.', 'ok');
+  const pushed = data.pushed ? (' Synced live to ' + data.pushed.ok_count + '/' + data.pushed.total + ' phone(s)!') : '';
+  showToast('Network hardening saved!' + pushed, 'ok');
   loadNetworkCenter();
+}
+
+async function pushLivePolicyToWorkers() {
+  const data = await authPost('/api/network/push-config', {});
+  if (data.error) { showToast('Policy push failed: ' + data.error, 'bad'); return; }
+  showToast('Pushed live policy (safety, concurrency & IP lock) to ' + data.ok_count + '/' + data.total + ' online phone(s)!', data.ok_count === data.total ? 'ok' : 'warn');
+  loadNetworkCenter();
+  refreshLive();
 }
 
 async function loadGatewayStatus() {
@@ -3141,6 +3158,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/gateway/check-isolation",
             "/api/network/profile",
             "/api/network/hardening",
+            "/api/network/push-config",
             "/api/jobs/cancel",
             "/api/nodes/add",
             "/api/nodes/update",
@@ -3203,7 +3221,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return
             spec = JobSpec(
                 index=0,
-                job_id=f"web-{int(time.time())}",
+                job_id=f"web-{int(time.time())}-{uuid.uuid4().hex[:6]}",
                 command=command,
                 timeout_sec=timeout,
             )
@@ -3502,7 +3520,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 )
                 if self.server.config_path is not None:
                     save_config(ctrl.config, self.server.config_path)
-            self._send_json(HTTPStatus.OK, {**res, "gateway": self.server.gateway_manager.status()})
+            pushed = ctrl.push_config_to_all()
+            self._send_json(
+                HTTPStatus.OK,
+                {**res, "gateway": self.server.gateway_manager.status(), "pushed": pushed},
+            )
 
         elif path == "/api/network/hardening":
             with ctrl.config_lock:
@@ -3532,7 +3554,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "enforce_worker_source_ip": ctrl.config.network.enforce_worker_source_ip,
                     "allowed_master_ips": list(ctrl.config.network.allowed_master_ips),
                 }
+            resp_hardening["pushed"] = ctrl.push_config_to_all()
             self._send_json(HTTPStatus.OK, resp_hardening)
+
+        elif path == "/api/network/push-config":
+            raw_ids = body.get("node_ids")
+            node_ids = [str(x).strip() for x in raw_ids if str(x).strip()] if isinstance(raw_ids, list) else None
+            self._send_json(HTTPStatus.OK, ctrl.push_config_to_all(node_ids=node_ids))
 
         elif path == "/api/gateway/check-isolation":
             results = ctrl.check_workers_wan_isolation()
@@ -3569,10 +3597,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"unsupported action '{action}'"})
                 return
             # Ship 05_workload_helpers.sh inline so it works regardless of install directory on each phone!
+            wl_job_id = f"wl-{action}-{uuid.uuid4().hex[:6]}"
             if WORKLOAD_HELPER_SCRIPT.exists():
                 spec = JobSpec(
                     index=0,
-                    job_id=f"wl-{action}",
+                    job_id=wl_job_id,
                     script_content=WORKLOAD_HELPER_SCRIPT.read_text(encoding="utf-8"),
                     script_name="05_workload_helpers.sh",
                     interpreter="bash",
@@ -3583,7 +3612,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 quoted_args = " ".join(shlex.quote(a) for a in script_args)
                 spec = JobSpec(
                     index=0,
-                    job_id=f"wl-{action}",
+                    job_id=wl_job_id,
                     command=f"bash ~/phonecluster/scripts/05_workload_helpers.sh {quoted_args}",
                     timeout_sec=30.0,
                 )
@@ -3596,7 +3625,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     from .routing import build_cross_tier_env as _build_env
 
                     snaps = ctrl.poll_health()
-                    ready_workers = [s for s in snaps if s.online and s.ready_for_jobs and s.node.role != "master"]
+                    quarantined = ctrl._quarantined_ids()
+                    ready_workers = [
+                        s
+                        for s in snaps
+                        if s.online and s.ready_for_jobs and s.node.role != "master" and s.node.id not in quarantined
+                    ]
                     if ready_workers:
                         cross_env = _build_env(snaps, ctrl.config)
                         outcomes = []
@@ -3728,7 +3762,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "max_concurrency": target_node.max_concurrency,
                     "weight": target_node.weight,
                 }
-            self._send_json(HTTPStatus.OK, {"node": updated_rec})
+            pushed = ctrl.push_config_to_all(node_ids=[node_id])
+            self._send_json(HTTPStatus.OK, {"node": updated_rec, "pushed": pushed})
 
         elif path == "/api/nodes/remove":
             node_id = str(body.get("id", "")).strip()
@@ -3771,7 +3806,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 ctrl.config.safety = updated
                 if self.server.config_path is not None:
                     save_config(ctrl.config, self.server.config_path)
-            self._send_json(HTTPStatus.OK, {"saved": True})
+            pushed = ctrl.push_config_to_all()
+            self._send_json(HTTPStatus.OK, {"saved": True, "pushed": pushed})
 
         elif path == "/api/settings/test-webhook":
             url = str(body.get("battery_webhook_url") or ctrl.config.safety.battery_webhook_url).strip()
