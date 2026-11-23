@@ -493,8 +493,58 @@ def is_local_port_open(port: int, timeout: float = 0.15) -> bool:
         return False
 
 
+def read_listening_tcp_ports(
+    tcp_path: Path = Path("/proc/net/tcp"),
+    tcp6_path: Path = Path("/proc/net/tcp6"),
+) -> list[dict[str, Any]]:
+    """List listening TCP ports from `/proc/net/tcp*` (zero deps, works unrooted on Linux/Termux).
+
+    Returns sorted dicts: `{"port": int, "exposed": bool}` where `exposed=True` means bound
+    to a non-loopback address (e.g. `0.0.0.0`, `::`, or a LAN interface).
+    """
+    ports: dict[int, bool] = {}
+    for path, is_v6 in ((tcp_path, False), (tcp6_path, True)):
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4 or parts[3].upper() != "0A":  # 0A = TCP_LISTEN
+                continue
+            local = parts[1]
+            if ":" not in local:
+                continue
+            addr_hex, port_hex = local.split(":", 1)
+            try:
+                port = int(port_hex, 16)
+            except ValueError:
+                continue
+            if port <= 0:
+                continue
+            if is_v6:
+                is_loop = addr_hex.upper() in {
+                    "00000000000000000000000001000000",  # ::1 little-endian
+                    "00000000000000000000000000000001",  # ::1 big-endian
+                    "0000000000000000FFFF00000100007F",  # ::ffff:127.0.0.1
+                }
+            else:
+                # Little-endian 127.x.x.x ends with 7F (e.g. 0100007F)
+                is_loop = addr_hex.upper().endswith("7F") or addr_hex.upper().startswith("7F")
+            exposed = not is_loop
+            ports[port] = ports.get(port, False) or exposed
+    return [{"port": p, "exposed": exp} for p, exp in sorted(ports.items())][:64]
+
+
 def detect_capabilities() -> dict[str, Any]:
     """Detect installed tools and live local services across Tier 1/2/3 nodes."""
+    adguard_installed = bool(
+        shutil.which("AdGuardHome")
+        or Path("/opt/AdGuardHome/AdGuardHome").exists()
+        or shutil.which("pihole")
+    )
     tools = {
         "python3": bool(shutil.which("python3")),
         "clang": bool(shutil.which("clang")),
@@ -514,7 +564,7 @@ def detect_capabilities() -> dict[str, Any]:
         "k3s": bool(shutil.which("k3s") or shutil.which("kubectl")),
         "homeassistant": bool(shutil.which("hass")),
         "mosquitto": bool(shutil.which("mosquitto") or shutil.which("mosquitto_pub")),
-        "adguard": bool(shutil.which("AdGuardHome") or shutil.which("pihole")),
+        "adguard": adguard_installed,
         "apt": bool(shutil.which("apt-get")),
         "tmux": bool(shutil.which("tmux")),
     }
@@ -527,6 +577,7 @@ def detect_capabilities() -> dict[str, Any]:
         "homeassistant_8123": is_local_port_open(8123),
         "mosquitto_1883": is_local_port_open(1883),
         "adguard_3000": is_local_port_open(3000),
+        "adguard_80": adguard_installed and is_local_port_open(80),
         "dns_53": is_local_port_open(53),
         "redis_6379": is_local_port_open(6379),
         "postgres_5432": is_local_port_open(5432),
@@ -650,6 +701,7 @@ def collect_node_health(
         "active_job_list": list(active_job_list) if active_job_list else [],
         "max_concurrency": max_concurrency,
         "top_processes": read_top_processes(limit=5) if include_processes else [],
+        "listening_ports": read_listening_tcp_ports(),
         "tools": caps["tools"],
         "services": caps["services"],
         "timestamp": int(time.time()),

@@ -9,6 +9,7 @@ import shlex
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +21,7 @@ from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
     GatewayConfig,
+    NetworkHardeningConfig,
     NodeConfig,
     SafetyConfig,
     save_config,
@@ -28,6 +30,7 @@ from .discovery import detect_local_ip, discover_lan_nodes
 from .doctor import run_doctor
 from .gateway import GatewayManager
 from .master import JobSpec, MasterController
+from .netguard import apply_security_profile, audit_cluster_network
 from .pairing import PairingManager
 
 LOG = logging.getLogger("phonecluster.dashboard")
@@ -376,6 +379,18 @@ DASHBOARD_HTML = r"""<!doctype html>
     background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px;
     padding: 11px 13px;
   }
+  .profile-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 10px; margin: 10px 0 12px;
+  }
+  .profile-btn {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; text-align: left; display: flex; flex-direction: column; gap: 4px;
+    color: var(--fg); font-weight: 400;
+  }
+  .profile-btn:hover { border-color: var(--accent); background: rgba(88, 166, 255, 0.08); }
+  .profile-btn strong { font-size: 0.94rem; }
+  .profile-btn span { font-size: 0.79rem; color: var(--muted); line-height: 1.38; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
   .col-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
   .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 10px; }
@@ -502,7 +517,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button role="tab" id="tab-terminal" aria-selected="false" aria-controls="panel-terminal" onclick="selectTab('terminal')">2. Terminal Control</button>
     <button role="tab" id="tab-jobs" aria-selected="false" aria-controls="panel-jobs" onclick="selectTab('jobs')">3. Parallel Batch &amp; Pipelines</button>
     <button role="tab" id="tab-workloads" aria-selected="false" aria-controls="panel-workloads" onclick="selectTab('workloads')">4. Workloads &amp; Service Mesh</button>
-    <button role="tab" id="tab-setup" aria-selected="false" aria-controls="panel-setup" onclick="selectTab('setup')">5. Phones, Network Guard &amp; Doctor</button>
+    <button role="tab" id="tab-network" aria-selected="false" aria-controls="panel-network" onclick="selectTab('network')">5. Network &amp; Pi Guard</button>
+    <button role="tab" id="tab-setup" aria-selected="false" aria-controls="panel-setup" onclick="selectTab('setup')">6. Phones, Safety &amp; Doctor</button>
   </nav>
 
   <main id="main-content">
@@ -541,6 +557,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <button onclick="selectTab('terminal')">⚡ Auto-Route Terminal</button>
         <button onclick="selectTab('jobs')">🔗 Cross-Tier Pipeline Builder</button>
         <button onclick="selectTab('workloads')">🌐 Service Mesh &amp; .cluster DNS</button>
+        <button onclick="selectTab('network')">🛡️ Network &amp; Pi Guard</button>
         <button onclick="selectTab('setup')">📱 Pair New Phone</button>
       </div>
 
@@ -895,17 +912,54 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
           <div id="doctor-list" aria-live="polite" class="hint">Click "Run Doctor Now" to inspect SSH, Termux:API, thermal, and battery safety.</div>
         </div>
       </div>
+    </section>
+
+    <!-- TAB 5: NETWORK & PI GUARD (MASTER/WORKER HARDENING, ADGUARD HOME, WATCHGUARD PROXY) -->
+    <section id="panel-network" class="panel" role="tabpanel" aria-labelledby="tab-network">
+      <div class="card">
+        <div class="row" style="justify-content:space-between; margin-bottom:6px;">
+          <h2 style="margin:0;">Master &amp; Raspberry Pi Network Command Center</h2>
+          <button class="small primary" onclick="loadNetworkCenter()">Refresh Audit</button>
+        </div>
+        <div id="net-hero-chips" class="chips" style="margin-bottom:10px;">
+          <span class="pill neutral">Scanning Master controller &amp; cluster security posture...</span>
+        </div>
+        <p class="hint" style="margin:0 0 8px;">Pick a <strong>1-Click Security Profile</strong> below (can be switched back to Standard Home LAN anytime — no Docker required!):</p>
+        <div class="profile-grid">
+          <button type="button" class="profile-btn" onclick="applySecurityProfile('standard')">
+            <strong>🟢 Standard Home LAN (Default)</strong>
+            <span>Network Guard OFF, direct LAN peers, zero friction on a trusted home Wi-Fi.</span>
+          </button>
+          <button type="button" class="profile-btn" onclick="applySecurityProfile('airgap_workers')">
+            <strong>🛡️ Air-Gapped Old Phones (Recommended)</strong>
+            <span>Network Guard Allowlist ON, SSRF Private-IP Guard ON, Per-Phone Rate Quota ON. Ideal when router blocks worker WAN.</span>
+          </button>
+          <button type="button" class="profile-btn" onclick="applySecurityProfile('lockdown')">
+            <strong>🔒 Maximum Lockdown (Strict)</strong>
+            <span>Air-Gap Proxy (block_all), Dashboard Read-Auth Lock ON, Worker Master-IP Allowlist ON, 60 req/min cap.</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+          <h2 style="margin:0;">1. Per-Phone Attack Surface, Quarantine &amp; WAN Isolation</h2>
+          <button class="small primary" onclick="checkWanIsolation()">Verify Router WAN Block on Workers</button>
+        </div>
+        <p class="hint" style="margin-top:0;">Inspect token isolation, Master-IP allowlist enforcement, unexpected open TCP ports (<code class="mono">/proc/net/tcp</code>), and instantly <strong>Quarantine</strong> any suspicious worker phone with 1 click.</p>
+        <div id="net-nodes-table" class="hint">Loading cluster network posture...</div>
+        <div id="gw-isolation-box" class="hint" style="margin-top:10px;"></div>
+      </div>
 
       <div class="card">
         <div class="row" style="justify-content:space-between; margin-bottom:6px;">
-          <h2 style="margin:0;">4. Optional Network Guard (Watchguard Proxy &amp; WAN Isolation)</h2>
+          <h2 style="margin:0;">2. Optional Master Network Guard (Allowlist Proxy &amp; Traffic Log)</h2>
           <div class="row" style="margin:0;">
             <span id="gw-status-pill" class="pill neutral">OFF (Direct LAN)</span>
-            <button class="small" onclick="loadGatewayStatus()">Refresh</button>
+            <button class="small" onclick="loadGatewayStatus()">Refresh Log</button>
           </div>
         </div>
-        <p class="hint" style="margin-top:0;"><strong>Optional (OFF by default):</strong> If you have older unrooted Android worker phones, block their direct internet (WAN) on your home router and turn ON Network Guard on your updated Master phone (or a Raspberry Pi Zero 2 W Master). Approved worker traffic passes through Master's authenticated allowlist proxy with live monitoring and SSRF protection.</p>
-
+        <p class="hint" style="margin-top:0;"><strong>Optional (OFF by default):</strong> Block direct internet (WAN) on your router for old unrooted worker phones, then route approved package/API traffic through your updated Master phone or Raspberry Pi Zero 2 W.</p>
         <div class="chips" id="gw-stats-chips" style="margin-bottom:12px;"></div>
 
         <div class="form-grid">
@@ -928,6 +982,10 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
             <label for="gw-port">Proxy Port on Master</label>
             <input id="gw-port" type="number" min="1024" max="65535" value="8888" />
           </div>
+          <div class="field">
+            <label for="gw-rpm">Max Req/Min per Phone (0=off)</label>
+            <input id="gw-rpm" type="number" min="0" max="10000" value="120" />
+          </div>
         </div>
 
         <div class="row" style="margin-bottom:8px;">
@@ -947,33 +1005,80 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
         <div class="col-grid" style="margin-bottom:10px;">
           <div>
             <label for="gw-allowed" class="hint">Allowed Domains (one per line · supports <code class="mono">*.domain.com</code>):</label>
-            <textarea id="gw-allowed" style="min-height:105px;"></textarea>
+            <textarea id="gw-allowed" style="min-height:95px;"></textarea>
           </div>
           <div>
             <label for="gw-blocked" class="hint">Always-Blocked Domains (one per line · overrides Monitor mode):</label>
-            <textarea id="gw-blocked" style="min-height:105px;" placeholder="ads.example.com&#10;*.telemetry.vendor.com"></textarea>
+            <textarea id="gw-blocked" style="min-height:95px;" placeholder="ads.example.com&#10;*.telemetry.vendor.com"></textarea>
           </div>
         </div>
 
         <div class="row">
           <button class="primary" onclick="saveGatewaySettings()">Save &amp; Apply Network Guard</button>
-          <button class="small" onclick="checkWanIsolation()">Verify Router WAN Block on Workers</button>
           <button class="small danger" onclick="clearGatewayLogs()">Clear Audit Log</button>
         </div>
 
-        <div id="gw-isolation-box" class="hint" style="margin-bottom:10px;"></div>
-
         <h3 style="margin:12px 0 6px;">Live Worker Traffic Audit Log</h3>
         <div id="gw-events-table" class="hint">Network Guard is currently OFF.</div>
+      </div>
 
-        <details style="margin-top:12px;">
-          <summary style="cursor:pointer; font-weight:700; font-size:0.88rem;">Router Isolation &amp; Raspberry Pi Zero 2 W Setup Tips</summary>
-          <div class="hint" style="margin-top:6px;">
-            1. <strong>Router rule:</strong> Give each phone a static DHCP lease, then block outbound WAN (Firewall / Parental Controls) for old worker MAC/IPs while keeping LAN traffic open to Master.<br/>
-            2. <strong>Master choice:</strong> Use your newest/updated Android phone as Master, <em>or</em> run PhoneCluster Master + Network Guard on a ~€15 <strong>Raspberry Pi Zero 2 W</strong> (updated Debian 13, zero battery-swelling risk, optional WireGuard/AdGuard).<br/>
-            3. <strong>LAN Mesh stays direct:</strong> <code class="mono">NO_PROXY</code> automatically excludes <code class="mono">.cluster</code> and every phone's LAN IP so MQTT, Home Assistant, and AdGuard stay fast and local.
+      <div class="col-grid">
+        <div class="card">
+          <h2>3. Native AdGuard Home (No Docker!) &amp; Raspberry Pi Hub</h2>
+          <p class="hint" style="margin-top:0;"><strong>No Docker required:</strong> AdGuard Home is a single ~12 MB native Go binary (~30–60 MB RAM) — runs effortlessly on a <strong>Raspberry Pi Zero 2 W</strong> or <strong>Tier 2 Debian 13</strong> phone.</p>
+          <div id="net-adguard-status" class="check-item" style="margin-bottom:10px;">Checking AdGuard Home status...</div>
+          <div class="row" style="justify-content:space-between; margin-bottom:4px;">
+            <strong>1-Line Pi Zero 2 W + Native AdGuard Installer</strong>
+            <button class="small" onclick="copyEl('net-ag-install')">Copy</button>
           </div>
-        </details>
+          <pre id="net-ag-install" class="code">Loading...</pre>
+
+          <div class="row" style="justify-content:space-between; margin:10px 0 4px;">
+            <strong>AdGuard .cluster DNS Rewrites (YAML)</strong>
+            <button class="small" onclick="copyEl('net-ag-rewrites')">Copy YAML</button>
+          </div>
+          <pre id="net-ag-rewrites" class="code" style="max-height:170px;">Loading...</pre>
+
+          <div class="row" style="justify-content:space-between; margin:10px 0 4px;">
+            <strong>Old-Phone Telemetry / Ad Block Rules</strong>
+            <button class="small" onclick="copyEl('net-ag-blocks')">Copy Rules</button>
+          </div>
+          <pre id="net-ag-blocks" class="code" style="max-height:170px;">Loading...</pre>
+        </div>
+
+        <div class="card">
+          <h2>4. Master &amp; Worker Hardening + Firewall Rules</h2>
+          <div class="form-grid" style="margin-bottom:8px;">
+            <div class="field"><label for="hard-subnet">Home LAN Subnet (CIDR)</label><input id="hard-subnet" placeholder="192.168.1.0/24" /></div>
+            <div class="field"><label for="hard-ag-url">Custom AdGuard URL (optional)</label><input id="hard-ag-url" placeholder="http://192.168.1.200:3000" /></div>
+          </div>
+          <div class="row" style="margin-bottom:8px;">
+            <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:5px;">
+              <input id="hard-req-auth" type="checkbox" style="width:auto; padding:0;" /> Lock read-only Dashboard stats behind token (<code class="mono">dashboard_require_auth</code>)
+            </label>
+          </div>
+          <div class="row" style="margin-bottom:10px;">
+            <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:5px;">
+              <input id="hard-src-ip" type="checkbox" style="width:auto; padding:0;" /> Workers accept HTTP <code class="mono">:8765</code> ONLY from Master IP (run <code class="mono">pc sync</code> after enabling)
+            </label>
+          </div>
+          <div class="row">
+            <button class="primary small" onclick="saveHardeningSettings()">Save Hardening Settings</button>
+          </div>
+
+          <h3 style="margin:12px 0 6px;">Hardening Checklist</h3>
+          <div id="net-checks-list" class="hint" style="margin-bottom:12px;">Loading checklist...</div>
+
+          <div class="row" style="justify-content:space-between; margin-bottom:4px;">
+            <div class="row" style="margin:0;">
+              <button id="btn-fw-router" class="small primary" onclick="setFwTab('router')">Router Checklist</button>
+              <button id="btn-fw-nft" class="small" onclick="setFwTab('nft')">Pi / Debian nftables</button>
+              <button id="btn-fw-ufw" class="small" onclick="setFwTab('ufw')">UFW</button>
+            </div>
+            <button class="small" onclick="copyEl('net-fw-code')">Copy Rules</button>
+          </div>
+          <pre id="net-fw-code" class="code" style="max-height:240px;">Loading...</pre>
+        </div>
       </div>
     </section>
   </main>
@@ -1240,7 +1345,7 @@ function initPreferences() {
 }
 
 function selectTab(name) {
-  const tabs = ['overview', 'terminal', 'jobs', 'workloads', 'setup'];
+  const tabs = ['overview', 'terminal', 'jobs', 'workloads', 'network', 'setup'];
   for (const t of tabs) {
     const btn = document.getElementById('tab-' + t);
     const panel = document.getElementById('panel-' + t);
@@ -1251,10 +1356,8 @@ function selectTab(name) {
   if (name === 'terminal') document.getElementById('term-input').focus();
   if (name === 'jobs') renderPipeBuilder();
   if (name === 'workloads') loadWorkloads();
-  if (name === 'setup') {
-    loadGatewayStatus();
-    if (getToken()) { loadSafetySettings(); pollPairingStatus(); }
-  }
+  if (name === 'network') loadNetworkCenter();
+  if (name === 'setup' && getToken()) { loadSafetySettings(); pollPairingStatus(); }
 }
 
 document.querySelector('nav.tabs').addEventListener('keydown', e => {
@@ -2479,6 +2582,142 @@ async function runDoctorUi() {
 }
 
 let gwPresetsCache = {};
+let lastNetAudit = null;
+let activeFwTab = 'router';
+
+function setFwTab(tab) {
+  activeFwTab = tab;
+  document.getElementById('btn-fw-router').className = 'small' + (tab === 'router' ? ' primary' : '');
+  document.getElementById('btn-fw-nft').className = 'small' + (tab === 'nft' ? ' primary' : '');
+  document.getElementById('btn-fw-ufw').className = 'small' + (tab === 'ufw' ? ' primary' : '');
+  const codeEl = document.getElementById('net-fw-code');
+  if (!codeEl || !lastNetAudit) return;
+  const fg = lastNetAudit.firewall_guides || {};
+  if (tab === 'nft') codeEl.textContent = fg.nftables || '';
+  else if (tab === 'ufw') codeEl.textContent = fg.ufw || '';
+  else codeEl.textContent = fg.router_checklist || '';
+}
+
+async function loadNetworkCenter() {
+  await Promise.all([loadGatewayStatus(), loadNetworkAudit()]);
+}
+
+async function loadNetworkAudit() {
+  try {
+    const r = await apiFetch('/api/network/audit');
+    if (r.status === 401 || !r.ok) return;
+    const d = await r.json();
+    lastNetAudit = d;
+    const hi = d.host_info || {};
+    const scoreTone = d.score >= 80 ? 'ok' : (d.score >= 55 ? 'accent' : 'warn');
+    const boardIcon = hi.is_raspberry_pi ? '🥧 ' : (hi.is_termux ? '📱 ' : '🐧 ');
+    document.getElementById('net-hero-chips').innerHTML =
+      '<span class="pill ' + scoreTone + '">Hardening Score: ' + esc(d.score) + '/100 (' + esc(d.grade) + ')</span>'
+      + '<span class="pill purple">' + boardIcon + esc(hi.friendly_name || 'Master') + '</span>'
+      + '<span class="pill neutral mono">Master IP: ' + esc(hi.master_host || hi.lan_ip || '-') + '</span>'
+      + '<span class="pill neutral mono">LAN: ' + esc(hi.lan_subnet || '-') + '</span>'
+      + (d.adguard_url
+          ? '<span class="pill ok">✓ AdGuard Home Live (' + esc(d.adguard_node) + ')</span>'
+          : '<span class="pill neutral">AdGuard Home: Not Detected (No Docker Needed)</span>');
+
+    // Per-phone attack surface & quarantine table
+    const nodes = d.nodes || [];
+    const nBox = document.getElementById('net-nodes-table');
+    if (!nodes.length) {
+      nBox.innerHTML = '<p class="hint">No phones configured yet.</p>';
+    } else {
+      nBox.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Phone</th><th>Tier</th><th>Token Isolation</th><th>Master-IP Lock</th><th>Open Ports</th><th>Proxy Traffic</th><th>Action</th></tr></thead><tbody>'
+        + nodes.map(n => {
+            const tokPill = n.token_isolated ? '<span class="pill ok">✓ Unique</span>' : '<span class="pill warn">⚠ Shared</span>';
+            const ipPill = n.role === 'master'
+              ? '<span class="pill purple">MASTER</span>'
+              : (n.source_ip_allowlist_active ? '<span class="pill ok">✓ Enforced</span>' : '<span class="pill neutral">Open LAN</span>');
+            const portCell = !n.online
+              ? '<span class="pill bad">Offline</span>'
+              : (n.unexpected_ports && n.unexpected_ports.length
+                  ? '<span class="pill warn">⚠ ' + esc(n.unexpected_ports.join(', ')) + '</span>'
+                  : '<span class="pill ok">✓ Clean (' + (n.exposed_ports || []).length + ')</span>');
+            const traf = n.role === 'master'
+              ? '<span class="hint">Gateway</span>'
+              : '<span class="mono">' + esc(n.proxy_allowed || 0) + ' ok / ' + esc(n.proxy_blocked || 0) + ' blk</span>';
+            let act = '<span class="hint">-</span>';
+            if (n.role !== 'master') {
+              act = n.quarantined
+                ? '<button class="small primary" onclick="toggleQuarantine(\'' + esc(n.id) + '\', false)">✓ Unblock</button>'
+                : '<button class="small danger" onclick="toggleQuarantine(\'' + esc(n.id) + '\', true)">🔒 Quarantine</button>';
+            }
+            const nameBadge = n.quarantined
+              ? '<strong>' + esc(n.id) + '</strong> <span class="pill bad">QUARANTINED</span>'
+              : '<strong>' + esc(n.id) + '</strong>';
+            return '<tr><td>' + nameBadge + '<div class="hint mono" style="margin:0;">' + esc(n.host) + '</div></td>'
+              + '<td>' + tierPillHtml(n.tier, n.pool) + '</td><td>' + tokPill + '</td><td>' + ipPill + '</td>'
+              + '<td>' + portCell + '</td><td>' + traf + '</td><td>' + act + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>';
+    }
+
+    // AdGuard & Pi hub
+    const agBox = document.getElementById('net-adguard-status');
+    if (d.adguard_url) {
+      agBox.innerHTML = '<span class="pill ok">✓ Active</span> AdGuard Home reachable on <strong>' + esc(d.adguard_node) + '</strong>: '
+        + '<a href="' + esc(d.adguard_url) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(d.adguard_url) + '</a>';
+    } else if (hi.is_termux) {
+      agBox.innerHTML = '<span class="pill warn">Unrooted Termux Master</span> Port 53 requires root — run native AdGuard Home on a <strong>Raspberry Pi Zero 2 W</strong> Master or a <strong>Tier 2 Debian 13</strong> phone (no Docker needed!).';
+    } else {
+      agBox.innerHTML = '<span class="pill neutral">Not Installed</span> Your controller (' + esc(hi.friendly_name) + ') can run <strong>native AdGuard Home</strong> directly without Docker using the 1-line installer below!';
+    }
+    const sn = d.adguard_snippets || {};
+    document.getElementById('net-ag-install').textContent = sn.native_install_cmd || '';
+    document.getElementById('net-ag-rewrites').textContent = sn.rewrites_yaml || '';
+    document.getElementById('net-ag-blocks').textContent = sn.worker_block_rules || '';
+
+    // Hardening controls & checklist
+    const hd = d.hardening || {};
+    document.getElementById('hard-subnet').value = hd.lan_subnet || '';
+    document.getElementById('hard-ag-url').value = hd.adguard_url || '';
+    document.getElementById('hard-req-auth').checked = Boolean(hd.dashboard_require_auth);
+    document.getElementById('hard-src-ip').checked = Boolean(hd.enforce_worker_source_ip);
+
+    const cBox = document.getElementById('net-checks-list');
+    const cIcons = { ok: '✓ OK', warn: '⚠ WARN', info: 'ℹ TIP' };
+    const cCls = { ok: 'ok', warn: 'warn', info: 'neutral' };
+    cBox.innerHTML = (d.checks || []).map(c =>
+      '<div class="check-item"><span class="pill ' + (cCls[c.status] || 'neutral') + '">' + (cIcons[c.status] || c.status) + '</span> '
+      + '<strong>' + esc(c.name) + '</strong>: ' + esc(c.detail)
+      + (c.fix ? '<div class="hint">' + esc(c.fix) + '</div>' : '')
+      + '</div>'
+    ).join('');
+
+    setFwTab(activeFwTab);
+  } catch (e) {}
+}
+
+async function applySecurityProfile(profile) {
+  const data = await authPost('/api/network/profile', { profile });
+  if (data.error) { showToast('Profile error: ' + data.error, 'bad'); return; }
+  showToast('Applied profile: ' + data.description, 'ok');
+  loadNetworkCenter();
+}
+
+async function toggleQuarantine(nodeId, quarantine) {
+  const data = await authPost('/api/gateway/quarantine', { node_id: nodeId, quarantine });
+  if (data.error) { showToast('Quarantine failed: ' + data.error, 'bad'); return; }
+  showToast(quarantine ? ('🔒 Quarantined ' + nodeId + ' (outbound proxy blocked!)') : ('✓ Unblocked ' + nodeId), quarantine ? 'warn' : 'ok');
+  loadNetworkCenter();
+}
+
+async function saveHardeningSettings() {
+  const payload = {
+    dashboard_require_auth: document.getElementById('hard-req-auth').checked,
+    enforce_worker_source_ip: document.getElementById('hard-src-ip').checked,
+    lan_subnet: document.getElementById('hard-subnet').value.trim(),
+    adguard_url: document.getElementById('hard-ag-url').value.trim(),
+  };
+  const data = await authPost('/api/network/hardening', payload);
+  if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
+  showToast('Network hardening saved! Run `pc sync` to push Master-IP allowlist to workers.', 'ok');
+  loadNetworkCenter();
+}
 
 async function loadGatewayStatus() {
   try {
@@ -2501,6 +2740,7 @@ async function loadGatewayStatus() {
     document.getElementById('gw-enabled').value = d.enabled ? 'true' : 'false';
     document.getElementById('gw-mode').value = d.mode || 'allowlist';
     document.getElementById('gw-port').value = d.port || 8888;
+    document.getElementById('gw-rpm').value = d.max_requests_per_min_per_node ?? 120;
     document.getElementById('gw-ssrf').checked = Boolean(d.block_private_ips);
     document.getElementById('gw-inject').checked = Boolean(d.inject_proxy_env);
     document.getElementById('gw-allowed').value = (d.allowed_domains || []).join('\n');
@@ -2564,6 +2804,7 @@ async function saveGatewaySettings() {
     enabled: document.getElementById('gw-enabled').value === 'true',
     mode: document.getElementById('gw-mode').value,
     port: Number(document.getElementById('gw-port').value || 8888),
+    max_requests_per_min_per_node: Number(document.getElementById('gw-rpm').value || 0),
     block_private_ips: document.getElementById('gw-ssrf').checked,
     inject_proxy_env: document.getElementById('gw-inject').checked,
     allowed_domains: document.getElementById('gw-allowed').value.split('\n').map(s => s.trim()).filter(Boolean),
@@ -2572,7 +2813,7 @@ async function saveGatewaySettings() {
   const data = await authPost('/api/gateway/settings', payload);
   if (data.error) { showToast('Network Guard error: ' + data.error, 'bad'); return; }
   showToast(payload.enabled ? 'Network Guard ON (port ' + data.port + ', mode: ' + data.mode + ')!' : 'Network Guard turned OFF.', payload.enabled ? 'ok' : 'neutral');
-  loadGatewayStatus();
+  loadNetworkCenter();
 }
 
 async function allowBlockedDomain(domain) {
@@ -2681,8 +2922,28 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_response(int(status))
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if self.path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(raw)
+
+    def _check_same_origin(self) -> bool:
+        """Block cross-site browser POSTs (CSRF defense) while keeping non-browser API clients working."""
+        origin = self.headers.get("Origin", "").strip()
+        if not origin:
+            return True
+        host_hdr = self.headers.get("Host", "").strip().lower()
+        parsed = urllib.parse.urlparse(origin)
+        if not host_hdr or parsed.netloc.lower() != host_hdr:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "forbidden: cross-origin browser POST rejected"},
+            )
+            return False
+        return True
 
     def _send_json(self, status: int, data: dict[str, Any]) -> None:
         self._send(status, "application/json", json.dumps(data).encode("utf-8"))
@@ -2760,6 +3021,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/workloads",
             "/api/services",
             "/api/gateway/status",
+            "/api/network/audit",
             "/api/discover",
         }:
             if not self._require_read_auth_if_locked():
@@ -2779,6 +3041,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, self.server.controller.get_services_info())
             elif path == "/api/gateway/status":
                 self._send_json(HTTPStatus.OK, self.server.gateway_manager.status())
+            elif path == "/api/network/audit":
+                self._send_json(
+                    HTTPStatus.OK,
+                    audit_cluster_network(
+                        self.server.controller,
+                        gateway_manager=self.server.gateway_manager,
+                    ),
+                )
             elif path == "/api/doctor":
                 report = run_doctor(config_path=self.server.config_path, check_remote=True)
                 self._send_json(HTTPStatus.OK, report)
@@ -2835,7 +3105,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/gateway/settings",
             "/api/gateway/logs/clear",
             "/api/gateway/allow-domain",
+            "/api/gateway/quarantine",
             "/api/gateway/check-isolation",
+            "/api/network/profile",
+            "/api/network/hardening",
             "/api/jobs/cancel",
             "/api/nodes/add",
             "/api/nodes/update",
@@ -2848,6 +3121,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         }
         if path not in valid_paths:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        if not self._check_same_origin():
             return
         if not self._require_auth():
             return
@@ -3071,6 +3346,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 "inject_proxy_env": body.get("inject_proxy_env", cur.inject_proxy_env),
                 "max_connections": body.get("max_connections", cur.max_connections),
                 "idle_timeout_sec": body.get("idle_timeout_sec", cur.idle_timeout_sec),
+                "quarantined_nodes": body.get("quarantined_nodes", cur.quarantined_nodes),
+                "max_requests_per_min_per_node": body.get(
+                    "max_requests_per_min_per_node", cur.max_requests_per_min_per_node
+                ),
             }
             try:
                 updated_gw = GatewayConfig.from_dict(merged)
@@ -3108,6 +3387,80 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if self.server.config_path is not None:
                 save_config(ctrl.config, self.server.config_path)
             self._send_json(HTTPStatus.OK, {"allowed": dom, "allowed_domains": ctrl.config.gateway.allowed_domains})
+
+        elif path == "/api/gateway/quarantine":
+            node_id = str(body.get("node_id", "")).strip()
+            quarantine = bool(body.get("quarantine", True))
+            if not node_id or not any(n.id == node_id for n in ctrl.config.nodes):
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
+                return
+            target_n = ctrl.config.get_node(node_id)
+            if target_n.role == "master":
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot quarantine the master node"})
+                return
+            q_set = set(ctrl.config.gateway.quarantined_nodes)
+            if quarantine:
+                q_set.add(node_id)
+            else:
+                q_set.discard(node_id)
+            ctrl.config.gateway.quarantined_nodes = sorted(q_set)
+            if self.server.config_path is not None:
+                save_config(ctrl.config, self.server.config_path)
+            self._send_json(
+                HTTPStatus.OK,
+                {"node_id": node_id, "quarantined": quarantine, "quarantined_nodes": ctrl.config.gateway.quarantined_nodes},
+            )
+
+        elif path == "/api/network/profile":
+            profile = str(body.get("profile", "")).strip()
+            try:
+                res = apply_security_profile(ctrl.config, profile)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            ok, msg = self.server.gateway_manager.sync_with_config()
+            if not ok:
+                ctrl.config.gateway.enabled = False
+                ctrl.gateway_port_override = None
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": msg})
+                return
+            ctrl.gateway_port_override = (
+                self.server.gateway_manager.bound_port if ctrl.config.gateway.enabled else None
+            )
+            if self.server.config_path is not None:
+                save_config(ctrl.config, self.server.config_path)
+            self._send_json(HTTPStatus.OK, {**res, "gateway": self.server.gateway_manager.status()})
+
+        elif path == "/api/network/hardening":
+            if "dashboard_require_auth" in body:
+                ctrl.config.dashboard_require_auth = bool(body["dashboard_require_auth"])
+            cur_net = ctrl.config.network
+            master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
+            raw_ips = body.get("allowed_master_ips", cur_net.allowed_master_ips)
+            ips = [str(i).strip() for i in raw_ips if str(i).strip()] if isinstance(raw_ips, list) else list(cur_net.allowed_master_ips)
+            if master_node.host and master_node.host not in ips:
+                ips.append(master_node.host)
+            ag_url = str(body.get("adguard_url", cur_net.adguard_url)).strip()
+            if ag_url and not ag_url.startswith(("http://", "https://")):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https://"})
+                return
+            ctrl.config.network = NetworkHardeningConfig(
+                enforce_worker_source_ip=bool(body.get("enforce_worker_source_ip", cur_net.enforce_worker_source_ip)),
+                allowed_master_ips=ips,
+                adguard_url=ag_url,
+                lan_subnet=str(body.get("lan_subnet", cur_net.lan_subnet)).strip(),
+            )
+            if self.server.config_path is not None:
+                save_config(ctrl.config, self.server.config_path)
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "saved": True,
+                    "dashboard_require_auth": ctrl.config.dashboard_require_auth,
+                    "enforce_worker_source_ip": ctrl.config.network.enforce_worker_source_ip,
+                    "allowed_master_ips": ctrl.config.network.allowed_master_ips,
+                },
+            )
 
         elif path == "/api/gateway/check-isolation":
             results = ctrl.check_workers_wan_isolation()

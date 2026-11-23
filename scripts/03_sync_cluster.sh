@@ -89,13 +89,22 @@ if role == "master":
     out = cfg
 else:
     node = next(n for n in cfg["nodes"] if n["id"] == node_id)
+    master = next((n for n in cfg["nodes"] if n.get("role") == "master"), cfg["nodes"][0])
     tok = node.get("auth_token") or cfg["auth_token"]
     scoped_node = dict(node)
     scoped_node["auth_token"] = tok
+    net_cfg = dict(cfg.get("network") or {})
+    allowed_masters = list(net_cfg.get("allowed_master_ips") or [])
+    if master.get("host") and master["host"] not in allowed_masters:
+        allowed_masters.append(master["host"])
     out = {
         "cluster_name": cfg.get("cluster_name", "phonecluster"),
         "auth_token": tok,
         "safety": cfg.get("safety", {}),
+        "network": {
+            "enforce_worker_source_ip": bool(net_cfg.get("enforce_worker_source_ip", False)),
+            "allowed_master_ips": allowed_masters,
+        },
         "nodes": [scoped_node],
     }
 print(json.dumps(out, indent=2))

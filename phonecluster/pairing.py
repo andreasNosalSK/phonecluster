@@ -42,6 +42,7 @@ from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
     ClusterConfig,
+    NetworkHardeningConfig,
     NodeConfig,
     SafetyConfig,
     generate_auth_token,
@@ -643,6 +644,12 @@ class PairingManager:
                     "webhook_cooldown_sec": self.config.safety.webhook_cooldown_sec,
                     "battery_webhook_url": self.config.safety.battery_webhook_url,
                 },
+                "network": {
+                    "enforce_worker_source_ip": self.config.network.enforce_worker_source_ip,
+                    "allowed_master_ips": sorted(
+                        set(self.config.network.allowed_master_ips) | {master_node.host}
+                    ),
+                },
                 "master_ssh_pubkey": _read_master_ssh_pubkey(),
             }
 
@@ -917,10 +924,17 @@ def join_cluster_via_pairing(
 
     # Write LEAST-PRIVILEGE worker config containing ONLY this worker's own unique token!
     worker_token = str(bundle["node_token"])
+    raw_net = dict(bundle.get("network") or {})
+    master_ips = list(raw_net.get("allowed_master_ips") or [])
+    for m_ip in (str(bundle.get("master_host") or ""), master_host):
+        if m_ip and m_ip not in master_ips:
+            master_ips.append(m_ip)
+    raw_net["allowed_master_ips"] = master_ips
     worker_cfg = ClusterConfig(
         cluster_name=str(bundle["cluster_name"]),
         auth_token=worker_token,
         safety=SafetyConfig.from_dict(bundle.get("safety") or {}),
+        network=NetworkHardeningConfig.from_dict(raw_net),
         nodes=[
             NodeConfig(
                 id=node_id,

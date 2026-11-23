@@ -54,6 +54,7 @@ class WorkerState:
     max_concurrency: int = 2
     workdir: Path = field(default_factory=lambda: Path.cwd())
     health_provider: Callable[[], dict[str, Any]] | None = None
+    allowed_client_ips: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).resolve()
@@ -90,13 +91,14 @@ class WorkerState:
             health["active_jobs"] = active_count
             health["active_job_list"] = active_list
             health["max_concurrency"] = self.max_concurrency
+            health["source_ip_allowlist_active"] = bool(self.allowed_client_ips)
             if active_count >= self.max_concurrency:
                 health["ready_for_jobs"] = False
                 reasons = list(health.get("not_ready_reasons", []))
                 reasons.append(f"busy ({active_count}/{self.max_concurrency})")
                 health["not_ready_reasons"] = reasons
             return health
-        return collect_node_health(
+        health = collect_node_health(
             node_id=self.node_id,
             role=self.role,
             safety=self.safety,
@@ -108,6 +110,8 @@ class WorkerState:
             net_sampler=self.net_sampler,
             active_job_list=active_list,
         )
+        health["source_ip_allowlist_active"] = bool(self.allowed_client_ips)
+        return health
 
     def try_reserve_slot(
         self, job_id: str, preview: str, force: bool = False
@@ -487,12 +491,24 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(raw)
 
     def _check_auth(self) -> bool:
-        client_ip = self.client_address[0]
-        blocked, retry_after = self.server.state.rate_limiter.is_blocked(client_ip)
+        client_ip = str(self.client_address[0])
+        norm_ip = client_ip[7:] if client_ip.startswith("::ffff:") else client_ip
+        allowed_ips = self.server.state.allowed_client_ips
+        if allowed_ips and norm_ip not in allowed_ips and client_ip not in allowed_ips:
+            LOG.warning("Rejected worker HTTP request from non-Master IP %s", client_ip)
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "forbidden: source IP not in Master allowlist"},
+            )
+            return False
+        blocked, retry_after = self.server.state.rate_limiter.is_blocked(norm_ip)
         if blocked:
             self._send_json(
                 HTTPStatus.TOO_MANY_REQUESTS,
@@ -500,10 +516,10 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
             )
             return False
         if not verify_token(self.headers, self.server.state.auth_token):
-            self.server.state.rate_limiter.record_failure(client_ip)
+            self.server.state.rate_limiter.record_failure(norm_ip)
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return False
-        self.server.state.rate_limiter.record_success(client_ip)
+        self.server.state.rate_limiter.record_success(norm_ip)
         return True
 
     def _read_json_body(self) -> dict[str, Any] | None:

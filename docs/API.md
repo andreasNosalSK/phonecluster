@@ -78,6 +78,7 @@ Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
 | `GET /api/workloads` | None* | Live `distcc_hosts`, `llama_rpc`, `mpi_hostfile`, Home Assistant URLs, Docker nodes, plus `services_info` |
 | `GET /api/services` | None* | Live cross-tier Service Mesh (`pools`, `services`, `env` vars, and `.cluster` `dns_hosts`) |
 | `GET /api/gateway/status` | None* | Optional Master Network Guard status, policy config, stats, presets, and recent audit events |
+| `GET /api/network/audit` | None* | Full Master/Worker network hardening audit, Raspberry Pi & AdGuard detection, open ports, and firewall/AdGuard guides |
 | `GET /api/discover` | None* | Runs a 2-second UDP LAN scan and returns discovered phones |
 | `GET /api/auth/verify` | Bearer | Validates an `auth_token` before unlocking UI controls |
 | `GET /api/settings` | Bearer | Returns full safety settings including `battery_webhook_url` |
@@ -90,8 +91,11 @@ Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
 | `POST /api/services/probe` | Bearer | Measure TCP reachability & latency to a registered Service Mesh endpoint |
 | `POST /api/gateway/settings` | Bearer | Enable/disable Master Network Guard, change policy (`allowlist`/`monitor`/`block_all`), edit domains/ports |
 | `POST /api/gateway/allow-domain` | Bearer | One-click approve a blocked domain into the Network Guard allowlist |
+| `POST /api/gateway/quarantine` | Bearer | Instantly quarantine or unblock a worker phone on the Master Network Guard proxy |
 | `POST /api/gateway/logs/clear` | Bearer | Clear Network Guard traffic audit counters and log ring buffer |
 | `POST /api/gateway/check-isolation` | Bearer | Probe workers directly (bypassing proxy) to verify router WAN firewall blocking |
+| `POST /api/network/profile` | Bearer | Apply a 1-click security profile (`standard`, `airgap_workers`, or `lockdown`) |
+| `POST /api/network/hardening` | Bearer | Configure `dashboard_require_auth`, `enforce_worker_source_ip`, `lan_subnet`, and `adguard_url` |
 | `POST /api/jobs/cancel` | Bearer | Cancel a running job on a specific `node_id` |
 | `POST /api/workloads/action` | Bearer | Start/stop `distcc` or `llama-rpc` across all ready phones |
 | `POST /api/nodes/add` | Bearer | Add a discovered or manual worker phone (with optional `tier` & `pool`) into `config/cluster.json` |

@@ -64,6 +64,7 @@ from phonecluster.telemetry import (
     ThermalGate,
     _normalize_sysfs_temp,
     read_battery_via_sysfs,
+    read_listening_tcp_ports,
     read_memory_info,
 )
 from phonecluster.tui import make_sparkline, render_top_frame
@@ -1727,6 +1728,214 @@ class TestMasterNetworkGuard(unittest.TestCase):
                 for srv in servers:
                     srv.shutdown()
                     srv.server_close()
+
+    def test_worker_source_ip_allowlist_quarantine_rate_limit_csrf_and_net_audit(self) -> None:
+        # 1. `/proc/net/tcp` listening port parser (distinguishes loopback vs exposed!)
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_tcp = Path(tmp) / "tcp"
+            fake_tcp.write_text(
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid\n"
+                "   0: 00000000:15B3 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000\n"  # 0.0.0.0:5555 LISTEN
+                "   1: 0100007F:223D 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000\n"  # 127.0.0.1:8765 LISTEN
+                "   2: 00000000:0050 0100007F:9999 01 00000000:00000000 00:00000000 00000000  1000\n",  # ESTABLISHED (ignored)
+                encoding="utf-8",
+            )
+            parsed = read_listening_tcp_ports(tcp_path=fake_tcp, tcp6_path=Path(tmp) / "missing")
+            self.assertEqual(parsed, [{"port": 5555, "exposed": True}, {"port": 8765, "exposed": False}])
+
+        # 2. Worker Source-IP Allowlist rejects non-Master IP (403) even with valid Bearer token!
+        w_tok = "strict-worker-token"
+        st_blocked = WorkerState(
+            node_id="w_strict",
+            role="worker",
+            auth_token=w_tok,
+            safety=SafetyConfig(),
+            allowed_client_ips={"10.99.0.1"},
+        )
+        srv_blk, _g1, ev1 = create_worker_server("127.0.0.1", 0, st_blocked)
+        p_blk = srv_blk.server_address[1]
+        threading.Thread(target=srv_blk.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        st_ok = WorkerState(
+            node_id="node1",
+            role="worker",
+            auth_token=w_tok,
+            safety=SafetyConfig(),
+            allowed_client_ips={"127.0.0.1"},
+            health_provider=lambda: {
+                "node_id": "node1",
+                "role": "worker",
+                "os_env": "termux",
+                "cpu_cores": 8,
+                "load_1m": 0.1,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 2048,
+                "temp_c": 33.0,
+                "battery_pct": 55,
+                "battery_status": "DISCHARGING",
+                "overheated": False,
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "listening_ports": [{"port": 8765, "exposed": True}, {"port": 5555, "exposed": True}],
+                "tools": {"python3": True},
+                "services": {},
+            },
+        )
+        srv_ok, _g2, ev2 = create_worker_server("127.0.0.1", 0, st_ok)
+        p_ok = srv_ok.server_address[1]
+        threading.Thread(target=srv_ok.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        try:
+            req_403 = urllib.request.Request(
+                f"http://127.0.0.1:{p_blk}/health",
+                headers=build_auth_headers(w_tok),
+                method="GET",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_403, timeout=3.0)
+            try:
+                self.assertEqual(ctx.exception.code, 403)
+            finally:
+                ctx.exception.close()
+
+            req_200 = urllib.request.Request(
+                f"http://127.0.0.1:{p_ok}/health",
+                headers=build_auth_headers(w_tok),
+                method="GET",
+            )
+            with urllib.request.urlopen(req_200, timeout=3.0) as resp:
+                self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
+                self.assertEqual(resp.headers.get("X-Frame-Options"), "DENY")
+                self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
+                h_ok = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(h_ok["source_ip_allowlist_active"])
+
+            # 3. Per-worker Quarantine + Rate Limit + Dashboard CSRF + 1-click Profiles + `pc net-audit`
+            m_tok = "hardened-master-tok"
+            cfg = ClusterConfig(
+                cluster_name="hardened-cluster",
+                auth_token=m_tok,
+                nodes=[
+                    NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=p_ok),
+                    NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=p_ok, auth_token=w_tok),
+                ],
+                gateway=GatewayConfig(
+                    enabled=True,
+                    bind_host="127.0.0.1",
+                    port=0,
+                    mode="allowlist",
+                    allowed_domains=["example.com"],
+                    max_requests_per_min_per_node=2,
+                ),
+            )
+            ctrl = MasterController(cfg)
+
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg_path = Path(tmp) / "cluster.json"
+                save_config(cfg, cfg_path)
+                dash = DashboardHTTPServer(("127.0.0.1", 0), ctrl, config_path=cfg_path, enable_pairing_beacon=False)
+                d_port = dash.server_address[1]
+                gw_port = dash.gateway_manager.bound_port
+                threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+                try:
+                    # 3a. Cross-origin browser POST must be blocked by CSRF Origin check (403)!
+                    csrf_headers = build_auth_headers(m_tok)
+                    csrf_headers["Origin"] = "http://evil.attacker.com"
+                    req_csrf = urllib.request.Request(
+                        f"http://127.0.0.1:{d_port}/api/network/hardening",
+                        data=json.dumps({"enforce_worker_source_ip": True}).encode("utf-8"),
+                        headers=csrf_headers,
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as csrf_ctx:
+                        urllib.request.urlopen(req_csrf, timeout=3.0)
+                    try:
+                        self.assertEqual(csrf_ctx.exception.code, 403)
+                    finally:
+                        csrf_ctx.exception.close()
+
+                    # 3b. Quarantine node1 via API -> proxy immediately returns 403 quarantined!
+                    req_q = urllib.request.Request(
+                        f"http://127.0.0.1:{d_port}/api/gateway/quarantine",
+                        data=json.dumps({"node_id": "node1", "quarantine": True}).encode("utf-8"),
+                        headers=build_auth_headers(m_tok),
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req_q, timeout=3.0) as resp:
+                        self.assertTrue(json.loads(resp.read().decode("utf-8"))["quarantined"])
+
+                    pw = derive_proxy_password(w_tok, "node1")
+                    auth_b64 = base64.b64encode(f"node1:{pw}".encode("utf-8")).decode("ascii")
+
+                    def _proxy_try() -> bytes:
+                        with socket.create_connection(("127.0.0.1", gw_port), timeout=3.0) as s:
+                            s.sendall(
+                                f"GET http://blocked.invalid/ HTTP/1.1\r\n"
+                                f"Host: blocked.invalid\r\n"
+                                f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode()
+                            )
+                            return s.recv(1024)
+
+                    q_resp = _proxy_try()
+                    self.assertIn(b"403 Forbidden", q_resp)
+                    self.assertIn(b"quarantined", q_resp)
+
+                    # Unblock node1 -> first 2 hit allowlist (403), 3rd hits per-worker rate limit (429)!
+                    req_unq = urllib.request.Request(
+                        f"http://127.0.0.1:{d_port}/api/gateway/quarantine",
+                        data=json.dumps({"node_id": "node1", "quarantine": False}).encode("utf-8"),
+                        headers=build_auth_headers(m_tok),
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req_unq, timeout=3.0) as resp:
+                        self.assertFalse(json.loads(resp.read().decode("utf-8"))["quarantined"])
+                    self.assertIn(b"403 Forbidden", _proxy_try())
+                    self.assertIn(b"403 Forbidden", _proxy_try())
+                    self.assertIn(b"429 Too Many Requests", _proxy_try())
+
+                    # 3c. GET /api/network/audit flags unexpected port 5555 & includes AdGuard/nftables guides
+                    with urllib.request.urlopen(f"http://127.0.0.1:{d_port}/api/network/audit", timeout=5.0) as resp:
+                        self.assertEqual(resp.headers.get("X-Frame-Options"), "DENY")
+                        self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
+                        audit = json.loads(resp.read().decode("utf-8"))
+                    self.assertGreater(audit["score"], 0)
+                    self.assertFalse(audit["host_info"]["docker_required_for_adguard"])
+                    self.assertIn("rewrites:", audit["adguard_snippets"]["rewrites_yaml"])
+                    self.assertIn("nft", audit["firewall_guides"]["nftables"])
+                    w_surf = next(n for n in audit["nodes"] if n["id"] == "node1")
+                    self.assertIn(5555, w_surf["unexpected_ports"])
+
+                    # 3d. 1-Click Security Profile `lockdown` + `standard`
+                    req_prof = urllib.request.Request(
+                        f"http://127.0.0.1:{d_port}/api/network/profile",
+                        data=json.dumps({"profile": "lockdown"}).encode("utf-8"),
+                        headers=build_auth_headers(m_tok),
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req_prof, timeout=5.0) as resp:
+                        pres = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(pres["profile"], "lockdown")
+                    reloaded = load_config(cfg_path)
+                    self.assertTrue(reloaded.dashboard_require_auth)
+                    self.assertTrue(reloaded.network.enforce_worker_source_ip)
+                    self.assertEqual(reloaded.gateway.mode, "block_all")
+
+                    # 3e. CLI `pc net-audit` flags
+                    self.assertEqual(cli_main(["--config", str(cfg_path), "net-audit", "--firewall"]), 0)
+                    self.assertEqual(cli_main(["--config", str(cfg_path), "net-audit", "--adguard"]), 0)
+                    self.assertEqual(cli_main(["--config", str(cfg_path), "net-audit", "--router"]), 0)
+                    self.assertEqual(cli_main(["--config", str(cfg_path), "net-audit", "--profile", "standard"]), 0)
+                    self.assertFalse(load_config(cfg_path).gateway.enabled)
+                finally:
+                    dash.shutdown()
+                    dash.server_close()
+        finally:
+            ev1.set()
+            ev2.set()
+            srv_blk.shutdown()
+            srv_blk.server_close()
+            srv_ok.shutdown()
+            srv_ok.server_close()
 
 
 if __name__ == "__main__":

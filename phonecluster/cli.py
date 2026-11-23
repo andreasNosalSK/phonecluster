@@ -27,6 +27,7 @@ from .discovery import discover_lan_nodes
 from .doctor import run_doctor
 from .gateway import GatewayManager
 from .master import JobOutcome, JobSpec, MasterController
+from .netguard import apply_security_profile, audit_cluster_network
 from .pairing import (
     DEFAULT_PAIR_PORT,
     discover_pairing_masters,
@@ -89,6 +90,12 @@ def _cmd_worker(args: argparse.Namespace) -> int:
 
     port = args.port or node.worker_port
     max_conc = args.max_concurrency or node.max_concurrency
+    allowed_ips: set[str] = set()
+    if cfg.network.enforce_worker_source_ip:
+        allowed_ips = {"127.0.0.1", "::1"} | set(cfg.network.allowed_master_ips)
+        for n in cfg.nodes:
+            if n.role == "master" and n.host:
+                allowed_ips.add(n.host)
     state = WorkerState(
         node_id=node.id,
         role=node.role,
@@ -96,6 +103,7 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         safety=cfg.safety,
         max_concurrency=max_conc,
         workdir=Path(args.workdir),
+        allowed_client_ips=allowed_ips,
     )
     serve_worker(
         args.bind,
@@ -517,6 +525,62 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
         print("\nStopping Network Guard...")
     finally:
         mgr.stop()
+    return 0
+
+
+def _cmd_net_audit(args: argparse.Namespace) -> int:
+    cfg_path = resolve_config_path(args.config)
+    cfg = load_config(cfg_path)
+    if args.profile:
+        res = apply_security_profile(cfg, args.profile)
+        save_config(cfg, cfg_path)
+        print(f"Applied security profile '{res['profile']}': {res['description']}")
+        print(f"Saved -> {cfg_path}")
+        return 0
+
+    ctrl = MasterController(cfg)
+    report = audit_cluster_network(ctrl)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+    if args.firewall:
+        print(report["firewall_guides"]["nftables"], end="")
+        return 0
+    if args.ufw:
+        print(report["firewall_guides"]["ufw"], end="")
+        return 0
+    if args.router:
+        print(report["firewall_guides"]["router_checklist"], end="")
+        return 0
+    if args.adguard:
+        print(report["adguard_snippets"]["rewrites_yaml"], end="")
+        print()
+        print(report["adguard_snippets"]["worker_block_rules"], end="")
+        return 0
+
+    hi = report["host_info"]
+    print(f"Master Controller : {hi['friendly_name']} ({hi['master_host']} | LAN {hi['lan_subnet']})")
+    print(f"Hardening Score   : {report['score']}/100 ({report['grade']})")
+    print(f"AdGuard Home      : {report['adguard_url'] or 'Not detected (runs natively — NO Docker required!)'}")
+    print()
+    for c in report["checks"]:
+        badge = {"ok": "[OK]  ", "warn": "[WARN]", "info": "[TIP] "}.get(c["status"], "[INFO]")
+        print(f"  {badge} {c['name']}: {c['detail']}")
+        if c["fix"]:
+            print(f"         -> {c['fix']}")
+    print()
+    rows = [
+        [
+            n["id"],
+            f"T{n['tier']}:{n['pool']}",
+            "YES" if n["token_isolated"] else "NO",
+            "ON" if n["source_ip_allowlist_active"] else "off",
+            "QUARANTINED" if n["quarantined"] else ("ONLINE" if n["online"] else "OFFLINE"),
+            ",".join(str(p) for p in n["unexpected_ports"]) or "clean",
+        ]
+        for n in report["nodes"]
+    ]
+    print(_fmt_table(["NODE", "TIER/POOL", "TOK-ISO", "IP-LOCK", "STATUS", "UNEXPECTED PORTS"], rows))
     return 0
 
 
@@ -1212,6 +1276,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_gw.add_argument("--check-isolation", action="store_true", help="Test if router blocks direct WAN on workers")
     p_gw.add_argument("--json", action="store_true", help="Output raw JSON")
     p_gw.set_defaults(func=_cmd_gateway)
+
+    # net-audit (Master & Worker network hardening, Raspberry Pi, AdGuard & Firewall generator)
+    p_net = sub.add_parser(
+        "net-audit",
+        help="Audit Master/Worker network security, apply security profiles, or generate AdGuard & nftables/UFW rules",
+    )
+    p_net.add_argument(
+        "--profile",
+        choices=["standard", "airgap_workers", "lockdown"],
+        default="",
+        help="Apply a 1-click security profile to cluster.json",
+    )
+    p_net.add_argument("--firewall", action="store_true", help="Print hardened nftables rules for Raspberry Pi / Debian Master")
+    p_net.add_argument("--ufw", action="store_true", help="Print hardened UFW commands for Raspberry Pi / Debian Master")
+    p_net.add_argument("--router", action="store_true", help="Print personalized Home Router WAN-block checklist")
+    p_net.add_argument("--adguard", action="store_true", help="Print native AdGuard Home .cluster YAML rewrites & telemetry block rules")
+    p_net.add_argument("--json", action="store_true", help="Output full audit as JSON")
+    p_net.set_defaults(func=_cmd_net_audit)
 
     # dashboard
     p_dash = sub.add_parser("dashboard", help="Start the Master web dashboard UI")

@@ -413,7 +413,25 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
         self.stop_event = threading.Event()
         self.conn_sem = threading.BoundedSemaphore(max(4, config.gateway.max_connections))
         self.rate_limiter = AuthRateLimiter(max_failures=15, window_sec=60.0, block_sec=60.0)
+        self._node_req_lock = threading.Lock()
+        self._node_req_times: dict[str, collections.deque[float]] = {}
         super().__init__(addr, _NetworkGuardHandler)
+
+    def check_node_rate_limit(self, node_id: str) -> tuple[bool, int]:
+        """Enforce per-worker sliding-window requests/minute quota (`0` = unlimited)."""
+        limit = int(self.cluster_config.gateway.max_requests_per_min_per_node)
+        if limit <= 0:
+            return True, 0
+        now = time.monotonic()
+        cutoff = now - 60.0
+        with self._node_req_lock:
+            dq = self._node_req_times.setdefault(node_id, collections.deque())
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if len(dq) >= limit:
+                return False, len(dq)
+            dq.append(now)
+            return True, len(dq)
 
     def authenticate_worker(self, headers: dict[str, str], client_ip: str) -> tuple[str | None, str]:
         blocked, retry = self.rate_limiter.is_blocked(client_ip)
@@ -501,6 +519,40 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             return
 
         gw = self.server.cluster_config.gateway
+
+        # 1b. Per-worker Quarantine check (instant 1-click isolation from Master UI!)
+        if node_id in gw.quarantined_nodes:
+            self.server.audit_log.record(
+                node_id=node_id,
+                client_ip=client_ip,
+                method=method_u,
+                host=target[:120],
+                port=0,
+                action="quarantined",
+                reason="node quarantined by Master",
+            )
+            _send_proxy_error(conn, 403, "Forbidden", f"node '{node_id}' is quarantined by Master")
+            return
+
+        # 1c. Per-worker Request Rate Quota (prevents runaway/compromised phone flooding Master)
+        under_quota, rpm_cur = self.server.check_node_rate_limit(node_id)
+        if not under_quota:
+            self.server.audit_log.record(
+                node_id=node_id,
+                client_ip=client_ip,
+                method=method_u,
+                host=target[:120],
+                port=0,
+                action="rate_limited",
+                reason=f"rate quota exceeded ({rpm_cur}/{gw.max_requests_per_min_per_node} req/min)",
+            )
+            _send_proxy_error(
+                conn,
+                429,
+                "Too Many Requests",
+                f"per-worker quota exceeded ({gw.max_requests_per_min_per_node} req/min)",
+            )
+            return
 
         # 2. Extract destination host & port
         if method_u == "CONNECT":
@@ -780,6 +832,8 @@ class GatewayManager:
             "allowed_ports": list(gw.allowed_ports),
             "block_private_ips": gw.block_private_ips,
             "inject_proxy_env": gw.inject_proxy_env,
+            "quarantined_nodes": list(gw.quarantined_nodes),
+            "max_requests_per_min_per_node": gw.max_requests_per_min_per_node,
             "last_error": self._last_error,
             "presets": GATEWAY_PRESETS,
             "stats": {

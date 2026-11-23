@@ -139,6 +139,8 @@ class GatewayConfig:
     inject_proxy_env: bool = True
     max_connections: int = 32
     idle_timeout_sec: float = 30.0
+    quarantined_nodes: list[str] = field(default_factory=list)
+    max_requests_per_min_per_node: int = 120
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "GatewayConfig":
@@ -169,8 +171,15 @@ class GatewayConfig:
                 ports = [80, 443]
         else:
             ports = [80, 443]
+        raw_q = data.get("quarantined_nodes")
+        quarantined = (
+            sorted({str(n).strip() for n in raw_q if str(n).strip()})
+            if isinstance(raw_q, list)
+            else []
+        )
         max_conn = max(4, min(256, int(data.get("max_connections", 32))))
         idle_to = max(5.0, float(data.get("idle_timeout_sec", 30.0)))
+        rpm = max(0, min(10000, int(data.get("max_requests_per_min_per_node", 120))))
         return cls(
             enabled=bool(data.get("enabled", False)),
             bind_host=str(data.get("bind_host", "0.0.0.0")).strip() or "0.0.0.0",
@@ -183,6 +192,35 @@ class GatewayConfig:
             inject_proxy_env=bool(data.get("inject_proxy_env", True)),
             max_connections=max_conn,
             idle_timeout_sec=idle_to,
+            quarantined_nodes=quarantined,
+            max_requests_per_min_per_node=rpm,
+        )
+
+
+@dataclass
+class NetworkHardeningConfig:
+    """Optional Master & Worker network hardening controls (OFF by default)."""
+
+    enforce_worker_source_ip: bool = False  # Workers only accept HTTP :8765 from allowed_master_ips
+    allowed_master_ips: list[str] = field(default_factory=list)
+    adguard_url: str = ""  # Optional custom AdGuard Home URL (e.g. http://192.168.1.200:3000)
+    lan_subnet: str = ""   # Optional LAN CIDR for firewall generation (e.g. 192.168.1.0/24)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "NetworkHardeningConfig":
+        if not isinstance(data, dict):
+            return cls()
+        raw_ips = data.get("allowed_master_ips")
+        ips = (
+            [str(ip).strip() for ip in raw_ips if str(ip).strip()]
+            if isinstance(raw_ips, list)
+            else []
+        )
+        return cls(
+            enforce_worker_source_ip=bool(data.get("enforce_worker_source_ip", False)),
+            allowed_master_ips=ips,
+            adguard_url=str(data.get("adguard_url", "")).strip(),
+            lan_subnet=str(data.get("lan_subnet", "")).strip(),
         )
 
 
@@ -195,6 +233,7 @@ class ClusterConfig:
     nodes: list[NodeConfig]
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
+    network: NetworkHardeningConfig = field(default_factory=NetworkHardeningConfig)
     default_job_timeout_sec: int = 600
     health_timeout_sec: float = 3.0
     dashboard_port: int = 8080
@@ -220,6 +259,7 @@ class ClusterConfig:
             )
         safety = SafetyConfig.from_dict(data.get("safety", {}))
         gateway = GatewayConfig.from_dict(data.get("gateway"))
+        network = NetworkHardeningConfig.from_dict(data.get("network"))
         raw_svcs = data.get("custom_services") or {}
         custom_services = (
             {str(k): str(v) for k, v in raw_svcs.items()}
@@ -232,6 +272,7 @@ class ClusterConfig:
             nodes=nodes,
             safety=safety,
             gateway=gateway,
+            network=network,
             default_job_timeout_sec=int(data.get("default_job_timeout_sec", 600)),
             health_timeout_sec=float(data.get("health_timeout_sec", 3.0)),
             dashboard_port=int(data.get("dashboard_port", 8080)),

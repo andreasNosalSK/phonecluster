@@ -77,5 +77,20 @@ By default, all phones sit on your home Wi-Fi as LAN peers (`gateway.enabled = f
 ### Updated Master Phone vs. Raspberry Pi / Pi Zero 2 W as Master
 | Choice | Best When | Pros & Cons |
 | :--- | :--- | :--- |
-| **Updated Modern Android Phone as Master** *(€0 extra)* | You already have one newer phone receiving security updates (or rooted Debian 13). | Zero extra hardware, runs Dashboard + Scheduler + Network Guard unrooted on Termux; cannot do kernel-level L3 NAT routing without root (router handles WAN blocking instead). |
-| **Raspberry Pi Zero 2 W (~€15) / Pi 4 as Master** | **All** of your phones are old/unpatched, OR you want a zero-battery-swelling 24/7 controller. | Runs updated 64-bit Debian 13 natively, **no Li-Po battery risk**, uses ~1–2 W, runs PhoneCluster Master + Network Guard + optionally AdGuard Home DNS / WireGuard VPN / full `nftables` gateway! |
+| **Updated Modern Android Phone as Master** *(€0 extra)* | You already have one newer phone receiving security updates (or rooted Debian 13). | Zero extra hardware, runs Dashboard + Scheduler + Network Guard unrooted on Termux; cannot run port-53 AdGuard Home or kernel `nftables` without root (router handles WAN blocking instead). |
+| **Raspberry Pi Zero 2 W (~€15) / Pi 4 as Master** | **All** of your phones are old/unpatched, OR you want a zero-battery-swelling 24/7 controller with AdGuard DNS. | Runs updated 64-bit Debian 13 natively, **no Li-Po battery risk**, ~1–2 W, runs PhoneCluster Master + Network Guard + **Native AdGuard Home (single ~12 MB Go binary — NO Docker required!)** + hardened `nftables` firewall! |
+
+### One-Command Raspberry Pi / Pi Zero 2 W Master + Native AdGuard Setup
+```bash
+sudo bash scripts/setup_pi_master.sh --with-adguard --with-firewall --enable-gateway
+```
+
+---
+
+## 6. Master & Worker Deep Network Hardening (`Tab 5: Network & Pi Guard`)
+
+- **Worker Master-IP Source Allowlist (`network.enforce_worker_source_ip`):** When enabled (1-click in Tab 5 or `pc net-audit --profile lockdown`), worker daemons reject HTTP `:8765` connections from ANY IP except your Master (`HTTP 403 Forbidden`) before reading the body. Both `pc pair` and `pc sync` automatically propagate your Master's IP into each worker's scoped `cluster.json`.
+- **Per-Worker Instant Quarantine & Rate Quotas:** Click **Quarantine** on any worker in Tab 5 (`POST /api/gateway/quarantine`) to immediately block 100% of its outbound proxy traffic (`HTTP 403`), and cap proxy traffic per phone (`max_requests_per_min_per_node`, default `120 req/min` → `HTTP 429`) so a runaway device cannot flood a Pi Zero 2 W Master.
+- **Listening-Port Attack Surface Audit (`/proc/net/tcp`):** Every online phone reports externally bound listening TCP ports; `pc net-audit` and Tab 5 highlight unexpected ports and compute a 0–100 Hardening Score.
+- **Browser CSRF & Security Headers:** Both Master Dashboard and Workers return `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` on `/api/*`. Cross-origin browser `POST` requests whose `Origin` mismatches `Host` are rejected (`HTTP 403`).
+- **3 One-Click Security Profiles (`Tab 5` or `pc net-audit --profile ...`):** `standard` (default direct LAN), `airgap_workers` (allowlist proxy + SSRF guard + rate quota), and `lockdown` (air-gap `block_all` + Dashboard read-auth lock + Worker Master-IP allowlist).
