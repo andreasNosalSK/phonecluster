@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+config/cluster.json
+logs/
+*.jsonl
+.venv/
+apks/
+# Local personal research notes / PDFs (remove these two lines if you want to publish them)
+instruction.txt
+*.pdf

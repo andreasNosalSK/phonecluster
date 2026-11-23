@@ -1,0 +1,104 @@
+# REST & Discovery API Reference
+
+All HTTP payloads are UTF-8 JSON. Mutating and worker endpoints require:
+```http
+Authorization: Bearer <auth_token>
+```
+
+---
+
+## 1. Worker Agent API (Default Port `8765`)
+
+### `GET /health` *(Auth required)*
+Returns live node telemetry, thermal/RAM readiness, active jobs, and detected local services.
+```json
+{
+  "node_id": "node1",
+  "role": "worker",
+  "os_env": "termux",
+  "cpu_cores": 8,
+  "load_1m": 0.42,
+  "mem_total_mb": 3512,
+  "mem_available_mb": 1920,
+  "battery_pct": 54,
+  "temp_c": 34.5,
+  "battery_status": "DISCHARGING",
+  "overheated": false,
+  "ready_for_jobs": true,
+  "not_ready_reasons": [],
+  "active_jobs": 0,
+  "max_concurrency": 2,
+  "tools": {"python3": true, "distccd": true},
+  "services": {"sshd_8022": true, "distccd_3632": true, "llama_rpc_50052": false}
+}
+```
+
+### `GET /jobs` *(Auth required)*
+Returns `{"active": [...], "recent": [...]}` for jobs on this phone.
+
+### `POST /exec` *(Auth required)*
+Executes a shell command or staged inline script inside a new process group (`start_new_session=True`).
+
+- **Shell command payload:**
+  ```json
+  { "command": "uname -a", "timeout_sec": 120 }
+  ```
+- **Inline script payload (automatically written to a temporary file, executed, and deleted):**
+  ```json
+  {
+    "script_content": "import sys; print(sys.argv[1])",
+    "script_name": "task.py",
+    "interpreter": "python3",
+    "args": ["hello"],
+    "timeout_sec": 120
+  }
+  ```
+- **Responses:**
+  - `200 OK`: `{"job_id", "node_id", "returncode", "timed_out", "cancelled", "duration_sec", "stdout", "stderr"}`
+  - `503 Service Unavailable`: Node is overheated, low on RAM, or at `max_concurrency` (signals Master to re-route the job).
+
+### `POST /cancel` *(Auth required)*
+Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
+```json
+{ "job_id": "map-0004" }
+```
+
+---
+
+## 2. Master Web Control Center API (Default Port `8080`)
+
+| Endpoint | Auth | Purpose |
+| :--- | :--- | :--- |
+| `GET /` | None | Accessible offline-first HTML/CSS/JS Control Center |
+| `GET /api/status` | None | Unified cluster summary + per-node health (never exposes `auth_token`) |
+| `GET /api/doctor` | None | Live local + remote diagnostic & battery safety audit |
+| `GET /api/workloads` | None | Live `distcc_hosts`, `llama_rpc`, `mpi_hostfile`, Home Assistant URLs, Docker nodes |
+| `GET /api/discover` | None | Runs a 2-second UDP LAN scan and returns discovered phones |
+| `POST /api/exec` | Bearer | Run a single command on `best`, `all`, or a specific `node_id` |
+| `POST /api/map` | Bearer | Run a parallel batch of shell commands or inline script + args across all ready phones |
+| `POST /api/workloads/action` | Bearer | Start/stop `distcc` or `llama-rpc` across all ready phones |
+| `POST /api/nodes/add` | Bearer | Add a discovered or manual worker phone directly into `config/cluster.json` |
+
+---
+
+## 3. Zero-Config UDP LAN Discovery (Port `8766`)
+
+- **Probe (Master broadcasts to `<subnet>.255:8766` and `255.255.255.255:8766`):**
+  ```json
+  { "type": "phonecluster_discover_v1", "ts": 1795450000 }
+  ```
+- **Reply (Each running worker unicasts back to probe sender):**
+  ```json
+  {
+    "type": "phonecluster_announce_v1",
+    "node_id": "node1",
+    "role": "worker",
+    "worker_port": 8765,
+    "ssh_port": 8022,
+    "ssh_user": "u0_a250",
+    "os_env": "termux",
+    "cpu_cores": 8,
+    "mem_total_mb": 3512
+  }
+  ```
+- **Security:** `auth_token` is never sent over UDP.

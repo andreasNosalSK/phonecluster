@@ -1,0 +1,55 @@
+{
+  "cluster_name": "redmi-cluster",
+  "auth_token": "REPLACE_ME_OR_RUN_INIT_CONFIG",
+  "default_job_timeout_sec": 600,
+  "health_timeout_sec": 3.0,
+  "dashboard_port": 8080,
+  "safety": {
+    "max_temp_c": 40.0,
+    "resume_temp_c": 37.0,
+    "min_free_ram_mb": 256,
+    "battery_low_pct": 45,
+    "battery_high_pct": 60,
+    "battery_poll_sec": 60,
+    "webhook_cooldown_sec": 900,
+    "battery_webhook_url": ""
+  },
+  "nodes": [
+    {
+      "id": "node0",
+      "host": "192.168.1.201",
+      "role": "master",
+      "worker_port": 8765,
+      "ssh_port": 8022,
+      "ssh_user": "u0_a250",
+      "max_concurrency": 2,
+      "weight": 1.2,
+      "tags": ["master", "ufs", "5g"],
+      "notes": "Master phone (highest RAM + UFS 2.2, e.g. Redmi Note 9T or 9 5G)"
+    },
+    {
+      "id": "node1",
+      "host": "192.168.1.202",
+      "role": "worker",
+      "worker_port": 8765,
+      "ssh_port": 8022,
+      "ssh_user": "u0_a250",
+      "max_concurrency": 2,
+      "weight": 1.0,
+      "tags": ["worker", "ufs", "5g"],
+      "notes": "Worker 1 (e.g. Redmi Note 10 5G)"
+    },
+    {
+      "id": "node2",
+      "host": "192.168.1.203",
+      "role": "worker",
+      "worker_port": 8765,
+      "ssh_port": 8022,
+      "ssh_user": "u0_a250",
+      "max_concurrency": 2,
+      "weight": 0.8,
+      "tags": ["worker", "emmc"],
+      "notes": "Worker 2 (e.g. Redmi Note 9 - avoid write-heavy DBs on eMMC)"
+    }
+  ]
+}
