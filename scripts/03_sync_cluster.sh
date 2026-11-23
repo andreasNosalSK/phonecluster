@@ -4,6 +4,7 @@
 set -euo pipefail
 
 CONFIG_PATH="${PHONECLUSTER_CONFIG:-config/cluster.json}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE_DIR="~/phonecluster"
 SETUP_KEYS=0
 SKIP_LOCAL=""
@@ -69,7 +70,7 @@ while IFS=$'\t' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
   fi
 
   # Stream project code via tar over SSH (without shipping Master's full cluster.json to workers)
-  tar -cf - \
+  tar -C "${REPO_ROOT}" -cf - \
     phonecluster \
     phonecluster_cli.py \
     scripts \
@@ -152,7 +153,7 @@ fi
 
 # Also clean up any orphaned worker for the same node_id started outside PID file
 if command -v pkill >/dev/null 2>&1; then
-  pkill -f "phonecluster_cli\.py.*worker --node-id ${NODE_ID}\$" 2>/dev/null || true
+  pkill -f "phonecluster_cli\.py.*worker --node-id ${NODE_ID}(\$| )" 2>/dev/null || true
   sleep 0.2
 fi
 

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -80,7 +82,7 @@ def run_setup_wizard(
     master_host = _prompt("2. Static LAN IP of your Master phone (node0)", local_ip, input_fn=input_fn)
     ssh_user = _prompt("3. Default SSH username on phones (from `whoami`)", user, input_fn=input_fn)
     ssh_port_str = _prompt("4. Default SSH port (8022 for Termux, 22 for Debian)", str(default_ssh_port), input_fn=input_fn)
-    ssh_port = int(ssh_port_str) if ssh_port_str.isdigit() else DEFAULT_SSH_PORT
+    ssh_port = int(ssh_port_str) if ssh_port_str.isdigit() and 1 <= int(ssh_port_str) <= 65535 else DEFAULT_SSH_PORT
 
     nodes: list[NodeConfig] = [
         NodeConfig(
@@ -157,7 +159,12 @@ def run_setup_wizard(
             existing_hosts.add(ip)
 
     print("\n6. Thermal & 24/7 Battery Safety Guard:")
-    max_temp = float(_prompt("Pause jobs on a phone if temperature reaches (°C)", "40.0", input_fn=input_fn))
+    raw_temp = _prompt("Pause jobs on a phone if temperature reaches (°C)", "40.0", input_fn=input_fn)
+    try:
+        max_temp = max(25.0, min(85.0, float(raw_temp.rstrip("cC° "))))
+    except ValueError:
+        max_temp = 40.0
+    resume_temp = round(max(20.0, max_temp - 3.0), 1)
     webhook = _prompt(
         "Optional battery/smart-plug webhook URL (Home Assistant / ntfy.sh, or blank)",
         "",
@@ -170,7 +177,7 @@ def run_setup_wizard(
         nodes=nodes,
         safety=SafetyConfig(
             max_temp_c=max_temp,
-            resume_temp_c=max(25.0, round(max_temp - 3.0, 1)),
+            resume_temp_c=resume_temp,
             battery_webhook_url=webhook,
         ),
     )
@@ -255,7 +262,7 @@ def run_interactive_menu(
             ctrl = MasterController(cfg)
             target = _prompt("Target ('best', 'all', or node id like 'node1')", "best", input_fn=input_fn)
             cmd = _prompt("Shell command to run", "uname -a && nproc", input_fn=input_fn)
-            spec = JobSpec(index=0, job_id="menu-run", command=cmd, timeout_sec=cfg.default_job_timeout_sec)
+            spec = JobSpec(index=0, job_id=f"menu-run-{uuid.uuid4().hex[:6]}", command=cmd, timeout_sec=cfg.default_job_timeout_sec)
             for o in ctrl.run_single(spec, target=target):
                 print(f"\n=== [{o.node_id}] {'OK' if o.ok else 'FAIL'} ({o.duration_sec:.2f}s) ===")
                 if o.stdout:
@@ -318,7 +325,7 @@ def run_interactive_menu(
                 if helper_sh.exists():
                     spec = JobSpec(
                         index=0,
-                        job_id="menu-distcc",
+                        job_id=f"menu-distcc-{uuid.uuid4().hex[:6]}",
                         script_content=helper_sh.read_text(encoding="utf-8"),
                         script_name="05_workload_helpers.sh",
                         interpreter="bash",
@@ -328,8 +335,8 @@ def run_interactive_menu(
                 else:
                     spec = JobSpec(
                         index=0,
-                        job_id="menu-distcc",
-                        command=f"bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-start {cidr}",
+                        job_id=f"menu-distcc-{uuid.uuid4().hex[:6]}",
+                        command=f"bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-start {shlex.quote(cidr)}",
                         timeout_sec=30.0,
                     )
                 for o in ctrl.run_single(spec, target="all"):

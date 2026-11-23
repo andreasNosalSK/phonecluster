@@ -14,7 +14,15 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import ClusterConfig, NodeConfig, format_host_for_url, format_host_port, is_loopback_or_unspecified_host
+from .config import (
+    ClusterConfig,
+    NodeConfig,
+    format_host_for_url,
+    format_host_port,
+    is_loopback_or_unspecified_host,
+    normalize_host,
+)
+from .discovery import detect_local_ip
 
 TIER_LABELS: dict[int, str] = {
     1: "Tier 1 · Termux Compute",
@@ -195,11 +203,15 @@ def select_snapshots_for_target(
     """
     excluded = excluded_node_ids or set()
     busy = busy_node_ids or set()
+    use_live_busy = busy_node_ids is not None
     ready = [
         s
         for s in snapshots
         if s.online
-        and (s.ready_for_jobs or force)
+        and (
+            (getattr(s, "healthy_for_scheduling", s.ready_for_jobs) if use_live_busy else s.ready_for_jobs)
+            or force
+        )
         and (s.node.id not in excluded or (force and target == s.node.id))
         and s.node.id not in busy
     ]
@@ -427,7 +439,13 @@ def build_cross_tier_env(
     env: dict[str, str] = {"PHONECLUSTER_CLUSTER_NAME": config.cluster_name}
     if config.nodes:
         master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
-        env["PHONECLUSTER_MASTER_HOST"] = master_node.host
+        m_host = normalize_host(master_node.host)
+        has_remote_nodes = any(not is_loopback_or_unspecified_host(n.host) for n in config.nodes)
+        if is_loopback_or_unspecified_host(m_host) and has_remote_nodes:
+            lan_ip = normalize_host(detect_local_ip())
+            if lan_ip and not is_loopback_or_unspecified_host(lan_ip):
+                m_host = lan_ip
+        env["PHONECLUSTER_MASTER_HOST"] = m_host or master_node.host
 
     registry = build_service_registry(snapshots, config)
     by_name: dict[str, list[dict[str, Any]]] = {}
@@ -515,7 +533,11 @@ def build_cluster_dns_hosts(
         if snap.node.id in quarantined:
             continue
         tier, pool = resolve_node_tier_and_pool(snap.node, snap.health if snap.online else None)
-        lines.append(f"{snap.node.host:<16s} {snap.node.id}.{domain}  # Tier {tier} ({pool})")
+        norm_h = normalize_host(snap.node.host)
+        if _is_ip_address(norm_h):
+            lines.append(f"{norm_h:<16s} {snap.node.id}.{domain}  # Tier {tier} ({pool})")
+        elif norm_h:
+            lines.append(f"# {norm_h} -> {snap.node.id}.{domain} (hostname — resolve to IP for /etc/hosts)")
 
     registry = build_service_registry(snapshots, config)
     # Prefer externally reachable, cool/ready auto-discovered services before loopback/warm duplicates
@@ -539,14 +561,15 @@ def build_cluster_dns_hosts(
     }
     for item in ordered_registry:
         alias = alias_map.get(item["name"])
-        if alias and item["host"] and alias not in seen_aliases:
+        item_host = normalize_host(str(item.get("host") or ""))
+        if alias and item_host and alias not in seen_aliases and _is_ip_address(item_host):
             seen_aliases.add(alias)
-            lines.append(f"{item['host']:<16s} {alias}.{domain}  # {item['name']} on {item['node_id']} (Tier {item['tier']})")
-        elif item.get("source") == "config" and item.get("host") and _is_ip_address(item["host"]):
+            lines.append(f"{item_host:<16s} {alias}.{domain}  # {item['name']} on {item['node_id']} (Tier {item['tier']})")
+        elif item.get("source") == "config" and item_host and _is_ip_address(item_host):
             slug = re.sub(r"[^a-z0-9_-]+", "-", str(item["name"]).lower()).strip("-_")
             if slug and slug not in seen_aliases:
                 seen_aliases.add(slug)
-                lines.append(f"{item['host']:<16s} {slug}.{domain}  # custom service ({item['url']})")
+                lines.append(f"{item_host:<16s} {slug}.{domain}  # custom service ({item['url']})")
     return "\n".join(lines) + "\n"
 
 

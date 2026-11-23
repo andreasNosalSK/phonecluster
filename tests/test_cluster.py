@@ -2788,6 +2788,468 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_map_jobs_no_starvation_after_busy_poll_and_concurrent_batch_job_ids(self) -> None:
+        """Verify map_jobs does not starve a worker caught busy by health poll, and concurrent /api/map batches do not collide."""
+        tok = "starve-tok-1234567890"
+        st_fast = WorkerState(
+            node_id="fast1",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=1,
+            health_provider=lambda: {
+                "node_id": "fast1",
+                "role": "worker",
+                "os_env": "termux",
+                "tier": 1,
+                "pool": "compute",
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "cpu_cores": 8,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 2048,
+                "tools": {},
+                "services": {},
+            },
+        )
+        st_slow = WorkerState(
+            node_id="slow2",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=1,
+            health_provider=lambda: {
+                "node_id": "slow2",
+                "role": "worker",
+                "os_env": "termux",
+                "tier": 1,
+                "pool": "compute",
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "cpu_cores": 4,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 2048,
+                "tools": {},
+                "services": {},
+            },
+        )
+        srv1, _g1, ev1 = create_worker_server("127.0.0.1", 0, st_fast)
+        srv2, _g2, ev2 = create_worker_server("127.0.0.1", 0, st_slow)
+        p1, p2 = srv1.server_address[1], srv2.server_address[1]
+        threading.Thread(target=srv1.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        threading.Thread(target=srv2.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        cfg = ClusterConfig(
+            cluster_name="nostarve",
+            auth_token=tok,
+            nodes=[
+                NodeConfig(id="fast1", host="127.0.0.1", role="worker", worker_port=p1, max_concurrency=1, tier=1, pool="compute", weight=2.0),
+                NodeConfig(id="slow2", host="127.0.0.1", role="worker", worker_port=p2, max_concurrency=1, tier=1, pool="compute", weight=1.0),
+            ],
+        )
+        ctrl = MasterController(cfg)
+        try:
+            # Verify healthy_for_scheduling differentiates busy-only from thermal/RAM throttle
+            snap_busy = NodeSnapshot(
+                node=cfg.nodes[0],
+                online=True,
+                health={"ready_for_jobs": False, "not_ready_reasons": ["busy (1/1)"], "active_jobs": 1, "max_concurrency": 1},
+            )
+            snap_hot = NodeSnapshot(
+                node=cfg.nodes[0],
+                online=True,
+                health={"ready_for_jobs": False, "not_ready_reasons": ["overheated (41C >= 40C)", "busy (1/1)"], "active_jobs": 1, "max_concurrency": 1},
+            )
+            self.assertTrue(snap_busy.healthy_for_scheduling)
+            self.assertFalse(snap_hot.healthy_for_scheduling)
+            from phonecluster.routing import classify_workload, select_snapshots_for_target
+
+            picked_busy, _ = select_snapshots_for_target(
+                [snap_busy, snap_hot],
+                target="auto",
+                route=classify_workload("echo ok"),
+                busy_node_ids=set(),
+            )
+            self.assertEqual([s.node.id for s in picked_busy], ["fast1"])
+            self.assertEqual(score_node(snap_busy, in_flight_local=0), score_node(
+                NodeSnapshot(node=cfg.nodes[0], online=True, health={"ready_for_jobs": True, "active_jobs": 0, "max_concurrency": 1}),
+                in_flight_local=0,
+            ))
+
+            # Poll #1 sees both idle -> dispatches j0 (0.25s) to fast1 and j1 (1.2s) to slow2.
+            # At t=0.10s, poll #2 catches fast1 busy (`ready_for_jobs=False, not_ready_reasons=["busy (1/1)"]`).
+            # Even with a long 10s interval after poll #2, fast1 MUST immediately take j2 and j3 once j0 finishes!
+            jobs = [
+                JobSpec(index=0, job_id="ns-0", command="sleep 0.25 && echo j0", timeout_sec=5.0),
+                JobSpec(index=1, job_id="ns-1", command="sleep 1.2 && echo j1", timeout_sec=5.0),
+                JobSpec(index=2, job_id="ns-2", command="sleep 0.20 && echo j2", timeout_sec=5.0),
+                JobSpec(index=3, job_id="ns-3", command="sleep 0.20 && echo j3", timeout_sec=5.0),
+            ]
+            saw_busy_poll = [False]
+            orig_poll = ctrl.poll_health
+
+            def _poll_track_busy(tags: list[str] | None = None) -> list[NodeSnapshot]:
+                snaps = orig_poll(tags=tags)
+                for s in snaps:
+                    if s.node.id == "fast1" and not s.ready_for_jobs and any(
+                        str(r).startswith("busy") for r in s.health.get("not_ready_reasons", [])
+                    ):
+                        saw_busy_poll[0] = True
+                return snaps
+
+            ctrl.poll_health = _poll_track_busy  # type: ignore[method-assign]
+            t0 = time.monotonic()
+            outs = ctrl.map_jobs(jobs, health_refresh_sec=0.12, wait_for_ready_sec=5.0)
+            elapsed = time.monotonic() - t0
+            self.assertTrue(all(o.ok for o in outs), [o.to_dict() for o in outs])
+            self.assertTrue(saw_busy_poll[0], "Expected mid-batch poll to observe fast1 busy")
+            self.assertLess(elapsed, 3.0)
+            ctrl.poll_health = orig_poll  # type: ignore[method-assign]
+
+            # Also verify two concurrent Web UI /api/map requests NEVER collide on job_id!
+            st_fast.max_concurrency = 4
+            cfg.nodes[0].max_concurrency = 4
+            dash = DashboardHTTPServer(
+                ("127.0.0.1", 0), ctrl, enable_pairing_beacon=False, pairing_fail_delay_sec=0.0
+            )
+            d_port = dash.server_address[1]
+            threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+            try:
+                results_pair: list[dict[str, Any]] = []
+
+                def _run_web_map() -> None:
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{d_port}/api/map",
+                        data=json.dumps({"mode": "commands", "commands": ["sleep 0.15 && echo a", "sleep 0.15 && echo b"]}).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=8.0) as resp:
+                        results_pair.append(json.loads(resp.read().decode("utf-8")))
+
+                ta = threading.Thread(target=_run_web_map)
+                tb = threading.Thread(target=_run_web_map)
+                ta.start()
+                tb.start()
+                ta.join(timeout=8.0)
+                tb.join(timeout=8.0)
+                self.assertEqual(len(results_pair), 2)
+                for res in results_pair:
+                    self.assertEqual(res["ok_count"], 2, res)
+                    self.assertEqual(res["fail_count"], 0, res)
+            finally:
+                dash.shutdown()
+                dash.server_close()
+        finally:
+            ev1.set()
+            ev2.set()
+            srv1.shutdown()
+            srv2.shutdown()
+            srv1.server_close()
+            srv2.server_close()
+
+    def test_gateway_quarantine_disconnects_active_tunnel_and_rejects_smuggling(self) -> None:
+        """Verify quarantining severs open CONNECT tunnels immediately, and smuggling/truncated-chunked requests are rejected."""
+        import base64
+        import socketserver
+
+        received_bodies: list[bytes] = []
+
+        class _EchoTunnelHandler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.settimeout(5.0)
+                try:
+                    while True:
+                        chunk = self.request.recv(4096)
+                        if not chunk:
+                            break
+                        received_bodies.append(chunk)
+                        self.request.sendall(b"ECHO:" + chunk)
+                except OSError:
+                    pass
+
+        class _ReuseTCPServer(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        upstream_srv = _ReuseTCPServer(("127.0.0.1", 0), _EchoTunnelHandler)
+        up_port = upstream_srv.server_address[1]
+        threading.Thread(target=upstream_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        tok = "gw-smug-tok-1234567890"
+        w_tok = "gw-smug-worker-token-987654"
+        cfg = ClusterConfig(
+            cluster_name="gw-hardening",
+            auth_token=tok,
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=8766, auth_token=w_tok),
+            ],
+            gateway=GatewayConfig(
+                enabled=True,
+                bind_host="127.0.0.1",
+                port=0,
+                mode="allowlist",
+                allowed_domains=["127.0.0.1"],
+                allowed_ports=[up_port],
+                block_private_ips=False,
+                idle_timeout_sec=15.0,
+            ),
+        )
+        gw_mgr = GatewayManager(cfg)
+        ok, msg = gw_mgr.start()
+        self.assertTrue(ok, msg)
+        gw_port = gw_mgr.bound_port
+        secret = derive_proxy_password(w_tok, "node1")
+        auth_b64 = base64.b64encode(f"node1:{secret}".encode("utf-8")).decode("ascii")
+
+        try:
+            # 1. Open active CONNECT tunnel, verify echo works, then Quarantine -> tunnel MUST close immediately!
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"CONNECT 127.0.0.1:{up_port} HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+                )
+                resp_head = s.recv(1024)
+                self.assertIn(b"200 Connection Established", resp_head)
+                s.sendall(b"ping1")
+                self.assertEqual(s.recv(1024), b"ECHO:ping1")
+
+                # Quarantine node1 and sever active sockets!
+                cfg.gateway.quarantined_nodes = ["node1"]
+                closed_n = gw_mgr.disconnect_node("node1")
+                self.assertGreaterEqual(closed_n, 1)
+
+                t0 = time.monotonic()
+                s.settimeout(2.0)
+                try:
+                    tail = s.recv(1024)
+                    self.assertEqual(tail, b"")
+                except OSError:
+                    pass
+                self.assertLess(time.monotonic() - t0, 1.5)
+
+            # Unblock node1 for smuggling tests
+            cfg.gateway.quarantined_nodes = []
+
+            # 2a. CL + TE simultaneous headers -> 400 Bad Request (request smuggling defense)
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"POST http://127.0.0.1:{up_port}/smug HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                    f"Transfer-Encoding: chunked\r\n"
+                    f"Content-Length: 5\r\n\r\n0\r\n\r\n".encode("ascii")
+                )
+                r1 = s.recv(1024)
+                self.assertIn(b"400 Bad Request", r1)
+
+            # 2b. Conflicting duplicate Content-Length -> 400 Bad Request
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"POST http://127.0.0.1:{up_port}/smug2 HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                    f"Content-Length: 3\r\n"
+                    f"Content-Length: 9\r\n\r\nabc".encode("ascii")
+                )
+                r2 = s.recv(1024)
+                self.assertIn(b"400 Bad Request", r2)
+
+            # 2c. Negative Content-Length -> 400 Bad Request
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"POST http://127.0.0.1:{up_port}/neg HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                    f"Content-Length: -5\r\n\r\n".encode("ascii")
+                )
+                r3 = s.recv(1024)
+                self.assertIn(b"400 Bad Request", r3)
+
+            # 2d. Truncated chunked request body fails fast with 502 (does not hang until idle_timeout)
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"POST http://127.0.0.1:{up_port}/trunc HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                    f"Transfer-Encoding: chunked\r\n\r\n5\r\nhel".encode("ascii")
+                )
+                s.shutdown(socket.SHUT_WR)
+                t0 = time.monotonic()
+                r4 = s.recv(1024)
+                self.assertLess(time.monotonic() - t0, 2.0)
+                self.assertIn(b"502 Bad Gateway", r4)
+        finally:
+            gw_mgr.stop()
+            upstream_srv.shutdown()
+            upstream_srv.server_close()
+
+    def test_worker_input_safety_pipeline_all_failure_node_removal_and_audit_accuracy(self) -> None:
+        """Verify job_id path sanitization, NaN timeout rejection, IPv4-mapped allowlist, pipeline all-failure, node removal quarantine cleanup, llama-rpc guard, audit warning, and dashboard XSS fix."""
+        tok = "safety-audit-tok-123456"
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "work"
+            workdir.mkdir()
+            st1 = WorkerState(
+                node_id="node0",
+                role="master",
+                auth_token=tok,
+                safety=SafetyConfig(),
+                max_concurrency=2,
+                workdir=workdir,
+                allowed_client_ips={"127.0.0.1", "192.168.1.50"},
+                health_provider=lambda: {
+                    "node_id": "node0",
+                    "role": "master",
+                    "os_env": "debian-13",
+                    "tier": 1,
+                    "pool": "compute",
+                    "ready_for_jobs": True,
+                    "not_ready_reasons": [],
+                    "cpu_cores": 4,
+                    "mem_total_mb": 512,
+                    "mem_available_mb": 256,
+                    "tools": {},
+                    "services": {},
+                },
+            )
+            st2 = WorkerState(
+                node_id="node1",
+                role="worker",
+                auth_token="worker-tok-unique-123456",
+                safety=SafetyConfig(),
+                max_concurrency=2,
+                workdir=workdir,
+                health_provider=lambda: {
+                    "node_id": "node1",
+                    "role": "worker",
+                    "os_env": "termux",
+                    "tier": 1,
+                    "pool": "compute",
+                    "ready_for_jobs": True,
+                    "not_ready_reasons": [],
+                    "cpu_cores": 8,
+                    "mem_total_mb": 4096,
+                    "mem_available_mb": 2048,
+                    "tools": {},
+                    "services": {},
+                },
+            )
+            # 1. IPv4-mapped IPv6 address matches exact IPv4 allowlist safely
+            self.assertTrue(st1.is_client_ip_allowed("::ffff:192.168.1.50"))
+            self.assertFalse(st1.is_client_ip_allowed("::ffff:192.168.1.99"))
+
+            srv1, _g1, ev1 = create_worker_server("127.0.0.1", 0, st1)
+            srv2, _g2, ev2 = create_worker_server("127.0.0.1", 0, st2)
+            p1, p2 = srv1.server_address[1], srv2.server_address[1]
+            threading.Thread(target=srv1.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+            threading.Thread(target=srv2.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+            cfg_path = Path(tmp) / "cluster.json"
+            cfg = ClusterConfig(
+                cluster_name="audit-fix",
+                auth_token=tok,
+                nodes=[
+                    NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=p1, max_concurrency=2),
+                    NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=p2, max_concurrency=2, auth_token="worker-tok-unique-123456"),
+                ],
+                gateway=GatewayConfig(enabled=False),
+            )
+            save_config(cfg, cfg_path)
+            ctrl = MasterController(cfg)
+            dash = DashboardHTTPServer(
+                ("127.0.0.1", 0), ctrl, config_path=cfg_path, enable_pairing_beacon=False, pairing_fail_delay_sec=0.0
+            )
+            d_port = dash.server_address[1]
+            threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+            try:
+                # 2. Path-traversal job_id executes safely inside cwd & NaN timeout returns 400
+                trav_spec = JobSpec(
+                    index=0,
+                    job_id="../../outside/escape",
+                    script_content="import os; print(os.getcwd())\n",
+                    script_name="ok.py",
+                    interpreter=sys.executable,
+                    timeout_sec=5.0,
+                )
+                kind, res_t = ctrl.exec_on_node(cfg.nodes[0], trav_spec)
+                self.assertEqual(kind, "ok", res_t)
+                self.assertEqual(res_t["returncode"], 0)
+                self.assertEqual(Path(res_t["stdout"].strip()).resolve(), workdir.resolve())
+
+                req_nan = urllib.request.Request(
+                    f"http://127.0.0.1:{p1}/exec",
+                    data=json.dumps({"command": "echo hi", "timeout_sec": "nan"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as exc_ctx:
+                    urllib.request.urlopen(req_nan, timeout=3.0)
+                try:
+                    self.assertEqual(exc_ctx.exception.code, 400)
+                finally:
+                    exc_ctx.exception.close()
+
+                # 3. run_pipeline with target='all' where node0 succeeds & node1 fails preserves failure returncode & stderr
+                pipe = ctrl.run_pipeline(
+                    [
+                        {
+                            "name": "partial-fail",
+                            "target": "all",
+                            "command": 'if [ "$PHONECLUSTER_NODE_ID" = "node1" ]; then echo boom >&2; exit 7; fi; echo ok',
+                        }
+                    ]
+                )
+                self.assertFalse(pipe["ok"])
+                step0 = pipe["results"][0]
+                self.assertFalse(step0["ok"])
+                self.assertEqual(step0["returncode"], 7)
+                self.assertIn("boom", step0["stderr"])
+
+                # 4. Quarantine node1 -> llama-rpc-start must NOT fall back to Master!
+                def _post_dash(ep: str, payload: dict[str, Any]) -> dict[str, Any]:
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{d_port}{ep}",
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+
+                _post_dash("/api/gateway/quarantine", {"node_id": "node1", "quarantine": True})
+                wl_res = _post_dash("/api/workloads/action", {"action": "llama-rpc-start"})
+                self.assertEqual(wl_res["results"][0]["node_id"], "none")
+                self.assertFalse(wl_res["results"][0]["ok"])
+
+                # 5. Removing a quarantined node clears it from quarantined_nodes so reused ID isn't stuck!
+                _post_dash("/api/nodes/remove", {"id": "node1"})
+                self.assertNotIn("node1", cfg.gateway.quarantined_nodes)
+
+                # 6. audit_cluster_network warns (not 20/20 ok) if gateway.enabled=True while gateway_manager is stopped
+                from phonecluster.dashboard import DASHBOARD_HTML
+                from phonecluster.netguard import audit_cluster_network
+
+                cfg.gateway.enabled = True
+                rep = audit_cluster_network(ctrl, gateway_manager=dash.gateway_manager)
+                gw_chk = next(c for c in rep["checks"] if c["name"] == "Master Network Guard (WAN Filter)")
+                self.assertEqual(gw_chk["status"], "warn")
+
+                # 7. Dashboard HTML uses jsArg() and never passes raw esc(...) inside single-quoted onclick attributes
+                self.assertIn("function jsArg(", DASHBOARD_HTML)
+                self.assertNotRegex(DASHBOARD_HTML, r"onclick=\"[^\"]*\\'\s*\+\s*esc\(")
+            finally:
+                dash.shutdown()
+                dash.server_close()
+                ev1.set()
+                ev2.set()
+                srv1.shutdown()
+                srv2.shutdown()
+                srv1.server_close()
+                srv2.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

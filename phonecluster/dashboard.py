@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import shlex
+import signal
+import socket
 import threading
 import time
 import urllib.error
@@ -1125,7 +1128,7 @@ function renderPoolStrip(summary) {
   for (const p of pools) {
     const key = 'pool:' + p.pool;
     const isAct = activePoolFilter === key;
-    html += '<button class="pool-chip' + (isAct ? ' active' : '') + '" onclick="setPoolFilter(\'' + esc(key) + '\')">'
+    html += '<button class="pool-chip' + (isAct ? ' active' : '') + '" onclick="setPoolFilter(' + jsArg(key) + ')">'
       + '<span class="pool-chip-title">' + tierPillHtml(p.tier, p.pool)
       + ' <span class="mono">' + esc(p.nodes_ready) + '/' + esc(p.nodes_total) + '</span></span>'
       + '<span class="pool-chip-sub mono">' + esc(p.total_cores) + 'c · ' + ((p.mem_total_mb || 0) / 1024).toFixed(1) + ' GB · ' + esc((p.node_ids || []).join(', ')) + '</span>'
@@ -1158,7 +1161,7 @@ function openNodeTierEditor(nodeId) {
     + '<input id="ed-conc" type="number" min="1" max="16" value="' + esc(n.max_concurrency || 2) + '" /></div>'
     + '</div>'
     + '<div class="row" style="margin:0;">'
-    + '<button class="small primary" onclick="saveNodeTier(\'' + esc(n.id) + '\')">Save Tier &amp; Pool</button>'
+    + '<button class="small primary" onclick="saveNodeTier(' + jsArg(n.id) + ')">Save Tier &amp; Pool</button>'
     + '<span class="hint" style="margin:0;">Effective now: ' + tierPillHtml(n.tier, n.pool) + '</span>'
     + '</div>';
 }
@@ -1175,7 +1178,8 @@ async function saveNodeTier(nodeId) {
   const data = await authPost('/api/nodes/update', { id: nodeId, tier, pool, max_concurrency });
   if (data.error) { showToast('Update failed: ' + data.error, 'bad'); return; }
   closeNodeTierEditor();
-  showToast('Updated ' + nodeId + ' -> Tier ' + (tier || 'auto') + ' / pool ' + pool, 'ok');
+  const pushed = data.pushed ? (' · live-synced ' + data.pushed.ok_count + '/' + data.pushed.total) : '';
+  showToast('Updated ' + nodeId + ' -> Tier ' + (tier || 'auto') + ' / pool ' + pool + pushed, 'ok');
   refreshLive();
 }
 
@@ -1188,6 +1192,9 @@ let activeTermJob = null;
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function jsArg(s) {
+  return esc(JSON.stringify(String(s ?? '')).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029'));
 }
 
 function fmtUptime(sec) {
@@ -1447,7 +1454,7 @@ function renderTasksBoard(live) {
     + rows.map((r, idx) => {
       const tone = r.state === 'OK' ? 'ok' : (r.state === 'RUNNING' ? 'warn' : 'bad');
       const btn = r.active
-        ? '<button class="small danger" onclick="cancelJob(\'' + esc(r.node_id) + '\',\'' + esc(r.job_id) + '\')">Cancel</button>'
+        ? '<button class="small danger" onclick="cancelJob(' + jsArg(r.node_id) + ',' + jsArg(r.job_id) + ')">Cancel</button>'
         : '<button class="small" onclick="rerunTask(' + idx + ')">Re-run</button>';
       return '<tr><td><b>' + esc(r.node_id) + '</b></td><td class="mono">' + esc(r.job_id) + '</td>'
         + '<td><span class="pill ' + tone + '">' + esc(r.state) + '</span></td>'
@@ -1635,7 +1642,7 @@ function renderNodesGrid(live) {
         const temp = h.temp_c;
         const tempTone = temp == null ? '' : (temp >= maxTemp ? 'bad' : (temp >= resTemp ? 'warn' : 'ok'));
         const bat = h.battery_pct;
-        const batTone = bat == null ? '' : (bat >= batHigh && h.battery_status === 'CHARGING' ? 'warn' : (bat < 20 ? 'bad' : 'ok'));
+        const batTone = bat == null ? '' : (bat >= batHigh && (h.battery_status === 'CHARGING' || h.battery_status === 'FULL') ? 'warn' : (bat < 20 ? 'bad' : 'ok'));
 
         bodyHtml += metricBar('Memory', ramUsedMb + ' / ' + (h.mem_total_mb || 0) + ' MB (' + ramUsedPct.toFixed(0) + '%)', ramUsedPct, ramUsedPct > 85 ? 'bad' : '');
         bodyHtml += metricBar('Temperature', temp != null ? temp.toFixed(1) + ' °C' : 'N/A', temp != null ? (temp / 50) * 100 : 0, tempTone);
@@ -1676,10 +1683,10 @@ function renderNodesGrid(live) {
         ? '<span class="pill purple">MASTER</span>'
         : '<span class="pill neutral">WORKER</span>';
       let actionsHtml = '<div class="node-actions">'
-        + '<button class="small primary" onclick="openNodeTerminal(\'' + esc(n.id) + '\')">Terminal</button>'
-        + '<button class="small" onclick="openNodeTierEditor(\'' + esc(n.id) + '\')">Tier / Pool</button>';
+        + '<button class="small primary" onclick="openNodeTerminal(' + jsArg(n.id) + ')">Terminal</button>'
+        + '<button class="small" onclick="openNodeTierEditor(' + jsArg(n.id) + ')">Tier / Pool</button>';
       if (n.role !== 'master') {
-        actionsHtml += '<button class="small danger" onclick="removeNode(\'' + esc(n.id) + '\')">Remove</button>';
+        actionsHtml += '<button class="small danger" onclick="removeNode(' + jsArg(n.id) + ')">Remove</button>';
       }
       actionsHtml += '</div>';
 
@@ -1750,7 +1757,7 @@ async function submitTerminalCommand() {
   screen.appendChild(entry);
   screen.scrollTop = screen.scrollHeight;
 
-  const jobId = 'wterm-' + Date.now().toString(36);
+  const jobId = 'wterm-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
   activeTermJob = { node_id: target, job_id: jobId };
   document.getElementById('btn-term-run').disabled = true;
   const isDynamicTarget = (target === 'auto' || target === 'all' || target === 'best' || target.startsWith('tier:') || target.startsWith('pool:'));
@@ -1864,12 +1871,21 @@ async function authPost(url, payload) {
   if (!token) {
     return { error: 'Controls are locked. Paste your auth_token in the top bar and click Unlock.' };
   }
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-    body: JSON.stringify(payload),
-  });
-  return await r.json();
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify(payload),
+    });
+    const text = await r.text();
+    try {
+      return JSON.parse(text);
+    } catch (_e) {
+      return { error: 'Unexpected server response (HTTP ' + r.status + ')' };
+    }
+  } catch (e) {
+    return { error: 'Could not reach Master: ' + (e && e.message ? e.message : String(e)) };
+  }
 }
 
 function toggleMapMode() {
@@ -2031,7 +2047,7 @@ function renderPipeBuilder() {
       ? ''
       : '<option value="' + esc(st.target) + '" selected>' + esc(st.target) + '</option>';
     const varsHtml = getAvailableMeshVars(idx).map(v =>
-      '<button type="button" class="var-chip" onclick="insertPipeVar(' + idx + ',\'' + esc(v.val) + '\')">' + esc(v.label) + '</button>'
+      '<button type="button" class="var-chip" onclick="insertPipeVar(' + idx + ',' + jsArg(v.val) + ')">' + esc(v.label) + '</button>'
     ).join('');
     return '<div class="step-card">'
       + '<div class="step-card-head">'
@@ -2351,10 +2367,10 @@ async function loadWorkloads() {
               const tp = s.tier ? tierPillHtml(s.tier, s.pool) : '<span class="pill neutral">custom</span>';
               let actions = '';
               if (s.host && Number(s.port) > 0) {
-                actions += '<button class="small" id="probe-btn-' + idx + '" onclick="probeService(' + idx + ',\'' + esc(s.name) + '\',\'' + esc(s.host) + '\',' + Number(s.port) + ')">Test</button> ';
+                actions += '<button class="small" id="probe-btn-' + idx + '" onclick="probeService(' + idx + ',' + jsArg(s.name) + ',' + jsArg(s.host) + ',' + Number(s.port) + ')">Test</button> ';
               }
               if (s.source === 'config') {
-                actions += '<button class="small danger" onclick="removeCustomService(\'' + esc(s.name) + '\')">Remove</button>';
+                actions += '<button class="small danger" onclick="removeCustomService(' + jsArg(s.name) + ')">Remove</button>';
               }
               const stCls = s.loopback_only ? 'warn' : (s.ready ? 'ok' : 'warn');
               const stLbl = s.loopback_only ? '⚠ Localhost-Only' : (s.ready ? '✓ Live' : 'Warm/Busy');
@@ -2509,7 +2525,7 @@ async function scanLan() {
     box.innerHTML = d.discovered.map(item => {
       const btn = item.already_configured
         ? '<span class="pill ok">✓ Already in Cluster</span>'
-        : '<button class="small primary" onclick="addDiscoveredNode(\'' + esc(item.host) + '\',' + Number(item.worker_port) + ',' + Number(item.ssh_port) + ',\'' + esc(item.ssh_user) + '\')">+ Add to Cluster</button>';
+        : '<button class="small primary" onclick="addDiscoveredNode(' + jsArg(item.host) + ',' + Number(item.worker_port) + ',' + Number(item.ssh_port) + ',' + jsArg(item.ssh_user) + ')">+ Add to Cluster</button>';
       return '<div class="check-item" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">'
         + '<div><strong>' + esc(item.host) + '</strong> (' + esc(item.os_env) + ', ' + esc(item.cpu_cores) + ' cores, ' + esc(item.mem_total_mb) + ' MB RAM)</div>'
         + btn + '</div>';
@@ -2669,8 +2685,8 @@ async function loadNetworkAudit() {
             let act = '<span class="hint">-</span>';
             if (n.role !== 'master') {
               act = n.quarantined
-                ? '<button class="small primary" onclick="toggleQuarantine(\'' + esc(n.id) + '\', false)">✓ Unblock</button>'
-                : '<button class="small danger" onclick="toggleQuarantine(\'' + esc(n.id) + '\', true)">🔒 Quarantine</button>';
+                ? '<button class="small primary" onclick="toggleQuarantine(' + jsArg(n.id) + ', false)">✓ Unblock</button>'
+                : '<button class="small danger" onclick="toggleQuarantine(' + jsArg(n.id) + ', true)">🔒 Quarantine</button>';
             }
             const nameBadge = n.quarantined
               ? '<strong>' + esc(n.id) + '</strong> <span class="pill bad">QUARANTINED</span>'
@@ -2786,7 +2802,7 @@ async function loadGatewayStatus() {
     const pBox = document.getElementById('gw-preset-chips');
     if (pBox) {
       pBox.innerHTML = Object.entries(gwPresetsCache).map(([key, p]) =>
-        '<button type="button" class="var-chip" onclick="addGatewayPreset(\'' + esc(key) + '\')">+ ' + esc(p.label) + '</button>'
+        '<button type="button" class="var-chip" onclick="addGatewayPreset(' + jsArg(key) + ')">+ ' + esc(p.label) + '</button>'
       ).join('');
     }
 
@@ -2813,7 +2829,7 @@ async function loadGatewayStatus() {
             const dataTxt = totalB > 1024 ? (totalB / 1024).toFixed(1) + ' KB' : totalB + ' B';
             const canAllow = ev.action === 'block' && ev.host && !String(ev.reason || '').includes('SSRF') && !String(ev.reason || '').includes('port');
             const fixBtn = canAllow
-              ? '<button class="small" onclick="allowBlockedDomain(\'' + esc(ev.host) + '\')">+ Allow</button>'
+              ? '<button class="small" onclick="allowBlockedDomain(' + jsArg(ev.host) + ')">+ Allow</button>'
               : '<span class="hint">-</span>';
             return '<tr><td class="mono">' + esc(tm) + '</td><td><strong>' + esc(ev.node_id) + '</strong></td>'
               + '<td class="mono">' + esc(ev.host) + (ev.port ? ':' + esc(ev.port) : '') + '</td>'
@@ -2924,6 +2940,8 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.controller = controller
         self.config_path = config_path
         self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
+        if ":" in str(addr[0]):
+            self.address_family = socket.AF_INET6
         super().__init__(addr, DashboardRequestHandler)
         self.pairing_manager = PairingManager(
             config=controller.config,
@@ -3093,19 +3111,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/workloads":
                 ctrl = self.server.controller
                 snaps = ctrl.poll_health()
+                quarantined = ctrl._quarantined_ids()
                 ha_urls: list[str] = []
                 docker_nodes: list[str] = []
                 for s in snaps:
-                    if not s.online:
+                    if not s.online or s.node.id in quarantined:
                         continue
                     if s.health.get("services", {}).get("homeassistant_8123"):
                         ha_urls.append(f"http://{format_host_port(s.node.host, 8123)}")
                     if s.health.get("tools", {}).get("docker") or resolve_node_tier_and_pool(s.node, s.health)[0] == 3:
                         docker_nodes.append(s.node.id)
-                master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
-                lan_subnet = infer_lan_subnet(
-                    master_node.host or detect_local_ip(), ctrl.config.network.lan_subnet
-                )
+                with ctrl.config_lock:
+                    master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
+                    cfg_subnet = ctrl.config.network.lan_subnet
+                lan_subnet = infer_lan_subnet(master_node.host or detect_local_ip(), cfg_subnet)
                 self._send_json(
                     HTTPStatus.OK,
                     {
@@ -3202,8 +3221,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return float(ctrl.config.default_job_timeout_sec)
             try:
                 val = float(raw_val)
-                if val <= 0:
-                    raise ValueError("timeout_sec must be > 0")
+                if not math.isfinite(val) or val <= 0:
+                    raise ValueError("timeout_sec must be a finite number > 0")
                 return val
             except (TypeError, ValueError):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a positive number"})
@@ -3262,6 +3281,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if timeout is None:
                 return
             jobs: list[JobSpec] = []
+            batch_id = uuid.uuid4().hex[:6]
             if mode == "script":
                 script_content = str(body.get("script_content", ""))
                 interpreter = str(body.get("interpreter", "python3"))
@@ -3281,7 +3301,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     jobs.append(
                         JobSpec(
                             index=idx,
-                            job_id=f"webmap-{idx:04d}",
+                            job_id=f"webmap-{batch_id}-{idx:04d}",
                             script_content=script_content,
                             script_name="web_job.py" if "python" in interpreter else "web_job.sh",
                             interpreter=interpreter,
@@ -3301,12 +3321,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         jobs.append(
                             JobSpec(
                                 index=idx,
-                                job_id=f"webmap-{idx:04d}",
+                                job_id=f"webmap-{batch_id}-{idx:04d}",
                                 command=cmd_s,
                                 timeout_sec=timeout,
                                 env={"PHONECLUSTER_TASK_INDEX": str(idx)},
                             )
                         )
+                if not jobs:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "provide at least one non-empty command"})
+                    return
             t0 = time.monotonic()
             outcomes = ctrl.map_jobs(jobs, retries=1, target=target, workload_hint=workload_hint)
             wall = round(time.monotonic() - t0, 2)
@@ -3485,9 +3508,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if self.server.config_path is not None:
                     save_config(ctrl.config, self.server.config_path)
                 q_copy = list(ctrl.config.gateway.quarantined_nodes)
+            closed_tunnels = (
+                self.server.gateway_manager.disconnect_node(node_id) if quarantine else 0
+            )
             self._send_json(
                 HTTPStatus.OK,
-                {"node_id": node_id, "quarantined": quarantine, "quarantined_nodes": q_copy},
+                {
+                    "node_id": node_id,
+                    "quarantined": quarantine,
+                    "quarantined_nodes": q_copy,
+                    "disconnected_tunnels": closed_tunnels,
+                },
             )
 
         elif path == "/api/network/profile":
@@ -3584,8 +3615,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             action = str(body.get("action", "")).strip()
             cidr = str(body.get("cidr", "")).strip()
             if not cidr:
-                master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
-                cidr = infer_lan_subnet(master_node.host or detect_local_ip(), ctrl.config.network.lan_subnet)
+                with ctrl.config_lock:
+                    master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
+                    cfg_subnet = ctrl.config.network.lan_subnet
+                cidr = infer_lan_subnet(master_node.host or detect_local_ip(), cfg_subnet)
             action_args_map = {
                 "distcc-start": ["distcc-start", cidr],
                 "distcc-stop": ["distcc-stop"],
@@ -3662,6 +3695,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         outcomes.sort(key=lambda o: o.node_id)
                         self._send_json(HTTPStatus.OK, {"action": action, "results": [o.to_dict() for o in outcomes]})
                         return
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {
+                            "action": action,
+                            "results": [
+                                {
+                                    "index": 0,
+                                    "job_id": wl_job_id,
+                                    "label": "llama-rpc-start",
+                                    "node_id": "none",
+                                    "ok": False,
+                                    "returncode": -1,
+                                    "duration_sec": 0.0,
+                                    "error": "No online, ready, non-quarantined worker phones available for llama-rpc-start (Master skipped to protect low-RAM controllers).",
+                                }
+                            ],
+                        },
+                    )
+                    return
             outcomes = ctrl.run_single(spec, target="all")
             self._send_json(HTTPStatus.OK, {"action": action, "results": [o.to_dict() for o in outcomes]})
 
@@ -3674,8 +3726,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 tier = int(body.get("tier", 0))
                 worker_port = int(body.get("worker_port", DEFAULT_WORKER_PORT))
                 ssh_port = int(body.get("ssh_port", DEFAULT_SSH_PORT))
-                max_conc = max(1, int(body.get("max_concurrency", 2)))
+                max_conc = max(1, min(32, int(body.get("max_concurrency", 2))))
                 weight = max(0.1, float(body.get("weight", 1.0)))
+                if not math.isfinite(weight):
+                    raise ValueError("weight must be finite")
             except (TypeError, ValueError):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid numeric node parameter"})
                 return
@@ -3741,13 +3795,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     target_node.pool = str(body["pool"]).strip().lower() or "auto"
                 if "max_concurrency" in body:
                     try:
-                        target_node.max_concurrency = max(1, int(body["max_concurrency"]))
+                        mc_val = int(body["max_concurrency"])
+                        if not (1 <= mc_val <= 32):
+                            raise ValueError("must be between 1 and 32")
+                        target_node.max_concurrency = mc_val
                     except (TypeError, ValueError):
-                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid max_concurrency"})
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "max_concurrency must be an integer between 1 and 32"})
                         return
                 if "weight" in body:
                     try:
-                        target_node.weight = max(0.1, float(body["weight"]))
+                        w_val = float(body["weight"])
+                        if not math.isfinite(w_val) or w_val <= 0:
+                            raise ValueError("must be positive")
+                        target_node.weight = max(0.1, w_val)
                     except (TypeError, ValueError):
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid weight"})
                         return
@@ -3779,8 +3839,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot remove the master node"})
                     return
                 ctrl.config.nodes = [n for n in ctrl.config.nodes if n.id != node_id]
+                if node_id in ctrl.config.gateway.quarantined_nodes:
+                    ctrl.config.gateway.quarantined_nodes = [
+                        q for q in ctrl.config.gateway.quarantined_nodes if q != node_id
+                    ]
                 if self.server.config_path is not None:
                     save_config(ctrl.config, self.server.config_path)
+            self.server.gateway_manager.disconnect_node(node_id)
             self._send_json(HTTPStatus.OK, {"removed": node_id})
 
         elif path == "/api/settings":
@@ -3866,6 +3931,17 @@ def serve_dashboard(
     server = DashboardHTTPServer((bind_host, port), controller, config_path=config_path)
     stop_event = threading.Event()
     _start_background_sampler(controller, stop_event, interval_sec=4.0)
+
+    def _handle_sigterm(signum: int, _frame: Any) -> None:
+        LOG.info("Received signal %s; shutting down Master Dashboard...", signum)
+        stop_event.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    try:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except ValueError:
+        pass  # Not on main thread
+
     lan_ip = detect_local_ip()
     actual_port = server.server_address[1]
     print(f"PhoneCluster Web Control Center -> http://{lan_ip}:{actual_port}")

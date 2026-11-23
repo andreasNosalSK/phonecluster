@@ -73,6 +73,7 @@ apt-get install -y -qq "${PKGS[@]}"
 # 2. Global `pc` & `phonecluster` CLI wrapper
 cat > /usr/local/bin/phonecluster <<EOF
 #!/usr/bin/env bash
+export PHONECLUSTER_CONFIG="\${PHONECLUSTER_CONFIG:-${REPO_DIR}/config/cluster.json}"
 exec python3 "${REPO_DIR}/phonecluster_cli.py" "\$@"
 EOF
 chmod 0755 /usr/local/bin/phonecluster

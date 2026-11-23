@@ -581,15 +581,20 @@ class PairingManager:
                 "attempts_left": left,
             }
 
-        # Proof verified! Register phone with its OWN unique least-privilege node_token.
-        worker_port = int(metadata.get("worker_port", DEFAULT_WORKER_PORT))
-        ssh_port = int(metadata.get("ssh_port", DEFAULT_SSH_PORT))
+        # Proof verified! Validate metadata cleanly and mint a unique least-privilege node_token.
+        try:
+            worker_port = int(metadata.get("worker_port", DEFAULT_WORKER_PORT))
+            ssh_port = int(metadata.get("ssh_port", DEFAULT_SSH_PORT))
+            cores = max(1, int(metadata.get("cpu_cores", 4)))
+            mem_mb = max(0, int(metadata.get("mem_total_mb", 0)))
+            max_conc = max(1, min(32, int(metadata.get("max_concurrency", 2))))
+            raw_tier = int(metadata.get("tier", 0))
+        except (TypeError, ValueError) as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": f"Invalid numeric pairing metadata: {exc}"}
+        if not (0 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
+            return HTTPStatus.BAD_REQUEST, {"error": "worker_port must be 0..65535 and ssh_port must be 1..65535."}
         ssh_user = str(metadata.get("ssh_user", ""))[:64]
         os_env = str(metadata.get("os_env", "unknown"))[:32]
-        cores = max(1, int(metadata.get("cpu_cores", 4)))
-        mem_mb = max(0, int(metadata.get("mem_total_mb", 0)))
-        max_conc = max(1, min(8, int(metadata.get("max_concurrency", 2))))
-        raw_tier = int(metadata.get("tier", 0))
         node_tier = raw_tier if raw_tier in {0, 1, 2, 3} else 0
         node_pool = str(metadata.get("pool", "auto")).strip().lower() or "auto"
         node_token = generate_auth_token()
@@ -718,6 +723,8 @@ class StandalonePairingServer(ThreadingHTTPServer):
 
     def __init__(self, addr: tuple[str, int], manager: PairingManager) -> None:
         self.manager = manager
+        if ":" in str(addr[0]):
+            self.address_family = socket.AF_INET6
         super().__init__(addr, StandalonePairingHandler)
 
 
@@ -848,6 +855,8 @@ def _http_json(url: str, method: str = "GET", body: dict[str, Any] | None = None
         except json.JSONDecodeError:
             parsed = {"error": raw[:200]}
         return exc.code, parsed
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not reach Master pairing endpoint {url}: {exc}") from exc
 
 
 def _install_ssh_pubkey(pubkey: str) -> bool:

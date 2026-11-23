@@ -12,7 +12,13 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .config import ClusterConfig, format_host_for_url, format_host_port
+from .config import (
+    ClusterConfig,
+    format_host_for_url,
+    format_host_port,
+    is_loopback_or_unspecified_host,
+    normalize_host,
+)
 from .discovery import detect_local_ip
 from .routing import build_service_registry, resolve_node_tier_and_pool
 from .telemetry import _read_listening_tcp_map, detect_os_environment, is_local_port_open, read_memory_info
@@ -146,11 +152,14 @@ def build_adguard_config_snippets(
 ) -> dict[str, str]:
     """Generate native AdGuard Home YAML rewrites & old-phone telemetry blocking rules (NO Docker needed!)."""
     registry = build_service_registry(snapshots, config)
+    quarantined = set(config.gateway.quarantined_nodes)
     master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
 
     rewrite_entries: list[tuple[str, str]] = [("master.cluster", master_node.host)]
     seen_domains: set[str] = {"master.cluster"}
     for snap in snapshots:
+        if snap.node.id in quarantined:
+            continue
         dom = f"{snap.node.id}.cluster"
         if dom not in seen_domains and snap.node.host:
             seen_domains.add(dom)
@@ -336,8 +345,13 @@ def apply_security_profile(config: ClusterConfig, profile: str) -> dict[str, Any
     """Apply a 1-click network security profile (`standard`, `airgap_workers`, or `lockdown`)."""
     clean = profile.strip().lower()
     master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
-    if master_node.host and master_node.host not in config.network.allowed_master_ips:
-        config.network.allowed_master_ips.append(master_node.host)
+    m_host = normalize_host(master_node.host)
+    if m_host and m_host not in config.network.allowed_master_ips:
+        config.network.allowed_master_ips.append(m_host)
+    if is_loopback_or_unspecified_host(m_host):
+        lan_ip = normalize_host(detect_local_ip())
+        if lan_ip and not is_loopback_or_unspecified_host(lan_ip) and lan_ip not in config.network.allowed_master_ips:
+            config.network.allowed_master_ips.append(lan_ip)
 
     if clean == "standard":
         config.gateway.enabled = False
@@ -387,8 +401,9 @@ def audit_cluster_network(
             adguard_url = f"http://{format_host_port(host_info['master_host'], 3000)}"
             adguard_node = "master (local)"
         else:
+            quarantined_set = set(config.gateway.quarantined_nodes)
             for s in snaps:
-                if not s.online:
+                if not s.online or s.node.id in quarantined_set:
                     continue
                 svcs = (s.health or {}).get("services") or {}
                 if svcs.get("adguard_80"):
@@ -474,7 +489,16 @@ def audit_cluster_network(
     # 4. Master Network Guard (20 pts)
     gw = config.gateway
     gw_running = bool(gateway_manager.is_running) if gateway_manager is not None else gw.enabled
-    if gw.enabled and gw.mode in {"allowlist", "block_all"} and gw.block_private_ips:
+    if gw.enabled and not gw_running:
+        score += 5
+        err_note = f" ({gateway_manager.status(include_events=0).get('last_error')})" if gateway_manager is not None and gateway_manager.status(include_events=0).get("last_error") else ""
+        checks.append({
+            "name": "Master Network Guard (WAN Filter)",
+            "status": "warn",
+            "detail": f"Enabled in config ({gw.mode}), but proxy is NOT currently listening on port {gw.port}{err_note}.",
+            "fix": "Check if another process uses that port or change the proxy port in Tab 5 and click Save & Apply.",
+        })
+    elif gw.enabled and gw.mode in {"allowlist", "block_all"} and gw.block_private_ips:
         score += 20
         checks.append({
             "name": "Master Network Guard (WAN Filter)",

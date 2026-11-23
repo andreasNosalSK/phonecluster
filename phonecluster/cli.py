@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import shlex
+import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -295,6 +297,7 @@ def _cmd_map(args: argparse.Namespace) -> int:
     timeout = args.timeout or cfg.default_job_timeout_sec
 
     jobs: list[JobSpec] = []
+    batch_id = uuid.uuid4().hex[:6]
     if args.script:
         sp = Path(args.script)
         if not sp.exists():
@@ -307,7 +310,7 @@ def _cmd_map(args: argparse.Namespace) -> int:
                 jobs.append(
                     JobSpec(
                         index=idx,
-                        job_id=f"map-{idx:04d}",
+                        job_id=f"map-{batch_id}-{idx:04d}",
                         script_content=content,
                         script_name=sp.name,
                         interpreter=args.interpreter,
@@ -323,7 +326,7 @@ def _cmd_map(args: argparse.Namespace) -> int:
                 jobs.append(
                     JobSpec(
                         index=idx,
-                        job_id=f"map-{idx:04d}",
+                        job_id=f"map-{batch_id}-{idx:04d}",
                         script_content=content,
                         script_name=sp.name,
                         interpreter=args.interpreter,
@@ -343,7 +346,7 @@ def _cmd_map(args: argparse.Namespace) -> int:
             jobs.append(
                 JobSpec(
                     index=idx,
-                    job_id=f"map-{idx:04d}",
+                    job_id=f"map-{batch_id}-{idx:04d}",
                     command=cmd,
                     timeout_sec=timeout,
                     workdir=args.workdir,
@@ -357,7 +360,7 @@ def _cmd_map(args: argparse.Namespace) -> int:
             jobs.append(
                 JobSpec(
                     index=idx,
-                    job_id=f"map-{idx:04d}",
+                    job_id=f"map-{batch_id}-{idx:04d}",
                     command=cmd_str,
                     timeout_sec=timeout,
                     workdir=args.workdir,
@@ -524,12 +527,22 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
     if not ok:
         print(f"Failed to start Network Guard: {msg}", file=sys.stderr)
         return 1
+    stop_ev = threading.Event()
+
+    def _on_sigterm(_signum: int, _frame: Any) -> None:
+        stop_ev.set()
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:
+        pass
+
     print(f"PhoneCluster Master Network Guard listening on {cfg.gateway.bind_host}:{mgr.bound_port}")
     print(f"Policy mode: {cfg.gateway.mode} | SSRF guard: {'ON' if cfg.gateway.block_private_ips else 'OFF'} | Allowlist: {len(cfg.gateway.allowed_domains)} domains")
     print("Press Ctrl+C to stop.")
     try:
-        while True:
-            time.sleep(0.5)
+        while not stop_ev.is_set():
+            stop_ev.wait(0.5)
     except KeyboardInterrupt:
         print("\nStopping Network Guard...")
     finally:
@@ -546,8 +559,10 @@ def _cmd_net_audit(args: argparse.Namespace) -> int:
     if args.profile:
         res = apply_security_profile(cfg, args.profile)
         save_config(cfg, cfg_path)
+        ctrl = MasterController(cfg)
+        pushed = ctrl.push_config_to_all()
         print(f"Applied security profile '{res['profile']}': {res['description']}")
-        print(f"Saved -> {cfg_path}")
+        print(f"Saved -> {cfg_path} (live-synced to {pushed['ok_count']}/{pushed['total']} online node(s))")
         return 0
 
     ctrl = MasterController(cfg)
@@ -719,16 +734,16 @@ def _cmd_join(args: argparse.Namespace) -> int:
             subprocess.call(["bash", str(setup_sh), "--node-id", res["node_id"], "--repo-dir", str(REPO_ROOT)])
 
     if not args.no_start:
-        import signal as _sig
-
         log_dir = REPO_ROOT / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"worker-{res['node_id']}.log"
+        pid_file = log_dir / f"worker-{res['node_id']}.pid"
         # Stop any previously running local worker PID (e.g. when re-pairing) so port 8765 is free
         for old_pid_file in log_dir.glob("worker-*.pid"):
             try:
                 old_pid = int(old_pid_file.read_text(encoding="utf-8").strip())
                 if old_pid > 1 and old_pid != os.getpid():
-                    os.kill(old_pid, _sig.SIGTERM)
+                    os.kill(old_pid, signal.SIGTERM)
                     for _ in range(15):
                         time.sleep(0.1)
                         try:
@@ -737,8 +752,11 @@ def _cmd_join(args: argparse.Namespace) -> int:
                             break
             except (OSError, ValueError):
                 pass
-        log_file = log_dir / f"worker-{res['node_id']}.log"
-        pid_file = log_dir / f"worker-{res['node_id']}.pid"
+            if old_pid_file != pid_file:
+                try:
+                    old_pid_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
         with log_file.open("a", encoding="utf-8") as lf:
             proc = subprocess.Popen(
                 [

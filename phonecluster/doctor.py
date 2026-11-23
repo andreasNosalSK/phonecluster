@@ -239,8 +239,11 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
     if cfg is not None and check_remote:
         ctrl = MasterController(cfg)
         snaps = ctrl.poll_health()
+        quarantined = set(cfg.gateway.quarantined_nodes)
         online = [s for s in snaps if s.online]
-        ready = [s for s in snaps if s.ready_for_jobs]
+        ready = [s for s in snaps if s.ready_for_jobs and s.node.id not in quarantined]
+        q_online = [s.node.id for s in online if s.node.id in quarantined]
+        q_suffix = f"; quarantined: {', '.join(q_online)}" if q_online else ""
         if not online:
             checks.append(
                 CheckResult(
@@ -256,7 +259,7 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                 CheckResult(
                     "Cluster Nodes",
                     "warn",
-                    f"{len(online)}/{len(snaps)} online ({len(ready)} ready); offline: {', '.join(offline_ids)}",
+                    f"{len(online)}/{len(snaps)} online ({len(ready)} ready{q_suffix}); offline: {', '.join(offline_ids)}",
                     "Check Wi-Fi connection and start worker on offline phone(s).",
                 )
             )
@@ -265,7 +268,7 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                 CheckResult(
                     "Cluster Nodes",
                     "ok",
-                    f"All {len(snaps)}/{len(snaps)} nodes online ({len(ready)} ready for jobs)",
+                    f"All {len(snaps)}/{len(snaps)} nodes online ({len(ready)} ready for jobs{q_suffix})",
                 )
             )
 

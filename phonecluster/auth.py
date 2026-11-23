@@ -67,11 +67,24 @@ class AuthRateLimiter:
                 self._blocked_until.pop(client_ip, None)
         return False, 0
 
+    def _prune_locked(self, now: float) -> None:
+        """Bound in-memory IP tracking tables on long-running low-RAM controllers."""
+        if len(self._failures) > 512:
+            cutoff = now - self.window_sec
+            stale = [ip for ip, dq in self._failures.items() if not dq or dq[-1] < cutoff]
+            for ip in stale:
+                self._failures.pop(ip, None)
+        if len(self._blocked_until) > 512:
+            expired = [ip for ip, until in self._blocked_until.items() if until <= now]
+            for ip in expired:
+                self._blocked_until.pop(ip, None)
+
     def record_failure(self, client_ip: str) -> bool:
         """Record one failed auth attempt; returns True if the IP is now blocked."""
         now = time.monotonic()
         cutoff = now - self.window_sec
         with self._lock:
+            self._prune_locked(now)
             dq = self._failures.setdefault(client_ip, collections.deque())
             while dq and dq[0] < cutoff:
                 dq.popleft()

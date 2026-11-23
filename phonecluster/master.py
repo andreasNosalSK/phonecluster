@@ -23,7 +23,9 @@ from .config import (
     format_host_for_url,
     format_host_port,
     is_loopback_or_unspecified_host,
+    normalize_host,
 )
+from .discovery import detect_local_ip
 from .gateway import build_worker_proxy_env
 from .routing import (
     build_cluster_dns_hosts,
@@ -54,6 +56,18 @@ class NodeSnapshot:
     @property
     def ready_for_jobs(self) -> bool:
         return self.online and bool(self.health.get("ready_for_jobs", False))
+
+    @property
+    def healthy_for_scheduling(self) -> bool:
+        """True if online and not thermally/RAM-throttled (ignores stale `busy` flag during live tracking)."""
+        if not self.online:
+            return False
+        if bool(self.health.get("ready_for_jobs", False)):
+            return True
+        reasons = self.health.get("not_ready_reasons")
+        if isinstance(reasons, list) and reasons:
+            return all(str(r).startswith("busy") for r in reasons)
+        return False
 
     @property
     def active_jobs(self) -> int:
@@ -161,11 +175,15 @@ class JobOutcome:
         }
 
 
-def score_node(snapshot: NodeSnapshot, in_flight_local: int = 0, max_temp_c: float = 40.0) -> float:
+def score_node(
+    snapshot: NodeSnapshot, in_flight_local: int | None = None, max_temp_c: float = 40.0
+) -> float:
     """Rank healthy nodes so cooler, faster, less-loaded phones get picked first."""
     if not snapshot.online:
         return -1e9
-    effective_active = max(snapshot.active_jobs, in_flight_local)
+    effective_active = (
+        max(0, in_flight_local) if in_flight_local is not None else snapshot.active_jobs
+    )
     free_slots = snapshot.max_concurrency - effective_active
     if free_slots <= 0:
         return -1e6
@@ -269,7 +287,9 @@ class MasterController:
         self.gateway_port_override: int | None = None
 
     def _headers_for(self, node: NodeConfig) -> dict[str, str]:
-        return build_auth_headers(self.config.token_for_node(node))
+        with self.config_lock:
+            tok = self.config.token_for_node(node)
+        return build_auth_headers(tok)
 
     def _quarantined_ids(self) -> set[str]:
         with self.config_lock:
@@ -366,9 +386,10 @@ class MasterController:
     ) -> JobSpec:
         """Return a copy of `spec` enriched with cross-tier mesh + optional per-worker gateway proxy env."""
         merged = dict(cross_env)
-        proxy_env = build_worker_proxy_env(
-            self.config, node, port_override=self.gateway_port_override
-        )
+        with self.config_lock:
+            proxy_env = build_worker_proxy_env(
+                self.config, node, port_override=self.gateway_port_override
+            )
         if proxy_env:
             merged.update(proxy_env)
         if spec.env:
@@ -609,6 +630,7 @@ class MasterController:
         max_workers = max(
             1,
             sum(n.max_concurrency for n in self._filter_nodes(tags)),
+            sum(s.max_concurrency for s in snapshots if s.online),
         )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -675,6 +697,7 @@ class MasterController:
                         timeout=0.25,
                         return_when=concurrent.futures.FIRST_COMPLETED,
                     )
+                    needs_refresh = False
                     for fut in done:
                         spec, snap, attempt, failed_nodes, reason = running_futures.pop(fut)
                         in_flight_per_node[snap.node.id] = max(
@@ -685,8 +708,7 @@ class MasterController:
                         if kind == "retryable" and attempt <= retries:
                             failed_nodes.add(snap.node.id)
                             pending.appendleft((spec, attempt, failed_nodes))
-                            # Refresh health immediately since a node likely throttled or dropped
-                            _refresh_health()
+                            needs_refresh = True
                             continue
 
                         tier, pool_name = resolve_node_tier_and_pool(snap.node, snap.health)
@@ -704,6 +726,9 @@ class MasterController:
                         completed_count += 1
                         if on_result is not None:
                             on_result(outcome, completed_count, total_jobs)
+                    if needs_refresh:
+                        # Refresh health once per completed batch since a node throttled or dropped
+                        _refresh_health()
                 elif pending and not dispatched_any:
                     # No jobs running and no compatible node currently ready (all hot/offline)
                     if no_ready_since is None:
@@ -898,6 +923,17 @@ class MasterController:
             if len(outcomes) > 1:
                 rec["outcomes"] = [o.to_dict() for o in outcomes]
                 rec["stdout"] = "\n".join(f"[{o.node_id}] {o.stdout.rstrip()}" for o in outcomes)
+                errs = [f"[{o.node_id}] {o.stderr.rstrip()}" for o in outcomes if o.stderr.strip()]
+                if errs:
+                    rec["stderr"] = "\n".join(errs)
+                err_msgs = [f"[{o.node_id}] {o.error}" for o in outcomes if o.error]
+                if err_msgs:
+                    rec["error"] = "; ".join(err_msgs)
+                if not step_ok:
+                    first_fail = next((o for o in outcomes if not o.ok), primary)
+                    rec["returncode"] = first_fail.returncode
+                    rec["timed_out"] = any(o.timed_out for o in outcomes)
+                    rec["cancelled"] = any(o.cancelled for o in outcomes)
             results.append(rec)
 
             clean_out = rec["stdout"].replace("\x00", "").strip()
@@ -905,7 +941,7 @@ class MasterController:
             prev_node = primary.node_id
             prev_tier = primary.node_tier
             prev_pool = primary.node_pool
-            prev_rc = primary.returncode
+            prev_rc = int(rec.get("returncode", primary.returncode))
             prior_step_env[f"PHONECLUSTER_STEP_{idx}_STDOUT"] = clean_out[:16384]
             prior_step_env[f"PHONECLUSTER_STEP_{idx}_NODE"] = primary.node_id
 
@@ -1202,7 +1238,7 @@ class MasterController:
         def _probe_one(node: NodeConfig) -> dict[str, Any]:
             spec = JobSpec(
                 index=0,
-                job_id=f"wancheck-{node.id}",
+                job_id=f"wancheck-{node.id}-{uuid.uuid4().hex[:6]}",
                 script_content=probe_code,
                 script_name="wan_check.py",
                 interpreter="python3",
@@ -1332,10 +1368,19 @@ class MasterController:
         with self.config_lock:
             s = self.config.safety
             net = self.config.network
-            master_node = next((n for n in self.config.nodes if n.role == "master"), self.config.nodes[0])
+            master_node = next(
+                (n for n in self.config.nodes if n.role == "master"),
+                self.config.nodes[0] if self.config.nodes else None,
+            )
             allowed_ips = list(net.allowed_master_ips)
-            if master_node.host and master_node.host not in allowed_ips:
-                allowed_ips.append(master_node.host)
+            if master_node is not None and master_node.host:
+                m_host = normalize_host(master_node.host)
+                if m_host and m_host not in allowed_ips:
+                    allowed_ips.append(m_host)
+                if is_loopback_or_unspecified_host(m_host) and not is_loopback_or_unspecified_host(node.host):
+                    lan_ip = normalize_host(detect_local_ip())
+                    if lan_ip and not is_loopback_or_unspecified_host(lan_ip) and lan_ip not in allowed_ips:
+                        allowed_ips.append(lan_ip)
             payload = {
                 "target_node_id": node.id,
                 "max_concurrency": node.max_concurrency,

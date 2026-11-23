@@ -319,10 +319,14 @@ class GatewayAuditLog:
 
 
 def _read_http_head(conn: socket.socket, timeout_sec: float = 10.0) -> bytes | None:
-    """Read an HTTP request head up to `\\r\\n\\r\\n` with strict byte limit."""
-    conn.settimeout(timeout_sec)
+    """Read an HTTP request head up to `\\r\\n\\r\\n` with strict byte limit and total deadline."""
+    deadline = time.monotonic() + max(0.5, timeout_sec)
     buf = bytearray()
     while b"\r\n\r\n" not in buf:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            return None
+        conn.settimeout(rem)
         chunk = conn.recv(4096)
         if not chunk:
             return None
@@ -367,6 +371,7 @@ def _relay_bidirectional(
     upstream_sock: socket.socket,
     idle_timeout: float,
     stop_event: threading.Event,
+    abort_check: Any | None = None,
 ) -> tuple[int, int]:
     """Relay bytes between client and upstream sockets with proper TCP half-close handling."""
     bytes_in = 0
@@ -377,11 +382,13 @@ def _relay_bidirectional(
     open_readers = [client_sock, upstream_sock]
 
     while open_readers and not stop_event.is_set():
+        if abort_check is not None and abort_check():
+            break
         try:
             readable, _, errored = select.select(open_readers, [], open_readers, 0.5)
         except (OSError, ValueError):
             break
-        if errored:
+        if errored or (abort_check is not None and abort_check()):
             break
         if not readable:
             if time.monotonic() - last_activity >= idle_timeout:
@@ -435,6 +442,7 @@ def _relay_chunked_request_body(
     buf = bytearray(initial)
     total_body = 0
     bytes_forwarded = 0
+    saw_final_chunk = False
     conn.settimeout(idle_timeout)
 
     def _fill_until(needle: bytes, max_line: int = 8192) -> bool:
@@ -449,7 +457,7 @@ def _relay_chunked_request_body(
 
     while not stop_event.is_set():
         if not _fill_until(b"\r\n"):
-            break
+            raise OSError("truncated chunked request body")
         line_end = buf.find(b"\r\n")
         size_line = bytes(buf[: line_end + 2])
         del buf[: line_end + 2]
@@ -469,13 +477,14 @@ def _relay_chunked_request_body(
             # Forward optional trailers until terminating CRLF
             while not stop_event.is_set():
                 if not _fill_until(b"\r\n"):
-                    break
+                    raise OSError("truncated chunked trailers")
                 tr_end = buf.find(b"\r\n")
                 tr_line = bytes(buf[: tr_end + 2])
                 del buf[: tr_end + 2]
                 upstream.sendall(tr_line)
                 bytes_forwarded += len(tr_line)
                 if tr_line == b"\r\n":
+                    saw_final_chunk = True
                     break
             break
 
@@ -494,6 +503,8 @@ def _relay_chunked_request_body(
             bytes_forwarded += take
             need -= take
 
+    if not saw_final_chunk:
+        raise OSError("incomplete chunked request body")
     return bytes_forwarded
 
 
@@ -516,9 +527,44 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
         self.rate_limiter = AuthRateLimiter(max_failures=15, window_sec=60.0, block_sec=60.0)
         self._node_req_lock = threading.Lock()
         self._node_req_times: dict[str, collections.deque[float]] = {}
+        self._active_conns_lock = threading.Lock()
+        self._active_node_sockets: dict[str, set[socket.socket]] = {}
         if ":" in str(addr[0]):
             self.address_family = socket.AF_INET6
         super().__init__(addr, _NetworkGuardHandler)
+
+    def register_node_sockets(self, node_id: str, *socks: socket.socket) -> None:
+        with self._active_conns_lock:
+            bucket = self._active_node_sockets.setdefault(node_id, set())
+            for s in socks:
+                bucket.add(s)
+
+    def unregister_node_sockets(self, node_id: str, *socks: socket.socket) -> None:
+        with self._active_conns_lock:
+            bucket = self._active_node_sockets.get(node_id)
+            if not bucket:
+                return
+            for s in socks:
+                bucket.discard(s)
+            if not bucket:
+                self._active_node_sockets.pop(node_id, None)
+
+    def disconnect_node(self, node_id: str) -> int:
+        """Immediately sever all active proxy/CONNECT tunnels belonging to `node_id` (e.g. on quarantine)."""
+        with self._active_conns_lock:
+            socks = list(self._active_node_sockets.pop(node_id, set()))
+        closed = 0
+        for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+                closed += 1
+            except OSError:
+                pass
+        return closed
 
     def check_node_rate_limit(self, node_id: str) -> tuple[bool, int]:
         """Enforce per-worker sliding-window requests/minute quota (`0` = unlimited)."""
@@ -545,7 +591,11 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
             self.rate_limiter.record_failure(client_ip)
             return None, "missing Proxy-Authorization"
         node_id, password = creds
-        node = next((n for n in self.cluster_config.nodes if n.id == node_id), None)
+        nodes_snapshot = list(self.cluster_config.nodes)
+        node = next((n for n in nodes_snapshot if n.id == node_id), None)
+        if node is None and "%" in node_id:
+            unquoted_id = urllib.parse.unquote(node_id)
+            node = next((n for n in nodes_snapshot if n.id == unquoted_id), None)
         if node is None:
             self.rate_limiter.record_failure(client_ip)
             return None, f"unknown node '{node_id}'"
@@ -759,6 +809,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             if upstream is None:
                 raise last_conn_err or OSError("unable to connect to upstream")
 
+            self.server.register_node_sockets(node_id, conn, upstream)
             if method_u == "CONNECT":
                 conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 response_started = True
@@ -766,16 +817,61 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     upstream.sendall(leftover)
                     bytes_out += len(leftover)
                 r_in, r_out = _relay_bidirectional(
-                    conn, upstream, idle_timeout=gw.idle_timeout_sec, stop_event=self.server.stop_event
+                    conn,
+                    upstream,
+                    idle_timeout=gw.idle_timeout_sec,
+                    stop_event=self.server.stop_event,
+                    abort_check=lambda: node_id in self.server.cluster_config.gateway.quarantined_nodes,
                 )
                 bytes_in += r_in
                 bytes_out += r_out
             else:
+                # Reject ambiguous HTTP request framing (RFC 9112 smuggling defense: CL+TE or conflicting CL)
+                cl_values = [v.strip() for k, v in header_pairs if k.lower() == "content-length"]
+                te_values = [v.strip() for k, v in header_pairs if k.lower() == "transfer-encoding"]
+                if te_values and cl_values:
+                    _send_proxy_error(conn, 400, "Bad Request", "conflicting Transfer-Encoding and Content-Length")
+                    return
+                is_chunked = any("chunked" in v.lower() for v in te_values)
+                if te_values and not is_chunked:
+                    _send_proxy_error(conn, 501, "Not Implemented", "unsupported Transfer-Encoding")
+                    return
+                content_len = 0
+                if cl_values:
+                    if len(set(cl_values)) > 1:
+                        _send_proxy_error(conn, 400, "Bad Request", "conflicting duplicate Content-Length headers")
+                        return
+                    try:
+                        content_len = int(cl_values[0])
+                        if content_len < 0:
+                            raise ValueError("negative")
+                    except ValueError:
+                        _send_proxy_error(conn, 400, "Bad Request", "invalid Content-Length header")
+                        return
+                if content_len > MAX_HTTP_BODY_BYTES:
+                    _send_proxy_error(conn, 413, "Payload Too Large", "request body exceeds limit")
+                    return
+
                 # Strip Proxy-* / hop-by-hop headers so worker credentials NEVER leak upstream!
+                conn_tokens = {
+                    tok.strip().lower()
+                    for k, v in header_pairs
+                    if k.lower() == "connection"
+                    for tok in v.split(",")
+                    if tok.strip()
+                }
+                hop_headers = {
+                    "connection",
+                    "keep-alive",
+                    "te",
+                    "trailers",
+                    "upgrade",
+                    "expect",
+                } | conn_tokens
                 out_headers = [
                     f"{k}: {v}"
                     for k, v in header_pairs
-                    if k.lower() not in {"proxy-authorization", "proxy-connection", "connection", "expect"}
+                    if not k.lower().startswith("proxy-") and k.lower() not in hop_headers
                 ]
                 if "host" not in headers_lower:
                     host_hdr = (
@@ -790,17 +886,6 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     + "\r\n".join(out_headers)
                     + "\r\n\r\n"
                 ).encode("iso-8859-1", errors="replace")
-
-                is_chunked = "chunked" in headers_lower.get("transfer-encoding", "").lower()
-                content_len = 0
-                if not is_chunked and "content-length" in headers_lower:
-                    try:
-                        content_len = max(0, int(headers_lower["content-length"]))
-                    except ValueError:
-                        content_len = 0
-                if content_len > MAX_HTTP_BODY_BYTES:
-                    _send_proxy_error(conn, 413, "Payload Too Large", "request body exceeds limit")
-                    return
 
                 upstream.sendall(req_head)
                 bytes_out += len(req_head)
@@ -821,11 +906,12 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                         code = 413 if "limit" in str(exc) else 400
                         _send_proxy_error(conn, code, "Bad Request" if code == 400 else "Payload Too Large", str(exc))
                         return
-                else:
-                    if leftover:
-                        upstream.sendall(leftover)
-                        bytes_out += len(leftover)
-                    remaining = max(0, content_len - len(leftover))
+                elif content_len > 0:
+                    initial_body = leftover[:content_len]
+                    if initial_body:
+                        upstream.sendall(initial_body)
+                        bytes_out += len(initial_body)
+                    remaining = max(0, content_len - len(initial_body))
                     conn.settimeout(gw.idle_timeout_sec)
                     while remaining > 0 and not self.server.stop_event.is_set():
                         chunk = conn.recv(min(RELAY_CHUNK_BYTES, remaining))
@@ -838,6 +924,8 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 # Relay upstream HTTP response back to worker
                 upstream.settimeout(gw.idle_timeout_sec)
                 while not self.server.stop_event.is_set():
+                    if node_id in self.server.cluster_config.gateway.quarantined_nodes:
+                        break
                     resp_chunk = upstream.recv(RELAY_CHUNK_BYTES)
                     if not resp_chunk:
                         break
@@ -872,6 +960,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 _send_proxy_error(conn, 502, "Bad Gateway", str(exc))
         finally:
             if upstream is not None:
+                self.server.unregister_node_sockets(node_id, conn, upstream)
                 try:
                     upstream.close()
                 except OSError:
@@ -934,6 +1023,14 @@ class GatewayManager:
                 len(gw.allowed_domains),
             )
             return True, f"started on {gw.bind_host}:{actual_port}"
+
+    def disconnect_node(self, node_id: str) -> int:
+        """Sever any active proxy/CONNECT tunnels for a newly quarantined or removed worker."""
+        with self._lock:
+            srv = self._server
+        if srv is not None:
+            return srv.disconnect_node(node_id)
+        return 0
 
     def stop(self) -> None:
         with self._lock:

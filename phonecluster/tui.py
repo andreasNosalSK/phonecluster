@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any
 
 from .master import JobSpec, MasterController
@@ -569,7 +570,7 @@ def run_top_tui(
             elif key in {"x", "X"} and all_nodes:
                 cmd = _prompt_line("Auto-Route (Smart Tier)> ", old_settings)
                 if cmd:
-                    spec = JobSpec(index=0, job_id=f"auto-{int(time.time())}", command=cmd, timeout_sec=60.0)
+                    spec = JobSpec(index=0, job_id=f"auto-{int(time.time())}-{uuid.uuid4().hex[:6]}", command=cmd, timeout_sec=60.0)
                     outcomes = controller.run_single(spec, target="auto")
                     parts = []
                     for o in outcomes:
@@ -585,7 +586,7 @@ def run_top_tui(
                 target = "all" if key in {"a", "A"} else nodes[selected_idx]["id"]
                 cmd = _prompt_line(f"Run on [{target}]> ", old_settings)
                 if cmd:
-                    spec = JobSpec(index=0, job_id=f"top-{int(time.time())}", command=cmd, timeout_sec=60.0)
+                    spec = JobSpec(index=0, job_id=f"top-{int(time.time())}-{uuid.uuid4().hex[:6]}", command=cmd, timeout_sec=60.0)
                     outcomes = controller.run_single(spec, target=target)
                     parts = []
                     for o in outcomes:

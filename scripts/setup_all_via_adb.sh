@@ -113,7 +113,7 @@ for idx, (score, ser, dev, model, mem_mb, ip) in enumerate(rows):
     host = ip if ip else f"192.168.1.{201 + idx}"
     is_emmc = dev.startswith("merlin")
     weight = 1.2 if role == "master" else (0.8 if is_emmc else 1.0)
-    nodes.append({
+    node_entry = {
         "id": f"node{idx}",
         "host": host,
         "role": role,
@@ -124,7 +124,10 @@ for idx, (score, ser, dev, model, mem_mb, ip) in enumerate(rows):
         "weight": weight,
         "tags": [role, "emmc" if is_emmc else "ufs"],
         "notes": f"{model} ({dev}, {mem_mb} MB RAM, serial {ser})",
-    })
+    }
+    if role == "worker":
+        node_entry["auth_token"] = secrets.token_urlsafe(32)
+    nodes.append(node_entry)
 
 cfg = {
     "cluster_name": "phone-cluster",

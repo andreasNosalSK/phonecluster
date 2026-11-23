@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 import secrets
 import tempfile
@@ -95,25 +96,35 @@ class NodeConfig:
     def from_dict(cls, data: dict[str, Any]) -> "NodeConfig":
         if "id" not in data or "host" not in data:
             raise ValueError(f"Node entry must define 'id' and 'host': {data}")
+        node_id = str(data["id"]).strip()
+        host = str(data["host"]).strip()
+        if not node_id or not host:
+            raise ValueError(f"Node 'id' and 'host' must be non-empty: {data}")
         role = str(data.get("role", "worker")).lower()
         if role not in {"master", "worker"}:
-            raise ValueError(f"Invalid role '{role}' for node '{data['id']}'")
+            raise ValueError(f"Invalid role '{role}' for node '{node_id}'")
+        worker_port = int(data.get("worker_port", DEFAULT_WORKER_PORT))
+        ssh_port = int(data.get("ssh_port", DEFAULT_SSH_PORT))
+        if not (0 <= worker_port <= 65535):
+            raise ValueError(f"worker_port must be 0..65535 for node '{node_id}'")
+        if not (1 <= ssh_port <= 65535):
+            raise ValueError(f"ssh_port must be 1..65535 for node '{node_id}'")
         max_conc = int(data.get("max_concurrency", 2))
         if max_conc < 1:
-            raise ValueError(f"max_concurrency must be >= 1 for node '{data['id']}'")
+            raise ValueError(f"max_concurrency must be >= 1 for node '{node_id}'")
         weight = float(data.get("weight", 1.0))
-        if weight <= 0:
-            raise ValueError(f"weight must be > 0 for node '{data['id']}'")
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError(f"weight must be a finite number > 0 for node '{node_id}'")
         tier = int(data.get("tier", 0))
         if tier not in {0, 1, 2, 3}:
-            raise ValueError(f"tier must be 0 (auto), 1, 2, or 3 for node '{data['id']}'")
+            raise ValueError(f"tier must be 0 (auto), 1, 2, or 3 for node '{node_id}'")
         pool = str(data.get("pool", "auto")).strip().lower() or "auto"
         return cls(
-            id=str(data["id"]),
-            host=str(data["host"]),
+            id=node_id,
+            host=host,
             role=role,
-            worker_port=int(data.get("worker_port", DEFAULT_WORKER_PORT)),
-            ssh_port=int(data.get("ssh_port", DEFAULT_SSH_PORT)),
+            worker_port=worker_port,
+            ssh_port=ssh_port,
             ssh_user=str(data.get("ssh_user", "")),
             max_concurrency=max_conc,
             weight=weight,
@@ -150,8 +161,12 @@ class SafetyConfig:
             webhook_cooldown_sec=int(data.get("webhook_cooldown_sec", 900)),
             battery_webhook_url=str(data.get("battery_webhook_url", "")),
         )
+        if not (math.isfinite(cfg.max_temp_c) and math.isfinite(cfg.resume_temp_c)):
+            raise ValueError("safety temperatures must be finite numbers")
         if cfg.resume_temp_c > cfg.max_temp_c:
             raise ValueError("safety.resume_temp_c must be <= safety.max_temp_c")
+        if cfg.min_free_ram_mb < 0 or cfg.battery_poll_sec < 1 or cfg.webhook_cooldown_sec < 0:
+            raise ValueError("safety min_free_ram_mb/webhook_cooldown_sec must be >= 0 and battery_poll_sec >= 1")
         if not (0 <= cfg.battery_low_pct < cfg.battery_high_pct <= 100):
             raise ValueError(
                 "safety battery thresholds must satisfy 0 <= low < high <= 100"
@@ -307,6 +322,15 @@ class ClusterConfig:
             if isinstance(raw_svcs, dict)
             else {}
         )
+        default_timeout = int(data.get("default_job_timeout_sec", 600))
+        health_timeout = float(data.get("health_timeout_sec", 3.0))
+        dash_port = int(data.get("dashboard_port", 8080))
+        if default_timeout <= 0:
+            raise ValueError("default_job_timeout_sec must be > 0")
+        if not math.isfinite(health_timeout) or health_timeout <= 0:
+            raise ValueError("health_timeout_sec must be a finite number > 0")
+        if not (0 <= dash_port <= 65535):
+            raise ValueError("dashboard_port must be between 0 and 65535")
         return cls(
             cluster_name=str(data.get("cluster_name", "phonecluster")),
             auth_token=token,
@@ -314,9 +338,9 @@ class ClusterConfig:
             safety=safety,
             gateway=gateway,
             network=network,
-            default_job_timeout_sec=int(data.get("default_job_timeout_sec", 600)),
-            health_timeout_sec=float(data.get("health_timeout_sec", 3.0)),
-            dashboard_port=int(data.get("dashboard_port", 8080)),
+            default_job_timeout_sec=default_timeout,
+            health_timeout_sec=health_timeout,
+            dashboard_port=dash_port,
             dashboard_require_auth=bool(data.get("dashboard_require_auth", False)),
             custom_services=custom_services,
         )

@@ -6,7 +6,9 @@ import collections
 import ipaddress
 import json
 import logging
+import math
 import os
+import re
 import shlex
 import signal
 import socket
@@ -81,55 +83,74 @@ class WorkerState:
         self._last_alert_ts: dict[str, float] = {}
         self._allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
         self._allowed_exact_ips: set[str] = set()
-        self._compile_allowed_clients()
+        exact, nets = self._build_allowed_clients(self.allowed_client_ips)
+        self._allowed_exact_ips = exact
+        self._allowed_networks = nets
 
-    def _compile_allowed_clients(self) -> None:
-        """Expand configured `allowed_client_ips` (exact IPs, CIDRs, or hostnames) cleanly."""
-        self._allowed_exact_ips = set()
-        self._allowed_networks = []
-        for raw in self.allowed_client_ips:
+    @staticmethod
+    def _build_allowed_clients(
+        raw_entries: set[str] | list[str],
+    ) -> tuple[set[str], list[ipaddress.IPv4Network | ipaddress.IPv6Network]]:
+        """Compile exact IPs, CIDRs, and best-effort hostnames WITHOUT holding `self.lock`."""
+        exact_ips: set[str] = set()
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for raw in raw_entries:
             entry = normalize_host(raw)
             if not entry:
                 continue
             if "/" in entry:
                 try:
-                    self._allowed_networks.append(ipaddress.ip_network(entry, strict=False))
+                    networks.append(ipaddress.ip_network(entry, strict=False))
                     continue
                 except ValueError:
                     pass
             try:
                 addr = ipaddress.ip_address(entry)
                 if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-                    self._allowed_exact_ips.add(str(addr.ipv4_mapped))
-                self._allowed_exact_ips.add(str(addr))
+                    exact_ips.add(str(addr.ipv4_mapped))
+                exact_ips.add(str(addr))
                 continue
             except ValueError:
                 pass
             # Best-effort hostname resolution (e.g. `raspberrypi.local`, Tailscale MagicDNS)
-            self._allowed_exact_ips.add(entry)
+            exact_ips.add(entry)
             try:
                 for _fam, _st, _pr, _cn, sa in socket.getaddrinfo(entry, None, type=socket.SOCK_STREAM):
-                    self._allowed_exact_ips.add(normalize_host(str(sa[0])))
+                    exact_ips.add(normalize_host(str(sa[0])))
             except OSError:
                 pass
+        return exact_ips, networks
+
+    def _compile_allowed_clients(self) -> None:
+        """Expand configured `allowed_client_ips` (exact IPs, CIDRs, or hostnames) cleanly."""
+        with self.lock:
+            raw_copy = set(self.allowed_client_ips)
+        exact, nets = self._build_allowed_clients(raw_copy)
+        with self.lock:
+            self._allowed_exact_ips = exact
+            self._allowed_networks = nets
 
     def is_client_ip_allowed(self, client_ip: str) -> bool:
         """Return True if `client_ip` satisfies the optional Master source-IP allowlist."""
-        if not self.allowed_client_ips:
-            return True
+        with self.lock:
+            if not self.allowed_client_ips:
+                return True
+            exact_ips = self._allowed_exact_ips
+            networks = self._allowed_networks
         norm = normalize_host(client_ip)
-        if norm in self._allowed_exact_ips or client_ip in self._allowed_exact_ips:
+        if norm in exact_ips or client_ip in exact_ips:
             return True
-        if self._allowed_networks:
-            try:
-                addr = ipaddress.ip_address(norm)
-                if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-                    addr = addr.ipv4_mapped
-                for net in self._allowed_networks:
-                    if addr.version == net.version and addr in net:
-                        return True
-            except ValueError:
-                pass
+        try:
+            addr = ipaddress.ip_address(norm)
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+                addr = addr.ipv4_mapped
+            if str(addr) in exact_ips:
+                return True
+            for net in networks:
+                if addr.version == net.version and addr in net:
+                    return True
+        except ValueError:
+            pass
         return False
 
     def get_health(self) -> dict[str, Any]:
@@ -343,6 +364,11 @@ class WorkerState:
             else:
                 new_allowed_ips = set()
 
+        compiled_clients: tuple[set[str], list[ipaddress.IPv4Network | ipaddress.IPv6Network]] | None = None
+        if new_allowed_ips is not None:
+            # Resolve hostnames OUTSIDE `self.lock` so slow mDNS never stalls worker /health or /exec
+            compiled_clients = self._build_allowed_clients(new_allowed_ips)
+
         persisted = False
         with self.lock:
             if new_safety is not None:
@@ -350,9 +376,9 @@ class WorkerState:
                 self.thermal_gate.update_limits(new_safety.max_temp_c, new_safety.resume_temp_c)
             if new_max_conc is not None:
                 self.max_concurrency = new_max_conc
-            if new_allowed_ips is not None:
+            if new_allowed_ips is not None and compiled_clients is not None:
                 self.allowed_client_ips = new_allowed_ips
-                self._compile_allowed_clients()
+                self._allowed_exact_ips, self._allowed_networks = compiled_clients
 
             if self.config_path is not None and self.config_path.exists():
                 try:
@@ -495,6 +521,8 @@ def _run_process_bounded(
     out_buf = bytearray()
     err_buf = bytearray()
     overflow = [0, 0]
+    buf_lock = threading.Lock()
+    finished_collecting = threading.Event()
 
     def _drain(stream: Any, target: bytearray, idx: int) -> None:
         if stream is None:
@@ -504,13 +532,16 @@ def _run_process_bounded(
                 chunk = stream.read(32768)
                 if not chunk:
                     break
-                rem = max_bytes - len(target)
-                if rem > 0:
-                    target.extend(chunk[:rem])
-                    if len(chunk) > rem:
-                        overflow[idx] += len(chunk) - rem
-                else:
-                    overflow[idx] += len(chunk)
+                if finished_collecting.is_set():
+                    continue
+                with buf_lock:
+                    rem = max_bytes - len(target)
+                    if rem > 0:
+                        target.extend(chunk[:rem])
+                        if len(chunk) > rem:
+                            overflow[idx] += len(chunk) - rem
+                    else:
+                        overflow[idx] += len(chunk)
         except OSError:
             pass
         finally:
@@ -535,8 +566,13 @@ def _run_process_bounded(
 
     t_out.join(timeout=2.0)
     t_err.join(timeout=2.0)
-    stdout_text = _decode_capped(bytes(out_buf), limit=max_bytes, overflow_bytes=overflow[0])
-    stderr_text = _decode_capped(bytes(err_buf), limit=max_bytes, overflow_bytes=overflow[1])
+    finished_collecting.set()
+    with buf_lock:
+        out_bytes = bytes(out_buf)
+        err_bytes = bytes(err_buf)
+        ov_out, ov_err = overflow[0], overflow[1]
+    stdout_text = _decode_capped(out_bytes, limit=max_bytes, overflow_bytes=ov_out)
+    stderr_text = _decode_capped(err_bytes, limit=max_bytes, overflow_bytes=ov_err)
     if timed_out:
         stderr_text = stderr_text + f"\n[Job timed out after {timeout_sec}s]"
     return returncode, stdout_text, stderr_text, timed_out
@@ -544,7 +580,7 @@ def _run_process_bounded(
 
 def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """Run a shell command or staged inline script with timeout and cancellation."""
-    job_id = str(payload.get("job_id") or uuid.uuid4().hex[:12])
+    job_id = str(payload.get("job_id") or uuid.uuid4().hex[:12]).strip() or uuid.uuid4().hex[:12]
     command = payload.get("command")
     script_content = payload.get("script_content")
     if not command and not script_content:
@@ -552,9 +588,12 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             "error": "Provide either 'command' or 'script_content'."
         }
 
-    timeout_sec = float(payload.get("timeout_sec", 600))
-    if timeout_sec <= 0:
-        return HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be > 0"}
+    try:
+        timeout_sec = float(payload.get("timeout_sec", 600))
+    except (TypeError, ValueError):
+        return HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a finite number > 0"}
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0:
+        return HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a finite number > 0"}
 
     force = bool(payload.get("force", False))
     extra_env = payload.get("env") or {}
@@ -611,8 +650,9 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             else:
                 args = []
 
+            safe_job_prefix = re.sub(r"[^A-Za-z0-9._-]+", "_", job_id).strip("._")[:40] or "job"
             fd, tmp_name = tempfile.mkstemp(
-                prefix=f"pc_{job_id}_", suffix=suffix, dir=str(cwd)
+                prefix=f"pc_{safe_job_prefix}_", suffix=suffix, dir=str(cwd)
             )
             temp_script_path = Path(tmp_name)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -732,12 +772,12 @@ class BatteryGuardLoop(threading.Thread):
                 )
 
     def run(self) -> None:
-        interval = max(5, int(self.state.safety.battery_poll_sec))
         while not self.stop_event.is_set():
             try:
                 self.check_once()
             except Exception as exc:  # pragma: no cover - guard loop resilience
                 LOG.exception("Battery guard check failed: %s", exc)
+            interval = max(5, int(self.state.safety.battery_poll_sec))
             self.stop_event.wait(interval)
 
 
