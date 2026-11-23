@@ -8,7 +8,9 @@ tier can talk to services hosted on every other tier without hardcoded IPs.
 
 from __future__ import annotations
 
+import ipaddress
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -190,6 +192,8 @@ def select_snapshots_for_target(
     if target.startswith("tier:"):
         raw_t = target.split(":", 1)[1].strip()
         want_tier = int(raw_t) if raw_t.isdigit() else 0
+        if want_tier not in {1, 2, 3}:
+            return [], f"Invalid tier target '{target}' (expected tier:1, tier:2, or tier:3)"
         matched = [
             s for s in ready if resolve_node_tier_and_pool(s.node, s.health)[0] == want_tier
         ]
@@ -317,12 +321,18 @@ def build_service_registry(
             )
 
     for cname, curl in sorted(config.custom_services.items()):
+        parsed = urllib.parse.urlparse(curl)
+        c_host = parsed.hostname or ""
+        try:
+            c_port = parsed.port or (443 if parsed.scheme == "https" else (80 if parsed.scheme == "http" else 0))
+        except ValueError:
+            c_port = 0
         entries.append(
             {
                 "name": cname,
                 "node_id": "custom",
-                "host": "",
-                "port": 0,
+                "host": c_host,
+                "port": c_port,
                 "url": curl,
                 "tier": 0,
                 "pool": "custom",
@@ -331,6 +341,14 @@ def build_service_registry(
             }
         )
     return entries
+
+
+def _pick_primary_service(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Prefer a cool/ready service instance over an overheated or busy one."""
+    for item in items:
+        if item.get("ready"):
+            return item
+    return items[0]
 
 
 def build_cross_tier_env(
@@ -342,8 +360,9 @@ def build_cross_tier_env(
     to Tier 2 Mosquitto MQTT or calling Tier 3 Home Assistant without hardcoded IPs).
     """
     env: dict[str, str] = {"PHONECLUSTER_CLUSTER_NAME": config.cluster_name}
-    master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
-    env["PHONECLUSTER_MASTER_HOST"] = master_node.host
+    if config.nodes:
+        master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
+        env["PHONECLUSTER_MASTER_HOST"] = master_node.host
 
     registry = build_service_registry(snapshots, config)
     by_name: dict[str, list[dict[str, Any]]] = {}
@@ -351,34 +370,38 @@ def build_cross_tier_env(
         by_name.setdefault(item["name"], []).append(item)
 
     if "mqtt" in by_name:
-        first = by_name["mqtt"][0]
+        first = _pick_primary_service(by_name["mqtt"])
         env["PHONECLUSTER_MQTT_HOST"] = first["host"]
         env["PHONECLUSTER_MQTT_PORT"] = str(first["port"])
         env["PHONECLUSTER_MQTT_URL"] = first["url"]
     if "homeassistant" in by_name:
-        env["PHONECLUSTER_HOMEASSISTANT_URL"] = by_name["homeassistant"][0]["url"]
+        env["PHONECLUSTER_HOMEASSISTANT_URL"] = _pick_primary_service(by_name["homeassistant"])["url"]
     if "adguard" in by_name:
-        env["PHONECLUSTER_ADGUARD_URL"] = by_name["adguard"][0]["url"]
+        env["PHONECLUSTER_ADGUARD_URL"] = _pick_primary_service(by_name["adguard"])["url"]
     if "dns" in by_name:
-        env["PHONECLUSTER_DNS_HOST"] = by_name["dns"][0]["host"]
+        env["PHONECLUSTER_DNS_HOST"] = _pick_primary_service(by_name["dns"])["host"]
     if "llama_api" in by_name:
-        env["PHONECLUSTER_LLAMA_API_URL"] = by_name["llama_api"][0]["url"]
+        env["PHONECLUSTER_LLAMA_API_URL"] = _pick_primary_service(by_name["llama_api"])["url"]
     if "llama_rpc" in by_name:
-        env["PHONECLUSTER_LLAMA_RPC"] = ",".join(
-            f"{e['host']}:{e['port']}" for e in by_name["llama_rpc"] if e["ready"]
-        )
+        rpc_eps = [f"{e['host']}:{e['port']}" for e in by_name["llama_rpc"] if e.get("ready")]
+        if rpc_eps:
+            env["PHONECLUSTER_LLAMA_RPC"] = ",".join(rpc_eps)
     if "redis" in by_name:
-        env["PHONECLUSTER_REDIS_URL"] = by_name["redis"][0]["url"]
+        env["PHONECLUSTER_REDIS_URL"] = _pick_primary_service(by_name["redis"])["url"]
     if "postgres" in by_name:
-        env["PHONECLUSTER_POSTGRES_HOST"] = by_name["postgres"][0]["host"]
+        env["PHONECLUSTER_POSTGRES_HOST"] = _pick_primary_service(by_name["postgres"])["host"]
 
-    # Pool host lists so any node can reach peers in other tiers
+    # Pool host lists so any node can reach peers in other tiers (ready nodes listed first)
     pool_hosts: dict[str, list[str]] = {}
-    for snap in snapshots:
-        if not snap.online:
-            continue
+    ordered_snaps = sorted(
+        (s for s in snapshots if s.online),
+        key=lambda s: (0 if s.ready_for_jobs else 1, s.node.id),
+    )
+    for snap in ordered_snaps:
         _t, pool = resolve_node_tier_and_pool(snap.node, snap.health)
-        pool_hosts.setdefault(pool, []).append(snap.node.host)
+        hosts = pool_hosts.setdefault(pool, [])
+        if snap.node.host not in hosts:
+            hosts.append(snap.node.host)
     for pool_name, hosts in sorted(pool_hosts.items()):
         key = re.sub(r"[^A-Z0-9]+", "_", pool_name.upper()).strip("_")
         if key:
@@ -392,6 +415,14 @@ def build_cross_tier_env(
     return env
 
 
+def _is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
 def build_cluster_dns_hosts(
     snapshots: list[Any], config: ClusterConfig, domain: str = "cluster"
 ) -> str:
@@ -402,6 +433,8 @@ def build_cluster_dns_hosts(
         lines.append(f"{snap.node.host:<16s} {snap.node.id}.{domain}  # Tier {tier} ({pool})")
 
     registry = build_service_registry(snapshots, config)
+    # Prefer cool/ready auto-discovered services before busy/warm duplicates
+    ordered_registry = sorted(registry, key=lambda e: (0 if e.get("ready") else 1, 0 if e.get("source") == "auto" else 1))
     seen_aliases: set[str] = set()
     alias_map = {
         "mqtt": "mqtt",
@@ -412,11 +445,16 @@ def build_cluster_dns_hosts(
         "redis": "redis",
         "postgres": "db",
     }
-    for item in registry:
+    for item in ordered_registry:
         alias = alias_map.get(item["name"])
         if alias and item["host"] and alias not in seen_aliases:
             seen_aliases.add(alias)
             lines.append(f"{item['host']:<16s} {alias}.{domain}  # {item['name']} on {item['node_id']} (Tier {item['tier']})")
+        elif item.get("source") == "config" and item.get("host") and _is_ip_address(item["host"]):
+            slug = re.sub(r"[^a-z0-9_-]+", "-", str(item["name"]).lower()).strip("-_")
+            if slug and slug not in seen_aliases:
+                seen_aliases.add(slug)
+                lines.append(f"{item['host']:<16s} {slug}.{domain}  # custom service ({item['url']})")
     return "\n".join(lines) + "\n"
 
 

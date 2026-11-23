@@ -442,7 +442,21 @@ class MasterController:
             ]
 
         # Specific node id
-        node = self.config.get_node(target)
+        try:
+            node = self.config.get_node(target)
+        except KeyError:
+            return [
+                JobOutcome(
+                    index=spec.index,
+                    job_id=spec.job_id,
+                    label=spec.label,
+                    node_id=target,
+                    returncode=-1,
+                    duration_sec=0.0,
+                    error=f"Unknown node id '{target}'. Check cluster.json or `pc status`.",
+                    routing_reason=f"Node '{target}' not found in cluster config",
+                )
+            ]
         snap = snap_by_id.get(node.id)
         tier, pool_name = resolve_node_tier_and_pool(
             node, snap.health if snap and snap.online else None
@@ -647,34 +661,97 @@ class MasterController:
 
         For example: Step 1 (Tier 1 compute/AI) -> Step 2 (Tier 2 Debian MQTT/services)
         -> Step 3 (Tier 3 Docker/Home Assistant). Each step automatically receives:
-        - `PHONECLUSTER_PREV_STDOUT` (capped at 32 KiB)
+        - `PHONECLUSTER_PREV_STDOUT` (previous step stdout, NUL-stripped, capped at 32 KiB)
+        - `PHONECLUSTER_STEP_{k}_STDOUT` & `PHONECLUSTER_STEP_{k}_NODE` (all prior steps, capped at 16 KiB each)
         - `PHONECLUSTER_PREV_NODE`, `PHONECLUSTER_PREV_TIER`, `PHONECLUSTER_PREV_POOL`, `PHONECLUSTER_PREV_RC`
         - `PHONECLUSTER_PIPELINE_STEP`, `PHONECLUSTER_PIPELINE_STEP_NAME`
         - Plus all live `PHONECLUSTER_*` cross-tier service discovery variables.
         """
         started = time.monotonic()
         results: list[dict[str, Any]] = []
+        prior_step_env: dict[str, str] = {}
         prev_stdout = ""
         prev_node = ""
         prev_tier = 0
         prev_pool = ""
         prev_rc = 0
         all_ok = True
+        failed_steps = 0
 
         for idx, raw_step in enumerate(steps, start=1):
             name = str(raw_step.get("name") or f"Step {idx}").strip()
             command = str(raw_step.get("command") or "").strip()
-            target = str(raw_step.get("target") or "auto").strip()
+            target = str(raw_step.get("target") or "auto").strip() or "auto"
             workload_hint = str(raw_step.get("workload") or raw_step.get("workload_hint") or "").strip()
-            timeout_sec = float(raw_step.get("timeout_sec") or self.config.default_job_timeout_sec)
-            step_env = {
-                str(k): str(v)
-                for k, v in (raw_step.get("env") or {}).items()
-            }
+            continue_on_err = bool(raw_step.get("continue_on_error", False))
+
+            raw_timeout = raw_step.get("timeout_sec")
+            if raw_timeout in (None, ""):
+                timeout_sec = float(self.config.default_job_timeout_sec)
+            else:
+                try:
+                    timeout_sec = float(raw_timeout)
+                    if timeout_sec <= 0:
+                        raise ValueError("must be > 0")
+                except (TypeError, ValueError):
+                    all_ok = False
+                    failed_steps += 1
+                    results.append(
+                        {
+                            "step_index": idx,
+                            "name": name,
+                            "target": target,
+                            "workload": workload_hint,
+                            "ok": False,
+                            "node_id": "none",
+                            "node_tier": 0,
+                            "node_pool": "",
+                            "routing_reason": "Invalid timeout_sec",
+                            "returncode": -1,
+                            "duration_sec": 0.0,
+                            "stdout": "",
+                            "stderr": "",
+                            "error": f"Invalid timeout_sec '{raw_timeout}' (must be a positive number).",
+                        }
+                    )
+                    if stop_on_error and not continue_on_err:
+                        break
+                    continue
+
+            raw_env = raw_step.get("env")
+            if raw_env is not None and not isinstance(raw_env, dict):
+                all_ok = False
+                failed_steps += 1
+                results.append(
+                    {
+                        "step_index": idx,
+                        "name": name,
+                        "target": target,
+                        "workload": workload_hint,
+                        "ok": False,
+                        "node_id": "none",
+                        "node_tier": 0,
+                        "node_pool": "",
+                        "routing_reason": "Invalid step env",
+                        "returncode": -1,
+                        "duration_sec": 0.0,
+                        "stdout": "",
+                        "stderr": "",
+                        "error": "Pipeline step 'env' must be a JSON object.",
+                    }
+                )
+                if stop_on_error and not continue_on_err:
+                    break
+                continue
+
+            step_env: dict[str, str] = dict(prior_step_env)
+            if isinstance(raw_env, dict):
+                for k, v in raw_env.items():
+                    step_env[str(k)] = str(v)
             step_env["PHONECLUSTER_PIPELINE_STEP"] = str(idx)
             step_env["PHONECLUSTER_PIPELINE_STEP_NAME"] = name
             if idx > 1:
-                step_env["PHONECLUSTER_PREV_STDOUT"] = prev_stdout[:32768]
+                step_env["PHONECLUSTER_PREV_STDOUT"] = prev_stdout.replace("\x00", "")[:32768]
                 step_env["PHONECLUSTER_PREV_NODE"] = prev_node
                 step_env["PHONECLUSTER_PREV_TIER"] = str(prev_tier)
                 step_env["PHONECLUSTER_PREV_POOL"] = prev_pool
@@ -682,6 +759,7 @@ class MasterController:
 
             if not command:
                 all_ok = False
+                failed_steps += 1
                 results.append(
                     {
                         "step_index": idx,
@@ -700,7 +778,7 @@ class MasterController:
                         "error": "Pipeline step requires a non-empty 'command'.",
                     }
                 )
-                if stop_on_error and not bool(raw_step.get("continue_on_error", False)):
+                if stop_on_error and not continue_on_err:
                     break
                 continue
 
@@ -731,21 +809,26 @@ class MasterController:
                 rec["stdout"] = "\n".join(f"[{o.node_id}] {o.stdout.rstrip()}" for o in outcomes)
             results.append(rec)
 
-            prev_stdout = rec["stdout"].strip()
+            clean_out = rec["stdout"].replace("\x00", "").strip()
+            prev_stdout = clean_out
             prev_node = primary.node_id
             prev_tier = primary.node_tier
             prev_pool = primary.node_pool
             prev_rc = primary.returncode
+            prior_step_env[f"PHONECLUSTER_STEP_{idx}_STDOUT"] = clean_out[:16384]
+            prior_step_env[f"PHONECLUSTER_STEP_{idx}_NODE"] = primary.node_id
 
             if not step_ok:
                 all_ok = False
-                if stop_on_error and not bool(raw_step.get("continue_on_error", False)):
+                failed_steps += 1
+                if stop_on_error and not continue_on_err:
                     break
 
         return {
             "ok": all_ok,
             "steps_total": len(steps),
             "steps_completed": len(results),
+            "failed_steps": failed_steps,
             "duration_sec": round(time.monotonic() - started, 3),
             "results": results,
         }
@@ -797,11 +880,13 @@ class MasterController:
     # Workload integration helpers (distcc, llama.cpp RPC, OpenMPI)
     # ------------------------------------------------------------------
 
-    def build_distcc_hosts(self, include_stopped: bool = False) -> str:
+    def build_distcc_hosts(
+        self, include_stopped: bool = False, snapshots: list[NodeSnapshot] | None = None
+    ) -> str:
         """Build a `DISTCC_HOSTS` string from currently healthy cluster nodes."""
-        snapshots = self.poll_health()
+        snaps = snapshots if snapshots is not None else self.poll_health()
         entries: list[str] = []
-        for snap in snapshots:
+        for snap in snaps:
             if not snap.ready_for_jobs:
                 continue
             services = snap.health.get("services", {})
@@ -818,11 +903,16 @@ class MasterController:
                 entries.append(f"{snap.node.host}/{cores},lzo")
         return " ".join(entries)
 
-    def build_llama_rpc_arg(self, port: int = 50052, include_master: bool = False) -> str:
+    def build_llama_rpc_arg(
+        self,
+        port: int = 50052,
+        include_master: bool = False,
+        snapshots: list[NodeSnapshot] | None = None,
+    ) -> str:
         """Build a comma-separated `--rpc` endpoint list for healthy llama.cpp workers."""
-        snapshots = self.poll_health()
+        snaps = snapshots if snapshots is not None else self.poll_health()
         endpoints: list[str] = []
-        for snap in snapshots:
+        for snap in snaps:
             if not snap.ready_for_jobs:
                 continue
             if not include_master and snap.node.role == "master":
@@ -831,11 +921,11 @@ class MasterController:
                 endpoints.append(f"{snap.node.host}:{port}")
         return ",".join(endpoints)
 
-    def build_mpi_hostfile(self) -> str:
+    def build_mpi_hostfile(self, snapshots: list[NodeSnapshot] | None = None) -> str:
         """Generate an OpenMPI hostfile containing all currently healthy nodes."""
-        snapshots = self.poll_health()
+        snaps = snapshots if snapshots is not None else self.poll_health()
         lines: list[str] = []
-        for snap in snapshots:
+        for snap in snaps:
             if not snap.ready_for_jobs:
                 continue
             cores = max(1, int(snap.health.get("cpu_cores", 4)))
@@ -945,15 +1035,37 @@ class MasterController:
             self.metrics_history.record(summary)
         return summary
 
-    def get_services_info(self) -> dict[str, Any]:
+    def get_services_info(
+        self, snapshots: list[NodeSnapshot] | None = None
+    ) -> dict[str, Any]:
         """Return live cross-tier service registry, `.env` vars, and DNS hosts block."""
-        snapshots = self.poll_health()
+        snaps = snapshots if snapshots is not None else self.poll_health()
         return {
-            "pools": summarize_pools(snapshots),
-            "services": build_service_registry(snapshots, self.config),
-            "env": build_cross_tier_env(snapshots, self.config),
-            "dns_hosts": build_cluster_dns_hosts(snapshots, self.config),
+            "pools": summarize_pools(snaps),
+            "services": build_service_registry(snaps, self.config),
+            "env": build_cross_tier_env(snaps, self.config),
+            "dns_hosts": build_cluster_dns_hosts(snaps, self.config),
         }
+
+    @staticmethod
+    def probe_tcp_endpoint(
+        host: str, port: int, timeout_sec: float = 1.5
+    ) -> dict[str, Any]:
+        """Measure TCP reachability & latency to a registered service mesh endpoint."""
+        t0 = time.monotonic()
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout_sec):
+                ms = round((time.monotonic() - t0) * 1000.0, 1)
+                return {"reachable": True, "latency_ms": ms, "host": host, "port": int(port)}
+        except OSError as exc:
+            ms = round((time.monotonic() - t0) * 1000.0, 1)
+            return {
+                "reachable": False,
+                "latency_ms": ms,
+                "host": host,
+                "port": int(port),
+                "error": str(exc),
+            }
 
     def exec_terminal_command(
         self,

@@ -307,7 +307,9 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
     try:
         env = os.environ.copy()
         for k, v in extra_env.items():
-            env[str(k)] = str(v)
+            clean_k = str(k).replace("\x00", "").strip()
+            if clean_k and "=" not in clean_k:
+                env[clean_k] = str(v).replace("\x00", "")
         env["PHONECLUSTER_NODE_ID"] = state.node_id
         env["PHONECLUSTER_JOB_ID"] = job_id
 
@@ -369,7 +371,7 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             returncode = -9
             stdout_text = _decode_capped(out_bytes)
             stderr_text = _decode_capped(err_bytes) + f"\n[Job timed out after {timeout_sec}s]"
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         stderr_text = f"Execution error: {exc}"
         returncode = 127
     finally:

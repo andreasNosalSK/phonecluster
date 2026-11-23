@@ -83,7 +83,10 @@ Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
 | `POST /api/exec` | Bearer | Run a single command (`target`: `auto` default, `tier:1\|2\|3`, `pool:<name>`, `best`, `all`, or `node_id`) |
 | `POST /api/terminal/exec` | Bearer | Run an interactive Web Terminal command with smart auto-routing & persistent `cwd` (`cd` support) |
 | `POST /api/map` | Bearer | Run a parallel batch of shell commands or inline script + args (supports `target` & `workload_hint`) |
-| `POST /api/pipeline` | Bearer | Execute a multi-step cross-tier pipeline chaining outputs (`PHONECLUSTER_PREV_STDOUT`) across Tier 1/2/3 |
+| `POST /api/pipeline` | Bearer | Execute a multi-step cross-tier pipeline chaining outputs (`PHONECLUSTER_PREV_STDOUT` & `PHONECLUSTER_STEP_{N}_STDOUT`) across Tier 1/2/3 |
+| `POST /api/services/custom` | Bearer | Register a custom service (`name`, `url`) in the Cross-Tier Service Mesh and save atomically |
+| `POST /api/services/custom/remove` | Bearer | Remove a custom service from the Service Mesh |
+| `POST /api/services/probe` | Bearer | Measure TCP reachability & latency to a registered Service Mesh endpoint |
 | `POST /api/jobs/cancel` | Bearer | Cancel a running job on a specific `node_id` |
 | `POST /api/workloads/action` | Bearer | Start/stop `distcc` or `llama-rpc` across all ready phones |
 | `POST /api/nodes/add` | Bearer | Add a discovered or manual worker phone (with optional `tier` & `pool`) into `config/cluster.json` |

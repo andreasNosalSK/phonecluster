@@ -1122,8 +1122,20 @@ class TestHeterogeneousMultiTierCluster(unittest.TestCase):
 
         svc_info = self.controller.get_services_info()
         hosts_txt = svc_info["dns_hosts"]
-        for expected_alias in ("mqtt.cluster", "ha.cluster", "adguard.cluster", "ai.cluster", "t1_compute.cluster"):
+        for expected_alias in (
+            "mqtt.cluster",
+            "ha.cluster",
+            "adguard.cluster",
+            "ai.cluster",
+            "t1_compute.cluster",
+            "custom_api.cluster",
+        ):
             self.assertIn(expected_alias, hosts_txt)
+
+        # Verify custom service URL host & port are parsed properly
+        custom_entry = next(s for s in svc_info["services"] if s["name"] == "custom_api")
+        self.assertEqual(custom_entry["host"], "192.168.1.209")
+        self.assertEqual(custom_entry["port"], 9000)
 
     def test_mixed_parallel_map_and_cross_tier_pipeline(self) -> None:
         # Mixed parallel map auto-routes each job to its exact Tier in one batch
@@ -1155,17 +1167,132 @@ class TestHeterogeneousMultiTierCluster(unittest.TestCase):
                 {
                     "name": "Step 3 Docker HA",
                     "target": "tier:3",
-                    "command": 'echo "final:$PHONECLUSTER_PREV_STDOUT:ha=$PHONECLUSTER_HOMEASSISTANT_URL"',
+                    "command": 'echo "final:$PHONECLUSTER_PREV_STDOUT|step1=$PHONECLUSTER_STEP_1_STDOUT|ha=$PHONECLUSTER_HOMEASSISTANT_URL"',
                 },
             ]
         )
         self.assertTrue(pipe["ok"], pipe)
         self.assertEqual(pipe["steps_completed"], 3)
+        self.assertEqual(pipe["failed_steps"], 0)
         self.assertEqual(pipe["results"][0]["node_id"], "t1_compute")
         self.assertEqual(pipe["results"][1]["node_id"], "t2_services")
         self.assertEqual(pipe["results"][2]["node_id"], "t3_docker")
         self.assertIn("relay:inference=sunny:from=t1_compute:mqtt=1883", pipe["results"][1]["stdout"])
+        self.assertIn("step1=inference=sunny", pipe["results"][2]["stdout"])
         self.assertIn("ha=http://127.0.0.1:8123", pipe["results"][2]["stdout"])
+
+    def test_pipeline_resilience_edge_cases_and_custom_service_api(self) -> None:
+        # 1. Unknown node target, bad timeout, bad env, NUL bytes in stdout, continue_on_error
+        res = self.controller.run_pipeline(
+            [
+                {
+                    "name": "Missing Node",
+                    "target": "ghost_phone_99",
+                    "command": "echo hi",
+                    "continue_on_error": True,
+                },
+                {
+                    "name": "Bad Timeout",
+                    "target": "tier:1",
+                    "timeout_sec": -10,
+                    "command": "echo hi",
+                    "continue_on_error": True,
+                },
+                {
+                    "name": "Bad Env Type",
+                    "target": "tier:1",
+                    "env": ["not-a-dict"],
+                    "command": "echo hi",
+                    "continue_on_error": True,
+                },
+                {
+                    "name": "NUL Byte Producer",
+                    "target": "tier:1",
+                    "command": "python3 -c \"import sys; sys.stdout.write('safe\\x00value')\"",
+                },
+                {
+                    "name": "NUL Consumer",
+                    "target": "tier:2",
+                    "command": 'echo "clean:$PHONECLUSTER_PREV_STDOUT"',
+                },
+            ]
+        )
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["steps_completed"], 5)
+        self.assertEqual(res["failed_steps"], 3)
+        self.assertIn("Unknown node id", res["results"][0]["error"])
+        self.assertIn("Invalid timeout_sec", res["results"][1]["error"])
+        self.assertIn("JSON object", res["results"][2]["error"])
+        self.assertTrue(res["results"][3]["ok"])
+        self.assertTrue(res["results"][4]["ok"])
+        self.assertIn("clean:safevalue", res["results"][4]["stdout"])
+
+        # 2. Dashboard /api/services/custom, /api/services/custom/remove, /api/services/probe (incl. SSRF guard)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cluster.json"
+            save_config(self.config, cfg_path)
+            dash = DashboardHTTPServer(
+                ("127.0.0.1", 0),
+                self.controller,
+                config_path=cfg_path,
+                enable_pairing_beacon=False,
+            )
+            port = dash.server_address[1]
+            t = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            t.start()
+            try:
+                # Register a custom service pointing to a live local worker port so probe succeeds!
+                live_w_port = self.config.get_node("t1_compute").worker_port
+                req_add = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/services/custom",
+                    data=json.dumps({"name": "portainer", "url": f"http://127.0.0.1:{live_w_port}"}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_add, timeout=5.0) as resp:
+                    add_res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(add_res["name"], "portainer")
+                self.assertEqual(load_config(cfg_path).custom_services["portainer"], f"http://127.0.0.1:{live_w_port}")
+
+                # Valid probe against registered service endpoint succeeds
+                req_probe = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/services/probe",
+                    data=json.dumps({"host": "127.0.0.1", "port": live_w_port}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_probe, timeout=5.0) as resp:
+                    p_ok = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(p_ok["reachable"])
+
+                # Unregistered arbitrary host/port probe MUST be rejected with 403 (SSRF protection)
+                req_ssrf = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/services/probe",
+                    data=json.dumps({"host": "127.0.0.1", "port": 22222}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req_ssrf, timeout=5.0)
+                try:
+                    self.assertEqual(ctx.exception.code, 403)
+                finally:
+                    ctx.exception.close()
+
+                # Remove custom service
+                req_rm = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/services/custom/remove",
+                    data=json.dumps({"name": "portainer"}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_rm, timeout=5.0) as resp:
+                    rm_res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(rm_res["removed"], "portainer")
+                self.assertNotIn("portainer", load_config(cfg_path).custom_services)
+            finally:
+                dash.shutdown()
+                dash.server_close()
 
     def test_dashboard_api_services_pipeline_node_update_and_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

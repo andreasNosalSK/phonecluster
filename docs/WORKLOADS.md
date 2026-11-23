@@ -63,7 +63,7 @@ eval "$(pc services --env)"         # Export $PHONECLUSTER_MQTT_HOST, $PHONECLUS
 pc services --hosts                 # Paste into AdGuard Home DNS Rewrites or /etc/hosts (mqtt.cluster, ha.cluster...)
 pc pipeline examples/cross_tier_pipeline.json   # Run Tier 1 -> Tier 2 -> Tier 3 chained workflow
 ```
-In pipelines, every step automatically receives `$PHONECLUSTER_PREV_STDOUT`, `$PHONECLUSTER_PREV_NODE`, `$PHONECLUSTER_PREV_TIER`, and all live `$PHONECLUSTER_*` service URLs!
+In pipelines, every step automatically receives `$PHONECLUSTER_PREV_STDOUT`, `$PHONECLUSTER_STEP_{N}_STDOUT` (all earlier steps), `$PHONECLUSTER_PREV_NODE`, `$PHONECLUSTER_PREV_TIER`, and all live `$PHONECLUSTER_*` service URLs! You can also build and run pipelines visually without writing JSON in **Web Control Center → Tab 3 (Visual Cross-Tier Pipeline Builder)**.
 
 ---
 

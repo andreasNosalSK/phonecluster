@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import threading
 import time
@@ -319,6 +320,60 @@ DASHBOARD_HTML = r"""<!doctype html>
     margin-top: 10px; padding: 10px; border-radius: 10px;
     background: var(--surface-3); border: 1px solid var(--border);
   }
+  .quick-strip {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; align-items: center;
+  }
+  .quick-strip button {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 7px 12px; font-size: 0.85rem;
+  }
+  .quick-strip button:hover { border-color: var(--accent); }
+  .pipe-flow {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    padding: 10px 12px; margin-bottom: 12px; border-radius: 10px;
+    background: var(--surface-3); border: 1px solid var(--border);
+  }
+  .pipe-flow-node {
+    display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px;
+    border-radius: 8px; background: var(--surface-2); border: 1px solid var(--border);
+    font-size: 0.82rem; font-weight: 700;
+  }
+  .pipe-flow-node.ok { border-color: var(--ok); background: var(--ok-bg); }
+  .pipe-flow-node.bad { border-color: var(--bad); background: var(--bad-bg); }
+  .pipe-flow-arrow { color: var(--muted); font-weight: 800; }
+  .step-card {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .step-card-head {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .step-num {
+    width: 26px; height: 26px; border-radius: 50%; display: inline-grid; place-items: center;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: var(--accent-fg);
+    font-weight: 800; font-size: 0.82rem; flex-shrink: 0;
+  }
+  .var-chip {
+    background: var(--surface-3); border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 9px; font-size: 0.76rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--accent); font-weight: 600; cursor: pointer;
+  }
+  .var-chip:hover { border-color: var(--accent); background: rgba(88, 166, 255, 0.14); }
+  .pipe-res-card {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; margin-top: 8px;
+  }
+  .pipe-res-card.ok { border-left: 4px solid var(--ok); }
+  .pipe-res-card.bad { border-left: 4px solid var(--bad); }
+  .mesh-diagram {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px; margin-bottom: 14px;
+  }
+  .mesh-tier-box {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 11px 13px;
+  }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
   .col-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
   .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 10px; }
@@ -479,6 +534,14 @@ DASHBOARD_HTML = r"""<!doctype html>
         </div>
       </div>
 
+      <div class="quick-strip" aria-label="Quick navigation shortcuts">
+        <span class="hint" style="margin:0 4px 0 0;">Quick actions:</span>
+        <button onclick="selectTab('terminal')">⚡ Auto-Route Terminal</button>
+        <button onclick="selectTab('jobs')">🔗 Cross-Tier Pipeline Builder</button>
+        <button onclick="selectTab('workloads')">🌐 Service Mesh &amp; .cluster DNS</button>
+        <button onclick="selectTab('setup')">📱 Pair New Phone</button>
+      </div>
+
       <div id="pool-strip" class="pool-strip" role="group" aria-label="Filter phones by Tier and Pool"></div>
       <div id="node-tier-editor" class="card" style="display:none" aria-live="polite"></div>
 
@@ -619,34 +682,45 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
       </div>
 
       <div class="card">
-        <h2>Cross-Tier Pipeline (Chain Tier 1 → Tier 2 → Tier 3 Seamlessly)</h2>
-        <p class="hint">Run a multi-step workflow where each step runs on its ideal Tier/Pool and receives <code class="mono">$PHONECLUSTER_PREV_STDOUT</code> plus all live <code class="mono">$PHONECLUSTER_*</code> cross-tier service URLs.</p>
-        <div class="row">
-          <label for="pipe-template">Pipeline Template:</label>
-          <select id="pipe-template" onchange="applyPipeTemplate(this.value)" aria-label="Cross-tier pipeline template">
-            <option value="">Choose a template...</option>
-            <option value="tiers">Tier 1 Compute → Tier 2 Debian Services → Tier 3 Docker</option>
-            <option value="mqtt">Tier 1 AI/Metric → Tier 2 MQTT Publish</option>
-            <option value="mesh">Cross-Tier Service Discovery Check</option>
-          </select>
-          <button id="btn-run-pipe" class="primary" onclick="runCrossTierPipeline()">Run Pipeline</button>
-          <button class="small" onclick="copyEl('pipe-out')">Copy Output</button>
+        <div class="row" style="justify-content:space-between; margin-bottom:6px;">
+          <h2 style="margin:0;">Visual Cross-Tier Pipeline Builder (No JSON Needed!)</h2>
+          <div class="row" style="margin:0;">
+            <label class="small" style="cursor:pointer; border:1px solid var(--border); border-radius:8px; padding:5px 9px;">
+              Import .json <input type="file" accept=".json" style="display:none" onchange="importPipeJsonFile(this)" />
+            </label>
+            <button class="small" onclick="downloadPipeJson()">Export .json</button>
+            <button class="small ghost" id="btn-toggle-pipe-json" onclick="togglePipeJsonDrawer()">Advanced JSON</button>
+          </div>
         </div>
-        <label for="pipe-json" class="sr-only">Pipeline steps JSON</label>
-        <textarea id="pipe-json" style="min-height:155px">[
-  {
-    "name": "Step 1 · Compute (Tier 1)",
-    "target": "tier:1",
-    "command": "python3 -c \"import os, platform; print(f'computed on {os.environ.get(\\\"PHONECLUSTER_NODE_ID\\\")} ({platform.machine()})')\""
-  },
-  {
-    "name": "Step 2 · Relay via Service Mesh (Auto)",
-    "target": "auto",
-    "command": "echo \"Received from $PHONECLUSTER_PREV_NODE (T$PHONECLUSTER_PREV_TIER): $PHONECLUSTER_PREV_STDOUT | MQTT=${PHONECLUSTER_MQTT_URL:-not-running}\""
-  }
-]</textarea>
+        <p class="hint" style="margin-top:0;">Build a multi-step workflow across <strong>Tier 1 (Termux)</strong> → <strong>Tier 2 (Debian Services)</strong> → <strong>Tier 3 (Docker)</strong>. Each step automatically gets the previous step's output (<code class="mono">$PHONECLUSTER_PREV_STDOUT</code>) and every live cluster service URL.</p>
+
+        <div class="row">
+          <label for="pipe-template">Starter Templates:</label>
+          <select id="pipe-template" onchange="applyPipeTemplate(this.value)" aria-label="Cross-tier pipeline template">
+            <option value="">Load a starter workflow...</option>
+            <option value="tiers">Tier 1 Compute → Tier 2 Debian Services → Tier 3 Docker</option>
+            <option value="mqtt">Tier 1 AI / Metric → Tier 2 Mosquitto MQTT Publish</option>
+            <option value="mesh">Inspect Live Cross-Tier Service Mesh</option>
+            <option value="health">Quick Check Across All Ready Phones</option>
+          </select>
+          <button class="small" onclick="addPipeStep()">+ Add Step</button>
+          <button id="btn-run-pipe" class="primary" onclick="runCrossTierPipeline()">▶ Run Cross-Tier Pipeline</button>
+        </div>
+
+        <div id="pipe-flow" class="pipe-flow" aria-label="Visual pipeline flow preview"></div>
+        <div id="pipe-steps-list"></div>
+
+        <div id="pipe-json-drawer" style="display:none; margin-top:10px; padding-top:10px; border-top:1px dashed var(--border);">
+          <div class="row" style="justify-content:space-between; margin-bottom:4px;">
+            <label for="pipe-json" class="hint" style="margin:0;">Advanced Raw JSON (auto-synced with Visual Builder above):</label>
+            <button class="small primary" onclick="applyPipeJsonFromDrawer()">Apply JSON to Visual Steps</button>
+          </div>
+          <textarea id="pipe-json" style="min-height:140px"></textarea>
+        </div>
+
         <div id="pipe-summary-chips" class="chips"></div>
-        <pre id="pipe-out" class="code" aria-live="polite">Pipeline step-by-step routing and outputs will appear here.</pre>
+        <div id="pipe-results-cards" aria-live="polite"></div>
+        <pre id="pipe-out" class="code" style="display:none"></pre>
       </div>
     </section>
 
@@ -657,8 +731,21 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
           <h2 style="margin:0;">Live Cross-Tier Service Mesh &amp; Auto-Discovery</h2>
           <button class="small primary" onclick="loadWorkloads()">Rescan Services</button>
         </div>
-        <p class="hint" style="margin-top:0;">Services detected on any Tier (e.g. Mosquitto/AdGuard on Tier 2, Home Assistant/Docker on Tier 3, llama.cpp on Tier 1) are automatically exposed to every job on every phone via <code class="mono">$PHONECLUSTER_*</code> environment variables.</p>
+        <p class="hint" style="margin-top:0;">Every tier sees every other tier's live services automatically — zero hardcoded IPs. Click <strong>Test</strong> to verify live reachability from your Master, or register extra custom apps below.</p>
+
+        <div id="mesh-tier-diagram" class="mesh-diagram" aria-label="Cross-tier architecture overview"></div>
         <div id="mesh-services-table" class="hint" style="margin-bottom:12px;">Scanning cluster services...</div>
+
+        <div class="tier-edit-box" style="margin-bottom:14px;">
+          <strong style="font-size:0.9rem;">+ Register Custom Service in Mesh (optional)</strong>
+          <p class="hint" style="margin:2px 0 8px;">Add any extra app (e.g. <code class="mono">portainer</code>, <code class="mono">jellyfin</code>, <code class="mono">ollama</code>) — it is immediately injected as <code class="mono">$PHONECLUSTER_SVC_&lt;NAME&gt;</code> into every job and added to <code class="mono">.cluster</code> DNS hosts.</p>
+          <div class="form-grid" style="margin-bottom:6px;">
+            <div class="field"><label for="custom-svc-name">Service Name</label><input id="custom-svc-name" placeholder="portainer" /></div>
+            <div class="field"><label for="custom-svc-url">Endpoint URL</label><input id="custom-svc-url" placeholder="http://192.168.1.206:9000" /></div>
+          </div>
+          <button class="small primary" onclick="addCustomService()">+ Add to Service Mesh</button>
+        </div>
+
         <div class="col-grid">
           <div>
             <div class="row" style="justify-content:space-between; margin-bottom:4px;">
@@ -1080,6 +1167,7 @@ function selectTab(name) {
     panel.classList.toggle('active', active);
   }
   if (name === 'terminal') document.getElementById('term-input').focus();
+  if (name === 'jobs') renderPipeBuilder();
   if (name === 'workloads') loadWorkloads();
   if (name === 'setup' && getToken()) { loadSafetySettings(); pollPairingStatus(); }
 }
@@ -1626,85 +1714,351 @@ async function runParallelMap() {
   }
 }
 
+let pipeSteps = [
+  {
+    name: 'Compute on Tier 1',
+    target: 'tier:1',
+    command: 'python3 -c "import os, platform; print(os.environ.get(\'PHONECLUSTER_NODE_ID\'), platform.machine())"',
+    continue_on_error: false
+  },
+  {
+    name: 'Relay via Service Mesh',
+    target: 'auto',
+    command: 'echo "From $PHONECLUSTER_PREV_NODE (T$PHONECLUSTER_PREV_TIER): $PHONECLUSTER_PREV_STDOUT | MQTT=${PHONECLUSTER_MQTT_URL:-not-running}"',
+    continue_on_error: false
+  }
+];
+let lastPipeResults = [];
+
+function pipeTargetLabel(t) {
+  if (t === 'auto') return '⚡ Auto';
+  if (t === 'tier:1') return 'T1 · Compute';
+  if (t === 'tier:2') return 'T2 · Services';
+  if (t === 'tier:3') return 'T3 · Docker';
+  if (t === 'all') return 'All Ready';
+  return t || 'auto';
+}
+
+function syncPipeJsonFromBuilder() {
+  const el = document.getElementById('pipe-json');
+  if (el) el.value = JSON.stringify(pipeSteps, null, 2);
+}
+
+function getAvailableMeshVars(stepIdx) {
+  const vars = [];
+  if (stepIdx > 0) {
+    vars.push({ label: '+ Prev Output', val: '$PHONECLUSTER_PREV_STDOUT' });
+    vars.push({ label: '+ Prev Node', val: '$PHONECLUSTER_PREV_NODE' });
+  }
+  if (stepIdx > 1) {
+    vars.push({ label: '+ Step 1 Output', val: '$PHONECLUSTER_STEP_1_STDOUT' });
+  }
+  const seen = new Set();
+  const svcs = (lastLive && lastLive.summary && lastLive.summary.services_registry) ? lastLive.summary.services_registry : [];
+  const svcToVar = {
+    mqtt: { label: '+ MQTT Host', val: '$PHONECLUSTER_MQTT_HOST' },
+    homeassistant: { label: '+ Home Assistant URL', val: '$PHONECLUSTER_HOMEASSISTANT_URL' },
+    adguard: { label: '+ AdGuard URL', val: '$PHONECLUSTER_ADGUARD_URL' },
+    llama_api: { label: '+ Local AI URL', val: '$PHONECLUSTER_LLAMA_API_URL' },
+    redis: { label: '+ Redis URL', val: '$PHONECLUSTER_REDIS_URL' },
+    postgres: { label: '+ Postgres Host', val: '$PHONECLUSTER_POSTGRES_HOST' }
+  };
+  for (const s of svcs) {
+    if (svcToVar[s.name] && !seen.has(s.name)) {
+      seen.add(s.name);
+      vars.push(svcToVar[s.name]);
+    } else if (s.source === 'config' && !seen.has('cfg:' + s.name)) {
+      seen.add('cfg:' + s.name);
+      const k = String(s.name).toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '');
+      if (k) vars.push({ label: '+ ' + s.name, val: '$PHONECLUSTER_SVC_' + k });
+    }
+  }
+  if (!seen.has('mqtt')) vars.push({ label: '+ MQTT URL', val: '${PHONECLUSTER_MQTT_URL:-none}' });
+  vars.push({ label: '+ Node ID', val: '$PHONECLUSTER_NODE_ID' });
+  return vars;
+}
+
+function renderPipeFlow() {
+  const flow = document.getElementById('pipe-flow');
+  if (!flow) return;
+  if (!pipeSteps.length) {
+    flow.innerHTML = '<span class="hint" style="margin:0;">No steps yet — click "+ Add Step" or choose a Starter Template.</span>';
+    return;
+  }
+  flow.innerHTML = pipeSteps.map((st, idx) => {
+    const res = lastPipeResults.find(r => r.step_index === idx + 1);
+    const cls = res ? (res.ok ? ' ok' : ' bad') : '';
+    const icon = res ? (res.ok ? '✓ ' : '✕ ') : '';
+    const targetBadge = res && res.node_id && res.node_id !== 'none'
+      ? (res.node_id + (res.node_tier ? ' · T' + res.node_tier : ''))
+      : pipeTargetLabel(st.target);
+    const arrow = idx < pipeSteps.length - 1 ? '<span class="pipe-flow-arrow" aria-hidden="true">→</span>' : '';
+    return '<span class="pipe-flow-node' + cls + '">'
+      + '<span>' + icon + (idx + 1) + '. ' + esc(st.name || ('Step ' + (idx + 1))) + '</span>'
+      + '<span class="pill neutral">' + esc(targetBadge) + '</span>'
+      + '</span>' + arrow;
+  }).join('');
+}
+
+function renderPipeBuilder() {
+  renderPipeFlow();
+  syncPipeJsonFromBuilder();
+  const list = document.getElementById('pipe-steps-list');
+  if (!list) return;
+  const nodes = (lastLive && lastLive.summary && lastLive.summary.nodes) ? lastLive.summary.nodes : [];
+  const baseTargets = [
+    ['auto', '⚡ Auto-Route by Workload (Smart Tier)'],
+    ['tier:1', 'Tier 1 · Termux Compute & AI'],
+    ['tier:2', 'Tier 2 · Debian 13 Services'],
+    ['tier:3', 'Tier 3 · Docker & Containers'],
+    ['all', 'ALL READY PHONES (Broadcast)']
+  ];
+  for (const n of nodes) {
+    baseTargets.push([n.id, 'Phone: ' + n.id + ' (T' + (n.tier || 1) + ':' + (n.pool || 'compute') + ')']);
+  }
+
+  list.innerHTML = pipeSteps.map((st, idx) => {
+    const optsHtml = baseTargets.map(([val, lbl]) =>
+      '<option value="' + esc(val) + '"' + (st.target === val ? ' selected' : '') + '>' + esc(lbl) + '</option>'
+    ).join('');
+    const customOpt = baseTargets.some(([v]) => v === st.target)
+      ? ''
+      : '<option value="' + esc(st.target) + '" selected>' + esc(st.target) + '</option>';
+    const varsHtml = getAvailableMeshVars(idx).map(v =>
+      '<button type="button" class="var-chip" onclick="insertPipeVar(' + idx + ',\'' + esc(v.val) + '\')">' + esc(v.label) + '</button>'
+    ).join('');
+    return '<div class="step-card">'
+      + '<div class="step-card-head">'
+      + '<div class="row" style="margin:0; flex:1; min-width:220px;">'
+      + '<span class="step-num">' + (idx + 1) + '</span>'
+      + '<input type="text" aria-label="Step ' + (idx + 1) + ' name" value="' + esc(st.name || '') + '" placeholder="Step name..." style="flex:1; min-width:150px;" oninput="updatePipeStep(' + idx + ',\'name\',this.value)" />'
+      + '<select aria-label="Step ' + (idx + 1) + ' target" onchange="updatePipeStep(' + idx + ',\'target\',this.value)">' + optsHtml + customOpt + '</select>'
+      + '</div>'
+      + '<div class="row" style="margin:0;">'
+      + '<button type="button" class="small" title="Move up" onclick="movePipeStep(' + idx + ',-1)"' + (idx === 0 ? ' disabled' : '') + '>↑</button>'
+      + '<button type="button" class="small" title="Move down" onclick="movePipeStep(' + idx + ',1)"' + (idx === pipeSteps.length - 1 ? ' disabled' : '') + '>↓</button>'
+      + '<button type="button" class="small" title="Duplicate step" onclick="dupPipeStep(' + idx + ')">Copy</button>'
+      + '<button type="button" class="small danger" title="Remove step" onclick="removePipeStep(' + idx + ')"' + (pipeSteps.length <= 1 ? ' disabled' : '') + '>✕</button>'
+      + '</div></div>'
+      + '<textarea id="pipe-cmd-' + idx + '" aria-label="Step ' + (idx + 1) + ' command" style="min-height:58px;" placeholder="Enter shell command (plain text — no JSON escaping needed)..." oninput="updatePipeStep(' + idx + ',\'command\',this.value)">' + esc(st.command || '') + '</textarea>'
+      + '<div class="row" style="justify-content:space-between; margin:6px 0 0;">'
+      + '<div class="chips" style="margin:0;">' + varsHtml + '</div>'
+      + '<label style="font-size:0.8rem; color:var(--muted); display:inline-flex; align-items:center; gap:5px;">'
+      + '<input type="checkbox" style="width:auto; padding:0;" ' + (st.continue_on_error ? 'checked ' : '') + 'onchange="updatePipeStep(' + idx + ',\'continue_on_error\',this.checked)" /> Continue if this step fails</label>'
+      + '</div></div>';
+  }).join('');
+}
+
+function updatePipeStep(idx, field, val) {
+  if (!pipeSteps[idx]) return;
+  pipeSteps[idx][field] = val;
+  syncPipeJsonFromBuilder();
+  if (field === 'name' || field === 'target') renderPipeFlow();
+}
+
+function insertPipeVar(idx, varToken) {
+  const ta = document.getElementById('pipe-cmd-' + idx);
+  if (!ta || !pipeSteps[idx]) return;
+  const start = ta.selectionStart ?? ta.value.length;
+  const end = ta.selectionEnd ?? ta.value.length;
+  const cur = ta.value;
+  ta.value = cur.slice(0, start) + varToken + cur.slice(end);
+  pipeSteps[idx].command = ta.value;
+  syncPipeJsonFromBuilder();
+  ta.focus();
+  ta.setSelectionRange(start + varToken.length, start + varToken.length);
+}
+
+function addPipeStep() {
+  const nextIdx = pipeSteps.length + 1;
+  const defaultTarget = nextIdx === 2 ? 'tier:2' : (nextIdx === 3 ? 'tier:3' : 'auto');
+  pipeSteps.push({
+    name: 'Step ' + nextIdx,
+    target: defaultTarget,
+    command: 'echo "Step ' + nextIdx + ' on $PHONECLUSTER_NODE_ID got: $PHONECLUSTER_PREV_STDOUT"',
+    continue_on_error: false
+  });
+  lastPipeResults = [];
+  renderPipeBuilder();
+}
+
+function movePipeStep(idx, delta) {
+  const targetIdx = idx + delta;
+  if (targetIdx < 0 || targetIdx >= pipeSteps.length) return;
+  const tmp = pipeSteps[idx];
+  pipeSteps[idx] = pipeSteps[targetIdx];
+  pipeSteps[targetIdx] = tmp;
+  lastPipeResults = [];
+  renderPipeBuilder();
+}
+
+function dupPipeStep(idx) {
+  if (!pipeSteps[idx]) return;
+  const copy = Object.assign({}, pipeSteps[idx], { name: (pipeSteps[idx].name || 'Step') + ' (copy)' });
+  pipeSteps.splice(idx + 1, 0, copy);
+  lastPipeResults = [];
+  renderPipeBuilder();
+}
+
+function removePipeStep(idx) {
+  if (pipeSteps.length <= 1) return;
+  pipeSteps.splice(idx, 1);
+  lastPipeResults = [];
+  renderPipeBuilder();
+}
+
+function togglePipeJsonDrawer() {
+  const box = document.getElementById('pipe-json-drawer');
+  const open = box.style.display === 'none';
+  box.style.display = open ? 'block' : 'none';
+  document.getElementById('btn-toggle-pipe-json').textContent = open ? 'Hide Advanced JSON' : 'Advanced JSON';
+  if (open) syncPipeJsonFromBuilder();
+}
+
+function applyPipeJsonFromDrawer() {
+  try {
+    const parsed = JSON.parse(document.getElementById('pipe-json').value);
+    const arr = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.steps) ? parsed.steps : null);
+    if (!arr || !arr.length) throw new Error('JSON must be a non-empty array of steps (or {"steps": [...]}).');
+    pipeSteps = arr.map((s, i) => ({
+      name: String(s.name || ('Step ' + (i + 1))),
+      target: String(s.target || 'auto'),
+      command: String(s.command || ''),
+      continue_on_error: Boolean(s.continue_on_error)
+    }));
+    lastPipeResults = [];
+    renderPipeBuilder();
+    showToast('Applied ' + pipeSteps.length + ' step(s) to Visual Builder!', 'ok');
+  } catch (e) {
+    showToast('Invalid Pipeline JSON: ' + e.message, 'bad');
+  }
+}
+
+function importPipeJsonFile(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    document.getElementById('pipe-json').value = String(reader.result || '');
+    applyPipeJsonFromDrawer();
+  };
+  reader.readAsText(file);
+  input.value = '';
+}
+
+function downloadPipeJson() {
+  const payload = { name: 'PhoneCluster Cross-Tier Pipeline', steps: pipeSteps };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'phonecluster-pipeline-' + Date.now() + '.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function applyPipeTemplate(name) {
   if (!name) return;
   const templates = {
     tiers: [
       {
-        name: 'Step 1 · Compute on Tier 1 (Termux)',
+        name: 'Compute on Tier 1 (Termux)',
         target: 'tier:1',
-        command: 'python3 -c "import os, platform; print(f\'result=42 from {os.environ.get(\\\"PHONECLUSTER_NODE_ID\\\")} ({platform.machine()})\')"'
+        command: 'python3 -c "import os, platform; print(\'result=42 from\', os.environ.get(\'PHONECLUSTER_NODE_ID\'), platform.machine())"',
+        continue_on_error: false
       },
       {
-        name: 'Step 2 · Debian Service Tier 2',
+        name: 'Relay via Tier 2 (Debian Services)',
         target: 'tier:2',
-        command: 'echo "Tier 2 ($PHONECLUSTER_NODE_ID) received: $PHONECLUSTER_PREV_STDOUT | MQTT=${PHONECLUSTER_MQTT_URL:-none}"'
+        command: 'echo "Tier 2 ($PHONECLUSTER_NODE_ID) received: $PHONECLUSTER_PREV_STDOUT | MQTT=${PHONECLUSTER_MQTT_URL:-none}"',
+        continue_on_error: false
       },
       {
-        name: 'Step 3 · Docker Tier 3',
+        name: 'Check Containers on Tier 3 (Docker)',
         target: 'tier:3',
-        command: 'echo "Tier 3 ($PHONECLUSTER_NODE_ID) received: $PHONECLUSTER_PREV_STDOUT" && docker ps --format "{{.Names}}" 2>&1 || true'
+        command: 'echo "Tier 3 ($PHONECLUSTER_NODE_ID) saw Step 1: $PHONECLUSTER_STEP_1_STDOUT" && docker ps --format "{{.Names}}: {{.Status}}" 2>&1 || true',
+        continue_on_error: false
       }
     ],
     mqtt: [
       {
-        name: 'Step 1 · Generate Metric on Tier 1',
+        name: 'Generate Metric on Tier 1',
         target: 'tier:1',
-        command: 'python3 -c "import json, os; print(json.dumps({\'node\': os.environ.get(\'PHONECLUSTER_NODE_ID\'), \'status\': \'ok\'}))"'
+        command: 'python3 -c "import json, os; print(json.dumps({\'node\': os.environ.get(\'PHONECLUSTER_NODE_ID\'), \'status\': \'ok\'}))"',
+        continue_on_error: false
       },
       {
-        name: 'Step 2 · Publish via Tier 2 Mosquitto',
+        name: 'Publish via Tier 2 Mosquitto',
         target: 'tier:2',
-        command: 'if command -v mosquitto_pub >/dev/null 2>&1 && [ -n "$PHONECLUSTER_MQTT_HOST" ]; then mosquitto_pub -h "$PHONECLUSTER_MQTT_HOST" -p "${PHONECLUSTER_MQTT_PORT:-1883}" -t phonecluster/events -m "$PHONECLUSTER_PREV_STDOUT" && echo "Published to $PHONECLUSTER_MQTT_URL"; else echo "Dry-run payload -> $PHONECLUSTER_PREV_STDOUT (start Mosquitto on Tier 2 to publish)"; fi'
+        command: 'if command -v mosquitto_pub >/dev/null 2>&1 && [ -n "$PHONECLUSTER_MQTT_HOST" ]; then mosquitto_pub -h "$PHONECLUSTER_MQTT_HOST" -p "${PHONECLUSTER_MQTT_PORT:-1883}" -t phonecluster/events -m "$PHONECLUSTER_PREV_STDOUT" && echo "Published to $PHONECLUSTER_MQTT_URL"; else echo "Dry-run payload -> $PHONECLUSTER_PREV_STDOUT (start Mosquitto on Tier 2 to publish)"; fi',
+        continue_on_error: false
       }
     ],
     mesh: [
       {
-        name: 'Step 1 · Inspect Live Cross-Tier Mesh',
+        name: 'Inspect Live Cross-Tier Mesh',
         target: 'auto',
-        command: 'env | grep ^PHONECLUSTER_ | sort'
+        command: 'env | grep ^PHONECLUSTER_ | sort',
+        continue_on_error: false
+      }
+    ],
+    health: [
+      {
+        name: 'Check Uptime Across All Phones',
+        target: 'all',
+        command: 'echo "$PHONECLUSTER_NODE_ID ($(uname -m)): $(uptime)"',
+        continue_on_error: false
       }
     ]
   };
   if (templates[name]) {
-    document.getElementById('pipe-json').value = JSON.stringify(templates[name], null, 2);
-    showToast('Loaded pipeline template: ' + name, 'ok');
+    pipeSteps = templates[name].map(s => Object.assign({}, s));
+    lastPipeResults = [];
+    renderPipeBuilder();
+    showToast('Loaded workflow template: ' + name, 'ok');
   }
+  document.getElementById('pipe-template').value = '';
 }
 
 async function runCrossTierPipeline() {
   const btn = document.getElementById('btn-run-pipe');
+  const cardsBox = document.getElementById('pipe-results-cards');
   const out = document.getElementById('pipe-out');
   const chips = document.getElementById('pipe-summary-chips');
-  let steps;
-  try {
-    steps = JSON.parse(document.getElementById('pipe-json').value);
-    if (!Array.isArray(steps) || !steps.length) throw new Error('Pipeline must be a non-empty JSON array.');
-  } catch (e) {
-    showToast('Invalid Pipeline JSON: ' + e.message, 'bad');
+  if (!pipeSteps.length) {
+    showToast('Add at least one step to the pipeline first.', 'warn');
     return;
   }
   btn.disabled = true;
   chips.innerHTML = '';
-  out.textContent = 'Running cross-tier pipeline (' + steps.length + ' steps)...';
+  cardsBox.innerHTML = '<p class="hint">Running ' + pipeSteps.length + ' cross-tier step(s)...</p>';
   try {
-    const data = await authPost('/api/pipeline', { steps });
-    if (data.error) { out.textContent = 'Error: ' + data.error; showToast(data.error, 'bad'); return; }
+    const data = await authPost('/api/pipeline', { steps: pipeSteps });
+    if (data.error) {
+      cardsBox.innerHTML = '<div class="pipe-res-card bad"><strong>Error:</strong> ' + esc(data.error) + '</div>';
+      showToast(data.error, 'bad');
+      return;
+    }
+    lastPipeResults = data.results || [];
+    renderPipeFlow();
     chips.innerHTML = '<span class="pill ' + (data.ok ? 'ok' : 'bad') + '">' + (data.ok ? '✓ PIPELINE OK' : '✕ FAILED') + '</span>'
       + '<span class="pill neutral mono">' + esc(data.duration_sec) + 's</span>'
-      + (data.results || []).map(r =>
-          '<span class="pill ' + (r.ok ? 'accent' : 'bad') + '">#' + esc(r.step_index) + ' → ' + esc(r.node_id)
-          + (r.node_tier ? ' (T' + esc(r.node_tier) + ':' + esc(r.node_pool) + ')' : '') + '</span>'
-        ).join('');
-    let txt = '';
-    for (const r of (data.results || [])) {
-      const t = r.node_tier ? (' [T' + r.node_tier + ':' + (r.node_pool || '') + ']') : '';
-      txt += '=== Step ' + r.step_index + ': ' + r.name + ' ===\n'
-        + 'Node: ' + r.node_id + t + ' | Status: ' + (r.ok ? 'OK' : 'FAIL') + ' (' + r.duration_sec + 's)'
-        + (r.routing_reason ? ' | ' + r.routing_reason : '') + '\n'
-        + (r.stdout || r.stderr || r.error || '(no output)').trim() + '\n\n';
-    }
-    out.textContent = txt.trim() || 'Done.';
+      + '<span class="pill neutral">' + esc(data.steps_completed) + '/' + esc(data.steps_total) + ' steps</span>';
+
+    cardsBox.innerHTML = lastPipeResults.map(r => {
+      const tp = r.node_tier ? tierPillHtml(r.node_tier, r.node_pool) : '<span class="pill neutral">none</span>';
+      const body = (r.stdout || r.stderr || r.error || '(no output)').trim();
+      return '<div class="pipe-res-card ' + (r.ok ? 'ok' : 'bad') + '">'
+        + '<div class="row" style="justify-content:space-between; margin-bottom:4px;">'
+        + '<div><strong>Step ' + esc(r.step_index) + ': ' + esc(r.name) + '</strong> '
+        + '<span class="pill ' + (r.ok ? 'ok' : 'bad') + '">' + (r.ok ? '✓ OK' : '✕ FAIL') + '</span> '
+        + '<span class="pill neutral mono">' + esc(r.node_id) + '</span> ' + tp + '</div>'
+        + '<span class="hint mono" style="margin:0;">' + esc(r.duration_sec) + 's</span></div>'
+        + (r.routing_reason ? '<div class="hint" style="margin:0 0 6px;">Route: ' + esc(r.routing_reason) + '</div>' : '')
+        + '<pre class="code" style="margin:0; max-height:180px;">' + esc(body) + '</pre>'
+        + '</div>';
+    }).join('');
+
+    out.textContent = JSON.stringify(data, null, 2);
     showToast('Pipeline finished: ' + data.steps_completed + '/' + data.steps_total + ' steps', data.ok ? 'ok' : 'warn');
     refreshLive();
   } finally {
@@ -1746,23 +2100,55 @@ async function loadWorkloads() {
     svcHtml += '<p><strong>Docker-ready nodes:</strong> ' + (d.docker_nodes.length ? esc(d.docker_nodes.join(', ')) : 'None yet (requires Tier 3 custom kernel + Droidspaces)') + '</p>';
     document.getElementById('wl-services').innerHTML = svcHtml;
 
-    // Cross-Tier Live Service Mesh Table + .env + .cluster DNS hosts
+    // Cross-Tier Live Service Mesh Diagram + Table + .env + .cluster DNS hosts
     const mesh = d.services_info || {};
     const svcs = mesh.services || [];
+    const pools = mesh.pools || [];
+    const diagBox = document.getElementById('mesh-tier-diagram');
+    if (diagBox) {
+      const tiersMeta = [
+        { t: 1, title: 'Tier 1 · Termux Compute', desc: 'Parallel scripts, Local LLMs, distcc' },
+        { t: 2, title: 'Tier 2 · Debian 13 Services', desc: 'Mosquitto MQTT, AdGuard DNS, glibc apps' },
+        { t: 3, title: 'Tier 3 · Docker & Containers', desc: 'Home Assistant, Docker stacks, K3s' }
+      ];
+      diagBox.innerHTML = tiersMeta.map(tm => {
+        const matchedPools = pools.filter(p => Number(p.tier) === tm.t);
+        const readyN = matchedPools.reduce((a, p) => a + (p.nodes_ready || 0), 0);
+        const totalN = matchedPools.reduce((a, p) => a + (p.nodes_total || 0), 0);
+        const tierSvcs = svcs.filter(s => Number(s.tier) === tm.t);
+        const svcPills = tierSvcs.length
+          ? tierSvcs.map(s => '<span class="pill ok">' + esc(s.name) + '</span>').join(' ')
+          : '<span class="hint" style="margin:0;">No active services detected</span>';
+        return '<div class="mesh-tier-box">'
+          + '<div class="row" style="justify-content:space-between; margin-bottom:4px;">'
+          + '<strong>' + esc(tm.title) + '</strong>'
+          + '<span class="pill ' + (readyN ? 'ok' : 'neutral') + '">' + readyN + '/' + totalN + ' ready</span></div>'
+          + '<div class="hint" style="margin:0 0 8px;">' + esc(tm.desc) + '</div>'
+          + '<div class="chips" style="margin:0;">' + svcPills + '</div></div>';
+      }).join('');
+    }
     const meshBox = document.getElementById('mesh-services-table');
     if (meshBox) {
       if (!svcs.length) {
-        meshBox.innerHTML = '<p class="hint">No cross-tier services detected yet (start Mosquitto, AdGuard Home, Home Assistant, llama.cpp, distcc, or Docker on any tier and click Rescan).</p>';
+        meshBox.innerHTML = '<p class="hint">No cross-tier services detected yet (start Mosquitto, AdGuard Home, Home Assistant, llama.cpp, distcc, or Docker on any tier, or register a Custom Service below).</p>';
       } else {
-        meshBox.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Service</th><th>Phone</th><th>Tier / Pool</th><th>Endpoint</th><th>Status</th></tr></thead><tbody>'
-          + svcs.map(s => {
+        meshBox.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Service</th><th>Phone</th><th>Tier / Pool</th><th>Endpoint</th><th>Status</th><th>Action</th></tr></thead><tbody>'
+          + svcs.map((s, idx) => {
               const link = String(s.url || '').startsWith('http')
                 ? '<a href="' + esc(s.url) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(s.url) + '</a>'
                 : '<span class="mono">' + esc(s.url) + '</span>';
               const tp = s.tier ? tierPillHtml(s.tier, s.pool) : '<span class="pill neutral">custom</span>';
+              let actions = '';
+              if (s.host && Number(s.port) > 0) {
+                actions += '<button class="small" id="probe-btn-' + idx + '" onclick="probeService(' + idx + ',\'' + esc(s.name) + '\',\'' + esc(s.host) + '\',' + Number(s.port) + ')">Test</button> ';
+              }
+              if (s.source === 'config') {
+                actions += '<button class="small danger" onclick="removeCustomService(\'' + esc(s.name) + '\')">Remove</button>';
+              }
               return '<tr><td><strong>' + esc(s.name) + '</strong></td><td class="mono">' + esc(s.node_id) + '</td>'
                 + '<td>' + tp + '</td><td>' + link + '</td>'
-                + '<td><span class="pill ' + (s.ready ? 'ok' : 'warn') + '">' + (s.ready ? '✓ Live' : 'Warm/Busy') + '</span></td></tr>';
+                + '<td><span id="probe-st-' + idx + '" class="pill ' + (s.ready ? 'ok' : 'warn') + '">' + (s.ready ? '✓ Live' : 'Warm/Busy') + '</span></td>'
+                + '<td>' + (actions || '<span class="hint">-</span>') + '</td></tr>';
             }).join('')
           + '</tbody></table></div>';
       }
@@ -1780,6 +2166,46 @@ async function loadWorkloads() {
   } catch (e) {
     document.getElementById('wl-distcc').textContent = 'Error loading workloads: ' + e;
   }
+}
+
+async function probeService(idx, name, host, port) {
+  const btn = document.getElementById('probe-btn-' + idx);
+  const st = document.getElementById('probe-st-' + idx);
+  if (btn) btn.disabled = true;
+  try {
+    const data = await authPost('/api/services/probe', { name, host, port });
+    if (data.error) { showToast('Probe error: ' + data.error, 'bad'); return; }
+    if (data.reachable) {
+      if (st) { st.className = 'pill ok'; st.textContent = '✓ ' + data.latency_ms + ' ms'; }
+      showToast('✓ ' + name + ' (' + host + ':' + port + ') reachable in ' + data.latency_ms + ' ms!', 'ok');
+    } else {
+      if (st) { st.className = 'pill bad'; st.textContent = '✕ Unreachable'; }
+      showToast('✕ ' + name + ' unreachable: ' + (data.error || 'timeout'), 'bad');
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function addCustomService() {
+  const name = document.getElementById('custom-svc-name').value.trim();
+  const url = document.getElementById('custom-svc-url').value.trim();
+  if (!name || !url) { showToast('Enter both a service name and endpoint URL.', 'warn'); return; }
+  const data = await authPost('/api/services/custom', { name, url });
+  if (data.error) { showToast('Could not save service: ' + data.error, 'bad'); return; }
+  document.getElementById('custom-svc-name').value = '';
+  document.getElementById('custom-svc-url').value = '';
+  showToast('Registered "' + data.name + '" in Cross-Tier Service Mesh!', 'ok');
+  loadWorkloads();
+  refreshLive();
+}
+
+async function removeCustomService(name) {
+  const data = await authPost('/api/services/custom/remove', { name });
+  if (data.error) { showToast('Remove failed: ' + data.error, 'bad'); return; }
+  showToast('Removed "' + name + '" from Service Mesh.', 'warn');
+  loadWorkloads();
+  refreshLive();
 }
 
 async function workloadAction(action) {
@@ -1982,6 +2408,7 @@ function refreshAll() {
 initPreferences();
 updateAuthBadge();
 onTermTargetChange();
+renderPipeBuilder();
 refreshLive();
 scheduleRefresh();
 </script>
@@ -2136,12 +2563,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.OK,
                     {
-                        "distcc_hosts": ctrl.build_distcc_hosts(),
-                        "llama_rpc": ctrl.build_llama_rpc_arg(),
-                        "mpi_hostfile": ctrl.build_mpi_hostfile(),
+                        "distcc_hosts": ctrl.build_distcc_hosts(snapshots=snaps),
+                        "llama_rpc": ctrl.build_llama_rpc_arg(snapshots=snaps),
+                        "mpi_hostfile": ctrl.build_mpi_hostfile(snapshots=snaps),
                         "home_assistant_urls": ha_urls,
                         "docker_nodes": docker_nodes,
-                        "services_info": ctrl.get_services_info(),
+                        "services_info": ctrl.get_services_info(snapshots=snaps),
                     },
                 )
             elif path == "/api/discover":
@@ -2168,6 +2595,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/terminal/exec",
             "/api/map",
             "/api/pipeline",
+            "/api/services/custom",
+            "/api/services/custom/remove",
+            "/api/services/probe",
             "/api/jobs/cancel",
             "/api/nodes/add",
             "/api/nodes/update",
@@ -2200,6 +2630,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, data)
             return
 
+        def _parse_timeout(raw_val: Any) -> float | None:
+            if raw_val in (None, ""):
+                return float(ctrl.config.default_job_timeout_sec)
+            try:
+                val = float(raw_val)
+                if val <= 0:
+                    raise ValueError("timeout_sec must be > 0")
+                return val
+            except (TypeError, ValueError):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a positive number"})
+                return None
+
         if path == "/api/exec":
             command = str(body.get("command", "")).strip()
             target = str(body.get("target", "auto")).strip() or "auto"
@@ -2207,11 +2649,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not command:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "empty command"})
                 return
+            timeout = _parse_timeout(body.get("timeout_sec"))
+            if timeout is None:
+                return
             spec = JobSpec(
                 index=0,
                 job_id=f"web-{int(time.time())}",
                 command=command,
-                timeout_sec=float(body.get("timeout_sec", ctrl.config.default_job_timeout_sec)),
+                timeout_sec=timeout,
             )
             outcomes = ctrl.run_single(spec, target=target, workload_hint=workload_hint)
             self._send_json(HTTPStatus.OK, {"results": [o.to_dict() for o in outcomes]})
@@ -2225,12 +2670,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not command:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "empty command"})
                 return
+            timeout = _parse_timeout(body.get("timeout_sec"))
+            if timeout is None:
+                return
             try:
                 results = ctrl.exec_terminal_command(
                     command=command,
                     target=target,
                     cwd=cwd,
-                    timeout_sec=float(body.get("timeout_sec", ctrl.config.default_job_timeout_sec)),
+                    timeout_sec=timeout,
                     job_id=job_id,
                     workload_hint=workload_hint,
                 )
@@ -2243,7 +2691,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             mode = str(body.get("mode", "commands"))
             target = str(body.get("target", "auto")).strip() or "auto"
             workload_hint = str(body.get("workload_hint", body.get("workload", ""))).strip()
-            timeout = float(body.get("timeout_sec", ctrl.config.default_job_timeout_sec))
+            timeout = _parse_timeout(body.get("timeout_sec"))
+            if timeout is None:
+                return
             jobs: list[JobSpec] = []
             if mode == "script":
                 script_content = str(body.get("script_content", ""))
@@ -2311,6 +2761,63 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             stop_on_error = bool(body.get("stop_on_error", True))
             res = ctrl.run_pipeline(steps, stop_on_error=stop_on_error)
             self._send_json(HTTPStatus.OK, res)
+
+        elif path == "/api/services/custom":
+            raw_name = str(body.get("name", "")).strip().lower()
+            url = str(body.get("url", "")).strip()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,39}", raw_name):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "service name must be 1-40 chars (letters, digits, '_' or '-')"},
+                )
+                return
+            allowed_schemes = ("http://", "https://", "mqtt://", "tcp://", "redis://", "postgresql://", "ssh://")
+            if not url or not url.startswith(allowed_schemes):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "url must start with http://, https://, mqtt://, tcp://, redis://, postgresql://, or ssh://"},
+                )
+                return
+            ctrl.config.custom_services[raw_name] = url
+            if self.server.config_path is not None:
+                save_config(ctrl.config, self.server.config_path)
+            self._send_json(
+                HTTPStatus.OK,
+                {"name": raw_name, "url": url, "custom_services": dict(ctrl.config.custom_services)},
+            )
+
+        elif path == "/api/services/custom/remove":
+            raw_name = str(body.get("name", "")).strip().lower()
+            if not raw_name or raw_name not in ctrl.config.custom_services:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"custom service '{raw_name}' not found"})
+                return
+            ctrl.config.custom_services.pop(raw_name, None)
+            if self.server.config_path is not None:
+                save_config(ctrl.config, self.server.config_path)
+            self._send_json(HTTPStatus.OK, {"removed": raw_name})
+
+        elif path == "/api/services/probe":
+            host = str(body.get("host", "")).strip()
+            try:
+                port = int(body.get("port", 0))
+            except (TypeError, ValueError):
+                port = 0
+            if not host or port <= 0 or port > 65535:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "valid host and port required"})
+                return
+            # Restrict probes strictly to endpoints already registered in the live Service Mesh
+            svc_entries = ctrl.get_services_info().get("services", [])
+            allowed = any(
+                str(e.get("host")) == host and int(e.get("port") or 0) == port
+                for e in svc_entries
+            )
+            if not allowed:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "probe allowed only for registered Service Mesh endpoints"},
+                )
+                return
+            self._send_json(HTTPStatus.OK, ctrl.probe_tcp_endpoint(host, port))
 
         elif path == "/api/jobs/cancel":
             node_id = str(body.get("node_id", "")).strip()
