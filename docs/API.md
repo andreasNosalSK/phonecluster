@@ -69,7 +69,9 @@ Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
 
 | Endpoint | Auth | Purpose |
 | :--- | :--- | :--- |
-| `GET /` | None | Accessible offline-first HTML/CSS/JS Control Center |
+| `GET /` | None | Accessible btop-inspired HTML/CSS/JS Control Center + Web Terminal |
+| `GET /api/live` | None | Single-request combined `summary`, `jobs`, and `history` (sparklines) payload |
+| `GET /api/metrics` | None | Time-series ring buffer (last 60 samples) for cluster & per-node CPU/RAM/Temp/Net |
 | `GET /api/status` | None | Unified cluster summary + per-node health + non-secret safety thresholds |
 | `GET /api/jobs` | None | Live active & recent jobs across every configured phone |
 | `GET /api/doctor` | None | Live local + remote diagnostic & battery safety audit |
@@ -78,6 +80,7 @@ Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
 | `GET /api/auth/verify` | Bearer | Validates an `auth_token` before unlocking UI controls |
 | `GET /api/settings` | Bearer | Returns full safety settings including `battery_webhook_url` |
 | `POST /api/exec` | Bearer | Run a single command on `best`, `all`, or a specific `node_id` |
+| `POST /api/terminal/exec` | Bearer | Run an interactive Web Terminal command with persistent `cwd` (`cd` support) |
 | `POST /api/map` | Bearer | Run a parallel batch of shell commands or inline script + args across all ready phones |
 | `POST /api/jobs/cancel` | Bearer | Cancel a running job on a specific `node_id` |
 | `POST /api/workloads/action` | Bearer | Start/stop `distcc` or `llama-rpc` across all ready phones |

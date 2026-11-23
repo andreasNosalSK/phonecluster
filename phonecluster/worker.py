@@ -24,7 +24,7 @@ from typing import Any, Callable
 from .auth import verify_token
 from .config import SafetyConfig
 from .discovery import DISCOVERY_PORT, DiscoveryResponder
-from .telemetry import ThermalGate, collect_node_health
+from .telemetry import CpuSampler, NetSampler, ThermalGate, collect_node_health
 
 LOG = logging.getLogger("phonecluster.worker")
 
@@ -61,6 +61,8 @@ class WorkerState:
             max_temp_c=self.safety.max_temp_c,
             resume_temp_c=self.safety.resume_temp_c,
         )
+        self.cpu_sampler = CpuSampler()
+        self.net_sampler = NetSampler()
         self.lock = threading.Lock()
         self.active_jobs: dict[str, ActiveJob] = {}
         self.recent_jobs: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
@@ -68,14 +70,24 @@ class WorkerState:
         self._last_alert_ts: dict[str, float] = {}
 
     def get_health(self) -> dict[str, Any]:
-        """Collect current node health and active job counts."""
+        """Collect current node health and active job details."""
         with self.lock:
-            active_count = len(self.active_jobs)
+            now = time.time()
+            active_list = [
+                {
+                    "job_id": j.job_id,
+                    "command": j.command_preview,
+                    "running_sec": round(now - j.started_at, 1),
+                }
+                for j in self.active_jobs.values()
+            ]
+            active_count = len(active_list)
         if self.health_provider is not None:
             health = dict(self.health_provider())
             health.setdefault("node_id", self.node_id)
             health.setdefault("role", self.role)
             health["active_jobs"] = active_count
+            health["active_job_list"] = active_list
             health["max_concurrency"] = self.max_concurrency
             if active_count >= self.max_concurrency:
                 health["ready_for_jobs"] = False
@@ -91,6 +103,9 @@ class WorkerState:
             active_jobs=active_count,
             max_concurrency=self.max_concurrency,
             workdir=self.workdir,
+            cpu_sampler=self.cpu_sampler,
+            net_sampler=self.net_sampler,
+            active_job_list=active_list,
         )
 
     def try_reserve_slot(

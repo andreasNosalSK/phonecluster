@@ -16,10 +16,12 @@ Old smartphones pack 8-core ARM64 CPUs, gigabytes of LPDDR4X RAM, UFS/eMMC stora
 PhoneCluster gives you **one entry point** (Web UI + interactive terminal menu + CLI) hosted on your strongest **Master phone**, automatically distributing parallel jobs across all phones while protecting them from overheating and battery swelling.
 
 ### Highlights
-- **Accessible Web Control Center** (`pc dashboard` on port `8080`):
-  - **Dark / Light / High-Contrast** themes + **Normal / Large / XL** text scaling + full keyboard navigation + color-blind safe badges.
-  - **4 task-oriented tabs**: *Overview*, *Run & Parallel Jobs*, *Workloads (Compiler / AI / OpenMPI / Home Assistant)*, and *Add Phone & Cluster Doctor*.
-  - Works 100% offline on your local Wi-Fi (no external CDN scripts).
+- **Shared Multi-Device `btop` Web Control Center** (`pc dashboard` on port `8080`):
+  - Live **SVG area sparklines** for Cluster CPU, Cluster Memory, Peak Thermal, Running Tasks, and Network RX/TX across all phones, plus **per-core CPU heat bars** and **shared Top Processes** per device.
+  - **Interactive Multi-Node Web Terminal**: run Linux commands on any phone (or broadcast to ALL phones) directly from your browser with persistent `cd` working directories, `↑/↓` history, `Ctrl+L` clear, and one-click job cancel.
+  - **Accessible by design**: Midnight Dark / Daylight Light / **High-Contrast** themes + **Normal / Large / XL** text scaling + full keyboard navigation + color-blind safe badges. Works 100% offline on your LAN.
+- **Shared Multi-Device `btop` Terminal Control** (`pc top`):
+  - Gorgeous ANSI 256-color full-screen terminal UI with Unicode rounded panels, sparklines (`▁▂▃▄▅▆▇█`), per-core heat bars, live running tasks & shared processes, and interactive keyboard controls (`↑/↓` select phone, `r` run, `a` broadcast, `s` instant SSH shell, `c` cancel job, `d` toggle tasks/processes).
 - **Easy & Automated Setup**:
   - One-click **PC USB Fleet Provisioner** ([`scripts/setup_all_via_adb.sh`](scripts/setup_all_via_adb.sh)) audits phones, picks the best Master, disables Android 12/13 Phantom Process Killer, whitelists Termux from Doze, and writes `config/cluster.json`.
   - One-command **Universal Installer** ([`install.sh`](install.sh)) installs global `phonecluster` and short `pc` commands + Termux:Boot auto-start.
@@ -90,8 +92,9 @@ pc
 
 ```bash
 pc                                    # Open interactive numbered menu
-pc status                             # Unified "one PC" cluster view
-pc status --watch                     # Live auto-refreshing terminal monitor (like htop)
+pc top                                # Pretty multi-device shared btop + Terminal Control!
+pc dashboard                          # Start Web Control Center (btop + Web Terminal :8080)
+pc status --watch                     # Quick live-refreshing status table
 pc jobs                               # See active & recent jobs across all phones
 pc cancel node1 <job_id>              # Cancel a runaway job on any phone
 pc ssh node1                          # Instant SSH into a phone by node name
@@ -102,7 +105,6 @@ pc update --sync                      # Pull latest updates from GitHub & push t
 pc doctor                             # Check SSH, Termux:API, temps, 24/7 battery safety
 pc discover                           # Auto-find new phones on Wi-Fi (UDP 8766)
 pc wizard                             # Guided interactive setup wizard
-pc dashboard                          # Start accessible Web Control Center (:8080)
 
 # Run commands & parallel scripts across all phones
 pc run "uname -a && nproc"            # Run on coolest/best phone

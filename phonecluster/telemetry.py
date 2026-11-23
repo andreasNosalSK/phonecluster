@@ -14,6 +14,7 @@ import platform
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,10 @@ from .config import SafetyConfig
 POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
 THERMAL_DIR = Path("/sys/class/thermal")
 MEMINFO_PATH = Path("/proc/meminfo")
+PROC_STAT_PATH = Path("/proc/stat")
+PROC_NET_DEV_PATH = Path("/proc/net/dev")
+PROC_UPTIME_PATH = Path("/proc/uptime")
+SYS_NET_DIR = Path("/sys/class/net")
 OS_RELEASE_PATH = Path("/etc/os-release")
 
 
@@ -270,6 +275,215 @@ def read_load_average() -> tuple[float, float, float]:
         return (0.0, 0.0, 0.0)
 
 
+def read_uptime_sec(uptime_path: Path = PROC_UPTIME_PATH) -> int | None:
+    """Return system uptime in whole seconds from /proc/uptime."""
+    try:
+        first = uptime_path.read_text(encoding="utf-8").split()[0]
+        return max(0, int(float(first)))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _parse_proc_stat(stat_path: Path = PROC_STAT_PATH) -> dict[str, tuple[int, int]] | None:
+    """Parse /proc/stat CPU lines into `{name: (idle_ticks, total_ticks)}`."""
+    try:
+        text = stat_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    out: dict[str, tuple[int, int]] = {}
+    for line in text.splitlines():
+        if not line.startswith("cpu"):
+            if out:
+                break
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        name = parts[0]
+        try:
+            vals = [int(x) for x in parts[1:]]
+        except ValueError:
+            continue
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        total = sum(vals)
+        out[name] = (idle, total)
+    return out if out else None
+
+
+class CpuSampler:
+    """Thread-safe delta sampler for total and per-core CPU percentages."""
+
+    def __init__(self, stat_path: Path = PROC_STAT_PATH) -> None:
+        self._stat_path = stat_path
+        self._lock = threading.Lock()
+        self._prev: dict[str, tuple[int, int]] | None = _parse_proc_stat(stat_path)
+        self._last_result: tuple[float | None, list[float]] = (None, [])
+
+    def sample(self, load_1m: float = 0.0, cpu_cores: int = 1) -> tuple[float, list[float]]:
+        """Return `(total_cpu_pct, per_core_pct_list)` using /proc/stat or load fallback."""
+        with self._lock:
+            curr = _parse_proc_stat(self._stat_path)
+            if curr is not None and self._prev is not None:
+                total_pct = self._calc_delta(self._prev.get("cpu"), curr.get("cpu"))
+                core_names = sorted(
+                    (k for k in curr if k != "cpu" and k[3:].isdigit()),
+                    key=lambda k: int(k[3:]),
+                )
+                per_core: list[float] = []
+                for cname in core_names:
+                    pct = self._calc_delta(self._prev.get(cname), curr.get(cname))
+                    if pct is not None:
+                        per_core.append(pct)
+                self._prev = curr
+                if total_pct is not None:
+                    self._last_result = (total_pct, per_core)
+                    return total_pct, per_core
+            elif curr is not None:
+                self._prev = curr
+
+            if self._last_result[0] is not None:
+                return self._last_result[0], list(self._last_result[1])
+
+        # Graceful fallback (e.g. first sample or strict Android SELinux blocking /proc/stat)
+        est = min(100.0, round((max(0.0, load_1m) / max(1, cpu_cores)) * 100.0, 1))
+        return est, []
+
+    @staticmethod
+    def _calc_delta(
+        prev: tuple[int, int] | None, curr: tuple[int, int] | None
+    ) -> float | None:
+        if prev is None or curr is None:
+            return None
+        d_idle = curr[0] - prev[0]
+        d_total = curr[1] - prev[1]
+        if d_total <= 0:
+            return None
+        busy = max(0.0, min(100.0, (1.0 - (d_idle / d_total)) * 100.0))
+        return round(busy, 1)
+
+
+def _read_net_bytes(
+    proc_net_path: Path = PROC_NET_DEV_PATH, sys_net_dir: Path = SYS_NET_DIR
+) -> tuple[int, int] | None:
+    """Return total non-loopback `(rx_bytes, tx_bytes)` across active interfaces."""
+    if proc_net_path.exists():
+        try:
+            rx_total = 0
+            tx_total = 0
+            found = False
+            for line in proc_net_path.read_text(encoding="utf-8", errors="ignore").splitlines()[2:]:
+                if ":" not in line:
+                    continue
+                iface, rest = line.split(":", 1)
+                iface = iface.strip()
+                if iface == "lo" or iface.startswith("dummy"):
+                    continue
+                cols = rest.split()
+                if len(cols) >= 9 and cols[0].isdigit() and cols[8].isdigit():
+                    rx_total += int(cols[0])
+                    tx_total += int(cols[8])
+                    found = True
+            if found:
+                return rx_total, tx_total
+        except OSError:
+            pass
+
+    if sys_net_dir.exists():
+        try:
+            rx_total = 0
+            tx_total = 0
+            found = False
+            for iface_dir in sys_net_dir.iterdir():
+                if iface_dir.name == "lo":
+                    continue
+                rx_s = _read_text_safe(iface_dir / "statistics" / "rx_bytes")
+                tx_s = _read_text_safe(iface_dir / "statistics" / "tx_bytes")
+                if rx_s and tx_s and rx_s.isdigit() and tx_s.isdigit():
+                    rx_total += int(rx_s)
+                    tx_total += int(tx_s)
+                    found = True
+            if found:
+                return rx_total, tx_total
+        except OSError:
+            pass
+    return None
+
+
+class NetSampler:
+    """Thread-safe delta sampler for network throughput in KB/s."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._prev_bytes = _read_net_bytes()
+        self._prev_ts = time.monotonic()
+
+    def sample(self) -> tuple[float | None, float | None]:
+        """Return `(rx_kbps, tx_kbps)` or `(None, None)` if unavailable."""
+        with self._lock:
+            now = time.monotonic()
+            curr = _read_net_bytes()
+            if curr is None:
+                return None, None
+            if self._prev_bytes is None or now - self._prev_ts < 0.2:
+                self._prev_bytes = curr
+                self._prev_ts = now
+                return 0.0, 0.0
+            dt = max(0.2, now - self._prev_ts)
+            d_rx = max(0, curr[0] - self._prev_bytes[0])
+            d_tx = max(0, curr[1] - self._prev_bytes[1])
+            self._prev_bytes = curr
+            self._prev_ts = now
+            return round((d_rx / 1024.0) / dt, 1), round((d_tx / 1024.0) / dt, 1)
+
+
+def read_top_processes(limit: int = 5, timeout_sec: float = 1.5) -> list[dict[str, Any]]:
+    """Return top running user-visible processes (gracefully works on Termux & Debian)."""
+    ps_bin = shutil.which("ps")
+    if not ps_bin:
+        return []
+    candidates = [
+        [ps_bin, "-eo", "pid,pcpu,pmem,comm", "--sort=-pcpu"],
+        [ps_bin, "-eo", "pid,pcpu,pmem,comm"],
+    ]
+    output = ""
+    for cmd in candidates:
+        try:
+            output = subprocess.check_output(
+                cmd, stderr=subprocess.DEVNULL, text=True, timeout=timeout_sec
+            )
+            if output.strip():
+                break
+        except (subprocess.SubprocessError, OSError):
+            continue
+    if not output:
+        return []
+
+    procs: list[dict[str, Any]] = []
+    for line in output.splitlines()[1:]:
+        parts = line.split(None, 3)
+        if len(parts) < 4 or not parts[0].isdigit():
+            continue
+        name = parts[3].strip()
+        if name in {"ps", "sh"}:
+            continue
+        try:
+            cpu = float(parts[1])
+            mem = float(parts[2])
+        except ValueError:
+            cpu = 0.0
+            mem = 0.0
+        procs.append(
+            {
+                "pid": int(parts[0]),
+                "cpu_pct": round(cpu, 1),
+                "mem_pct": round(mem, 1),
+                "name": name[:32],
+            }
+        )
+    procs.sort(key=lambda p: (p["cpu_pct"], p["mem_pct"]), reverse=True)
+    return procs[:limit]
+
+
 def is_local_port_open(port: int, timeout: float = 0.15) -> bool:
     """Return True if a local TCP daemon is accepting connections on `port`."""
     try:
@@ -313,18 +527,34 @@ def collect_node_health(
     active_jobs: int = 0,
     max_concurrency: int = 2,
     workdir: str | Path = ".",
+    cpu_sampler: CpuSampler | None = None,
+    net_sampler: NetSampler | None = None,
+    active_job_list: list[dict[str, Any]] | None = None,
+    include_processes: bool = True,
 ) -> dict[str, Any]:
-    """Assemble full node health payload for `/health` and master scheduling."""
+    """Assemble full btop-grade node health payload for `/health` and master scheduling."""
     battery = read_battery_info()
     mem = read_memory_info()
     l1, l5, l15 = read_load_average()
+    cpu_cores = os.cpu_count() or 1
+    if cpu_sampler is not None:
+        cpu_pct, per_core_pct = cpu_sampler.sample(load_1m=l1, cpu_cores=cpu_cores)
+    else:
+        cpu_pct = min(100.0, round((max(0.0, l1) / cpu_cores) * 100.0, 1))
+        per_core_pct = []
+
+    net_rx_kbps, net_tx_kbps = (
+        net_sampler.sample() if net_sampler is not None else (None, None)
+    )
     overheated = thermal_gate.evaluate(battery.temperature_c)
 
     try:
         disk = shutil.disk_usage(workdir)
         disk_free_gb = round(disk.free / (1024**3), 2)
+        disk_total_gb = round(disk.total / (1024**3), 2)
     except OSError:
         disk_free_gb = 0.0
+        disk_total_gb = 0.0
 
     low_ram = (
         mem["total_mb"] > 0 and mem["available_mb"] < safety.min_free_ram_mb
@@ -351,7 +581,10 @@ def collect_node_health(
         "hostname": socket.gethostname(),
         "os_env": detect_os_environment(),
         "arch": platform.machine(),
-        "cpu_cores": os.cpu_count() or 1,
+        "uptime_sec": read_uptime_sec(),
+        "cpu_cores": cpu_cores,
+        "cpu_pct": cpu_pct,
+        "per_core_pct": per_core_pct,
         "load_1m": l1,
         "load_5m": l5,
         "load_15m": l15,
@@ -359,6 +592,9 @@ def collect_node_health(
         "mem_available_mb": mem["available_mb"],
         "mem_used_mb": mem["used_mb"],
         "disk_free_gb": disk_free_gb,
+        "disk_total_gb": disk_total_gb,
+        "net_rx_kbps": net_rx_kbps,
+        "net_tx_kbps": net_tx_kbps,
         "battery_pct": battery.percentage,
         "temp_c": battery.temperature_c,
         "battery_status": battery.status,
@@ -368,7 +604,9 @@ def collect_node_health(
         "ready_for_jobs": ready_for_jobs,
         "not_ready_reasons": reasons,
         "active_jobs": active_jobs,
+        "active_job_list": list(active_job_list) if active_job_list else [],
         "max_concurrency": max_concurrency,
+        "top_processes": read_top_processes(limit=5) if include_processes else [],
         "tools": caps["tools"],
         "services": caps["services"],
         "timestamp": int(time.time()),

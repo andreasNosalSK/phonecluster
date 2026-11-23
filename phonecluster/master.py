@@ -7,9 +7,11 @@ import concurrent.futures
 import json
 import logging
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Callable
@@ -163,12 +165,81 @@ def score_node(snapshot: NodeSnapshot, in_flight_local: int = 0, max_temp_c: flo
     )
 
 
+class MetricsHistory:
+    """Thread-safe ring buffer of cluster & per-node live metrics for btop sparklines."""
+
+    def __init__(self, maxlen: int = 60) -> None:
+        self.maxlen = maxlen
+        self._lock = threading.Lock()
+        self._cluster: collections.deque[dict[str, Any]] = collections.deque(maxlen=maxlen)
+        self._nodes: dict[str, collections.deque[dict[str, Any]]] = {}
+
+    def record(self, summary: dict[str, Any]) -> None:
+        ts = int(summary.get("timestamp", time.time()))
+        with self._lock:
+            self._cluster.append(
+                {
+                    "ts": ts,
+                    "cpu_pct": summary.get("cluster_cpu_pct", 0.0),
+                    "ram_pct": summary.get("cluster_ram_pct", 0.0),
+                    "max_temp_c": summary.get("max_temp_c"),
+                    "active_jobs": summary.get("total_active_jobs", 0),
+                    "net_rx_kbps": summary.get("total_net_rx_kbps", 0.0),
+                    "net_tx_kbps": summary.get("total_net_tx_kbps", 0.0),
+                }
+            )
+            for n in summary.get("nodes", []):
+                nid = n["id"]
+                if nid not in self._nodes:
+                    self._nodes[nid] = collections.deque(maxlen=self.maxlen)
+                h = n.get("health") or {}
+                if n.get("online"):
+                    mem_tot = h.get("mem_total_mb") or 0
+                    mem_avail = h.get("mem_available_mb") or 0
+                    ram_pct = round(((mem_tot - mem_avail) / mem_tot) * 100.0, 1) if mem_tot else 0.0
+                    cpu_pct = h.get("cpu_pct")
+                    if cpu_pct is None:
+                        cores = max(1, int(h.get("cpu_cores", 1)))
+                        cpu_pct = min(100.0, round((float(h.get("load_1m", 0.0)) / cores) * 100.0, 1))
+                    self._nodes[nid].append(
+                        {
+                            "ts": ts,
+                            "online": True,
+                            "cpu_pct": float(cpu_pct),
+                            "ram_pct": ram_pct,
+                            "temp_c": h.get("temp_c"),
+                            "battery_pct": h.get("battery_pct"),
+                            "active_jobs": int(h.get("active_jobs", 0)),
+                        }
+                    )
+                else:
+                    self._nodes[nid].append(
+                        {
+                            "ts": ts,
+                            "online": False,
+                            "cpu_pct": 0.0,
+                            "ram_pct": 0.0,
+                            "temp_c": None,
+                            "battery_pct": None,
+                            "active_jobs": 0,
+                        }
+                    )
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "cluster": list(self._cluster),
+                "nodes": {nid: list(buf) for nid, buf in self._nodes.items()},
+            }
+
+
 class MasterController:
     """Coordinates health polling, job scheduling, and workload helpers across all nodes."""
 
     def __init__(self, config: ClusterConfig) -> None:
         self.config = config
         self.headers = build_auth_headers(config.auth_token)
+        self.metrics_history = MetricsHistory(maxlen=60)
 
     def _filter_nodes(self, tags: list[str] | None = None) -> list[NodeConfig]:
         if not tags:
@@ -528,7 +599,7 @@ class MasterController:
             lines.append(f"{snap.node.host} slots={cores}")
         return "\n".join(lines) + ("\n" if lines else "")
 
-    def cluster_summary(self) -> dict[str, Any]:
+    def cluster_summary(self, record_history: bool = True) -> dict[str, Any]:
         """Return an aggregate 'one PC' resource summary across all nodes."""
         snapshots = self.poll_health()
         total_cores = 0
@@ -536,17 +607,33 @@ class MasterController:
         avail_ram_mb = 0
         online_count = 0
         ready_count = 0
+        total_active_jobs = 0
+        total_net_rx = 0.0
+        total_net_tx = 0.0
+        weighted_cpu_sum = 0.0
         temps: list[float] = []
+        latencies: list[float] = []
         node_dicts: list[dict[str, Any]] = []
 
         for snap in snapshots:
             if snap.online:
                 online_count += 1
-                total_cores += int(snap.health.get("cpu_cores", 0))
+                cores = int(snap.health.get("cpu_cores", 0))
+                total_cores += cores
                 total_ram_mb += int(snap.health.get("mem_total_mb", 0))
                 avail_ram_mb += int(snap.health.get("mem_available_mb", 0))
+                total_active_jobs += int(snap.health.get("active_jobs", 0))
+                latencies.append(float(snap.latency_ms))
                 if snap.ready_for_jobs:
                     ready_count += 1
+                cpu_pct = snap.health.get("cpu_pct")
+                if cpu_pct is None:
+                    cpu_pct = min(100.0, (float(snap.health.get("load_1m", 0.0)) / max(1, cores)) * 100.0)
+                weighted_cpu_sum += float(cpu_pct) * max(1, cores)
+                if snap.health.get("net_rx_kbps") is not None:
+                    total_net_rx += float(snap.health["net_rx_kbps"])
+                if snap.health.get("net_tx_kbps") is not None:
+                    total_net_tx += float(snap.health["net_tx_kbps"])
                 t = snap.health.get("temp_c")
                 if t is not None:
                     temps.append(float(t))
@@ -570,15 +657,29 @@ class MasterController:
                 }
             )
 
-        return {
+        cluster_cpu_pct = round(weighted_cpu_sum / total_cores, 1) if total_cores > 0 else 0.0
+        cluster_ram_pct = (
+            round(((total_ram_mb - avail_ram_mb) / total_ram_mb) * 100.0, 1)
+            if total_ram_mb > 0
+            else 0.0
+        )
+        avg_latency_ms = round(sum(latencies) / len(latencies), 1) if latencies else 0.0
+
+        summary = {
             "cluster_name": self.config.cluster_name,
             "nodes_total": len(snapshots),
             "nodes_online": online_count,
             "nodes_ready": ready_count,
             "total_cores": total_cores,
+            "cluster_cpu_pct": cluster_cpu_pct,
+            "cluster_ram_pct": cluster_ram_pct,
             "mem_total_mb": total_ram_mb,
             "mem_available_mb": avail_ram_mb,
             "max_temp_c": max(temps) if temps else None,
+            "avg_latency_ms": avg_latency_ms,
+            "total_active_jobs": total_active_jobs,
+            "total_net_rx_kbps": round(total_net_rx, 1),
+            "total_net_tx_kbps": round(total_net_tx, 1),
             "safety": {
                 "max_temp_c": self.config.safety.max_temp_c,
                 "resume_temp_c": self.config.safety.resume_temp_c,
@@ -590,6 +691,51 @@ class MasterController:
             "timestamp": int(time.time()),
             "nodes": node_dicts,
         }
+        if record_history:
+            self.metrics_history.record(summary)
+        return summary
+
+    def exec_terminal_command(
+        self,
+        command: str,
+        target: str = "best",
+        cwd: str | None = None,
+        timeout_sec: float | None = None,
+        job_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Execute an interactive Web Terminal command while tracking persistent `cwd`."""
+        marker = f"__PC_CWD_{uuid.uuid4().hex[:8]}__"
+        wrapped = (
+            f"{command}\n"
+            f"__pc_rc=$?\n"
+            f"printf '\\n{marker}%s\\n' \"$PWD\"\n"
+            f"exit $__pc_rc"
+        )
+        spec = JobSpec(
+            index=0,
+            job_id=job_id or f"term-{uuid.uuid4().hex[:8]}",
+            command=wrapped,
+            workdir=cwd or None,
+            timeout_sec=float(timeout_sec or self.config.default_job_timeout_sec),
+        )
+        outcomes = self.run_single(spec, target=target)
+        results: list[dict[str, Any]] = []
+        for o in outcomes:
+            out_text = o.stdout
+            new_cwd = cwd or ""
+            idx = out_text.rfind(marker)
+            if idx != -1:
+                after = out_text[idx + len(marker) :].splitlines()
+                if after:
+                    new_cwd = after[0].strip()
+                out_text = out_text[:idx]
+                if out_text.endswith("\n"):
+                    out_text = out_text[:-1]
+            rec = o.to_dict()
+            rec["stdout"] = out_text
+            rec["cwd"] = new_cwd
+            results.append(rec)
+        return results
 
     def get_node_jobs(self, node: NodeConfig) -> dict[str, Any]:
         """Fetch active and recent jobs from one worker node."""

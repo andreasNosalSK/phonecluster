@@ -200,6 +200,7 @@ def run_interactive_menu(
     """Friendly numbered terminal menu so users never need to memorize flags."""
     from .cli import _cmd_jobs, _cmd_status
     from .dashboard import serve_dashboard
+    from .tui import run_top_tui
     import argparse
 
     cfg_path = resolve_config_path(config_path)
@@ -208,27 +209,28 @@ def run_interactive_menu(
         print("\n" + "=" * 52)
         print("  PhoneCluster Control Menu")
         print("=" * 52)
-        print("  1) Cluster Status (Unified 'One PC' View)")
-        print("  2) Run a Command (Best Phone or All Phones)")
-        print("  3) Run Parallel Jobs (Ship & Run a Script / File)")
-        print("  4) Scan Wi-Fi for Phones (Auto-Discover)")
-        print("  5) Cluster Doctor (Health & Battery Safety Check)")
-        print("  6) Start Accessible Web Dashboard (Browser UI)")
-        print("  7) Workloads Helper (distcc / llama.cpp / OpenMPI)")
-        print("  8) Guided Setup Wizard (Create/Edit cluster.json)")
-        print("  9) View Active/Recent Jobs & Show Auth Token")
+        print("  1) Shared Multi-Device btop (Live Terminal Control)")
+        print("  2) Cluster Status (Quick Summary Table)")
+        print("  3) Run a Command (Best Phone or All Phones)")
+        print("  4) Run Parallel Jobs (Ship & Run a Script / File)")
+        print("  5) Scan Wi-Fi for Phones (Auto-Discover)")
+        print("  6) Cluster Doctor (Health & Battery Safety Check)")
+        print("  7) Start Web Control Center (Browser btop + Terminal)")
+        print("  8) Workloads Helper (distcc / llama.cpp / OpenMPI)")
+        print("  9) Guided Setup Wizard (Create/Edit cluster.json)")
+        print("  t) View Active/Recent Jobs & Show Auth Token")
         print("  0) Exit")
         print("-" * 52)
 
-        choice = _prompt("Choose an option", "1", input_fn=input_fn)
+        choice = _prompt("Choose an option", "1", input_fn=input_fn).lower()
 
         if choice == "0":
             print("Goodbye!")
             return 0
-        elif choice == "8":
+        elif choice == "9":
             run_setup_wizard(cfg_path, input_fn=input_fn)
             continue
-        elif choice == "4":
+        elif choice == "5":
             print("Scanning Wi-Fi for PhoneCluster workers (2s)...")
             found = discover_lan_nodes(timeout_sec=2.0)
             if not found:
@@ -240,7 +242,7 @@ def run_interactive_menu(
                         f"os={n['os_env']} cores={n['cpu_cores']} ram={n['mem_total_mb']}MB"
                     )
             continue
-        elif choice == "5":
+        elif choice == "6":
             report = run_doctor(cfg_path)
             _print_doctor_report(report)
             continue
@@ -251,9 +253,12 @@ def run_interactive_menu(
             continue
 
         if choice == "1":
+            cfg = load_config(cfg_path)
+            run_top_tui(MasterController(cfg))
+        elif choice == "2":
             ns = argparse.Namespace(config=str(cfg_path), json=False)
             _cmd_status(ns)
-        elif choice == "2":
+        elif choice == "3":
             cfg = load_config(cfg_path)
             ctrl = MasterController(cfg)
             target = _prompt("Target ('best', 'all', or node id like 'node1')", "best", input_fn=input_fn)
@@ -267,7 +272,7 @@ def run_interactive_menu(
                     print(o.stderr.rstrip(), file=sys.stderr)
                 if o.error:
                     print(f"ERROR: {o.error}", file=sys.stderr)
-        elif choice == "3":
+        elif choice == "4":
             script = _prompt("Local script path (or blank to use a commands file)", "examples/sample_job.py", input_fn=input_fn)
             if script:
                 args_file = _prompt("Arguments file (one arg list per line)", "examples/sample_args.txt", input_fn=input_fn)
@@ -300,14 +305,14 @@ def run_interactive_menu(
                         ],
                         check=False,
                     )
-        elif choice == "6":
+        elif choice == "7":
             cfg = load_config(cfg_path)
             ctrl = MasterController(cfg)
             ip = detect_local_ip()
             print(f"\nStarting Web Dashboard at: http://{ip}:{cfg.dashboard_port}")
             print("Press Ctrl+C to return to the menu.")
             serve_dashboard("0.0.0.0", cfg.dashboard_port, ctrl, config_path=cfg_path)
-        elif choice == "7":
+        elif choice == "8":
             cfg = load_config(cfg_path)
             ctrl = MasterController(cfg)
             print("\n--- Live Workload Endpoints ---")
@@ -325,12 +330,12 @@ def run_interactive_menu(
                 )
                 for o in ctrl.run_single(spec, target="all"):
                     print(f"[{o.node_id}] {'OK' if o.ok else 'FAIL'}: {(o.stdout or o.stderr or o.error).strip()}")
-        elif choice == "9":
+        elif choice == "t":
             cfg = load_config(cfg_path)
             print(f"\nCluster auth_token (for Web UI Unlock): {cfg.auth_token}\n")
             _cmd_jobs(argparse.Namespace(config=str(cfg_path), limit=5, json=False))
         else:
-            print("Please enter a number from 0 to 9.")
+            print("Please enter a valid option (0-9 or t).")
 
 
 def _print_doctor_report(report: dict[str, Any]) -> None:

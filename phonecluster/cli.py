@@ -26,6 +26,7 @@ from .dashboard import serve_dashboard
 from .discovery import discover_lan_nodes
 from .doctor import run_doctor
 from .master import JobOutcome, JobSpec, MasterController
+from .tui import run_top_tui
 from .wizard import _print_doctor_report, run_interactive_menu, run_setup_wizard
 from .worker import WorkerState, serve_worker
 
@@ -471,6 +472,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if report["overall"] != "fail" else 1
 
 
+def _cmd_top(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
+    return run_top_tui(ctrl, refresh_sec=args.interval, once=args.once)
+
+
 def _cmd_jobs(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
@@ -673,6 +680,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Live-refresh every N seconds (default 3s when flag is given)",
     )
     p_status.set_defaults(func=_cmd_status)
+
+    # top (multi-device btop terminal control)
+    p_top = sub.add_parser("top", help="Pretty multi-device btop-style Terminal Control UI")
+    p_top.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Refresh interval in seconds (default: 2.0)",
+    )
+    p_top.add_argument(
+        "--once",
+        action="store_true",
+        help="Render one snapshot frame and exit (non-interactive)",
+    )
+    p_top.set_defaults(func=_cmd_top)
 
     # jobs & cancel
     p_jobs = sub.add_parser("jobs", help="Show active and recent jobs across all phones")

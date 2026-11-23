@@ -1,10 +1,11 @@
-"""Accessible, offline-first Web Control Center hosted on the Master phone."""
+"""Accessible, offline-first, btop-inspired Web Control Center + Interactive Web Terminal."""
 
 from __future__ import annotations
 
 import json
 import logging
 import shlex
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -34,18 +35,23 @@ DASHBOARD_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>PhoneCluster — Unified Control Center</title>
+<title>PhoneCluster — Shared btop &amp; Control Center</title>
 <style>
   :root {
     --font-size: 16px;
-    --bg: #0d1117;
-    --surface: #161b22;
-    --surface-2: #1f2630;
-    --border: #30363d;
-    --fg: #e6edf3;
-    --muted: #9aa7b8;
+    --bg: #090d14;
+    --bg-grad: radial-gradient(circle at 12% 0%, rgba(88, 166, 255, 0.12), transparent 36%),
+               radial-gradient(circle at 88% 8%, rgba(163, 113, 247, 0.11), transparent 34%);
+    --surface: #111824;
+    --surface-2: #182232;
+    --surface-3: #0c121c;
+    --border: #263348;
+    --border-hi: #3a4f70;
+    --fg: #eaf1fb;
+    --muted: #93a4bc;
     --accent: #58a6ff;
-    --accent-fg: #0b1016;
+    --accent-2: #a371f7;
+    --accent-fg: #08101b;
     --ok: #3fb950;
     --ok-bg: rgba(63, 185, 80, 0.16);
     --warn: #e3b341;
@@ -53,15 +59,24 @@ DASHBOARD_HTML = r"""<!doctype html>
     --bad: #f85149;
     --bad-bg: rgba(248, 81, 73, 0.18);
     --focus: #ffd33d;
+    --term-bg: #070b11;
+    --term-fg: #dce6f5;
+    --term-prompt: #3fb950;
+    --shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
   }
   [data-theme="light"] {
-    --bg: #f4f6f9;
+    --bg: #eef2f7;
+    --bg-grad: radial-gradient(circle at 10% 0%, rgba(37, 99, 235, 0.08), transparent 40%),
+               radial-gradient(circle at 90% 10%, rgba(124, 58, 237, 0.07), transparent 38%);
     --surface: #ffffff;
-    --surface-2: #eef2f6;
+    --surface-2: #f3f6fb;
+    --surface-3: #e8eef6;
     --border: #cbd5e1;
+    --border-hi: #94a3b8;
     --fg: #0f172a;
     --muted: #475569;
     --accent: #1d4ed8;
+    --accent-2: #7c3aed;
     --accent-fg: #ffffff;
     --ok: #15803d;
     --ok-bg: #dcfce7;
@@ -70,15 +85,23 @@ DASHBOARD_HTML = r"""<!doctype html>
     --bad: #b91c1c;
     --bad-bg: #fee2e2;
     --focus: #1d4ed8;
+    --term-bg: #0f172a;
+    --term-fg: #e2e8f0;
+    --term-prompt: #4ade80;
+    --shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
   }
   [data-theme="contrast"] {
     --bg: #000000;
+    --bg-grad: none;
     --surface: #0a0a0a;
-    --surface-2: #161616;
+    --surface-2: #171717;
+    --surface-3: #000000;
     --border: #ffffff;
+    --border-hi: #ffea00;
     --fg: #ffffff;
     --muted: #e5e5e5;
     --accent: #ffea00;
+    --accent-2: #00ffff;
     --accent-fg: #000000;
     --ok: #00ff66;
     --ok-bg: #003314;
@@ -87,6 +110,10 @@ DASHBOARD_HTML = r"""<!doctype html>
     --bad: #ff4d4d;
     --bad-bg: #3b0000;
     --focus: #00ffff;
+    --term-bg: #000000;
+    --term-fg: #ffffff;
+    --term-prompt: #00ff66;
+    --shadow: none;
   }
   [data-scale="large"] { --font-size: 18px; }
   [data-scale="xl"] { --font-size: 20px; }
@@ -95,11 +122,15 @@ DASHBOARD_HTML = r"""<!doctype html>
   html { font-size: var(--font-size); }
   body {
     margin: 0;
+    min-height: 100vh;
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background: var(--bg);
+    background-image: var(--bg-grad);
+    background-attachment: fixed;
     color: var(--fg);
-    line-height: 1.5;
+    line-height: 1.48;
   }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
   .skip-link {
     position: absolute; left: -9999px; top: 8px;
     background: var(--accent); color: var(--accent-fg);
@@ -108,32 +139,47 @@ DASHBOARD_HTML = r"""<!doctype html>
   .skip-link:focus { left: 12px; }
   :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 
-  .wrap { max-width: 1200px; margin: 0 auto; padding: 16px; }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 16px; }
+
   header.topbar {
     display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-    padding: 14px 18px; margin-bottom: 14px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px 18px; margin-bottom: 12px; box-shadow: var(--shadow);
   }
-  .brand h1 { margin: 0; font-size: 1.35rem; line-height: 1.2; }
-  .brand .sub { color: var(--muted); font-size: 0.85rem; margin-top: 2px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo-badge {
+    width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: var(--accent-fg); font-weight: 800; font-size: 1.05rem; flex-shrink: 0;
+  }
+  .brand h1 { margin: 0; font-size: 1.28rem; line-height: 1.2; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .brand .sub { color: var(--muted); font-size: 0.83rem; margin-top: 2px; }
+  .live-dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--ok); display: inline-block;
+    box-shadow: 0 0 0 3px var(--ok-bg); animation: pulse 2s infinite;
+  }
+  .live-dot.paused { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-bg); animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+
   .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 
   button, input, select, textarea {
     font: inherit; color: var(--fg); background: var(--surface-2);
     border: 1px solid var(--border); border-radius: 8px; padding: 7px 11px;
   }
-  button { cursor: pointer; font-weight: 600; transition: opacity .15s; }
-  button:hover { opacity: 0.9; }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button { cursor: pointer; font-weight: 600; transition: transform .1s, border-color .15s, opacity .15s; }
+  button:hover { border-color: var(--border-hi); }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: 0.48; cursor: not-allowed; transform: none; }
   button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
   button.danger { background: var(--bad-bg); color: var(--bad); border-color: var(--bad); }
   button.ghost { background: transparent; }
-  button.small { padding: 5px 9px; font-size: 0.85rem; }
+  button.small { padding: 5px 9px; font-size: 0.83rem; }
 
   .toast {
-    position: fixed; bottom: 18px; right: 18px; max-width: 420px; z-index: 999;
-    background: var(--surface); border: 2px solid var(--accent); border-radius: 10px;
-    padding: 12px 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+    position: fixed; bottom: 18px; right: 18px; max-width: 440px; z-index: 999;
+    background: var(--surface); border: 2px solid var(--accent); border-radius: 12px;
+    padding: 12px 16px; box-shadow: 0 12px 32px rgba(0,0,0,0.48);
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
   }
   .toast.ok { border-color: var(--ok); }
@@ -141,94 +187,170 @@ DASHBOARD_HTML = r"""<!doctype html>
   .toast.bad { border-color: var(--bad); }
   .toast.hidden { display: none; }
 
+  .auth-bar {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 9px 14px; margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 10px;
+    align-items: center; justify-content: space-between;
+  }
+
   nav.tabs {
     display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;
-    border-bottom: 2px solid var(--border); padding-bottom: 10px;
+    border-bottom: 1px solid var(--border); padding-bottom: 10px;
   }
   nav.tabs button[role="tab"] {
     background: var(--surface); border: 1px solid var(--border); color: var(--fg);
-    padding: 8px 14px; border-radius: 8px;
+    padding: 8px 14px; border-radius: 10px; font-size: 0.92rem;
   }
   nav.tabs button[role="tab"][aria-selected="true"] {
-    background: var(--accent); color: var(--accent-fg); border-color: var(--accent);
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: var(--accent-fg); border-color: transparent;
   }
 
   .panel { display: none; }
   .panel.active { display: block; }
 
   .banner {
-    border-radius: 10px; padding: 12px 16px; margin-bottom: 14px;
+    border-radius: 10px; padding: 11px 15px; margin-bottom: 14px;
     border: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 12px;
   }
   .banner.warn { background: var(--warn-bg); border-color: var(--warn); }
-  .banner.ok { background: var(--ok-bg); border-color: var(--ok); }
   .banner.hidden { display: none; }
 
-  .stats-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  /* Hero KPI + Sparklines */
+  .kpi-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
     gap: 12px; margin-bottom: 16px;
   }
+  .kpi-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; justify-content: space-between;
+  }
+  .kpi-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .stat-label { color: var(--muted); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+  .stat-val { font-size: 1.55rem; font-weight: 800; line-height: 1.15; margin-top: 4px; }
+  .stat-sub { color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
+  .spark-wrap { margin-top: 8px; height: 34px; width: 100%; }
+  .spark-wrap svg { width: 100%; height: 100%; display: block; overflow: visible; }
+
   .card {
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 16px; margin-bottom: 14px;
+    border-radius: 14px; padding: 16px; margin-bottom: 14px; box-shadow: var(--shadow);
   }
   .card h2, .card h3 { margin: 0 0 10px; font-size: 1.05rem; }
-  .stat-label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
-  .stat-val { font-size: 1.55rem; font-weight: 700; margin-top: 4px; }
 
+  /* Multi-Device btop Cards */
   .nodes-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 14px; margin-bottom: 14px;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; margin-bottom: 16px;
   }
   .node-card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 15px;
-    display: flex; flex-direction: column; justify-content: space-between;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 16px;
+    display: flex; flex-direction: column; justify-content: space-between; box-shadow: var(--shadow);
+    transition: border-color .15s;
   }
+  .node-card:hover { border-color: var(--border-hi); }
+  .node-card.hot { border-color: var(--warn); }
+  .node-card.offline { border-color: var(--bad); opacity: 0.88; }
   .node-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 10px; }
-  .node-title { font-weight: 700; font-size: 1.05rem; }
-  .node-meta { color: var(--muted); font-size: 0.85rem; }
+  .node-title { font-weight: 800; font-size: 1.08rem; display: flex; align-items: center; gap: 6px; }
+  .node-meta { color: var(--muted); font-size: 0.82rem; margin-top: 2px; }
+
+  .cpu-btop-box {
+    background: var(--surface-3); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px; margin-bottom: 10px;
+  }
+  .cpu-btop-top { display: flex; justify-content: space-between; align-items: center; font-size: 0.84rem; margin-bottom: 6px; }
+  .core-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(22px, 1fr)); gap: 4px;
+    align-items: end; height: 28px; margin-top: 6px;
+  }
+  .core-col {
+    background: var(--surface-2); border-radius: 3px; height: 100%; display: flex; align-items: flex-end; overflow: hidden;
+  }
+  .core-col > span { width: 100%; border-radius: 3px; background: var(--ok); display: block; min-height: 2px; }
+  .core-col > span.warn { background: var(--warn); }
+  .core-col > span.bad { background: var(--bad); }
+
+  .metric-row { margin: 7px 0; font-size: 0.85rem; }
+  .metric-head { display: flex; justify-content: space-between; margin-bottom: 3px; }
+  .bar { height: 8px; background: var(--surface-3); border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
+  .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); border-radius: 999px; }
+  .bar.ok > span { background: linear-gradient(90deg, #2ea043, var(--ok)); }
+  .bar.warn > span { background: linear-gradient(90deg, #d29922, var(--warn)); }
+  .bar.bad > span { background: linear-gradient(90deg, #da3633, var(--bad)); }
+
+  .mini-procs {
+    margin-top: 10px; background: var(--surface-3); border: 1px solid var(--border); border-radius: 9px;
+    padding: 8px 10px; font-size: 0.79rem;
+  }
+  .mini-procs-head { color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; display: flex; justify-content: space-between; }
+  .proc-line { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; border-top: 1px dashed rgba(128,128,128,0.18); }
+  .proc-line:first-of-type { border-top: none; }
   .node-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
 
   .pill {
     display: inline-flex; align-items: center; gap: 4px;
-    padding: 3px 9px; border-radius: 999px; font-size: 0.8rem; font-weight: 700; white-space: nowrap;
+    padding: 2px 9px; border-radius: 999px; font-size: 0.77rem; font-weight: 700; white-space: nowrap;
   }
   .pill.ok { background: var(--ok-bg); color: var(--ok); border: 1px solid var(--ok); }
   .pill.warn { background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn); }
   .pill.bad { background: var(--bad-bg); color: var(--bad); border: 1px solid var(--bad); }
+  .pill.accent { background: rgba(88, 166, 255, 0.16); color: var(--accent); border: 1px solid var(--accent); }
+  .pill.purple { background: rgba(163, 113, 247, 0.16); color: var(--accent-2); border: 1px solid var(--accent-2); }
   .pill.neutral { background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
 
-  .metric-row { margin: 8px 0; font-size: 0.88rem; }
-  .metric-head { display: flex; justify-content: space-between; margin-bottom: 3px; }
-  .bar { height: 8px; background: var(--surface-2); border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
-  .bar > span { display: block; height: 100%; background: var(--accent); }
-  .bar.warn > span { background: var(--warn); }
-  .bar.bad > span { background: var(--bad); }
-  .bar.ok > span { background: var(--ok); }
-
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
-  .col-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
+  .col-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
   .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 10px; }
   .field label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 3px; }
   .field input, .field select { width: 100%; }
-  textarea { width: 100%; min-height: 110px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88rem; }
+  textarea { width: 100%; min-height: 115px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86rem; }
   pre.code {
-    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    background: var(--term-bg); color: var(--term-fg); border: 1px solid var(--border); border-radius: 10px;
     padding: 12px; overflow: auto; max-height: 360px; margin: 8px 0 0;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.84rem; white-space: pre-wrap;
   }
-  .auth-bar {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-    padding: 10px 14px; margin-bottom: 14px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
+
+  /* Interactive Web Terminal Console */
+  .term-window {
+    background: var(--term-bg); color: var(--term-fg); border: 1px solid var(--border-hi);
+    border-radius: 14px; overflow: hidden; box-shadow: var(--shadow);
   }
+  .term-titlebar {
+    background: var(--surface-2); border-bottom: 1px solid var(--border);
+    padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
+  }
+  .term-dots { display: flex; gap: 6px; align-items: center; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .dot.r { background: #ff5f56; } .dot.y { background: #ffbd2e; } .dot.g { background: #27c93f; }
+  .term-screen {
+    padding: 14px 16px; height: 420px; overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.87rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  .term-entry { margin-bottom: 12px; }
+  .term-cmd-line { color: var(--term-prompt); font-weight: 700; }
+  .term-meta { color: var(--muted); font-size: 0.78rem; margin-left: 8px; font-weight: 400; }
+  .term-err { color: #ff7b72; }
+  .term-input-bar {
+    display: flex; gap: 8px; align-items: center; padding: 10px 14px;
+    border-top: 1px solid var(--border); background: #0c121b;
+  }
+  .term-prompt-label { color: var(--term-prompt); font-weight: 700; white-space: nowrap; font-size: 0.88rem; }
+  .term-input-bar input {
+    flex: 1; background: transparent; border: none; color: #f0f6fc; padding: 6px 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9rem;
+  }
+  .term-input-bar input:focus { outline: none; }
+
   .check-item {
-    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+    border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; margin-bottom: 8px;
     background: var(--surface-2);
   }
-  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
   th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); }
-  .hint { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+  th { color: var(--muted); font-weight: 700; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .hint { color: var(--muted); font-size: 0.84rem; margin-top: 4px; }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
 
   @media (prefers-reduced-motion: reduce) {
@@ -246,24 +368,37 @@ DASHBOARD_HTML = r"""<!doctype html>
 <div class="wrap">
   <header class="topbar">
     <div class="brand">
-      <h1 id="cluster-title">PhoneCluster</h1>
-      <div class="sub" id="last-updated" aria-live="polite">Connecting to cluster...</div>
+      <div class="logo-badge" aria-hidden="true">PC</div>
+      <div>
+        <h1>
+          <span id="live-dot" class="live-dot" aria-hidden="true"></span>
+          <span id="cluster-title">PhoneCluster</span>
+        </h1>
+        <div class="sub" id="last-updated" aria-live="polite">Connecting to cluster...</div>
+      </div>
     </div>
     <div class="controls" aria-label="Display and refresh controls">
       <label class="sr-only" for="theme-select">Color theme</label>
-      <select id="theme-select" title="Color theme" aria-label="Color theme">
-        <option value="dark">Theme: Dark</option>
-        <option value="light">Theme: Light</option>
+      <select id="theme-select" aria-label="Color theme">
+        <option value="dark">Theme: Midnight</option>
+        <option value="light">Theme: Daylight</option>
         <option value="contrast">Theme: High Contrast</option>
       </select>
       <label class="sr-only" for="scale-select">Text size</label>
-      <select id="scale-select" title="Text size" aria-label="Text size">
+      <select id="scale-select" aria-label="Text size">
         <option value="normal">Text: Normal</option>
         <option value="large">Text: Large</option>
         <option value="xl">Text: XL</option>
       </select>
-      <button id="btn-auto" class="small" aria-pressed="true" onclick="toggleAutoRefresh()">Auto-Refresh: ON</button>
-      <button class="small primary" onclick="refreshAll()">Refresh Now</button>
+      <label class="sr-only" for="poll-select">Refresh rate</label>
+      <select id="poll-select" aria-label="Refresh rate">
+        <option value="2000">Live: 2s</option>
+        <option value="3000" selected>Live: 3s</option>
+        <option value="5000">Live: 5s</option>
+        <option value="10000">Live: 10s</option>
+        <option value="0">Paused</option>
+      </select>
+      <button class="small primary" onclick="refreshAll()">Refresh</button>
     </div>
   </header>
 
@@ -271,14 +406,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="row" style="margin:0; flex:1; min-width:260px;">
       <span id="auth-pill" class="pill neutral">Read-Only Mode</span>
       <label class="sr-only" for="auth-token">Cluster auth token</label>
-      <input id="auth-token" type="password" placeholder="Paste token (run `pc token` on Master) to unlock controls" style="flex:1; min-width:220px" />
-      <label style="font-size:0.85rem; display:inline-flex; align-items:center; gap:4px;">
+      <input id="auth-token" type="password" placeholder="Paste token (run `pc token` on Master) to unlock Terminal &amp; Controls" style="flex:1; min-width:220px" />
+      <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:4px;">
         <input id="remember-token" type="checkbox" style="width:auto; padding:0;" /> Remember
       </label>
       <button class="small primary" onclick="verifyAndSaveToken()">Unlock</button>
       <button class="small ghost" onclick="clearToken()">Lock</button>
     </div>
-    <div class="hint" style="margin:0;">Status &amp; Doctor work read-only; running jobs or editing nodes requires unlocking.</div>
+    <div class="hint" style="margin:0;">Tip: Run <code class="mono">pc top</code> in SSH for the matching terminal btop dashboard.</div>
   </section>
 
   <div id="battery-banner" class="banner warn hidden" role="status" aria-live="polite">
@@ -286,128 +421,168 @@ DASHBOARD_HTML = r"""<!doctype html>
   </div>
 
   <nav class="tabs" role="tablist" aria-label="Control Center Sections">
-    <button role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview" onclick="selectTab('overview')">1. Overview &amp; Jobs</button>
-    <button role="tab" id="tab-jobs" aria-selected="false" aria-controls="panel-jobs" onclick="selectTab('jobs')">2. Run &amp; Parallel Batch</button>
-    <button role="tab" id="tab-workloads" aria-selected="false" aria-controls="panel-workloads" onclick="selectTab('workloads')">3. Workloads (AI / Compiler / HA)</button>
-    <button role="tab" id="tab-setup" aria-selected="false" aria-controls="panel-setup" onclick="selectTab('setup')">4. Phones, Safety &amp; Doctor</button>
+    <button role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview" onclick="selectTab('overview')">1. Live btop &amp; Tasks</button>
+    <button role="tab" id="tab-terminal" aria-selected="false" aria-controls="panel-terminal" onclick="selectTab('terminal')">2. Terminal Control</button>
+    <button role="tab" id="tab-jobs" aria-selected="false" aria-controls="panel-jobs" onclick="selectTab('jobs')">3. Parallel Batch</button>
+    <button role="tab" id="tab-workloads" aria-selected="false" aria-controls="panel-workloads" onclick="selectTab('workloads')">4. Workloads (AI / Compiler / HA)</button>
+    <button role="tab" id="tab-setup" aria-selected="false" aria-controls="panel-setup" onclick="selectTab('setup')">5. Phones, Safety &amp; Doctor</button>
   </nav>
 
   <main id="main-content">
-    <!-- TAB 1: OVERVIEW -->
+    <!-- TAB 1: SHARED MULTI-DEVICE BTOP & RUNNING TASKS -->
     <section id="panel-overview" class="panel active" role="tabpanel" aria-labelledby="tab-overview">
-      <div class="stats-grid" aria-label="Unified cluster totals">
-        <div class="card" style="margin:0"><div class="stat-label">Phones Ready</div><div class="stat-val" id="s-nodes">-</div></div>
-        <div class="card" style="margin:0"><div class="stat-label">Combined CPU</div><div class="stat-val" id="s-cores">-</div></div>
-        <div class="card" style="margin:0"><div class="stat-label">Combined Free RAM</div><div class="stat-val" id="s-ram">-</div></div>
-        <div class="card" style="margin:0"><div class="stat-label">Peak Temp</div><div class="stat-val" id="s-temp">-</div></div>
+      <div class="kpi-grid" aria-label="Unified one-computer telemetry">
+        <div class="kpi-card">
+          <div class="kpi-top"><span class="stat-label">Cluster CPU</span><span id="k-cores" class="pill neutral">-</span></div>
+          <div class="stat-val mono" id="k-cpu">-</div>
+          <div class="spark-wrap" id="spark-cpu" aria-hidden="true"></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top"><span class="stat-label">Cluster Memory</span><span id="k-ram-pct" class="pill neutral">-</span></div>
+          <div class="stat-val mono" id="k-ram">-</div>
+          <div class="spark-wrap" id="spark-ram" aria-hidden="true"></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top"><span class="stat-label">Peak Thermal</span><span id="k-temp-pill" class="pill ok">Safe</span></div>
+          <div class="stat-val mono" id="k-temp">-</div>
+          <div class="spark-wrap" id="spark-temp" aria-hidden="true"></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top"><span class="stat-label">Running Tasks</span><span id="k-net" class="pill neutral mono">↓0 ↑0 KB/s</span></div>
+          <div class="stat-val mono" id="k-tasks">0</div>
+          <div class="stat-sub" id="k-tasks-sub">Idle across cluster</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top"><span class="stat-label">Fleet Status</span><span id="k-ping" class="pill neutral mono">- ms</span></div>
+          <div class="stat-val mono" id="k-nodes">-</div>
+          <div class="stat-sub" id="k-nodes-sub">Ready / Total phones</div>
+        </div>
       </div>
 
       <div id="nodes-grid" class="nodes-grid" aria-live="polite"></div>
 
       <div class="card">
-        <div class="row" style="justify-content:space-between; margin-bottom:8px;">
-          <h2 style="margin:0;">Live &amp; Recent Cluster Jobs</h2>
-          <button class="small" onclick="refreshJobs()">Refresh Jobs</button>
+        <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+          <h2 style="margin:0;">Shared Running Tasks &amp; Top Processes</h2>
+          <div class="row" style="margin:0;">
+            <button id="btn-board-tasks" class="small primary" onclick="setBoardView('tasks')">Running &amp; Recent Tasks</button>
+            <button id="btn-board-procs" class="small" onclick="setBoardView('procs')">Shared Processes (All Phones)</button>
+          </div>
         </div>
-        <div id="jobs-table-wrap" class="hint">Click "Refresh Jobs" or inspect any phone card to see active and recent jobs.</div>
+        <div id="tasks-board-wrap" class="hint">Loading cluster tasks...</div>
       </div>
     </section>
 
-    <!-- TAB 2: RUN & PARALLEL JOBS -->
-    <section id="panel-jobs" class="panel" role="tabpanel" aria-labelledby="tab-jobs">
-      <div class="col-grid">
-        <div class="card">
-          <h2>Run Single Command</h2>
-          <div class="row">
-            <label for="run-target">Target:</label>
-            <select id="run-target">
+    <!-- TAB 2: INTERACTIVE MULTI-NODE WEB TERMINAL -->
+    <section id="panel-terminal" class="panel" role="tabpanel" aria-labelledby="tab-terminal">
+      <div class="term-window">
+        <div class="term-titlebar">
+          <div class="row" style="margin:0;">
+            <div class="term-dots" aria-hidden="true"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></div>
+            <label for="term-target" class="sr-only">Terminal target phone</label>
+            <select id="term-target" onchange="onTermTargetChange()" aria-label="Terminal target phone">
               <option value="best">Smart: Best Coolest Phone</option>
-              <option value="all">All Ready Phones</option>
+              <option value="all">ALL READY PHONES (Broadcast)</option>
             </select>
+            <span id="term-cwd-pill" class="pill neutral mono">~</span>
           </div>
-          <div class="row">
-            <label class="sr-only" for="run-cmd">Shell command</label>
-            <input id="run-cmd" type="text" placeholder="e.g. uname -a && nproc (Enter to run)" style="flex:1; min-width:200px" />
-            <button id="btn-run-single" class="primary" onclick="runSingleCmd()">Run</button>
-            <button class="small" onclick="copyEl('run-out')">Copy</button>
+          <div class="row" style="margin:0;">
+            <button id="btn-term-cancel" class="small danger" onclick="cancelActiveTermJob()" disabled>Cancel (Ctrl+C)</button>
+            <button class="small" onclick="clearTerminal()">Clear</button>
+            <button class="small" onclick="downloadTermLog()">Save Log</button>
           </div>
-          <div class="row" aria-label="Quick presets">
-            <span class="hint" style="margin:0">Presets:</span>
-            <button class="small" onclick="setPreset('uname -a && nproc')">System Info</button>
-            <button class="small" onclick="setPreset('df -h ~')">Disk Space</button>
-            <button class="small" onclick="setPreset('uptime && head -n 3 /proc/meminfo')">Load &amp; RAM</button>
-            <button class="small" onclick="setPreset('ps aux 2>/dev/null | head -n 15 || ps | head -n 15')">Processes</button>
+        </div>
+        <div id="term-screen" class="term-screen" aria-live="polite" onclick="document.getElementById('term-input').focus()">
+          <div class="term-entry">
+            <span class="term-cmd-line">PhoneCluster Interactive Web Terminal</span>
+            <div class="hint" style="color:#8b9bb4;">Pick any phone (or ALL PHONES) above, unlock with your token, and type Linux commands below. Supports persistent `cd`, ↑/↓ history, and Ctrl+L clear.</div>
           </div>
-          <pre id="run-out" class="code" aria-live="polite">Output will appear here.</pre>
+        </div>
+        <div class="term-input-bar">
+          <span id="term-prompt" class="term-prompt-label mono">best:~ $</span>
+          <label class="sr-only" for="term-input">Terminal command input</label>
+          <input id="term-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a command (e.g. ls -la, uname -a, cd ~/phonecluster)..." />
+          <button id="btn-term-run" class="small primary" onclick="submitTerminalCommand()">Run</button>
+        </div>
+      </div>
+      <div class="chips" style="margin-top:10px;" aria-label="Quick terminal commands">
+        <span class="hint" style="margin:0 4px 0 0;">Quick commands:</span>
+        <button class="small" onclick="runTermPreset('uname -a && nproc')">System Info</button>
+        <button class="small" onclick="runTermPreset('ls -la')">ls -la</button>
+        <button class="small" onclick="runTermPreset('df -h ~')">Disk Space</button>
+        <button class="small" onclick="runTermPreset('uptime && head -n 5 /proc/meminfo')">Load &amp; RAM</button>
+        <button class="small" onclick="runTermPreset('ps -eo pid,pcpu,pmem,comm --sort=-pcpu 2>/dev/null | head -n 12 || ps | head -n 12')">Top Processes</button>
+      </div>
+    </section>
+
+    <!-- TAB 3: PARALLEL BATCH RUNNER -->
+    <section id="panel-jobs" class="panel" role="tabpanel" aria-labelledby="tab-jobs">
+      <div class="card">
+        <h2>Parallel Batch Runner (Distribute Work Across All Ready Phones)</h2>
+        <div class="row">
+          <label for="map-mode">Mode:</label>
+          <select id="map-mode" onchange="toggleMapMode()">
+            <option value="commands">Shell Command List (1 per line)</option>
+            <option value="script">Ship &amp; Run Script + Arguments</option>
+          </select>
+          <label class="sr-only" for="map-template">Load sample template</label>
+          <select id="map-template" onchange="applyMapTemplate(this.value)" aria-label="Load sample template">
+            <option value="">Templates...</option>
+            <option value="primes">Prime Benchmark (Python)</option>
+            <option value="audit">Hardware Audit (Shell)</option>
+            <option value="squares">Quick Square Test (Python)</option>
+          </select>
         </div>
 
-        <div class="card">
-          <h2>Parallel Batch Runner (All Ready Phones)</h2>
-          <div class="row">
-            <label for="map-mode">Mode:</label>
-            <select id="map-mode" onchange="toggleMapMode()">
-              <option value="commands">Shell Command List (1 per line)</option>
-              <option value="script">Ship &amp; Run Script + Args</option>
-            </select>
-            <label class="sr-only" for="map-template">Load sample template</label>
-            <select id="map-template" onchange="applyMapTemplate(this.value)" aria-label="Load sample template">
-              <option value="">Templates...</option>
-              <option value="primes">Prime Benchmark (Python)</option>
-              <option value="audit">Hardware Audit (Shell)</option>
-              <option value="squares">Quick Square Test (Python)</option>
-            </select>
+        <div id="map-commands-box">
+          <div class="row" style="justify-content:space-between; margin-bottom:4px;">
+            <label for="map-commands" class="hint" style="margin:0;">Commands (one per line · Ctrl+Enter to run):</label>
+            <label class="small" style="cursor:pointer; border:1px solid var(--border); border-radius:6px; padding:3px 8px;">
+              Load .txt <input type="file" accept=".txt,.sh" style="display:none" onchange="loadFileInto(this, 'map-commands')" />
+            </label>
           </div>
-
-          <div id="map-commands-box">
-            <div class="row" style="justify-content:space-between; margin-bottom:4px;">
-              <label for="map-commands" class="hint" style="margin:0;">Commands (one per line · Ctrl+Enter to run):</label>
-              <label class="small" style="cursor:pointer; border:1px solid var(--border); border-radius:6px; padding:3px 8px;">
-                Load .txt <input type="file" accept=".txt,.sh" style="display:none" onchange="loadFileInto(this, 'map-commands')" />
-              </label>
-            </div>
-            <textarea id="map-commands">echo "Job 1 on $PHONECLUSTER_NODE_ID"
+          <textarea id="map-commands">echo "Job 1 on $PHONECLUSTER_NODE_ID"
 echo "Job 2 on $PHONECLUSTER_NODE_ID"
 echo "Job 3 on $PHONECLUSTER_NODE_ID"
 echo "Job 4 on $PHONECLUSTER_NODE_ID"</textarea>
-          </div>
+        </div>
 
-          <div id="map-script-box" style="display:none">
-            <div class="row" style="justify-content:space-between;">
-              <div>
-                <label for="map-interp">Interpreter:</label>
-                <select id="map-interp">
-                  <option value="python3">python3</option>
-                  <option value="bash">bash</option>
-                  <option value="sh">sh</option>
-                </select>
-              </div>
-              <label class="small" style="cursor:pointer; border:1px solid var(--border); border-radius:6px; padding:4px 8px;">
-                Upload Script <input type="file" accept=".py,.sh,.bash" style="display:none" onchange="loadFileInto(this, 'map-script')" />
-              </label>
+        <div id="map-script-box" style="display:none">
+          <div class="row" style="justify-content:space-between;">
+            <div>
+              <label for="map-interp">Interpreter:</label>
+              <select id="map-interp">
+                <option value="python3">python3</option>
+                <option value="bash">bash</option>
+                <option value="sh">sh</option>
+              </select>
             </div>
-            <label for="map-script" class="hint">Script source (automatically shipped to every ready phone):</label>
-            <textarea id="map-script">import os, sys
+            <label class="small" style="cursor:pointer; border:1px solid var(--border); border-radius:6px; padding:4px 8px;">
+              Upload Script <input type="file" accept=".py,.sh,.bash" style="display:none" onchange="loadFileInto(this, 'map-script')" />
+            </label>
+          </div>
+          <label for="map-script" class="hint">Script source (automatically shipped to every ready phone):</label>
+          <textarea id="map-script">import os, sys
 n = int(sys.argv[1])
 print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</textarea>
-            <label for="map-args" class="hint">Arguments list (one parallel job per line):</label>
-            <textarea id="map-args" style="min-height:80px">10
+          <label for="map-args" class="hint">Arguments list (one parallel job per line):</label>
+          <textarea id="map-args" style="min-height:80px">10
 20
 30
 40</textarea>
-          </div>
-
-          <div class="row" style="margin-top:10px;">
-            <button id="btn-run-map" class="primary" onclick="runParallelMap()">Run Batch Across Cluster</button>
-            <button class="small" onclick="copyEl('map-out')">Copy Output</button>
-            <button id="btn-dl-map" class="small" onclick="downloadLastMapJson()" disabled>Download JSON</button>
-          </div>
-          <div id="map-summary-chips" class="chips"></div>
-          <pre id="map-out" class="code" aria-live="polite">Batch results will appear here.</pre>
         </div>
+
+        <div class="row" style="margin-top:10px;">
+          <button id="btn-run-map" class="primary" onclick="runParallelMap()">Run Batch Across Cluster</button>
+          <button class="small" onclick="copyEl('map-out')">Copy Output</button>
+          <button id="btn-dl-map" class="small" onclick="downloadLastMapJson()" disabled>Download JSON</button>
+        </div>
+        <div id="map-summary-chips" class="chips"></div>
+        <pre id="map-out" class="code" aria-live="polite">Batch results will appear here.</pre>
       </div>
     </section>
 
-    <!-- TAB 3: WORKLOADS -->
+    <!-- TAB 4: WORKLOADS -->
     <section id="panel-workloads" class="panel" role="tabpanel" aria-labelledby="tab-workloads">
       <div class="col-grid">
         <div class="card">
@@ -449,12 +624,12 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
       </div>
     </section>
 
-    <!-- TAB 4: PHONES, SAFETY & DOCTOR -->
+    <!-- TAB 5: PHONES, SAFETY & DOCTOR -->
     <section id="panel-setup" class="panel" role="tabpanel" aria-labelledby="tab-setup">
       <div class="col-grid">
         <div class="card">
           <h2>1. Auto-Discover or Add Phone</h2>
-          <p class="hint">Scan your Wi-Fi for phones already running PhoneCluster, or add an IP / Tailscale IP manually.</p>
+          <p class="hint">Scan Wi-Fi for phones running PhoneCluster, or add an IP / Tailscale IP manually.</p>
           <div class="row">
             <button class="primary" onclick="scanLan()">Scan Wi-Fi Now (2s)</button>
           </div>
@@ -507,14 +682,51 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
 </div>
 
 <script>
-let autoRefresh = true;
+let pollMs = 3000;
 let refreshTimer = null;
-let lastSummary = null;
+let lastLive = null;
 let lastMapData = null;
 let toastTimer = null;
+let boardView = 'tasks';
+
+// Interactive Web Terminal state
+const termCwds = {};
+const termHistory = [];
+let termHistIdx = -1;
+let termTranscript = [];
+let activeTermJob = null;
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtUptime(sec) {
+  if (sec == null) return '-';
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+
+function renderSparklineSvg(values, maxVal, strokeColor, fillColor) {
+  const w = 200, h = 34;
+  const pts = (values && values.length) ? values.slice(-40) : [0, 0];
+  const safeMax = Math.max(1, maxVal || 100);
+  const step = pts.length > 1 ? w / (pts.length - 1) : w;
+  const coords = pts.map((v, i) => {
+    const x = (i * step).toFixed(1);
+    const ratio = Math.max(0, Math.min(1, (Number(v) || 0) / safeMax));
+    const y = (h - 2 - ratio * (h - 5)).toFixed(1);
+    return [x, y];
+  });
+  const lineD = coords.map((p, i) => (i === 0 ? 'M' : 'L') + p[0] + ',' + p[1]).join(' ');
+  const areaD = lineD + ' L' + coords[coords.length - 1][0] + ',' + h + ' L' + coords[0][0] + ',' + h + ' Z';
+  return '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">'
+    + '<path d="' + areaD + '" fill="' + fillColor + '" />'
+    + '<path d="' + lineD + '" fill="none" stroke="' + strokeColor + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />'
+    + '</svg>';
 }
 
 function showToast(msg, tone) {
@@ -554,9 +766,7 @@ async function verifyAndSaveToken() {
     return;
   }
   try {
-    const r = await fetch('/api/auth/verify', {
-      headers: { 'Authorization': 'Bearer ' + candidate }
-    });
+    const r = await fetch('/api/auth/verify', { headers: { 'Authorization': 'Bearer ' + candidate } });
     if (!r.ok) {
       showToast('Invalid auth_token — check config/cluster.json or run `pc token`.', 'bad');
       return;
@@ -570,7 +780,7 @@ async function verifyAndSaveToken() {
     }
     updateAuthBadge();
     loadSafetySettings();
-    showToast('Token verified — cluster controls unlocked!', 'ok');
+    showToast('Token verified — Terminal & Cluster controls unlocked!', 'ok');
   } catch (e) {
     showToast('Could not reach Master to verify token: ' + e, 'bad');
   }
@@ -580,6 +790,17 @@ function clearToken() {
   localStorage.removeItem('pc_token');
   updateAuthBadge();
   showToast('Controls locked (Read-Only Mode).', 'neutral');
+}
+
+function scheduleRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  const dot = document.getElementById('live-dot');
+  if (pollMs > 0) {
+    dot.classList.remove('paused');
+    refreshTimer = setInterval(refreshLive, pollMs);
+  } else {
+    dot.classList.add('paused');
+  }
 }
 
 function initPreferences() {
@@ -599,11 +820,38 @@ function initPreferences() {
     document.documentElement.dataset.scale = e.target.value;
     localStorage.setItem('pc_scale', e.target.value);
   });
-
-  // Keyboard ergonomics
-  document.getElementById('run-cmd').addEventListener('keydown', e => {
-    if (e.key === 'Enter') runSingleCmd();
+  document.getElementById('poll-select').addEventListener('change', e => {
+    pollMs = Number(e.target.value);
+    scheduleRefresh();
   });
+
+  // Terminal keyboard shortcuts (Enter, Up/Down history, Ctrl+L clear)
+  const termInp = document.getElementById('term-input');
+  termInp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      submitTerminalCommand();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (termHistory.length && termHistIdx < termHistory.length - 1) {
+        termHistIdx++;
+        termInp.value = termHistory[termHistory.length - 1 - termHistIdx];
+      }
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (termHistIdx > 0) {
+        termHistIdx--;
+        termInp.value = termHistory[termHistory.length - 1 - termHistIdx];
+      } else {
+        termHistIdx = -1;
+        termInp.value = '';
+      }
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') {
+      e.preventDefault();
+      clearTerminal();
+    }
+  });
+
   for (const id of ['map-commands', 'map-script', 'map-args']) {
     document.getElementById(id).addEventListener('keydown', e => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') runParallelMap();
@@ -612,7 +860,7 @@ function initPreferences() {
 }
 
 function selectTab(name) {
-  const tabs = ['overview', 'jobs', 'workloads', 'setup'];
+  const tabs = ['overview', 'terminal', 'jobs', 'workloads', 'setup'];
   for (const t of tabs) {
     const btn = document.getElementById('tab-' + t);
     const panel = document.getElementById('panel-' + t);
@@ -620,6 +868,7 @@ function selectTab(name) {
     btn.setAttribute('aria-selected', active ? 'true' : 'false');
     panel.classList.toggle('active', active);
   }
+  if (name === 'terminal') document.getElementById('term-input').focus();
   if (name === 'workloads') loadWorkloads();
   if (name === 'setup' && getToken()) loadSafetySettings();
 }
@@ -632,58 +881,159 @@ document.querySelector('nav.tabs').addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft') { btns[(idx - 1 + btns.length) % btns.length].focus(); btns[(idx - 1 + btns.length) % btns.length].click(); }
 });
 
-function toggleAutoRefresh() {
-  autoRefresh = !autoRefresh;
-  const btn = document.getElementById('btn-auto');
-  btn.textContent = 'Auto-Refresh: ' + (autoRefresh ? 'ON' : 'OFF');
-  btn.setAttribute('aria-pressed', autoRefresh ? 'true' : 'false');
-}
-
 function metricBar(label, valueText, pct, tone) {
   const clamped = Math.max(0, Math.min(100, pct || 0));
   return '<div class="metric-row">'
-    + '<div class="metric-head"><span>' + esc(label) + '</span><span>' + esc(valueText) + '</span></div>'
+    + '<div class="metric-head"><span>' + esc(label) + '</span><span class="mono">' + esc(valueText) + '</span></div>'
     + '<div class="bar ' + esc(tone || '') + '"><span style="width:' + clamped + '%"></span></div>'
     + '</div>';
 }
 
-async function refreshStatus() {
+function setBoardView(mode) {
+  boardView = mode;
+  document.getElementById('btn-board-tasks').className = 'small' + (mode === 'tasks' ? ' primary' : '');
+  document.getElementById('btn-board-procs').className = 'small' + (mode === 'procs' ? ' primary' : '');
+  if (lastLive) renderTasksBoard(lastLive);
+}
+
+function renderTasksBoard(live) {
+  const wrap = document.getElementById('tasks-board-wrap');
+  if (boardView === 'procs') {
+    const procs = [];
+    for (const n of (live.summary.nodes || [])) {
+      if (!n.online) continue;
+      for (const p of ((n.health || {}).top_processes || [])) {
+        procs.push({ node_id: n.id, ...p });
+      }
+    }
+    procs.sort((a, b) => (b.cpu_pct - a.cpu_pct) || (b.mem_pct - a.mem_pct));
+    if (!procs.length) {
+      wrap.innerHTML = '<p class="hint">No process snapshots available from workers.</p>';
+      return;
+    }
+    wrap.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Phone</th><th>PID</th><th>CPU %</th><th>RAM %</th><th>Process</th></tr></thead><tbody>'
+      + procs.slice(0, 18).map(p =>
+        '<tr><td><b>' + esc(p.node_id) + '</b></td><td class="mono">' + esc(p.pid) + '</td>'
+        + '<td class="mono">' + esc(p.cpu_pct) + '%</td><td class="mono">' + esc(p.mem_pct) + '%</td>'
+        + '<td class="mono">' + esc(p.name) + '</td></tr>'
+      ).join('')
+      + '</tbody></table></div>';
+    return;
+  }
+
+  const rows = [];
+  for (const node of (live.jobs || [])) {
+    for (const j of (node.active || [])) {
+      rows.push({
+        node_id: node.node_id, job_id: j.job_id, state: 'RUNNING',
+        command: j.command, duration: j.running_sec + 's', active: true
+      });
+    }
+    for (const j of (node.recent || []).slice(0, 6)) {
+      const st = j.cancelled ? 'CANCELLED' : (j.timed_out ? 'TIMEOUT' : (j.returncode === 0 ? 'OK' : 'FAIL(' + j.returncode + ')'));
+      rows.push({
+        node_id: node.node_id, job_id: j.job_id, state: st,
+        command: j.command, duration: j.duration_sec + 's', active: false
+      });
+    }
+  }
+  if (!rows.length) {
+    wrap.innerHTML = '<p class="hint">No active or recent cluster tasks yet. Try running a command in Terminal Control or Parallel Batch!</p>';
+    return;
+  }
+  wrap.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Phone</th><th>Job ID</th><th>Status</th><th>Duration</th><th>Command</th><th>Action</th></tr></thead><tbody>'
+    + rows.map(r => {
+      const tone = r.state === 'OK' ? 'ok' : (r.state === 'RUNNING' ? 'warn' : 'bad');
+      const btn = r.active
+        ? '<button class="small danger" onclick="cancelJob(\'' + esc(r.node_id) + '\',\'' + esc(r.job_id) + '\')">Cancel</button>'
+        : '<button class="small" onclick="openNodeTerminal(\'' + esc(r.node_id) + '\', \'' + esc(r.command).replace(/'/g, '&#39;') + '\')">Re-run</button>';
+      return '<tr><td><b>' + esc(r.node_id) + '</b></td><td class="mono">' + esc(r.job_id) + '</td>'
+        + '<td><span class="pill ' + tone + '">' + esc(r.state) + '</span></td>'
+        + '<td class="mono">' + esc(r.duration) + '</td><td class="mono">' + esc(r.command) + '</td><td>' + btn + '</td></tr>';
+    }).join('')
+    + '</tbody></table></div>';
+}
+
+async function refreshLive() {
   try {
-    const r = await fetch('/api/status');
-    const d = await r.json();
-    lastSummary = d;
+    const r = await fetch('/api/live');
+    const live = await r.json();
+    lastLive = live;
+    const d = live.summary;
+    const hist = live.history || { cluster: [], nodes: {} };
     const safety = d.safety || {};
     const maxTemp = safety.max_temp_c ?? 40;
     const resTemp = safety.resume_temp_c ?? 37;
     const batHigh = safety.battery_high_pct ?? 60;
 
-    document.getElementById('cluster-title').textContent = d.cluster_name + ' — Unified Control Center';
-    document.getElementById('last-updated').textContent = 'Last synced ' + new Date().toLocaleTimeString();
-    document.getElementById('s-nodes').textContent = d.nodes_ready + ' / ' + d.nodes_total;
-    document.getElementById('s-cores').textContent = d.total_cores + ' cores';
-    document.getElementById('s-ram').textContent = (d.mem_available_mb / 1024).toFixed(2) + ' / ' + (d.mem_total_mb / 1024).toFixed(2) + ' GB';
-    document.getElementById('s-temp').textContent = d.max_temp_c !== null ? d.max_temp_c.toFixed(1) + ' °C' : 'N/A';
+    document.getElementById('cluster-title').textContent = d.cluster_name + ' — Shared btop';
+    document.getElementById('last-updated').textContent = 'Synced ' + new Date().toLocaleTimeString() + ' · ' + d.nodes_online + '/' + d.nodes_total + ' phones connected';
 
-    const targetSel = document.getElementById('run-target');
-    const prevVal = targetSel.value;
-    targetSel.innerHTML = '<option value="best">Smart: Best Coolest Phone</option><option value="all">All Ready Phones</option>';
+    // Hero KPIs + Sparklines
+    const cHist = hist.cluster || [];
+    document.getElementById('k-cpu').textContent = (d.cluster_cpu_pct ?? 0).toFixed(1) + '%';
+    document.getElementById('k-cores').textContent = d.total_cores + ' cores';
+    document.getElementById('spark-cpu').innerHTML = renderSparklineSvg(
+      cHist.map(p => p.cpu_pct), 100, '#58a6ff', 'rgba(88,166,255,0.18)'
+    );
+
+    const usedGb = ((d.mem_total_mb - d.mem_available_mb) / 1024).toFixed(2);
+    const totGb = (d.mem_total_mb / 1024).toFixed(2);
+    document.getElementById('k-ram').textContent = usedGb + ' / ' + totGb + ' GB';
+    document.getElementById('k-ram-pct').textContent = (d.cluster_ram_pct ?? 0).toFixed(0) + '%';
+    document.getElementById('spark-ram').innerHTML = renderSparklineSvg(
+      cHist.map(p => p.ram_pct), 100, '#a371f7', 'rgba(163,113,247,0.18)'
+    );
+
+    const peakT = d.max_temp_c;
+    document.getElementById('k-temp').textContent = peakT !== null ? peakT.toFixed(1) + ' °C' : 'N/A';
+    const tp = document.getElementById('k-temp-pill');
+    if (peakT === null) { tp.textContent = 'N/A'; tp.className = 'pill neutral'; }
+    else if (peakT >= maxTemp) { tp.textContent = '⚠ HOT'; tp.className = 'pill bad'; }
+    else if (peakT >= resTemp) { tp.textContent = 'Warm'; tp.className = 'pill warn'; }
+    else { tp.textContent = '✓ Cool'; tp.className = 'pill ok'; }
+    document.getElementById('spark-temp').innerHTML = renderSparklineSvg(
+      cHist.map(p => p.max_temp_c ?? 0), 55, peakT >= maxTemp ? '#f85149' : '#3fb950',
+      peakT >= maxTemp ? 'rgba(248,81,73,0.18)' : 'rgba(63,185,80,0.16)'
+    );
+
+    document.getElementById('k-tasks').textContent = String(d.total_active_jobs || 0);
+    document.getElementById('k-tasks-sub').textContent = d.total_active_jobs ? 'Active across cluster' : 'Idle · ready for work';
+    document.getElementById('k-net').textContent = '↓' + (d.total_net_rx_kbps ?? 0) + ' ↑' + (d.total_net_tx_kbps ?? 0) + ' KB/s';
+
+    document.getElementById('k-nodes').textContent = d.nodes_ready + ' / ' + d.nodes_total;
+    document.getElementById('k-ping').textContent = (d.avg_latency_ms ?? 0) + ' ms';
+    document.getElementById('k-nodes-sub').textContent = d.nodes_online + ' online · ' + d.nodes_ready + ' ready';
+
+    // Update Terminal Target Dropdown dynamically
+    const termSel = document.getElementById('term-target');
+    const prevTerm = termSel.value;
+    termSel.innerHTML = '<option value="best">Smart: Best Coolest Phone</option><option value="all">ALL READY PHONES (Broadcast)</option>';
     for (const n of d.nodes) {
       const opt = document.createElement('option');
       opt.value = n.id;
-      opt.textContent = n.id + ' (' + n.role + ' — ' + n.host + ')';
-      targetSel.appendChild(opt);
+      opt.textContent = n.id + ' (' + n.role + ' · ' + n.host + ')';
+      termSel.appendChild(opt);
     }
-    if (Array.from(targetSel.options).some(o => o.value === prevVal)) targetSel.value = prevVal;
+    if (Array.from(termSel.options).some(o => o.value === prevTerm)) termSel.value = prevTerm;
 
+    // Render Shared Multi-Device btop Cards
     const batWarnings = [];
     const grid = document.getElementById('nodes-grid');
     grid.innerHTML = '';
 
     for (const n of d.nodes) {
       const h = n.health || {};
+      const nHist = (hist.nodes && hist.nodes[n.id]) ? hist.nodes[n.id] : [];
       let badge = '<span class="pill bad">✕ OFFLINE</span>';
-      if (n.online && n.ready_for_jobs) badge = '<span class="pill ok">✓ READY (' + (h.active_jobs || 0) + '/' + (h.max_concurrency || n.max_concurrency || 2) + ')</span>';
-      else if (n.online) badge = '<span class="pill warn">⚠ ' + esc((h.not_ready_reasons || ['PAUSED']).join(', ')) + '</span>';
+      let cardCls = 'node-card offline';
+      if (n.online && n.ready_for_jobs) {
+        badge = '<span class="pill ok">✓ READY (' + (h.active_jobs || 0) + '/' + (h.max_concurrency || n.max_concurrency || 2) + ')</span>';
+        cardCls = 'node-card';
+      } else if (n.online) {
+        badge = '<span class="pill warn">⚠ ' + esc((h.not_ready_reasons || ['PAUSED']).join(', ')) + '</span>';
+        cardCls = 'node-card hot';
+      }
 
       if (n.online && h.battery_pct != null && h.battery_pct >= batHigh && (h.battery_status === 'CHARGING' || h.battery_status === 'FULL')) {
         batWarnings.push(n.id + ' is at ' + h.battery_pct + '% (' + h.battery_status + ')');
@@ -694,39 +1044,81 @@ async function refreshStatus() {
         bodyHtml = '<p class="hint">Unreachable: ' + esc(n.error || 'connection refused') + '</p>';
       } else {
         const cores = h.cpu_cores || 1;
-        const loadPct = ((h.load_1m || 0) / cores) * 100;
-        const ramUsedPct = h.mem_total_mb ? ((h.mem_total_mb - h.mem_available_mb) / h.mem_total_mb) * 100 : 0;
+        const cpuPct = h.cpu_pct != null ? Number(h.cpu_pct) : Math.min(100, ((h.load_1m || 0) / cores) * 100);
+        const perCore = h.per_core_pct || [];
+        const coreCols = perCore.length
+          ? '<div class="core-grid" title="Per-core CPU utilization">'
+            + perCore.slice(0, 16).map(p => {
+                const c = p >= 85 ? 'bad' : (p >= 60 ? 'warn' : '');
+                return '<div class="core-col"><span class="' + c + '" style="height:' + Math.max(6, Math.round(p)) + '%"></span></div>';
+              }).join('')
+            + '</div>'
+          : '';
+
+        bodyHtml += '<div class="cpu-btop-box">'
+          + '<div class="cpu-btop-top"><span><strong>CPU</strong> ' + cores + ' cores · load ' + esc(h.load_1m ?? 0) + '</span>'
+          + '<span class="mono"><strong>' + cpuPct.toFixed(1) + '%</strong></span></div>'
+          + '<div class="spark-wrap" style="height:28px;margin-top:0">'
+          + renderSparklineSvg(nHist.map(p => p.cpu_pct), 100, '#58a6ff', 'rgba(88,166,255,0.18)')
+          + '</div>' + coreCols + '</div>';
+
+        const ramUsedMb = Math.max(0, (h.mem_total_mb || 0) - (h.mem_available_mb || 0));
+        const ramUsedPct = h.mem_total_mb ? (ramUsedMb / h.mem_total_mb) * 100 : 0;
         const temp = h.temp_c;
         const tempTone = temp == null ? '' : (temp >= maxTemp ? 'bad' : (temp >= resTemp ? 'warn' : 'ok'));
         const bat = h.battery_pct;
         const batTone = bat == null ? '' : (bat >= batHigh && h.battery_status === 'CHARGING' ? 'warn' : (bat < 20 ? 'bad' : 'ok'));
 
-        bodyHtml += metricBar('CPU Load', cores + ' cores · load ' + (h.load_1m ?? 0), loadPct, loadPct > 85 ? 'warn' : '');
-        bodyHtml += metricBar('RAM Used', (h.mem_available_mb || 0) + ' MB free / ' + (h.mem_total_mb || 0) + ' MB', ramUsedPct, ramUsedPct > 85 ? 'bad' : '');
+        bodyHtml += metricBar('Memory', ramUsedMb + ' / ' + (h.mem_total_mb || 0) + ' MB (' + ramUsedPct.toFixed(0) + '%)', ramUsedPct, ramUsedPct > 85 ? 'bad' : '');
         bodyHtml += metricBar('Temperature', temp != null ? temp.toFixed(1) + ' °C' : 'N/A', temp != null ? (temp / 50) * 100 : 0, tempTone);
-        bodyHtml += metricBar('Battery', bat != null ? bat + '% (' + (h.battery_status || '?') + ')' : 'N/A', bat ?? 0, batTone);
+        bodyHtml += metricBar('Battery', bat != null ? bat + '% · ' + (h.battery_status || '?') : 'N/A', bat ?? 0, batTone);
+
+        // Inline running tasks badge
+        const activeJobs = h.active_job_list || [];
+        if (activeJobs.length) {
+          bodyHtml += '<div class="chips">' + activeJobs.map(j =>
+            '<span class="pill accent mono">▶ ' + esc(j.command.slice(0, 26)) + ' (' + esc(j.running_sec) + 's)</span>'
+          ).join('') + '</div>';
+        }
+
+        // Top processes mini-panel
+        const procs = h.top_processes || [];
+        if (procs.length) {
+          bodyHtml += '<div class="mini-procs"><div class="mini-procs-head"><span>Top Processes</span><span>CPU / MEM</span></div>'
+            + procs.slice(0, 4).map(p =>
+                '<div class="proc-line mono"><span>' + esc(p.name) + ' <small style="color:var(--muted)">#' + esc(p.pid) + '</small></span>'
+                + '<span>' + esc(p.cpu_pct) + '% / ' + esc(p.mem_pct) + '%</span></div>'
+              ).join('')
+            + '</div>';
+        }
 
         const svcs = Object.entries(h.services || {}).filter(([, v]) => v).map(([k]) => k.split('_')[0]);
+        const netChip = (h.net_rx_kbps != null && h.net_tx_kbps != null)
+          ? '<span class="pill neutral mono">↓' + esc(h.net_rx_kbps) + ' ↑' + esc(h.net_tx_kbps) + ' KB/s</span>' : '';
         bodyHtml += '<div class="chips">'
           + '<span class="pill neutral">' + esc(h.os_env || 'linux') + '</span>'
-          + '<span class="pill neutral">' + esc(n.latency_ms) + ' ms</span>'
+          + '<span class="pill neutral mono">up ' + esc(fmtUptime(h.uptime_sec)) + '</span>'
+          + '<span class="pill neutral mono">' + esc(n.latency_ms) + ' ms</span>'
+          + netChip
           + svcs.map(s => '<span class="pill ok">' + esc(s) + '</span>').join('')
           + '</div>';
       }
 
+      const rolePill = n.role === 'master'
+        ? '<span class="pill purple">MASTER</span>'
+        : '<span class="pill neutral">WORKER</span>';
       let actionsHtml = '<div class="node-actions">'
-        + '<button class="small" onclick="runQuickOnNode(\'' + esc(n.id) + '\')">Run Command</button>'
-        + '<button class="small" onclick="refreshJobs()">View Jobs</button>';
+        + '<button class="small primary" onclick="openNodeTerminal(\'' + esc(n.id) + '\')">Terminal</button>';
       if (n.role !== 'master') {
         actionsHtml += '<button class="small danger" onclick="removeNode(\'' + esc(n.id) + '\')">Remove</button>';
       }
       actionsHtml += '</div>';
 
       const card = document.createElement('article');
-      card.className = 'node-card';
+      card.className = cardCls;
       card.innerHTML = '<div><div class="node-head">'
-        + '<div><div class="node-title">' + esc(n.id) + ' <small style="color:var(--muted);font-weight:400">(' + esc(n.role) + ')</small></div>'
-        + '<div class="node-meta">' + esc(n.host) + '</div></div>'
+        + '<div><div class="node-title">' + esc(n.id) + ' ' + rolePill + '</div>'
+        + '<div class="node-meta mono">' + esc(n.host) + '</div></div>'
         + badge + '</div>' + bodyHtml + '</div>' + actionsHtml;
       grid.appendChild(card);
     }
@@ -734,102 +1126,124 @@ async function refreshStatus() {
     const banner = document.getElementById('battery-banner');
     if (batWarnings.length) {
       document.getElementById('battery-banner-text').textContent = batWarnings.join('; ')
-        + '. Avoid leaving Li-Po batteries pinned at 100% 24/7 (configure a smart-plug webhook in Tab 4 or use rooted ACC).';
+        + '. Avoid leaving Li-Po batteries pinned at 100% 24/7 (configure a smart-plug webhook in Tab 5 or use rooted ACC).';
       banner.classList.remove('hidden');
     } else {
       banner.classList.add('hidden');
     }
+
+    renderTasksBoard(live);
   } catch (e) {
     document.getElementById('last-updated').textContent = 'Connection error: ' + e;
   }
 }
 
-function runQuickOnNode(nodeId) {
-  document.getElementById('run-target').value = nodeId;
-  selectTab('jobs');
-  document.getElementById('run-cmd').focus();
+/* ---------------- Interactive Multi-Node Web Terminal ---------------- */
+function onTermTargetChange() {
+  const target = document.getElementById('term-target').value;
+  const cwd = termCwds[target] || '~';
+  document.getElementById('term-cwd-pill').textContent = cwd;
+  document.getElementById('term-prompt').textContent = target + ':' + cwd.split('/').slice(-1)[0] + ' $';
 }
 
-async function refreshJobs() {
-  const wrap = document.getElementById('jobs-table-wrap');
-  wrap.textContent = 'Loading jobs from all phones...';
+function openNodeTerminal(nodeId, prefillCmd) {
+  selectTab('terminal');
+  const sel = document.getElementById('term-target');
+  if (Array.from(sel.options).some(o => o.value === nodeId)) sel.value = nodeId;
+  onTermTargetChange();
+  const inp = document.getElementById('term-input');
+  if (prefillCmd) inp.value = prefillCmd;
+  inp.focus();
+}
+
+function runTermPreset(cmd) {
+  document.getElementById('term-input').value = cmd;
+  submitTerminalCommand();
+}
+
+function clearTerminal() {
+  document.getElementById('term-screen').innerHTML = '';
+  termTranscript = [];
+}
+
+function downloadTermLog() {
+  const blob = new Blob([termTranscript.join('\n\n')], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'phonecluster-terminal-' + Date.now() + '.log';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function submitTerminalCommand() {
+  const inp = document.getElementById('term-input');
+  const cmd = inp.value.trim();
+  if (!cmd) return;
+  if (cmd === 'clear') { inp.value = ''; clearTerminal(); return; }
+
+  const target = document.getElementById('term-target').value;
+  const cwd = termCwds[target] || '';
+  termHistory.push(cmd);
+  termHistIdx = -1;
+  inp.value = '';
+
+  const screen = document.getElementById('term-screen');
+  const entry = document.createElement('div');
+  entry.className = 'term-entry';
+  const promptText = target + ':' + (cwd ? cwd.split('/').slice(-1)[0] : '~') + ' $ ' + cmd;
+  entry.innerHTML = '<div class="term-cmd-line">' + esc(promptText) + '<span class="term-meta">running...</span></div>';
+  screen.appendChild(entry);
+  screen.scrollTop = screen.scrollHeight;
+
+  const jobId = 'wterm-' + Date.now().toString(36);
+  activeTermJob = { node_id: target, job_id: jobId };
+  document.getElementById('btn-term-run').disabled = true;
+  document.getElementById('btn-term-cancel').disabled = (target === 'all' || target === 'best');
+
   try {
-    const r = await fetch('/api/jobs');
-    const d = await r.json();
-    const rows = [];
-    for (const node of (d.nodes || [])) {
-      for (const j of (node.active || [])) {
-        rows.push({
-          node_id: node.node_id, job_id: j.job_id, state: 'RUNNING',
-          command: j.command, duration: j.running_sec + 's', active: true
-        });
-      }
-      for (const j of (node.recent || []).slice(0, 6)) {
-        const st = j.cancelled ? 'CANCELLED' : (j.timed_out ? 'TIMEOUT' : (j.returncode === 0 ? 'OK' : 'FAIL(' + j.returncode + ')'));
-        rows.push({
-          node_id: node.node_id, job_id: j.job_id, state: st,
-          command: j.command, duration: j.duration_sec + 's', active: false
-        });
-      }
-    }
-    if (!rows.length) {
-      wrap.innerHTML = '<p class="hint">No active or recent jobs recorded yet.</p>';
+    const data = await authPost('/api/terminal/exec', { command: cmd, target, cwd, job_id: jobId });
+    if (data.error) {
+      entry.innerHTML = '<div class="term-cmd-line">' + esc(promptText) + '</div><div class="term-err">Error: ' + esc(data.error) + '</div>';
+      showToast(data.error, 'bad');
       return;
     }
-    wrap.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Node</th><th>Job ID</th><th>Status</th><th>Duration</th><th>Command</th><th>Action</th></tr></thead><tbody>'
-      + rows.map(r => {
-        const tone = r.state === 'OK' ? 'ok' : (r.state === 'RUNNING' ? 'warn' : 'bad');
-        const btn = r.active
-          ? '<button class="small danger" onclick="cancelJob(\'' + esc(r.node_id) + '\',\'' + esc(r.job_id) + '\')">Cancel</button>'
-          : '-';
-        return '<tr><td><b>' + esc(r.node_id) + '</b></td><td><code>' + esc(r.job_id) + '</code></td>'
-          + '<td><span class="pill ' + tone + '">' + esc(r.state) + '</span></td>'
-          + '<td>' + esc(r.duration) + '</td><td>' + esc(r.command) + '</td><td>' + btn + '</td></tr>';
-      }).join('')
-      + '</tbody></table></div>';
-  } catch (e) {
-    wrap.textContent = 'Failed to load jobs: ' + e;
+    let html = '<div class="term-cmd-line">' + esc(promptText) + '</div>';
+    let plainOut = '$ ' + promptText + '\n';
+    for (const r of (data.results || [])) {
+      if (target !== 'all' && r.cwd) {
+        termCwds[target] = r.cwd;
+        onTermTargetChange();
+      }
+      const meta = '[' + r.node_id + ' · ' + (r.ok ? 'OK' : 'rc=' + r.returncode) + ' · ' + r.duration_sec + 's]';
+      html += '<div class="term-meta" style="margin-left:0;">' + esc(meta) + '</div>';
+      if (r.stdout) { html += '<div>' + esc(r.stdout) + '</div>'; plainOut += meta + '\n' + r.stdout + '\n'; }
+      if (r.stderr) { html += '<div class="term-err">' + esc(r.stderr) + '</div>'; plainOut += '[stderr]\n' + r.stderr + '\n'; }
+      if (r.error) { html += '<div class="term-err">Error: ' + esc(r.error) + '</div>'; plainOut += '[error] ' + r.error + '\n'; }
+    }
+    entry.innerHTML = html;
+    termTranscript.push(plainOut.trim());
+    screen.scrollTop = screen.scrollHeight;
+    refreshLive();
+  } finally {
+    activeTermJob = null;
+    document.getElementById('btn-term-run').disabled = false;
+    document.getElementById('btn-term-cancel').disabled = true;
   }
+}
+
+async function cancelActiveTermJob() {
+  if (!activeTermJob) return;
+  await cancelJob(activeTermJob.node_id, activeTermJob.job_id);
 }
 
 async function cancelJob(nodeId, jobId) {
   const data = await authPost('/api/jobs/cancel', { node_id: nodeId, job_id: jobId });
   if (data.error) { showToast('Cancel failed: ' + data.error, 'bad'); return; }
   showToast('Cancelled job ' + jobId + ' on ' + nodeId, 'warn');
-  refreshJobs();
+  refreshLive();
 }
 
-async function loadWorkloads() {
-  try {
-    const r = await fetch('/api/workloads');
-    const d = await r.json();
-    document.getElementById('wl-distcc').textContent = d.distcc_hosts
-      ? 'export DISTCC_HOSTS="' + d.distcc_hosts + '"'
-      : '# No running distccd workers detected (click Start All above).';
-    document.getElementById('wl-llama').textContent = d.llama_rpc
-      ? '--rpc ' + d.llama_rpc
-      : '# No running llama.cpp rpc-server detected on port 50052.';
-    document.getElementById('wl-mpi').textContent = d.mpi_hostfile || '# No ready nodes available.';
-
-    let svcHtml = '';
-    if (d.home_assistant_urls && d.home_assistant_urls.length) {
-      svcHtml += '<p><strong>✓ Home Assistant detected:</strong> '
-        + d.home_assistant_urls.map(u => '<a href="' + esc(u) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(u) + '</a>').join(', ')
-        + '</p>';
-    } else {
-      svcHtml += '<p><strong>Home Assistant:</strong> Not detected on port 8123. Best deployed on Tier 2 (Rooted Debian 13 chroot) or Tier 3 (Docker).</p>';
-    }
-    svcHtml += '<p><strong>Docker-ready nodes:</strong> ' + (d.docker_nodes.length ? esc(d.docker_nodes.join(', ')) : 'None yet (requires Tier 3 custom kernel + Droidspaces)') + '</p>';
-    document.getElementById('wl-services').innerHTML = svcHtml;
-  } catch (e) {
-    document.getElementById('wl-distcc').textContent = 'Error loading workloads: ' + e;
-  }
-}
-
-function setPreset(cmd) {
-  document.getElementById('run-cmd').value = cmd;
-}
-
+/* ---------------- Parallel Batch, Workloads, Setup & Doctor ---------------- */
 function applyMapTemplate(name) {
   if (!name) return;
   if (name === 'primes') {
@@ -892,28 +1306,6 @@ async function authPost(url, payload) {
   return await r.json();
 }
 
-async function runSingleCmd() {
-  const cmd = document.getElementById('run-cmd').value.trim();
-  const target = document.getElementById('run-target').value;
-  if (!cmd) return;
-  const btn = document.getElementById('btn-run-single');
-  const out = document.getElementById('run-out');
-  btn.disabled = true;
-  out.textContent = 'Running across cluster...';
-  try {
-    const data = await authPost('/api/exec', { command: cmd, target });
-    if (data.error) { out.textContent = 'Error: ' + data.error; showToast(data.error, 'bad'); return; }
-    out.textContent = (data.results || []).map(res => {
-      const head = '=== [' + res.node_id + '] ' + (res.ok ? 'OK' : 'FAIL rc=' + res.returncode) + ' (' + res.duration_sec + 's) ===';
-      return [head, res.stdout, res.stderr ? '[stderr]\n' + res.stderr : '', res.error ? '[error] ' + res.error : '']
-        .filter(Boolean).join('\n');
-    }).join('\n\n');
-    refreshJobs();
-  } finally {
-    btn.disabled = false;
-  }
-}
-
 function toggleMapMode() {
   const mode = document.getElementById('map-mode').value;
   document.getElementById('map-commands-box').style.display = mode === 'commands' ? 'block' : 'none';
@@ -943,7 +1335,7 @@ async function runParallelMap() {
     if (data.error) { out.textContent = 'Error: ' + data.error; showToast(data.error, 'bad'); return; }
     lastMapData = data;
     document.getElementById('btn-dl-map').disabled = false;
-    chips.innerHTML = '<span class="pill neutral">' + esc(data.wall_sec) + 's</span>'
+    chips.innerHTML = '<span class="pill neutral mono">' + esc(data.wall_sec) + 's</span>'
       + '<span class="pill ok">✓ OK: ' + esc(data.ok_count) + '</span>'
       + (data.fail_count ? '<span class="pill bad">✕ FAIL: ' + esc(data.fail_count) + '</span>' : '')
       + Object.entries(data.distribution || {}).map(([k, v]) => '<span class="pill neutral">' + esc(k) + ': ' + esc(v) + '</span>').join('');
@@ -954,8 +1346,7 @@ async function runParallelMap() {
     }
     out.textContent = txt || 'Done.';
     showToast('Batch complete: ' + data.ok_count + ' succeeded, ' + data.fail_count + ' failed', data.fail_count ? 'warn' : 'ok');
-    refreshStatus();
-    refreshJobs();
+    refreshLive();
   } finally {
     btn.disabled = false;
   }
@@ -969,6 +1360,33 @@ function downloadLastMapJson() {
   a.download = 'phonecluster-batch-' + Date.now() + '.json';
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+async function loadWorkloads() {
+  try {
+    const r = await fetch('/api/workloads');
+    const d = await r.json();
+    document.getElementById('wl-distcc').textContent = d.distcc_hosts
+      ? 'export DISTCC_HOSTS="' + d.distcc_hosts + '"'
+      : '# No running distccd workers detected (click Start All above).';
+    document.getElementById('wl-llama').textContent = d.llama_rpc
+      ? '--rpc ' + d.llama_rpc
+      : '# No running llama.cpp rpc-server detected on port 50052.';
+    document.getElementById('wl-mpi').textContent = d.mpi_hostfile || '# No ready nodes available.';
+
+    let svcHtml = '';
+    if (d.home_assistant_urls && d.home_assistant_urls.length) {
+      svcHtml += '<p><strong>✓ Home Assistant detected:</strong> '
+        + d.home_assistant_urls.map(u => '<a href="' + esc(u) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(u) + '</a>').join(', ')
+        + '</p>';
+    } else {
+      svcHtml += '<p><strong>Home Assistant:</strong> Not detected on port 8123. Best deployed on Tier 2 (Rooted Debian 13 chroot) or Tier 3 (Docker).</p>';
+    }
+    svcHtml += '<p><strong>Docker-ready nodes:</strong> ' + (d.docker_nodes.length ? esc(d.docker_nodes.join(', ')) : 'None yet (requires Tier 3 custom kernel + Droidspaces)') + '</p>';
+    document.getElementById('wl-services').innerHTML = svcHtml;
+  } catch (e) {
+    document.getElementById('wl-distcc').textContent = 'Error loading workloads: ' + e;
+  }
 }
 
 async function workloadAction(action) {
@@ -1010,7 +1428,7 @@ async function addDiscoveredNode(host, worker_port, ssh_port, ssh_user) {
   if (data.error) { showToast('Could not add node: ' + data.error, 'bad'); return; }
   showToast('Added ' + data.node.id + ' (' + data.node.host + ') to cluster.json!', 'ok');
   scanLan();
-  refreshStatus();
+  refreshLive();
 }
 
 async function addManualNode() {
@@ -1023,7 +1441,7 @@ async function addManualNode() {
   if (data.error) { showToast('Could not add phone: ' + data.error, 'bad'); return; }
   document.getElementById('add-host').value = '';
   showToast('Added ' + data.node.id + ' (' + data.node.host + ')!', 'ok');
-  refreshStatus();
+  refreshLive();
 }
 
 async function removeNode(nodeId) {
@@ -1031,7 +1449,7 @@ async function removeNode(nodeId) {
   const data = await authPost('/api/nodes/remove', { id: nodeId });
   if (data.error) { showToast('Remove failed: ' + data.error, 'bad'); return; }
   showToast('Removed ' + nodeId + ' from cluster.', 'warn');
-  refreshStatus();
+  refreshLive();
 }
 
 async function loadSafetySettings() {
@@ -1059,8 +1477,8 @@ async function saveSafetySettings() {
   };
   const data = await authPost('/api/settings', payload);
   if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
-  showToast('Safety settings saved to cluster.json! Run `pc sync` to push to workers.', 'ok');
-  refreshStatus();
+  showToast('Safety settings saved! Run `pc sync` to push to worker phones.', 'ok');
+  refreshLive();
 }
 
 async function testSafetyWebhook() {
@@ -1098,14 +1516,15 @@ function copyEl(id) {
 }
 
 function refreshAll() {
-  refreshStatus();
+  refreshLive();
   if (document.getElementById('panel-workloads').classList.contains('active')) loadWorkloads();
 }
 
 initPreferences();
 updateAuthBadge();
-refreshStatus();
-refreshTimer = setInterval(() => { if (autoRefresh) refreshStatus(); }, 5000);
+onTermTargetChange();
+refreshLive();
+scheduleRefresh();
 </script>
 </body>
 </html>
@@ -1170,6 +1589,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"))
         elif path == "/api/status":
             self._send_json(HTTPStatus.OK, self.server.controller.cluster_summary())
+        elif path == "/api/metrics":
+            self._send_json(HTTPStatus.OK, self.server.controller.metrics_history.snapshot())
+        elif path == "/api/live":
+            summary = self.server.controller.cluster_summary()
+            jobs = self.server.controller.get_all_jobs()
+            history = self.server.controller.metrics_history.snapshot()
+            self._send_json(HTTPStatus.OK, {"summary": summary, "jobs": jobs, "history": history})
         elif path == "/api/jobs":
             self._send_json(HTTPStatus.OK, {"nodes": self.server.controller.get_all_jobs()})
         elif path == "/api/auth/verify":
@@ -1228,6 +1654,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         valid_paths = {
             "/api/exec",
+            "/api/terminal/exec",
             "/api/map",
             "/api/jobs/cancel",
             "/api/nodes/add",
@@ -1261,6 +1688,27 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
             outcomes = ctrl.run_single(spec, target=target)
             self._send_json(HTTPStatus.OK, {"results": [o.to_dict() for o in outcomes]})
+
+        elif path == "/api/terminal/exec":
+            command = str(body.get("command", "")).strip()
+            target = str(body.get("target", "best")).strip() or "best"
+            cwd = str(body.get("cwd", "")).strip() or None
+            job_id = str(body.get("job_id", "")).strip() or None
+            if not command:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "empty command"})
+                return
+            try:
+                results = ctrl.exec_terminal_command(
+                    command=command,
+                    target=target,
+                    cwd=cwd,
+                    timeout_sec=float(body.get("timeout_sec", ctrl.config.default_job_timeout_sec)),
+                    job_id=job_id,
+                )
+            except KeyError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, {"results": results})
 
         elif path == "/api/map":
             mode = str(body.get("mode", "commands"))
@@ -1451,14 +1899,35 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
 
 
+def _start_background_sampler(
+    controller: MasterController,
+    stop_event: threading.Event,
+    interval_sec: float = 4.0,
+) -> threading.Thread:
+    """Keep sparkline metrics warm even before a browser tab connects."""
+    def _loop() -> None:
+        while not stop_event.is_set():
+            try:
+                controller.cluster_summary(record_history=True)
+            except Exception:
+                pass
+            stop_event.wait(interval_sec)
+
+    t = threading.Thread(target=_loop, name="metrics-sampler", daemon=True)
+    t.start()
+    return t
+
+
 def serve_dashboard(
     bind_host: str,
     port: int,
     controller: MasterController,
     config_path: Path | None = None,
 ) -> None:
-    """Start the Master Phone's accessible Web Control Center."""
+    """Start the Master Phone's accessible btop Web Control Center."""
     server = DashboardHTTPServer((bind_host, port), controller, config_path=config_path)
+    stop_event = threading.Event()
+    _start_background_sampler(controller, stop_event, interval_sec=4.0)
     lan_ip = detect_local_ip()
     actual_port = server.server_address[1]
     print(f"PhoneCluster Web Control Center -> http://{lan_ip}:{actual_port}")
@@ -1475,4 +1944,5 @@ def serve_dashboard(
     except KeyboardInterrupt:
         pass
     finally:
+        stop_event.set()
         server.server_close()

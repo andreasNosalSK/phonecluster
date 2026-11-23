@@ -30,13 +30,15 @@ from phonecluster.master import (
     NodeSnapshot,
     score_node,
 )
-from phonecluster.wizard import run_setup_wizard
 from phonecluster.telemetry import (
+    CpuSampler,
     ThermalGate,
     _normalize_sysfs_temp,
     read_battery_via_sysfs,
     read_memory_info,
 )
+from phonecluster.tui import make_sparkline, render_top_frame
+from phonecluster.wizard import run_setup_wizard
 from phonecluster.worker import BatteryGuardLoop, WorkerState, create_worker_server
 
 
@@ -109,6 +111,28 @@ class TestTelemetry(unittest.TestCase):
             self.assertEqual(mem["available_mb"], 2000)
             self.assertEqual(mem["used_mb"], 2000)
 
+    def test_cpu_sampler_delta_and_per_core(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stat_file = Path(tmp) / "stat"
+            stat_file.write_text(
+                "cpu  100 0 100 800 0 0 0 0\n"
+                "cpu0 50 0 50 400 0 0 0 0\n"
+                "cpu1 50 0 50 400 0 0 0 0\n",
+                encoding="utf-8",
+            )
+            sampler = CpuSampler(stat_path=stat_file)
+            # Second sample: cpu busy increased by 100 out of 200 ticks (50.0%)
+            # cpu0: +75 busy / 100 total (75.0%), cpu1: +25 busy / 100 total (25.0%)
+            stat_file.write_text(
+                "cpu  150 0 150 900 0 0 0 0\n"
+                "cpu0 100 0 75 425 0 0 0 0\n"
+                "cpu1 50 0 75 475 0 0 0 0\n",
+                encoding="utf-8",
+            )
+            total, cores = sampler.sample(load_1m=0.5, cpu_cores=2)
+            self.assertEqual(total, 50.0)
+            self.assertEqual(cores, [75.0, 25.0])
+
 
 class TestLiveClusterEndToEnd(unittest.TestCase):
     """Spins up 3 real local worker HTTP servers (1 master + 2 workers) and tests full workflows."""
@@ -143,11 +167,20 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
                         "hostname": f"phone-{name}",
                         "os_env": "debian-13" if name == "node0" else "termux",
                         "arch": "aarch64",
+                        "uptime_sec": 7500,
                         "cpu_cores": 8,
+                        "cpu_pct": 28.5 if name == "node0" else 14.0,
+                        "per_core_pct": [15.0, 42.0, 10.0, 80.0, 22.0, 12.0, 5.0, 35.0],
                         "load_1m": 0.4,
                         "mem_total_mb": 3512,
                         "mem_available_mb": 1900,
                         "disk_free_gb": 42.0,
+                        "net_rx_kbps": 14.2,
+                        "net_tx_kbps": 3.8,
+                        "top_processes": [
+                            {"pid": 1001, "cpu_pct": 18.4, "mem_pct": 4.2, "name": "python3"},
+                            {"pid": 1002, "cpu_pct": 0.5, "mem_pct": 0.8, "name": "sshd"},
+                        ],
                         "battery_pct": 55 if name != "node1" else 65,
                         "temp_c": temp,
                         "battery_status": "CHARGING" if name == "node1" else "DISCHARGING",
@@ -474,9 +507,81 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
                     self.assertTrue(json.loads(resp.read().decode("utf-8"))["cancelled"])
                 bg.join(timeout=5.0)
                 self.assertTrue(slow_result and slow_result[0].get("cancelled"))
+                # 9. Unified /api/live & /api/metrics sparkline history
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/live", timeout=3.0) as resp:
+                    live = json.loads(resp.read().decode("utf-8"))
+                    self.assertIn("summary", live)
+                    self.assertIn("jobs", live)
+                    self.assertIn("history", live)
+                    self.assertGreaterEqual(len(live["history"]["cluster"]), 1)
+                    self.assertGreater(live["summary"]["cluster_cpu_pct"], 0)
+
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/metrics", timeout=3.0) as resp:
+                    hist = json.loads(resp.read().decode("utf-8"))
+                    self.assertIn("node0", hist["nodes"])
+
+                # 10. Interactive Web Terminal (/api/terminal/exec) with persistent cd
+                req_cd = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/terminal/exec",
+                    data=json.dumps({"command": "cd /tmp && echo in-tmp", "target": "node0"}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_cd, timeout=5.0) as resp:
+                    t1 = json.loads(resp.read().decode("utf-8"))["results"][0]
+                    self.assertTrue(t1["ok"])
+                    self.assertEqual(t1["stdout"].strip(), "in-tmp")
+                    self.assertEqual(t1["cwd"], "/tmp")
+
+                req_pwd = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/terminal/exec",
+                    data=json.dumps({"command": "pwd", "target": "node0", "cwd": t1["cwd"]}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_pwd, timeout=5.0) as resp:
+                    t2 = json.loads(resp.read().decode("utf-8"))["results"][0]
+                    self.assertEqual(t2["stdout"].strip(), "/tmp")
             finally:
                 dash.shutdown()
                 dash.server_close()
+
+    def test_btop_tui_renderer_and_cli_top_once(self) -> None:
+        from phonecluster import cli
+
+        summary = self.controller.cluster_summary()
+        all_jobs = self.controller.get_all_jobs()
+        hist = self.controller.metrics_history.snapshot()
+
+        frame_tasks = render_top_frame(
+            summary=summary,
+            history=hist,
+            all_jobs=all_jobs,
+            view_mode="tasks",
+            width=100,
+            use_color=False,
+        )
+        self.assertIn("UNIFIED MULTI-DEVICE BTOP", frame_tasks)
+        self.assertIn("node0", frame_tasks)
+        self.assertIn("node2", frame_tasks)
+        self.assertIn("RUNNING & RECENT CLUSTER TASKS", frame_tasks)
+
+        frame_procs = render_top_frame(
+            summary=summary,
+            history=hist,
+            all_jobs=all_jobs,
+            view_mode="procs",
+            width=100,
+            use_color=False,
+        )
+        self.assertIn("SHARED TOP PROCESSES", frame_procs)
+        self.assertIn("python3", frame_procs)
+        self.assertEqual(len(make_sparkline([10, 50, 90], width=8)), 8)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cluster.json"
+            save_config(self.config, cfg_path)
+            self.assertEqual(cli.main(["--config", str(cfg_path), "top", "--once"]), 0)
 
     def test_udp_lan_discovery(self) -> None:
         responder = DiscoveryResponder(
