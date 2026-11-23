@@ -74,17 +74,20 @@ Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
 | `GET /api/metrics` | None | Time-series ring buffer (last 60 samples) for cluster & per-node CPU/RAM/Temp/Net |
 | `GET /api/status` | None | Unified cluster summary + per-node health + non-secret safety thresholds |
 | `GET /api/jobs` | None | Live active & recent jobs across every configured phone |
-| `GET /api/doctor` | None | Live local + remote diagnostic & battery safety audit |
-| `GET /api/workloads` | None | Live `distcc_hosts`, `llama_rpc`, `mpi_hostfile`, Home Assistant URLs, Docker nodes |
-| `GET /api/discover` | None | Runs a 2-second UDP LAN scan and returns discovered phones |
+| `GET /api/doctor` | None* | Live local + remote diagnostic & battery safety audit |
+| `GET /api/workloads` | None* | Live `distcc_hosts`, `llama_rpc`, `mpi_hostfile`, Home Assistant URLs, Docker nodes, plus `services_info` |
+| `GET /api/services` | None* | Live cross-tier Service Mesh (`pools`, `services`, `env` vars, and `.cluster` `dns_hosts`) |
+| `GET /api/discover` | None* | Runs a 2-second UDP LAN scan and returns discovered phones |
 | `GET /api/auth/verify` | Bearer | Validates an `auth_token` before unlocking UI controls |
 | `GET /api/settings` | Bearer | Returns full safety settings including `battery_webhook_url` |
-| `POST /api/exec` | Bearer | Run a single command on `best`, `all`, or a specific `node_id` |
-| `POST /api/terminal/exec` | Bearer | Run an interactive Web Terminal command with persistent `cwd` (`cd` support) |
-| `POST /api/map` | Bearer | Run a parallel batch of shell commands or inline script + args across all ready phones |
+| `POST /api/exec` | Bearer | Run a single command (`target`: `auto` default, `tier:1\|2\|3`, `pool:<name>`, `best`, `all`, or `node_id`) |
+| `POST /api/terminal/exec` | Bearer | Run an interactive Web Terminal command with smart auto-routing & persistent `cwd` (`cd` support) |
+| `POST /api/map` | Bearer | Run a parallel batch of shell commands or inline script + args (supports `target` & `workload_hint`) |
+| `POST /api/pipeline` | Bearer | Execute a multi-step cross-tier pipeline chaining outputs (`PHONECLUSTER_PREV_STDOUT`) across Tier 1/2/3 |
 | `POST /api/jobs/cancel` | Bearer | Cancel a running job on a specific `node_id` |
 | `POST /api/workloads/action` | Bearer | Start/stop `distcc` or `llama-rpc` across all ready phones |
-| `POST /api/nodes/add` | Bearer | Add a discovered or manual worker phone directly into `config/cluster.json` |
+| `POST /api/nodes/add` | Bearer | Add a discovered or manual worker phone (with optional `tier` & `pool`) into `config/cluster.json` |
+| `POST /api/nodes/update` | Bearer | Update a phone's `tier` (`0..3`), `pool`, `max_concurrency`, `weight`, or `notes` in `config/cluster.json` |
 | `POST /api/nodes/remove` | Bearer | Remove a worker phone from `config/cluster.json` (Master protected) |
 | `GET /api/pair/hello` | Open Window | Public DH hello (`dh_pub`, `salt`, `session_id`, `fingerprint`) ONLY while a pairing window is open (`403` when closed) |
 | `POST /api/pair/complete` | Open Window | Completes 2048-bit DH + PIN mutual-proof handshake and returns Encrypt-then-MAC enrollment bundle (5-attempt lockout) |

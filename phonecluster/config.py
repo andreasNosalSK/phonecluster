@@ -27,6 +27,8 @@ class NodeConfig:
     ssh_user: str = ""
     max_concurrency: int = 2
     weight: float = 1.0
+    tier: int = 0  # 0 = auto-detect, 1 = Termux compute, 2 = Debian 13 services, 3 = Docker/Droidspaces
+    pool: str = "auto"  # "auto", "compute", "services", "docker", or any custom pool name
     tags: list[str] = field(default_factory=list)
     notes: str = ""
     auth_token: str = ""  # Optional per-node least-privilege token (recommended for workers)
@@ -48,6 +50,10 @@ class NodeConfig:
         weight = float(data.get("weight", 1.0))
         if weight <= 0:
             raise ValueError(f"weight must be > 0 for node '{data['id']}'")
+        tier = int(data.get("tier", 0))
+        if tier not in {0, 1, 2, 3}:
+            raise ValueError(f"tier must be 0 (auto), 1, 2, or 3 for node '{data['id']}'")
+        pool = str(data.get("pool", "auto")).strip().lower() or "auto"
         return cls(
             id=str(data["id"]),
             host=str(data["host"]),
@@ -57,6 +63,8 @@ class NodeConfig:
             ssh_user=str(data.get("ssh_user", "")),
             max_concurrency=max_conc,
             weight=weight,
+            tier=tier,
+            pool=pool,
             tags=[str(t) for t in data.get("tags", [])],
             notes=str(data.get("notes", "")),
             auth_token=str(data.get("auth_token", "")).strip(),
@@ -109,6 +117,7 @@ class ClusterConfig:
     health_timeout_sec: float = 3.0
     dashboard_port: int = 8080
     dashboard_require_auth: bool = False
+    custom_services: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ClusterConfig":
@@ -128,6 +137,12 @@ class ClusterConfig:
                 "Run `phonecluster init-config` to generate one."
             )
         safety = SafetyConfig.from_dict(data.get("safety", {}))
+        raw_svcs = data.get("custom_services") or {}
+        custom_services = (
+            {str(k): str(v) for k, v in raw_svcs.items()}
+            if isinstance(raw_svcs, dict)
+            else {}
+        )
         return cls(
             cluster_name=str(data.get("cluster_name", "phonecluster")),
             auth_token=token,
@@ -137,6 +152,7 @@ class ClusterConfig:
             health_timeout_sec=float(data.get("health_timeout_sec", 3.0)),
             dashboard_port=int(data.get("dashboard_port", 8080)),
             dashboard_require_auth=bool(data.get("dashboard_require_auth", False)),
+            custom_services=custom_services,
         )
 
     def to_dict(self) -> dict[str, Any]:

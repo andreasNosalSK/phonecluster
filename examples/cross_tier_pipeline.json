@@ -1,0 +1,24 @@
+{
+  "name": "Cross-Tier Compute -> MQTT -> Docker Pipeline",
+  "description": "Demonstrates Tier 1 (Termux compute/AI), Tier 2 (Debian 13 services/MQTT), and Tier 3 (Docker) collaborating as one seamless system using auto-injected PHONECLUSTER_* env vars.",
+  "steps": [
+    {
+      "name": "Step 1 · Run Inference / Compute on Tier 1",
+      "target": "tier:1",
+      "workload": "compute",
+      "command": "python3 -c \"import json, os, platform; print(json.dumps({'computed_on': os.environ.get('PHONECLUSTER_NODE_ID'), 'arch': platform.machine(), 'mqtt_detected': os.environ.get('PHONECLUSTER_MQTT_URL', 'none'), 'ha_detected': os.environ.get('PHONECLUSTER_HOMEASSISTANT_URL', 'none')}))\""
+    },
+    {
+      "name": "Step 2 · Relay Result via Tier 2 Debian Services / MQTT",
+      "target": "tier:2",
+      "workload": "service",
+      "command": "echo \"Tier 2 ($PHONECLUSTER_NODE_ID) got payload from $PHONECLUSTER_PREV_NODE (T$PHONECLUSTER_PREV_TIER): $PHONECLUSTER_PREV_STDOUT\" && if command -v mosquitto_pub >/dev/null 2>&1 && [ -n \"$PHONECLUSTER_MQTT_HOST\" ]; then mosquitto_pub -h \"$PHONECLUSTER_MQTT_HOST\" -p \"${PHONECLUSTER_MQTT_PORT:-1883}\" -t phonecluster/pipeline -m \"$PHONECLUSTER_PREV_STDOUT\"; fi"
+    },
+    {
+      "name": "Step 3 · Inspect or Trigger Containers on Tier 3 Docker",
+      "target": "tier:3",
+      "workload": "docker",
+      "command": "echo \"Tier 3 ($PHONECLUSTER_NODE_ID) verified upstream step from $PHONECLUSTER_PREV_NODE\" && docker ps --format '{{.Names}}: {{.Status}}' 2>&1 || true"
+    }
+  ]
+}

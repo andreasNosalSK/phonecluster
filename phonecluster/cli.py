@@ -141,9 +141,10 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
     rows: list[list[str]] = []
     for n in summary["nodes"]:
         h = n["health"]
+        tp_str = f"T{n.get('tier', 1)}:{n.get('pool', 'compute')}"
         if not n["online"]:
             state_str = f"OFFLINE ({n['error'][:28]})"
-            rows.append([n["id"], n["role"], n["host"], "-", state_str, "-", "-", "-", "-", "-"])
+            rows.append([n["id"], n["role"], tp_str, n["host"], "-", state_str, "-", "-", "-", "-", "-"])
             continue
         if n["ready_for_jobs"]:
             state_str = f"READY ({h.get('active_jobs', 0)}/{h.get('max_concurrency', '?')})"
@@ -162,6 +163,7 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
             [
                 n["id"],
                 n["role"],
+                tp_str,
                 n["host"],
                 str(h.get("os_env", "-")),
                 state_str,
@@ -175,7 +177,7 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
 
     print(
         _fmt_table(
-            ["NODE", "ROLE", "HOST", "OS", "STATE", "CPU/LOAD", "RAM FREE", "BAT", "TEMP", "SERVICES"],
+            ["NODE", "ROLE", "TIER/POOL", "HOST", "OS", "STATE", "CPU/LOAD", "RAM FREE", "BAT", "TEMP", "SERVICES"],
             rows,
         )
     )
@@ -231,14 +233,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
         force=args.force,
     )
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
-    outcomes = ctrl.run_single(spec, target=args.target, tags=tags)
+    outcomes = ctrl.run_single(
+        spec,
+        target=args.target,
+        tags=tags,
+        workload_hint=getattr(args, "workload", "") or "",
+    )
 
     if args.json:
         print(json.dumps([o.to_dict() for o in outcomes], indent=2))
     else:
         for o in outcomes:
             status = "OK" if o.ok else f"FAIL(rc={o.returncode})"
-            print(f"=== [{o.node_id}] {status} ({o.duration_sec:.2f}s) ===")
+            tier_tag = f" · T{o.node_tier}:{o.node_pool}" if o.node_tier else ""
+            why_tag = f" — {o.routing_reason}" if o.routing_reason else ""
+            print(f"=== [{o.node_id}{tier_tag}] {status} ({o.duration_sec:.2f}s){why_tag} ===")
             if o.error:
                 print(f"ERROR: {o.error}", file=sys.stderr)
             if o.stdout:
@@ -356,8 +365,9 @@ def _cmd_map(args: argparse.Namespace) -> int:
         if args.quiet:
             return
         tag = "OK" if o.ok else f"FAIL({o.returncode})"
+        tier_col = f"T{o.node_tier}:{o.node_pool}" if o.node_tier else "-"
         first_line = (o.stdout.strip().splitlines()[0] if o.stdout.strip() else o.error or "")[:80]
-        print(f"[{done}/{total}] {tag:9s} {o.node_id:7s} {o.duration_sec:5.2f}s | {o.label[:40]} -> {first_line}")
+        print(f"[{done}/{total}] {tag:9s} {o.node_id:7s} {tier_col:11s} {o.duration_sec:5.2f}s | {o.label[:36]} -> {first_line}")
 
     outcomes = ctrl.map_jobs(
         jobs,
@@ -365,6 +375,8 @@ def _cmd_map(args: argparse.Namespace) -> int:
         tags=tags,
         wait_for_ready_sec=args.wait_ready,
         on_result=_on_result,
+        target=getattr(args, "target", "auto") or "auto",
+        workload_hint=getattr(args, "workload", "") or "",
     )
     wall = round(time.monotonic() - t0, 2)
 
@@ -516,6 +528,8 @@ def _cmd_join(args: argparse.Namespace) -> int:
             worker_port=args.worker_port,
             max_concurrency=args.max_concurrency,
             trust_ssh_key=trust_ssh,
+            tier=args.tier,
+            pool=args.pool,
         )
     except RuntimeError as exc:
         print(f"Pairing failed: {exc}", file=sys.stderr)
@@ -525,6 +539,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
     print(f"  ✓ Securely Joined Cluster '{res['cluster_name']}'!")
     print("=" * 58)
     print(f"  Assigned Node ID : {res['node_id']} ({res['node_host']})")
+    print(f"  Tier / Pool      : Tier {res.get('tier', 1)} ({res.get('pool', 'compute')})")
     print(f"  Scoped Config    : {res['config_path']} (0600, unique per-node token)")
     if res["ssh_key_trusted"]:
         print("  Master SSH Key   : Added to ~/.ssh/authorized_keys")
@@ -723,6 +738,107 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     return subprocess.call(cmd, cwd=str(REPO_ROOT))
 
 
+def _cmd_pools(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
+    summary = ctrl.cluster_summary(record_history=False)
+    pools = summary.get("pools", [])
+    if args.json:
+        print(json.dumps({"cluster_name": summary["cluster_name"], "pools": pools}, indent=2))
+        return 0
+    if not pools:
+        print("No nodes configured in cluster.")
+        return 0
+    rows = [
+        [
+            f"Tier {p['tier']}",
+            p["pool"],
+            f"{p['nodes_ready']}/{p['nodes_total']} (online {p['nodes_online']})",
+            str(p["total_cores"]),
+            f"{p['mem_available_mb']/1024:.2f}/{p['mem_total_mb']/1024:.2f} GB",
+            str(p["active_jobs"]),
+            ", ".join(p["node_ids"]),
+        ]
+        for p in pools
+    ]
+    print(_fmt_table(["TIER", "POOL", "READY", "CORES", "RAM FREE/TOTAL", "ACTIVE", "PHONES"], rows))
+    return 0
+
+
+def _cmd_services(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
+    info = ctrl.get_services_info()
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return 0
+    if args.env:
+        for k, v in sorted(info.get("env", {}).items()):
+            print(f'export {k}={shlex.quote(str(v))}')
+        return 0
+    if args.hosts:
+        print(info.get("dns_hosts", ""), end="")
+        return 0
+    svcs = info.get("services", [])
+    if not svcs:
+        print("No live cross-tier services detected yet.")
+        print("Start Mosquitto, AdGuard Home, Home Assistant, llama.cpp, distcc, or Docker on any tier.")
+        return 0
+    rows = [
+        [
+            s["name"],
+            s["node_id"],
+            f"T{s['tier']}:{s['pool']}" if s.get("tier") else "custom",
+            s["url"],
+            "READY" if s.get("ready") else "BUSY/HOT",
+        ]
+        for s in svcs
+    ]
+    print(_fmt_table(["SERVICE", "NODE", "TIER/POOL", "ENDPOINT", "STATUS"], rows))
+    print('\nTip: Run `eval "$(pc services --env)"` to export PHONECLUSTER_* service URLs into your shell,')
+    print("     or `pc services --hosts` for AdGuard Home / `/etc/hosts` `.cluster` DNS rewrites.")
+    return 0
+
+
+def _cmd_pipeline(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
+    path = Path(args.pipeline_file)
+    if not path.exists():
+        print(f"Pipeline file not found: {path}", file=sys.stderr)
+        return 2
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Could not parse pipeline JSON: {exc}", file=sys.stderr)
+        return 2
+    steps = raw.get("steps") if isinstance(raw, dict) else raw
+    if not isinstance(steps, list) or not steps or not all(isinstance(s, dict) for s in steps):
+        print("Pipeline JSON must be a non-empty list of step objects (or {'steps': [...]}).", file=sys.stderr)
+        return 2
+
+    res = ctrl.run_pipeline(steps, stop_on_error=not args.continue_on_error)
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        for r in res["results"]:
+            status = "OK" if r["ok"] else f"FAIL(rc={r['returncode']})"
+            tier_tag = f" · T{r['node_tier']}:{r['node_pool']}" if r.get("node_tier") else ""
+            why = f" — {r['routing_reason']}" if r.get("routing_reason") else ""
+            print(f"=== Step {r['step_index']}/{res['steps_total']}: {r['name']} [{r['node_id']}{tier_tag}] {status} ({r['duration_sec']:.2f}s){why} ===")
+            if r.get("error"):
+                print(f"ERROR: {r['error']}", file=sys.stderr)
+            if r.get("stdout"):
+                out_s = r["stdout"]
+                print(out_s, end="" if out_s.endswith("\n") else "\n")
+            if r.get("stderr"):
+                err_s = r["stderr"]
+                print(err_s, end="" if err_s.endswith("\n") else "\n", file=sys.stderr)
+        overall = "SUCCESS" if res["ok"] else "FAILED"
+        print(f"\nPipeline {overall}: {res['steps_completed']}/{res['steps_total']} steps in {res['duration_sec']}s")
+    return 0 if res["ok"] else 1
+
+
 def _cmd_update(args: argparse.Namespace) -> int:
     print(f"Updating PhoneCluster in {REPO_ROOT}...")
     rc = subprocess.call(["git", "-C", str(REPO_ROOT), "pull", "--ff-only"])
@@ -773,6 +889,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_join.add_argument("--timeout", type=float, default=2.5, help="Wi-Fi search timeout in seconds (default: 2.5)")
     p_join.add_argument("--worker-port", type=int, default=8765, help="Local worker HTTP port (default: 8765)")
     p_join.add_argument("--max-concurrency", type=int, default=2, help="Max parallel jobs on this phone (default: 2)")
+    p_join.add_argument(
+        "--tier",
+        type=int,
+        choices=[0, 1, 2, 3],
+        default=0,
+        help="Device tier: 0=auto-detect (default), 1=Termux compute, 2=Debian 13 services, 3=Docker/Droidspaces",
+    )
+    p_join.add_argument(
+        "--pool",
+        default="auto",
+        help="Workload pool name (default: auto -> compute/services/docker based on tier)",
+    )
     p_join.add_argument("--trust-ssh", action="store_true", help="Automatically trust Master's SSH public key")
     p_join.add_argument("--no-ssh-key", action="store_true", help="Do not install Master's SSH public key")
     p_join.add_argument("--no-start", action="store_true", help="Save config only; do not auto-start worker daemon")
@@ -894,12 +1022,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_upd.add_argument("--sync", action="store_true", help="Also sync the update to all worker phones")
     p_upd.set_defaults(func=_cmd_update)
 
+    # pools, services, pipeline (heterogeneous multi-tier orchestration)
+    p_pools = sub.add_parser("pools", help="Show Tier 1/2/3 device pools and aggregated cores/RAM")
+    p_pools.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_pools.set_defaults(func=_cmd_pools)
+
+    p_svcs = sub.add_parser("services", help="Discover live cross-tier services (MQTT, AdGuard, HA, AI, Docker)")
+    p_svcs.add_argument("--env", action="store_true", help="Output `export PHONECLUSTER_*=...` shell vars")
+    p_svcs.add_argument("--hosts", action="store_true", help="Output `.cluster` DNS rewrites for AdGuard / /etc/hosts")
+    p_svcs.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_svcs.set_defaults(func=_cmd_services)
+
+    p_pipe = sub.add_parser("pipeline", help="Run a multi-step cross-tier JSON workflow (Tier 1 -> Tier 2 -> Tier 3)")
+    p_pipe.add_argument("pipeline_file", help="Path to pipeline JSON file (see examples/cross_tier_pipeline.json)")
+    p_pipe.add_argument("--continue-on-error", action="store_true", help="Continue remaining steps if a step fails")
+    p_pipe.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_pipe.set_defaults(func=_cmd_pipeline)
+
     # run
-    p_run = sub.add_parser("run", help="Run one command or script on best/all/specific phone")
+    p_run = sub.add_parser("run", help="Run a command or script (auto-routes to ideal Tier/Pool by default)")
     p_run.add_argument(
         "--target",
-        default="best",
-        help="Target node: 'best' (default), 'all', or a specific node_id (e.g. node1)",
+        default="auto",
+        help="Target: 'auto' (default smart tier), 'tier:1|2|3', 'pool:<name>', 'best', 'all', or a node_id",
+    )
+    p_run.add_argument(
+        "--workload",
+        default="",
+        help="Optional routing hint when --target=auto: compute, ai, service, docker",
     )
     p_run.add_argument("--script", default=None, help="Local Python/Shell script to ship & execute")
     p_run.add_argument("--interpreter", default=None, help="Interpreter override (e.g. python3, bash)")
@@ -913,7 +1063,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.set_defaults(func=_cmd_run)
 
     # map
-    p_map = sub.add_parser("map", help="Run many commands/scripts in parallel across all healthy phones")
+    p_map = sub.add_parser("map", help="Run many commands/scripts in parallel with smart Tier/Pool routing")
+    p_map.add_argument(
+        "--target",
+        default="auto",
+        help="Target: 'auto' (default smart routing per job), 'tier:1|2|3', 'pool:<name>', 'all', or node_id",
+    )
+    p_map.add_argument(
+        "--workload",
+        default="",
+        help="Optional routing hint for all batch jobs: compute, ai, service, docker",
+    )
     p_map.add_argument("--jobs-file", default=None, help="File with one shell command per line (or '-' for stdin)")
     p_map.add_argument("--script", default=None, help="Local script to ship & execute in parallel")
     p_map.add_argument("--args-file", default=None, help="File with one arg list per line for --script (or '-')")

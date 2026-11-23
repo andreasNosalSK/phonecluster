@@ -300,6 +300,25 @@ DASHBOARD_HTML = r"""<!doctype html>
   .pill.neutral { background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
 
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .pool-strip {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: stretch;
+  }
+  .pool-chip {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 9px 13px; text-align: left; display: flex; flex-direction: column; gap: 2px;
+    min-width: 170px; box-shadow: var(--shadow); color: var(--fg);
+  }
+  .pool-chip:hover { border-color: var(--border-hi); }
+  .pool-chip.active {
+    border-color: var(--accent);
+    background: linear-gradient(135deg, rgba(88, 166, 255, 0.16), rgba(163, 113, 247, 0.12));
+  }
+  .pool-chip-title { font-weight: 800; font-size: 0.88rem; display: flex; align-items: center; gap: 6px; }
+  .pool-chip-sub { font-size: 0.77rem; color: var(--muted); }
+  .tier-edit-box {
+    margin-top: 10px; padding: 10px; border-radius: 10px;
+    background: var(--surface-3); border: 1px solid var(--border);
+  }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
   .col-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
   .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 10px; }
@@ -422,10 +441,10 @@ DASHBOARD_HTML = r"""<!doctype html>
   </div>
 
   <nav class="tabs" role="tablist" aria-label="Control Center Sections">
-    <button role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview" onclick="selectTab('overview')">1. Live btop &amp; Tasks</button>
+    <button role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview" onclick="selectTab('overview')">1. Live btop &amp; Pools</button>
     <button role="tab" id="tab-terminal" aria-selected="false" aria-controls="panel-terminal" onclick="selectTab('terminal')">2. Terminal Control</button>
-    <button role="tab" id="tab-jobs" aria-selected="false" aria-controls="panel-jobs" onclick="selectTab('jobs')">3. Parallel Batch</button>
-    <button role="tab" id="tab-workloads" aria-selected="false" aria-controls="panel-workloads" onclick="selectTab('workloads')">4. Workloads (AI / Compiler / HA)</button>
+    <button role="tab" id="tab-jobs" aria-selected="false" aria-controls="panel-jobs" onclick="selectTab('jobs')">3. Parallel Batch &amp; Pipelines</button>
+    <button role="tab" id="tab-workloads" aria-selected="false" aria-controls="panel-workloads" onclick="selectTab('workloads')">4. Workloads &amp; Service Mesh</button>
     <button role="tab" id="tab-setup" aria-selected="false" aria-controls="panel-setup" onclick="selectTab('setup')">5. Phones, Safety &amp; Doctor</button>
   </nav>
 
@@ -460,6 +479,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         </div>
       </div>
 
+      <div id="pool-strip" class="pool-strip" role="group" aria-label="Filter phones by Tier and Pool"></div>
+      <div id="node-tier-editor" class="card" style="display:none" aria-live="polite"></div>
+
       <div id="nodes-grid" class="nodes-grid" aria-live="polite"></div>
 
       <div class="card">
@@ -481,8 +503,12 @@ DASHBOARD_HTML = r"""<!doctype html>
           <div class="row" style="margin:0;">
             <div class="term-dots" aria-hidden="true"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></div>
             <label for="term-target" class="sr-only">Terminal target phone</label>
-            <select id="term-target" onchange="onTermTargetChange()" aria-label="Terminal target phone">
-              <option value="best">Smart: Best Coolest Phone</option>
+            <select id="term-target" onchange="onTermTargetChange()" aria-label="Terminal target phone or tier">
+              <option value="auto">⚡ Auto-Route by Workload (Smart Tier)</option>
+              <option value="tier:1">Tier 1 · Termux Compute &amp; AI</option>
+              <option value="tier:2">Tier 2 · Debian 13 Services</option>
+              <option value="tier:3">Tier 3 · Docker &amp; Containers</option>
+              <option value="best">Best Coolest Phone (Any Tier)</option>
               <option value="all">ALL READY PHONES (Broadcast)</option>
             </select>
             <span id="term-cwd-pill" class="pill neutral mono">~</span>
@@ -495,40 +521,50 @@ DASHBOARD_HTML = r"""<!doctype html>
         </div>
         <div id="term-screen" class="term-screen" aria-live="polite" onclick="document.getElementById('term-input').focus()">
           <div class="term-entry">
-            <span class="term-cmd-line">PhoneCluster Interactive Web Terminal</span>
-            <div class="hint" style="color:#8b9bb4;">Pick any phone (or ALL PHONES) above, unlock with your token, and type Linux commands below. Supports persistent `cd`, ↑/↓ history, and Ctrl+L clear.</div>
+            <span class="term-cmd-line">PhoneCluster Unified Terminal (Auto-Routing Across Tiers)</span>
+            <div class="hint" style="color:#8b9bb4;">In Auto-Route mode, commands are automatically routed to the right tier (Docker → Tier 3, Debian services/MQTT → Tier 2, compute/AI → Tier 1) with live <code class="mono">$PHONECLUSTER_*</code> cross-tier service env vars injected.</div>
           </div>
         </div>
         <div class="term-input-bar">
-          <span id="term-prompt" class="term-prompt-label mono">best:~ $</span>
+          <span id="term-prompt" class="term-prompt-label mono">auto:~ $</span>
           <label class="sr-only" for="term-input">Terminal command input</label>
-          <input id="term-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a command (e.g. ls -la, uname -a, cd ~/phonecluster)..." />
+          <input id="term-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type any command (docker ps, mosquitto_pub, python3 ..., uname -a)..." />
           <button id="btn-term-run" class="small primary" onclick="submitTerminalCommand()">Run</button>
         </div>
       </div>
       <div class="chips" style="margin-top:10px;" aria-label="Quick terminal commands">
         <span class="hint" style="margin:0 4px 0 0;">Quick commands:</span>
         <button class="small" onclick="runTermPreset('uname -a && nproc')">System Info</button>
-        <button class="small" onclick="runTermPreset('ls -la')">ls -la</button>
+        <button class="small" onclick="runTermPreset('env | grep ^PHONECLUSTER_ | sort')">Cross-Tier Env</button>
+        <button class="small" onclick="runTermPreset('docker ps 2>&1')">Docker Status (Tier 3)</button>
         <button class="small" onclick="runTermPreset('df -h ~')">Disk Space</button>
         <button class="small" onclick="runTermPreset('uptime && head -n 5 /proc/meminfo')">Load &amp; RAM</button>
         <button class="small" onclick="runTermPreset('ps -eo pid,pcpu,pmem,comm --sort=-pcpu 2>/dev/null | head -n 12 || ps | head -n 12')">Top Processes</button>
       </div>
     </section>
 
-    <!-- TAB 3: PARALLEL BATCH RUNNER -->
+    <!-- TAB 3: PARALLEL BATCH & CROSS-TIER PIPELINES -->
     <section id="panel-jobs" class="panel" role="tabpanel" aria-labelledby="tab-jobs">
       <div class="card">
-        <h2>Parallel Batch Runner (Distribute Work Across All Ready Phones)</h2>
+        <h2>Parallel Batch Runner (Smart Tier Auto-Routing)</h2>
         <div class="row">
           <label for="map-mode">Mode:</label>
           <select id="map-mode" onchange="toggleMapMode()">
             <option value="commands">Shell Command List (1 per line)</option>
             <option value="script">Ship &amp; Run Script + Arguments</option>
           </select>
+          <label for="map-target">Target Tier/Pool:</label>
+          <select id="map-target" aria-label="Batch target tier or pool">
+            <option value="auto">⚡ Auto-Route Each Job</option>
+            <option value="tier:1">Tier 1 · Termux Compute</option>
+            <option value="tier:2">Tier 2 · Debian 13 Services</option>
+            <option value="tier:3">Tier 3 · Docker / Containers</option>
+            <option value="all">All Ready Phones (Any Tier)</option>
+          </select>
           <label class="sr-only" for="map-template">Load sample template</label>
           <select id="map-template" onchange="applyMapTemplate(this.value)" aria-label="Load sample template">
             <option value="">Templates...</option>
+            <option value="mixed">Mixed Multi-Tier Auto-Route</option>
             <option value="primes">Prime Benchmark (Python)</option>
             <option value="audit">Hardware Audit (Shell)</option>
             <option value="squares">Quick Square Test (Python)</option>
@@ -581,10 +617,66 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
         <div id="map-summary-chips" class="chips"></div>
         <pre id="map-out" class="code" aria-live="polite">Batch results will appear here.</pre>
       </div>
+
+      <div class="card">
+        <h2>Cross-Tier Pipeline (Chain Tier 1 → Tier 2 → Tier 3 Seamlessly)</h2>
+        <p class="hint">Run a multi-step workflow where each step runs on its ideal Tier/Pool and receives <code class="mono">$PHONECLUSTER_PREV_STDOUT</code> plus all live <code class="mono">$PHONECLUSTER_*</code> cross-tier service URLs.</p>
+        <div class="row">
+          <label for="pipe-template">Pipeline Template:</label>
+          <select id="pipe-template" onchange="applyPipeTemplate(this.value)" aria-label="Cross-tier pipeline template">
+            <option value="">Choose a template...</option>
+            <option value="tiers">Tier 1 Compute → Tier 2 Debian Services → Tier 3 Docker</option>
+            <option value="mqtt">Tier 1 AI/Metric → Tier 2 MQTT Publish</option>
+            <option value="mesh">Cross-Tier Service Discovery Check</option>
+          </select>
+          <button id="btn-run-pipe" class="primary" onclick="runCrossTierPipeline()">Run Pipeline</button>
+          <button class="small" onclick="copyEl('pipe-out')">Copy Output</button>
+        </div>
+        <label for="pipe-json" class="sr-only">Pipeline steps JSON</label>
+        <textarea id="pipe-json" style="min-height:155px">[
+  {
+    "name": "Step 1 · Compute (Tier 1)",
+    "target": "tier:1",
+    "command": "python3 -c \"import os, platform; print(f'computed on {os.environ.get(\\\"PHONECLUSTER_NODE_ID\\\")} ({platform.machine()})')\""
+  },
+  {
+    "name": "Step 2 · Relay via Service Mesh (Auto)",
+    "target": "auto",
+    "command": "echo \"Received from $PHONECLUSTER_PREV_NODE (T$PHONECLUSTER_PREV_TIER): $PHONECLUSTER_PREV_STDOUT | MQTT=${PHONECLUSTER_MQTT_URL:-not-running}\""
+  }
+]</textarea>
+        <div id="pipe-summary-chips" class="chips"></div>
+        <pre id="pipe-out" class="code" aria-live="polite">Pipeline step-by-step routing and outputs will appear here.</pre>
+      </div>
     </section>
 
-    <!-- TAB 4: WORKLOADS -->
+    <!-- TAB 4: WORKLOADS & CROSS-TIER SERVICE MESH -->
     <section id="panel-workloads" class="panel" role="tabpanel" aria-labelledby="tab-workloads">
+      <div class="card">
+        <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+          <h2 style="margin:0;">Live Cross-Tier Service Mesh &amp; Auto-Discovery</h2>
+          <button class="small primary" onclick="loadWorkloads()">Rescan Services</button>
+        </div>
+        <p class="hint" style="margin-top:0;">Services detected on any Tier (e.g. Mosquitto/AdGuard on Tier 2, Home Assistant/Docker on Tier 3, llama.cpp on Tier 1) are automatically exposed to every job on every phone via <code class="mono">$PHONECLUSTER_*</code> environment variables.</p>
+        <div id="mesh-services-table" class="hint" style="margin-bottom:12px;">Scanning cluster services...</div>
+        <div class="col-grid">
+          <div>
+            <div class="row" style="justify-content:space-between; margin-bottom:4px;">
+              <strong>Auto-Injected Cross-Tier Env Vars</strong>
+              <button class="small" onclick="copyEl('mesh-env-code')">Copy .env</button>
+            </div>
+            <pre id="mesh-env-code" class="code">Loading...</pre>
+          </div>
+          <div>
+            <div class="row" style="justify-content:space-between; margin-bottom:4px;">
+              <strong>Friendly .cluster DNS Rewrites (AdGuard / /etc/hosts)</strong>
+              <button class="small" onclick="copyEl('mesh-hosts-code')">Copy Hosts</button>
+            </div>
+            <pre id="mesh-hosts-code" class="code">Loading...</pre>
+          </div>
+        </div>
+      </div>
+
       <div class="col-grid">
         <div class="card">
           <h2>Compiler PC (distcc)</h2>
@@ -671,6 +763,16 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
             <div class="field"><label for="add-user">SSH User</label><input id="add-user" placeholder="u0_a250" /></div>
             <div class="field"><label for="add-ssh-port">SSH Port</label><input id="add-ssh-port" type="number" value="8022" /></div>
             <div class="field"><label for="add-conc">Max Parallel Jobs</label><input id="add-conc" type="number" min="1" max="8" value="2" /></div>
+            <div class="field">
+              <label for="add-tier">Tier / Role</label>
+              <select id="add-tier">
+                <option value="0" selected>Auto-Detect</option>
+                <option value="1">Tier 1 · Termux Compute</option>
+                <option value="2">Tier 2 · Debian 13 Services</option>
+                <option value="3">Tier 3 · Docker / Droidspaces</option>
+              </select>
+            </div>
+            <div class="field"><label for="add-pool">Pool Name</label><input id="add-pool" value="auto" placeholder="auto / compute / services / docker" /></div>
           </div>
           <div class="row">
             <button class="small primary" onclick="addManualNode()">+ Add Phone Manually</button>
@@ -715,6 +817,87 @@ let lastLive = null;
 let lastMapData = null;
 let toastTimer = null;
 let boardView = 'tasks';
+let activePoolFilter = 'all';
+
+function tierPillHtml(tier, pool) {
+  const t = Number(tier || 1);
+  const p = String(pool || 'compute').toUpperCase();
+  const cls = t === 3 ? 'warn' : (t === 2 ? 'purple' : 'accent');
+  return '<span class="pill ' + cls + '">T' + t + ' · ' + esc(p) + '</span>';
+}
+
+function setPoolFilter(filterKey) {
+  activePoolFilter = filterKey || 'all';
+  if (lastLive) {
+    renderPoolStrip(lastLive.summary);
+    renderNodesGrid(lastLive);
+  }
+}
+
+function renderPoolStrip(summary) {
+  const strip = document.getElementById('pool-strip');
+  if (!strip) return;
+  const pools = summary.pools || [];
+  let html = '<button class="pool-chip' + (activePoolFilter === 'all' ? ' active' : '') + '" onclick="setPoolFilter(\'all\')">'
+    + '<span class="pool-chip-title">All Phones <span class="pill ok">' + esc(summary.nodes_ready) + '/' + esc(summary.nodes_total) + '</span></span>'
+    + '<span class="pool-chip-sub mono">' + esc(summary.total_cores) + ' cores · ' + ((summary.mem_total_mb || 0) / 1024).toFixed(1) + ' GB RAM</span>'
+    + '</button>';
+  for (const p of pools) {
+    const key = 'pool:' + p.pool;
+    const isAct = activePoolFilter === key;
+    html += '<button class="pool-chip' + (isAct ? ' active' : '') + '" onclick="setPoolFilter(\'' + esc(key) + '\')">'
+      + '<span class="pool-chip-title">' + tierPillHtml(p.tier, p.pool)
+      + ' <span class="mono">' + esc(p.nodes_ready) + '/' + esc(p.nodes_total) + '</span></span>'
+      + '<span class="pool-chip-sub mono">' + esc(p.total_cores) + 'c · ' + ((p.mem_total_mb || 0) / 1024).toFixed(1) + ' GB · ' + esc((p.node_ids || []).join(', ')) + '</span>'
+      + '</button>';
+  }
+  strip.innerHTML = html;
+}
+
+function openNodeTierEditor(nodeId) {
+  if (!lastLive) return;
+  const n = (lastLive.summary.nodes || []).find(x => x.id === nodeId);
+  if (!n) return;
+  const ed = document.getElementById('node-tier-editor');
+  const cfgTier = Number(n.configured_tier || 0);
+  const cfgPool = String(n.configured_pool || 'auto');
+  ed.style.display = 'block';
+  ed.innerHTML = '<div class="row" style="justify-content:space-between; margin-bottom:8px;">'
+    + '<h3 style="margin:0;">Configure Tier &amp; Pool for <span class="mono">' + esc(n.id) + '</span> (' + esc(n.host) + ')</h3>'
+    + '<button class="small ghost" onclick="closeNodeTierEditor()">✕ Close</button></div>'
+    + '<div class="form-grid">'
+    + '<div class="field"><label for="ed-tier">Tier Role</label><select id="ed-tier">'
+    + '<option value="0"' + (cfgTier === 0 ? ' selected' : '') + '>Auto-Detect (from OS/Docker)</option>'
+    + '<option value="1"' + (cfgTier === 1 ? ' selected' : '') + '>Tier 1 · Termux Compute &amp; AI</option>'
+    + '<option value="2"' + (cfgTier === 2 ? ' selected' : '') + '>Tier 2 · Debian 13 Services</option>'
+    + '<option value="3"' + (cfgTier === 3 ? ' selected' : '') + '>Tier 3 · Docker / Droidspaces</option>'
+    + '</select></div>'
+    + '<div class="field"><label for="ed-pool">Workload Pool</label>'
+    + '<input id="ed-pool" value="' + esc(cfgPool) + '" placeholder="auto / compute / services / docker" /></div>'
+    + '<div class="field"><label for="ed-conc">Max Parallel Jobs</label>'
+    + '<input id="ed-conc" type="number" min="1" max="16" value="' + esc(n.max_concurrency || 2) + '" /></div>'
+    + '</div>'
+    + '<div class="row" style="margin:0;">'
+    + '<button class="small primary" onclick="saveNodeTier(\'' + esc(n.id) + '\')">Save Tier &amp; Pool</button>'
+    + '<span class="hint" style="margin:0;">Effective now: ' + tierPillHtml(n.tier, n.pool) + '</span>'
+    + '</div>';
+}
+
+function closeNodeTierEditor() {
+  const ed = document.getElementById('node-tier-editor');
+  if (ed) ed.style.display = 'none';
+}
+
+async function saveNodeTier(nodeId) {
+  const tier = Number(document.getElementById('ed-tier').value || 0);
+  const pool = document.getElementById('ed-pool').value.trim() || 'auto';
+  const max_concurrency = Number(document.getElementById('ed-conc').value || 2);
+  const data = await authPost('/api/nodes/update', { id: nodeId, tier, pool, max_concurrency });
+  if (data.error) { showToast('Update failed: ' + data.error, 'bad'); return; }
+  closeNodeTierEditor();
+  showToast('Updated ' + nodeId + ' -> Tier ' + (tier || 'auto') + ' / pool ' + pool, 'ok');
+  refreshLive();
+}
 
 // Interactive Web Terminal state
 const termCwds = {};
@@ -1043,24 +1226,81 @@ async function refreshLive() {
     document.getElementById('k-ping').textContent = (d.avg_latency_ms ?? 0) + ' ms';
     document.getElementById('k-nodes-sub').textContent = d.nodes_online + ' online · ' + d.nodes_ready + ' ready';
 
-    // Update Terminal Target Dropdown dynamically
+    // Update Terminal Target Dropdown dynamically (Smart Auto-Route + Tiers + Pools + Nodes)
     const termSel = document.getElementById('term-target');
     const prevTerm = termSel.value;
-    termSel.innerHTML = '<option value="best">Smart: Best Coolest Phone</option><option value="all">ALL READY PHONES (Broadcast)</option>';
+    let termOpts = '<option value="auto">⚡ Auto-Route by Workload (Smart Tier)</option>'
+      + '<option value="tier:1">Tier 1 · Termux Compute &amp; AI</option>'
+      + '<option value="tier:2">Tier 2 · Debian 13 Services</option>'
+      + '<option value="tier:3">Tier 3 · Docker &amp; Containers</option>'
+      + '<option value="best">Best Coolest Phone (Any Tier)</option>'
+      + '<option value="all">ALL READY PHONES (Broadcast)</option>';
+    const seenPools = new Set(['compute', 'services', 'docker']);
+    for (const p of (d.pools || [])) {
+      if (p.pool && !seenPools.has(p.pool)) {
+        seenPools.add(p.pool);
+        termOpts += '<option value="pool:' + esc(p.pool) + '">Pool: ' + esc(p.pool) + '</option>';
+      }
+    }
+    termSel.innerHTML = termOpts;
     for (const n of d.nodes) {
       const opt = document.createElement('option');
       opt.value = n.id;
-      opt.textContent = n.id + ' (' + n.role + ' · ' + n.host + ')';
+      opt.textContent = n.id + ' (' + n.role + ' · T' + (n.tier || 1) + ':' + (n.pool || 'compute') + ' · ' + n.host + ')';
       termSel.appendChild(opt);
     }
     if (Array.from(termSel.options).some(o => o.value === prevTerm)) termSel.value = prevTerm;
 
-    // Render Shared Multi-Device btop Cards
+    renderPoolStrip(d);
+    renderNodesGrid(live);
+
     const batWarnings = [];
+    for (const n of d.nodes) {
+      const h = n.health || {};
+      if (n.online && h.battery_pct != null && h.battery_pct >= batHigh && (h.battery_status === 'CHARGING' || h.battery_status === 'FULL')) {
+        batWarnings.push(n.id + ' is at ' + h.battery_pct + '% (' + h.battery_status + ')');
+      }
+    }
+
+    const banner = document.getElementById('battery-banner');
+    if (batWarnings.length) {
+      document.getElementById('battery-banner-text').textContent = batWarnings.join('; ')
+        + '. Avoid leaving Li-Po batteries pinned at 100% 24/7 (configure a smart-plug webhook in Tab 5 or use rooted ACC).';
+      banner.classList.remove('hidden');
+    } else {
+      banner.classList.add('hidden');
+    }
+
+    renderTasksBoard(live);
+  } catch (e) {
+    document.getElementById('last-updated').textContent = 'Connection error: ' + e;
+  }
+}
+
+function renderNodesGrid(live) {
+    const d = live.summary;
+    const hist = live.history || { cluster: [], nodes: {} };
+    const safety = d.safety || {};
+    const maxTemp = safety.max_temp_c ?? 40;
+    const resTemp = safety.resume_temp_c ?? 37;
+    const batHigh = safety.battery_high_pct ?? 60;
+
+    // Render Shared Multi-Device btop Cards (respecting active Tier/Pool filter)
     const grid = document.getElementById('nodes-grid');
     grid.innerHTML = '';
 
-    for (const n of d.nodes) {
+    const visibleNodes = (d.nodes || []).filter(n => {
+      if (activePoolFilter === 'all') return true;
+      if (activePoolFilter.startsWith('pool:')) return ('pool:' + (n.pool || 'compute')) === activePoolFilter;
+      return true;
+    });
+
+    if (!visibleNodes.length) {
+      grid.innerHTML = '<div class="card"><p class="hint">No phones in this pool yet. Click "All Phones" above or assign a phone via Tier / Pool.</p></div>';
+      return;
+    }
+
+    for (const n of visibleNodes) {
       const h = n.health || {};
       const nHist = (hist.nodes && hist.nodes[n.id]) ? hist.nodes[n.id] : [];
       let badge = '<span class="pill bad">✕ OFFLINE</span>';
@@ -1071,10 +1311,6 @@ async function refreshLive() {
       } else if (n.online) {
         badge = '<span class="pill warn">⚠ ' + esc((h.not_ready_reasons || ['PAUSED']).join(', ')) + '</span>';
         cardCls = 'node-card hot';
-      }
-
-      if (n.online && h.battery_pct != null && h.battery_pct >= batHigh && (h.battery_status === 'CHARGING' || h.battery_status === 'FULL')) {
-        batWarnings.push(n.id + ' is at ' + h.battery_pct + '% (' + h.battery_status + ')');
       }
 
       let bodyHtml = '';
@@ -1146,7 +1382,8 @@ async function refreshLive() {
         ? '<span class="pill purple">MASTER</span>'
         : '<span class="pill neutral">WORKER</span>';
       let actionsHtml = '<div class="node-actions">'
-        + '<button class="small primary" onclick="openNodeTerminal(\'' + esc(n.id) + '\')">Terminal</button>';
+        + '<button class="small primary" onclick="openNodeTerminal(\'' + esc(n.id) + '\')">Terminal</button>'
+        + '<button class="small" onclick="openNodeTierEditor(\'' + esc(n.id) + '\')">Tier / Pool</button>';
       if (n.role !== 'master') {
         actionsHtml += '<button class="small danger" onclick="removeNode(\'' + esc(n.id) + '\')">Remove</button>';
       }
@@ -1155,25 +1392,11 @@ async function refreshLive() {
       const card = document.createElement('article');
       card.className = cardCls;
       card.innerHTML = '<div><div class="node-head">'
-        + '<div><div class="node-title">' + esc(n.id) + ' ' + rolePill + '</div>'
+        + '<div><div class="node-title">' + esc(n.id) + ' ' + rolePill + ' ' + tierPillHtml(n.tier, n.pool) + '</div>'
         + '<div class="node-meta mono">' + esc(n.host) + '</div></div>'
         + badge + '</div>' + bodyHtml + '</div>' + actionsHtml;
       grid.appendChild(card);
     }
-
-    const banner = document.getElementById('battery-banner');
-    if (batWarnings.length) {
-      document.getElementById('battery-banner-text').textContent = batWarnings.join('; ')
-        + '. Avoid leaving Li-Po batteries pinned at 100% 24/7 (configure a smart-plug webhook in Tab 5 or use rooted ACC).';
-      banner.classList.remove('hidden');
-    } else {
-      banner.classList.add('hidden');
-    }
-
-    renderTasksBoard(live);
-  } catch (e) {
-    document.getElementById('last-updated').textContent = 'Connection error: ' + e;
-  }
 }
 
 /* ---------------- Interactive Multi-Node Web Terminal ---------------- */
@@ -1236,7 +1459,8 @@ async function submitTerminalCommand() {
   const jobId = 'wterm-' + Date.now().toString(36);
   activeTermJob = { node_id: target, job_id: jobId };
   document.getElementById('btn-term-run').disabled = true;
-  document.getElementById('btn-term-cancel').disabled = (target === 'all' || target === 'best');
+  const isDynamicTarget = (target === 'auto' || target === 'all' || target === 'best' || target.startsWith('tier:') || target.startsWith('pool:'));
+  document.getElementById('btn-term-cancel').disabled = isDynamicTarget;
 
   try {
     const data = await authPost('/api/terminal/exec', { command: cmd, target, cwd, job_id: jobId });
@@ -1248,11 +1472,13 @@ async function submitTerminalCommand() {
     let html = '<div class="term-cmd-line">' + esc(promptText) + '</div>';
     let plainOut = '$ ' + promptText + '\n';
     for (const r of (data.results || [])) {
-      if (target !== 'all' && r.cwd) {
+      if (!isDynamicTarget && r.cwd) {
         termCwds[target] = r.cwd;
         onTermTargetChange();
       }
-      const meta = '[' + r.node_id + ' · ' + (r.ok ? 'OK' : 'rc=' + r.returncode) + ' · ' + r.duration_sec + 's]';
+      const tierStr = r.node_tier ? (' · T' + r.node_tier + ':' + (r.node_pool || 'compute')) : '';
+      const whyStr = r.routing_reason ? (' — ' + r.routing_reason) : '';
+      const meta = '[' + r.node_id + tierStr + ' · ' + (r.ok ? 'OK' : 'rc=' + r.returncode) + ' · ' + r.duration_sec + 's' + whyStr + ']';
       html += '<div class="term-meta" style="margin-left:0;">' + esc(meta) + '</div>';
       if (r.stdout) { html += '<div>' + esc(r.stdout) + '</div>'; plainOut += meta + '\n' + r.stdout + '\n'; }
       if (r.stderr) { html += '<div class="term-err">' + esc(r.stderr) + '</div>'; plainOut += '[stderr]\n' + r.stderr + '\n'; }
@@ -1284,7 +1510,15 @@ async function cancelJob(nodeId, jobId) {
 /* ---------------- Parallel Batch, Workloads, Setup & Doctor ---------------- */
 function applyMapTemplate(name) {
   if (!name) return;
-  if (name === 'primes') {
+  if (name === 'mixed') {
+    document.getElementById('map-mode').value = 'commands';
+    document.getElementById('map-target').value = 'auto';
+    toggleMapMode();
+    document.getElementById('map-commands').value =
+      'python3 -c "import os; print(\'compute on\', os.environ.get(\'PHONECLUSTER_NODE_ID\'), \'mqtt=\', os.environ.get(\'PHONECLUSTER_MQTT_HOST\', \'none\'))"\n'
+      + 'echo "Parallel compute task on $PHONECLUSTER_NODE_ID (HA=${PHONECLUSTER_HOMEASSISTANT_URL:-none})"\n'
+      + 'docker ps --format "{{.Names}}: {{.Status}}" 2>&1 || true';
+  } else if (name === 'primes') {
     document.getElementById('map-mode').value = 'script';
     toggleMapMode();
     document.getElementById('map-interp').value = 'python3';
@@ -1352,22 +1586,23 @@ function toggleMapMode() {
 
 async function runParallelMap() {
   const mode = document.getElementById('map-mode').value;
+  const target = document.getElementById('map-target').value || 'auto';
   const btn = document.getElementById('btn-run-map');
   const out = document.getElementById('map-out');
   const chips = document.getElementById('map-summary-chips');
   btn.disabled = true;
   chips.innerHTML = '';
-  out.textContent = 'Dispatching parallel batch across all ready phones...';
+  out.textContent = 'Dispatching parallel batch (target: ' + target + ')...';
   try {
     let payload;
     if (mode === 'commands') {
       const commands = document.getElementById('map-commands').value.split('\n').map(s => s.trim()).filter(Boolean);
-      payload = { mode: 'commands', commands };
+      payload = { mode: 'commands', target, commands };
     } else {
       const script_content = document.getElementById('map-script').value;
       const interpreter = document.getElementById('map-interp').value;
       const args_lines = document.getElementById('map-args').value.split('\n').map(s => s.trim()).filter(Boolean);
-      payload = { mode: 'script', script_content, interpreter, args_lines };
+      payload = { mode: 'script', target, script_content, interpreter, args_lines };
     }
     const data = await authPost('/api/map', payload);
     if (data.error) { out.textContent = 'Error: ' + data.error; showToast(data.error, 'bad'); return; }
@@ -1379,11 +1614,98 @@ async function runParallelMap() {
       + Object.entries(data.distribution || {}).map(([k, v]) => '<span class="pill neutral">' + esc(k) + ': ' + esc(v) + '</span>').join('');
     let txt = '';
     for (const r of (data.results || [])) {
-      txt += '[' + (r.ok ? 'OK' : 'FAIL') + '] ' + r.node_id + ' (' + r.duration_sec + 's) ' + r.label + '\n  '
+      const tierStr = r.node_tier ? (' [T' + r.node_tier + ':' + (r.node_pool || 'compute') + ']') : '';
+      txt += '[' + (r.ok ? 'OK' : 'FAIL') + '] ' + r.node_id + tierStr + ' (' + r.duration_sec + 's) ' + r.label + '\n  '
         + (r.stdout || r.stderr || r.error || '').trim().replace(/\n/g, '\n  ') + '\n';
     }
     out.textContent = txt || 'Done.';
     showToast('Batch complete: ' + data.ok_count + ' succeeded, ' + data.fail_count + ' failed', data.fail_count ? 'warn' : 'ok');
+    refreshLive();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function applyPipeTemplate(name) {
+  if (!name) return;
+  const templates = {
+    tiers: [
+      {
+        name: 'Step 1 · Compute on Tier 1 (Termux)',
+        target: 'tier:1',
+        command: 'python3 -c "import os, platform; print(f\'result=42 from {os.environ.get(\\\"PHONECLUSTER_NODE_ID\\\")} ({platform.machine()})\')"'
+      },
+      {
+        name: 'Step 2 · Debian Service Tier 2',
+        target: 'tier:2',
+        command: 'echo "Tier 2 ($PHONECLUSTER_NODE_ID) received: $PHONECLUSTER_PREV_STDOUT | MQTT=${PHONECLUSTER_MQTT_URL:-none}"'
+      },
+      {
+        name: 'Step 3 · Docker Tier 3',
+        target: 'tier:3',
+        command: 'echo "Tier 3 ($PHONECLUSTER_NODE_ID) received: $PHONECLUSTER_PREV_STDOUT" && docker ps --format "{{.Names}}" 2>&1 || true'
+      }
+    ],
+    mqtt: [
+      {
+        name: 'Step 1 · Generate Metric on Tier 1',
+        target: 'tier:1',
+        command: 'python3 -c "import json, os; print(json.dumps({\'node\': os.environ.get(\'PHONECLUSTER_NODE_ID\'), \'status\': \'ok\'}))"'
+      },
+      {
+        name: 'Step 2 · Publish via Tier 2 Mosquitto',
+        target: 'tier:2',
+        command: 'if command -v mosquitto_pub >/dev/null 2>&1 && [ -n "$PHONECLUSTER_MQTT_HOST" ]; then mosquitto_pub -h "$PHONECLUSTER_MQTT_HOST" -p "${PHONECLUSTER_MQTT_PORT:-1883}" -t phonecluster/events -m "$PHONECLUSTER_PREV_STDOUT" && echo "Published to $PHONECLUSTER_MQTT_URL"; else echo "Dry-run payload -> $PHONECLUSTER_PREV_STDOUT (start Mosquitto on Tier 2 to publish)"; fi'
+      }
+    ],
+    mesh: [
+      {
+        name: 'Step 1 · Inspect Live Cross-Tier Mesh',
+        target: 'auto',
+        command: 'env | grep ^PHONECLUSTER_ | sort'
+      }
+    ]
+  };
+  if (templates[name]) {
+    document.getElementById('pipe-json').value = JSON.stringify(templates[name], null, 2);
+    showToast('Loaded pipeline template: ' + name, 'ok');
+  }
+}
+
+async function runCrossTierPipeline() {
+  const btn = document.getElementById('btn-run-pipe');
+  const out = document.getElementById('pipe-out');
+  const chips = document.getElementById('pipe-summary-chips');
+  let steps;
+  try {
+    steps = JSON.parse(document.getElementById('pipe-json').value);
+    if (!Array.isArray(steps) || !steps.length) throw new Error('Pipeline must be a non-empty JSON array.');
+  } catch (e) {
+    showToast('Invalid Pipeline JSON: ' + e.message, 'bad');
+    return;
+  }
+  btn.disabled = true;
+  chips.innerHTML = '';
+  out.textContent = 'Running cross-tier pipeline (' + steps.length + ' steps)...';
+  try {
+    const data = await authPost('/api/pipeline', { steps });
+    if (data.error) { out.textContent = 'Error: ' + data.error; showToast(data.error, 'bad'); return; }
+    chips.innerHTML = '<span class="pill ' + (data.ok ? 'ok' : 'bad') + '">' + (data.ok ? '✓ PIPELINE OK' : '✕ FAILED') + '</span>'
+      + '<span class="pill neutral mono">' + esc(data.duration_sec) + 's</span>'
+      + (data.results || []).map(r =>
+          '<span class="pill ' + (r.ok ? 'accent' : 'bad') + '">#' + esc(r.step_index) + ' → ' + esc(r.node_id)
+          + (r.node_tier ? ' (T' + esc(r.node_tier) + ':' + esc(r.node_pool) + ')' : '') + '</span>'
+        ).join('');
+    let txt = '';
+    for (const r of (data.results || [])) {
+      const t = r.node_tier ? (' [T' + r.node_tier + ':' + (r.node_pool || '') + ']') : '';
+      txt += '=== Step ' + r.step_index + ': ' + r.name + ' ===\n'
+        + 'Node: ' + r.node_id + t + ' | Status: ' + (r.ok ? 'OK' : 'FAIL') + ' (' + r.duration_sec + 's)'
+        + (r.routing_reason ? ' | ' + r.routing_reason : '') + '\n'
+        + (r.stdout || r.stderr || r.error || '(no output)').trim() + '\n\n';
+    }
+    out.textContent = txt.trim() || 'Done.';
+    showToast('Pipeline finished: ' + data.steps_completed + '/' + data.steps_total + ' steps', data.ok ? 'ok' : 'warn');
     refreshLive();
   } finally {
     btn.disabled = false;
@@ -1423,6 +1745,38 @@ async function loadWorkloads() {
     }
     svcHtml += '<p><strong>Docker-ready nodes:</strong> ' + (d.docker_nodes.length ? esc(d.docker_nodes.join(', ')) : 'None yet (requires Tier 3 custom kernel + Droidspaces)') + '</p>';
     document.getElementById('wl-services').innerHTML = svcHtml;
+
+    // Cross-Tier Live Service Mesh Table + .env + .cluster DNS hosts
+    const mesh = d.services_info || {};
+    const svcs = mesh.services || [];
+    const meshBox = document.getElementById('mesh-services-table');
+    if (meshBox) {
+      if (!svcs.length) {
+        meshBox.innerHTML = '<p class="hint">No cross-tier services detected yet (start Mosquitto, AdGuard Home, Home Assistant, llama.cpp, distcc, or Docker on any tier and click Rescan).</p>';
+      } else {
+        meshBox.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Service</th><th>Phone</th><th>Tier / Pool</th><th>Endpoint</th><th>Status</th></tr></thead><tbody>'
+          + svcs.map(s => {
+              const link = String(s.url || '').startsWith('http')
+                ? '<a href="' + esc(s.url) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(s.url) + '</a>'
+                : '<span class="mono">' + esc(s.url) + '</span>';
+              const tp = s.tier ? tierPillHtml(s.tier, s.pool) : '<span class="pill neutral">custom</span>';
+              return '<tr><td><strong>' + esc(s.name) + '</strong></td><td class="mono">' + esc(s.node_id) + '</td>'
+                + '<td>' + tp + '</td><td>' + link + '</td>'
+                + '<td><span class="pill ' + (s.ready ? 'ok' : 'warn') + '">' + (s.ready ? '✓ Live' : 'Warm/Busy') + '</span></td></tr>';
+            }).join('')
+          + '</tbody></table></div>';
+      }
+    }
+    const envObj = mesh.env || {};
+    const envEl = document.getElementById('mesh-env-code');
+    if (envEl) {
+      const lines = Object.entries(envObj).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => 'export ' + k + '="' + v + '"');
+      envEl.textContent = lines.join('\n') || '# No cluster env variables yet.';
+    }
+    const hostsEl = document.getElementById('mesh-hosts-code');
+    if (hostsEl) {
+      hostsEl.textContent = mesh.dns_hosts || '# No hosts generated yet.';
+    }
   } catch (e) {
     document.getElementById('wl-distcc').textContent = 'Error loading workloads: ' + e;
   }
@@ -1539,8 +1893,10 @@ async function addManualNode() {
   const ssh_user = document.getElementById('add-user').value.trim();
   const ssh_port = Number(document.getElementById('add-ssh-port').value || 8022);
   const max_concurrency = Number(document.getElementById('add-conc').value || 2);
+  const tier = Number(document.getElementById('add-tier').value || 0);
+  const pool = document.getElementById('add-pool').value.trim() || 'auto';
   if (!host) { showToast('Enter an IP address first.', 'warn'); return; }
-  const data = await authPost('/api/nodes/add', { host, ssh_user, ssh_port, max_concurrency });
+  const data = await authPost('/api/nodes/add', { host, ssh_user, ssh_port, max_concurrency, tier, pool });
   if (data.error) { showToast('Could not add phone: ' + data.error, 'bad'); return; }
   document.getElementById('add-host').value = '';
   showToast('Added ' + data.node.id + ' (' + data.node.host + ')!', 'ok');
@@ -1746,7 +2102,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "battery_webhook_url": s.battery_webhook_url,
                 },
             )
-        elif path in {"/api/status", "/api/metrics", "/api/live", "/api/jobs", "/api/doctor", "/api/workloads", "/api/discover"}:
+        elif path in {"/api/status", "/api/metrics", "/api/live", "/api/jobs", "/api/doctor", "/api/workloads", "/api/services", "/api/discover"}:
             if not self._require_read_auth_if_locked():
                 return
             if path == "/api/status":
@@ -1760,6 +2116,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {"summary": summary, "jobs": jobs, "history": history})
             elif path == "/api/jobs":
                 self._send_json(HTTPStatus.OK, {"nodes": self.server.controller.get_all_jobs()})
+            elif path == "/api/services":
+                self._send_json(HTTPStatus.OK, self.server.controller.get_services_info())
             elif path == "/api/doctor":
                 report = run_doctor(config_path=self.server.config_path, check_remote=True)
                 self._send_json(HTTPStatus.OK, report)
@@ -1783,6 +2141,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         "mpi_hostfile": ctrl.build_mpi_hostfile(),
                         "home_assistant_urls": ha_urls,
                         "docker_nodes": docker_nodes,
+                        "services_info": ctrl.get_services_info(),
                     },
                 )
             elif path == "/api/discover":
@@ -1808,8 +2167,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/exec",
             "/api/terminal/exec",
             "/api/map",
+            "/api/pipeline",
             "/api/jobs/cancel",
             "/api/nodes/add",
+            "/api/nodes/update",
             "/api/nodes/remove",
             "/api/workloads/action",
             "/api/settings",
@@ -1841,7 +2202,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/exec":
             command = str(body.get("command", "")).strip()
-            target = str(body.get("target", "best")).strip() or "best"
+            target = str(body.get("target", "auto")).strip() or "auto"
+            workload_hint = str(body.get("workload_hint", body.get("workload", ""))).strip()
             if not command:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "empty command"})
                 return
@@ -1851,14 +2213,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 command=command,
                 timeout_sec=float(body.get("timeout_sec", ctrl.config.default_job_timeout_sec)),
             )
-            outcomes = ctrl.run_single(spec, target=target)
+            outcomes = ctrl.run_single(spec, target=target, workload_hint=workload_hint)
             self._send_json(HTTPStatus.OK, {"results": [o.to_dict() for o in outcomes]})
 
         elif path == "/api/terminal/exec":
             command = str(body.get("command", "")).strip()
-            target = str(body.get("target", "best")).strip() or "best"
+            target = str(body.get("target", "auto")).strip() or "auto"
             cwd = str(body.get("cwd", "")).strip() or None
             job_id = str(body.get("job_id", "")).strip() or None
+            workload_hint = str(body.get("workload_hint", body.get("workload", ""))).strip()
             if not command:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "empty command"})
                 return
@@ -1869,6 +2232,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     cwd=cwd,
                     timeout_sec=float(body.get("timeout_sec", ctrl.config.default_job_timeout_sec)),
                     job_id=job_id,
+                    workload_hint=workload_hint,
                 )
             except KeyError as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
@@ -1877,6 +2241,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/map":
             mode = str(body.get("mode", "commands"))
+            target = str(body.get("target", "auto")).strip() or "auto"
+            workload_hint = str(body.get("workload_hint", body.get("workload", ""))).strip()
             timeout = float(body.get("timeout_sec", ctrl.config.default_job_timeout_sec))
             jobs: list[JobSpec] = []
             if mode == "script":
@@ -1917,7 +2283,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                             )
                         )
             t0 = time.monotonic()
-            outcomes = ctrl.map_jobs(jobs, retries=1)
+            outcomes = ctrl.map_jobs(jobs, retries=1, target=target, workload_hint=workload_hint)
             wall = round(time.monotonic() - t0, 2)
             dist: dict[str, int] = {}
             for o in outcomes:
@@ -1933,6 +2299,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "results": [o.to_dict() for o in outcomes],
                 },
             )
+
+        elif path == "/api/pipeline":
+            steps = body.get("steps")
+            if not isinstance(steps, list) or not steps or not all(isinstance(s, dict) for s in steps):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "provide a non-empty 'steps' array of pipeline step objects"},
+                )
+                return
+            stop_on_error = bool(body.get("stop_on_error", True))
+            res = ctrl.run_pipeline(steps, stop_on_error=stop_on_error)
+            self._send_json(HTTPStatus.OK, res)
 
         elif path == "/api/jobs/cancel":
             node_id = str(body.get("node_id", "")).strip()
@@ -1978,6 +2356,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if node_id in existing_ids:
                 self._send_json(HTTPStatus.CONFLICT, {"error": f"node id '{node_id}' already exists"})
                 return
+            try:
+                tier = int(body.get("tier", 0))
+            except (TypeError, ValueError):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+                return
+            if tier not in {0, 1, 2, 3}:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+                return
+            pool_name = str(body.get("pool", "auto")).strip().lower() or "auto"
             new_node = NodeConfig(
                 id=node_id,
                 host=host,
@@ -1987,13 +2374,68 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 ssh_user=str(body.get("ssh_user", "")),
                 max_concurrency=max(1, int(body.get("max_concurrency", 2))),
                 weight=max(0.1, float(body.get("weight", 1.0))),
+                tier=tier,
+                pool=pool_name,
                 tags=["worker"],
                 notes="Added via Web Control Center",
             )
             ctrl.config.nodes.append(new_node)
             if self.server.config_path is not None:
                 save_config(ctrl.config, self.server.config_path)
-            self._send_json(HTTPStatus.OK, {"node": {"id": new_node.id, "host": new_node.host}})
+            self._send_json(
+                HTTPStatus.OK,
+                {"node": {"id": new_node.id, "host": new_node.host, "tier": new_node.tier, "pool": new_node.pool}},
+            )
+
+        elif path == "/api/nodes/update":
+            node_id = str(body.get("id", "")).strip()
+            if not node_id:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing node id"})
+                return
+            target_node = next((n for n in ctrl.config.nodes if n.id == node_id), None)
+            if target_node is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
+                return
+            if "tier" in body:
+                try:
+                    t_val = int(body["tier"])
+                except (TypeError, ValueError):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+                    return
+                if t_val not in {0, 1, 2, 3}:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+                    return
+                target_node.tier = t_val
+            if "pool" in body:
+                target_node.pool = str(body["pool"]).strip().lower() or "auto"
+            if "max_concurrency" in body:
+                try:
+                    target_node.max_concurrency = max(1, int(body["max_concurrency"]))
+                except (TypeError, ValueError):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid max_concurrency"})
+                    return
+            if "weight" in body:
+                try:
+                    target_node.weight = max(0.1, float(body["weight"]))
+                except (TypeError, ValueError):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid weight"})
+                    return
+            if "notes" in body:
+                target_node.notes = str(body["notes"])[:240]
+            if self.server.config_path is not None:
+                save_config(ctrl.config, self.server.config_path)
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "node": {
+                        "id": target_node.id,
+                        "tier": target_node.tier,
+                        "pool": target_node.pool,
+                        "max_concurrency": target_node.max_concurrency,
+                        "weight": target_node.weight,
+                    }
+                },
+            )
 
         elif path == "/api/nodes/remove":
             node_id = str(body.get("id", "")).strip()

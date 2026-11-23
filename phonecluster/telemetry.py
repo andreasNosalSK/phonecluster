@@ -494,7 +494,7 @@ def is_local_port_open(port: int, timeout: float = 0.15) -> bool:
 
 
 def detect_capabilities() -> dict[str, Any]:
-    """Detect installed tools and live local compute services."""
+    """Detect installed tools and live local services across Tier 1/2/3 nodes."""
     tools = {
         "python3": bool(shutil.which("python3")),
         "clang": bool(shutil.which("clang")),
@@ -505,8 +505,17 @@ def detect_capabilities() -> dict[str, Any]:
             shutil.which("rpc-server")
             or Path.home().joinpath("llama.cpp/build/bin/rpc-server").exists()
         ),
-        "docker": bool(shutil.which("docker")),
+        "llama_cli": bool(
+            shutil.which("llama-cli")
+            or shutil.which("llama-server")
+            or Path.home().joinpath("llama.cpp/build/bin/llama-cli").exists()
+        ),
+        "docker": bool(shutil.which("docker") or shutil.which("podman")),
+        "k3s": bool(shutil.which("k3s") or shutil.which("kubectl")),
         "homeassistant": bool(shutil.which("hass")),
+        "mosquitto": bool(shutil.which("mosquitto") or shutil.which("mosquitto_pub")),
+        "adguard": bool(shutil.which("AdGuardHome") or shutil.which("pihole")),
+        "apt": bool(shutil.which("apt-get")),
         "tmux": bool(shutil.which("tmux")),
     }
     services = {
@@ -514,9 +523,39 @@ def detect_capabilities() -> dict[str, Any]:
         "sshd_22": is_local_port_open(22),
         "distccd_3632": is_local_port_open(3632),
         "llama_rpc_50052": is_local_port_open(50052),
+        "llama_api_8081": is_local_port_open(8081),
         "homeassistant_8123": is_local_port_open(8123),
+        "mosquitto_1883": is_local_port_open(1883),
+        "adguard_3000": is_local_port_open(3000),
+        "dns_53": is_local_port_open(53),
+        "redis_6379": is_local_port_open(6379),
+        "postgres_5432": is_local_port_open(5432),
     }
     return {"tools": tools, "services": services}
+
+
+def detect_node_tier(os_env: str, tools: dict[str, bool]) -> tuple[int, str]:
+    """Classify a device into Tier 1 (Termux/compute), Tier 2 (Debian/services), or Tier 3 (Docker).
+
+    Respects explicit `PHONECLUSTER_TIER` env var (`1`, `2`, or `3`) when set.
+    """
+    override = os.environ.get("PHONECLUSTER_TIER", "").strip()
+    if override in {"1", "2", "3"}:
+        tier = int(override)
+        return tier, {1: "compute", 2: "services", 3: "docker"}[tier]
+
+    if os_env == "termux":
+        return 1, "compute"
+
+    docker_ready = bool(tools.get("docker")) and (
+        Path("/var/run/docker.sock").exists()
+        or Path("/run/podman/podman.sock").exists()
+        or bool(tools.get("k3s"))
+    )
+    if docker_ready:
+        return 3, "docker"
+
+    return 2, "services"
 
 
 def collect_node_health(
@@ -560,6 +599,8 @@ def collect_node_health(
         mem["total_mb"] > 0 and mem["available_mb"] < safety.min_free_ram_mb
     )
     caps = detect_capabilities()
+    os_env = detect_os_environment()
+    detected_tier, detected_pool = detect_node_tier(os_env, caps["tools"])
 
     reasons: list[str] = []
     if overheated:
@@ -579,7 +620,9 @@ def collect_node_health(
         "node_id": node_id,
         "role": role,
         "hostname": socket.gethostname(),
-        "os_env": detect_os_environment(),
+        "os_env": os_env,
+        "tier": detected_tier,
+        "pool": detected_pool,
         "arch": platform.machine(),
         "uptime_sec": read_uptime_sec(),
         "cpu_cores": cpu_cores,

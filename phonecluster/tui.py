@@ -158,6 +158,17 @@ def _box_lines(title: str, body_lines: list[str], width: int, pal: Palette) -> l
     return out
 
 
+def _tier_badge(tier: int, pool: str, pal: Palette) -> str:
+    label = f"T{tier}:{pool}"
+    if tier == 3:
+        return pal.warn(label)
+    if tier == 2:
+        return pal.purple(label)
+    if tier == 1:
+        return pal.cyan(label)
+    return pal.dim(label)
+
+
 def render_top_frame(
     summary: dict[str, Any],
     history: dict[str, Any],
@@ -169,6 +180,7 @@ def render_top_frame(
     last_command_banner: str = "",
     width: int | None = None,
     use_color: bool = True,
+    pool_filter: str = "all",
 ) -> str:
     """Render one complete multi-device btop frame as a string."""
     pal = Palette(enabled=use_color)
@@ -222,11 +234,40 @@ def render_top_frame(
     else:
         header_lines = [top_row, cpu_part, mem_part, meta_row]
 
+    # Show heterogeneous Tier/Pool overview & live cross-tier Service Mesh in header
+    pools = summary.get("pools") or []
+    if pools:
+        pool_chips: list[str] = []
+        for p in pools:
+            badge = _tier_badge(int(p.get("tier", 1)), str(p.get("pool", "compute")), pal)
+            chip = f"{badge} {p.get('nodes_ready', 0)}/{p.get('nodes_total', 0)} ({p.get('total_cores', 0)}c)"
+            pool_chips.append(chip)
+        header_lines.append("POOLS " + " · ".join(pool_chips))
+
+    svcs_reg = summary.get("services_registry") or []
+    if svcs_reg:
+        svc_items: list[str] = []
+        seen_svc: set[tuple[str, str]] = set()
+        for entry in svcs_reg:
+            pair = (str(entry.get("name", "")), str(entry.get("node_id", "")))
+            if pair in seen_svc:
+                continue
+            seen_svc.add(pair)
+            svc_items.append(f"{pal.ok(pair[0])}@{pair[1]}")
+            if len(svc_items) >= 6:
+                break
+        if svc_items:
+            header_lines.append("SVCS  " + " · ".join(svc_items))
+
     frames: list[str] = []
     frames.extend(_box_lines("PHONECLUSTER · UNIFIED MULTI-DEVICE BTOP", header_lines, cols, pal))
 
     # 2. Per-Device Shared btop Panel
-    nodes = summary.get("nodes", [])
+    all_nodes = summary.get("nodes", [])
+    if pool_filter and pool_filter != "all":
+        nodes = [n for n in all_nodes if str(n.get("pool", "")) == pool_filter]
+    else:
+        nodes = all_nodes
     node_hist_map = history.get("nodes", {})
     device_lines: list[str] = []
     for idx, n in enumerate(nodes):
@@ -234,12 +275,15 @@ def render_top_frame(
         pointer = pal.sel_bg("▶") if is_sel else " "
         h = n.get("health") or {}
         role_badge = pal.purple("MASTER") if n.get("role") == "master" else pal.dim("WORKER")
+        tier_num = int(n.get("tier", 1) or 1)
+        pool_name = str(n.get("pool", "compute") or "compute")
+        t_badge = _tier_badge(tier_num, pool_name, pal)
         nid_styled = pal.sel_bg(f"{n['id']:<6s}") if is_sel else pal.bold(f"{n['id']:<6s}")
 
         if not n.get("online"):
             err = str(n.get("error", "unreachable"))[:42]
             device_lines.append(
-                f"{pointer} {nid_styled} [{role_badge}] {n['host']:<15s}  {pal.bad('✕ OFFLINE')}  {pal.dim(err)}"
+                f"{pointer} {nid_styled} [{role_badge} {t_badge}] {n['host']:<15s}  {pal.bad('✕ OFFLINE')}  {pal.dim(err)}"
             )
             continue
 
@@ -253,7 +297,7 @@ def render_top_frame(
         os_s = str(h.get("os_env", "linux"))[:10]
         lat_txt = f"{n.get('latency_ms', 0)}ms"
         device_lines.append(
-            f"{pointer} {nid_styled} [{role_badge}] {n['host']:<15s} {pal.dim(f'{os_s:<10s}')} "
+            f"{pointer} {nid_styled} [{role_badge} {t_badge}] {n['host']:<15s} {pal.dim(f'{os_s:<10s}')} "
             f"up {up_s:<6s} {st_badge}  {pal.dim(lat_txt)}"
         )
 
@@ -303,9 +347,17 @@ def render_top_frame(
             device_lines.append(pal.border("  " + "·" * max(10, cols - 8)))
 
     if not device_lines:
-        device_lines.append(pal.dim("No nodes configured in cluster.json."))
+        if pool_filter and pool_filter != "all":
+            device_lines.append(pal.dim(f"No phones in pool '{pool_filter}' — press [p] to show all."))
+        else:
+            device_lines.append(pal.dim("No nodes configured in cluster.json."))
 
-    frames.extend(_box_lines("DEVICES · SHARED CLUSTER VIEW", device_lines, cols, pal))
+    dev_title = (
+        "DEVICES · SHARED CLUSTER VIEW"
+        if not pool_filter or pool_filter == "all"
+        else f"DEVICES · POOL FILTER: {pool_filter.upper()} (press 'p' for all)"
+    )
+    frames.extend(_box_lines(dev_title, device_lines, cols, pal))
 
     # 3. Bottom Panel: Running Tasks & Recent History OR Shared Top Processes
     bottom_lines: list[str] = []
@@ -362,13 +414,14 @@ def render_top_frame(
 
     # 5. Keybinding Footer Bar
     footer = (
-        f" {pal.accent('[↑/↓]')} Select  "
-        f"{pal.accent('[r]')} Run Node  "
-        f"{pal.accent('[a]')} Broadcast  "
+        f" {pal.accent('[↑/↓]')} Sel  "
+        f"{pal.accent('[x]')} Auto-Run  "
+        f"{pal.accent('[p]')} Pool({pool_filter})  "
+        f"{pal.accent('[r]')} Run  "
+        f"{pal.accent('[a]')} All  "
         f"{pal.accent('[s]')} SSH  "
-        f"{pal.accent('[c]')} Cancel Job  "
+        f"{pal.accent('[c]')} Cancel  "
         f"{pal.accent('[d]')} Tasks/Procs  "
-        f"{pal.accent('[+/-]')} Speed  "
         f"{pal.accent('[Space]')} Pause  "
         f"{pal.accent('[q]')} Quit"
     )
@@ -440,6 +493,7 @@ def run_top_tui(
     old_settings = termios.tcgetattr(fd)
     selected_idx = 0
     view_mode = "tasks"
+    pool_filter = "all"
     paused = False
     last_banner = ""
     speed = max(0.5, refresh_sec)
@@ -460,7 +514,12 @@ def run_top_tui(
                 all_jobs = controller.get_all_jobs()
                 last_poll = now
 
-            nodes = summary.get("nodes", [])
+            all_nodes = summary.get("nodes", [])
+            nodes = (
+                [n for n in all_nodes if str(n.get("pool", "")) == pool_filter]
+                if pool_filter != "all"
+                else all_nodes
+            )
             if nodes:
                 selected_idx = max(0, min(selected_idx, len(nodes) - 1))
 
@@ -474,6 +533,7 @@ def run_top_tui(
                 paused=paused,
                 last_command_banner=last_banner,
                 use_color=True,
+                pool_filter=pool_filter,
             )
             sys.stdout.write("\033[H\033[J" + frame)
             sys.stdout.flush()
@@ -495,10 +555,30 @@ def run_top_tui(
                 paused = not paused
             elif key in {"d", "D"}:
                 view_mode = "procs" if view_mode == "tasks" else "tasks"
+            elif key in {"p", "P"}:
+                avail_pools = ["all"] + sorted({str(n.get("pool", "compute")) for n in all_nodes})
+                cur_pos = avail_pools.index(pool_filter) if pool_filter in avail_pools else 0
+                pool_filter = avail_pools[(cur_pos + 1) % len(avail_pools)]
+                selected_idx = 0
             elif key == "+":
                 speed = max(0.5, round(speed - 0.5, 1))
             elif key == "-":
                 speed = min(15.0, round(speed + 0.5, 1))
+            elif key in {"x", "X"} and all_nodes:
+                cmd = _prompt_line("Auto-Route (Smart Tier)> ", old_settings)
+                if cmd:
+                    spec = JobSpec(index=0, job_id=f"auto-{int(time.time())}", command=cmd, timeout_sec=60.0)
+                    outcomes = controller.run_single(spec, target="auto")
+                    parts = []
+                    for o in outcomes:
+                        first = (o.stdout.strip() or o.stderr.strip() or o.error or "(no output)").splitlines()[0][:80]
+                        tier_tag = f"T{o.node_tier}:{o.node_pool}" if o.node_tier else "none"
+                        status_str = "OK" if o.ok else "FAIL"
+                        parts.append(
+                            f"[{o.node_id} · {tier_tag}] {status_str} ({o.duration_sec:.2f}s) — {o.routing_reason}\n  {first}"
+                        )
+                    last_banner = "\n".join(parts)
+                    last_poll = 0.0
             elif key in {"r", "R", "a", "A"} and nodes:
                 target = "all" if key in {"a", "A"} else nodes[selected_idx]["id"]
                 cmd = _prompt_line(f"Run on [{target}]> ", old_settings)
@@ -508,7 +588,9 @@ def run_top_tui(
                     parts = []
                     for o in outcomes:
                         first = (o.stdout.strip() or o.stderr.strip() or o.error or "(no output)").splitlines()[0][:80]
-                        parts.append(f"[{o.node_id}] {'OK' if o.ok else 'FAIL'} ({o.duration_sec:.2f}s): {first}")
+                        tier_tag = f"T{o.node_tier}:{o.node_pool}" if o.node_tier else ""
+                        status_str = "OK" if o.ok else "FAIL"
+                        parts.append(f"[{o.node_id} {tier_tag}] {status_str} ({o.duration_sec:.2f}s): {first}")
                     last_banner = "\n".join(parts)
                     last_poll = 0.0  # force immediate refresh
             elif key in {"c", "C"} and nodes:

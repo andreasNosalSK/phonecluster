@@ -26,9 +26,44 @@ pc map \
   --args-file examples/sample_args.txt \
   --output-jsonl prime_results.jsonl
 ```
-Every job automatically receives two environment variables:
+Every job automatically receives cross-tier context environment variables:
 - `PHONECLUSTER_NODE_ID` (e.g. `node0`, `node1`, `node2`)
 - `PHONECLUSTER_TASK_INDEX` (`0`, `1`, `2`, ...)
+- Live cross-tier service endpoints discovered across every phone (`PHONECLUSTER_MQTT_HOST`, `PHONECLUSTER_MQTT_URL`, `PHONECLUSTER_HOMEASSISTANT_URL`, `PHONECLUSTER_ADGUARD_URL`, `PHONECLUSTER_LLAMA_API_URL`, `PHONECLUSTER_POOL_COMPUTE_HOSTS`, `PHONECLUSTER_POOL_SERVICES_HOSTS`, `PHONECLUSTER_POOL_DOCKER_HOSTS`, etc.)
+
+---
+
+## 1B. Mixed-Tier Heterogeneous Clusters (Tier 1 + Tier 2 + Tier 3 as One System)
+
+You can mix different phone OS tiers inside a single `config/cluster.json` (see [`examples/mixed_cluster.example.json`](../examples/mixed_cluster.example.json)):
+- **Tier 1 (`compute` pool)** — Unrooted Termux phones for parallel Python/Rust scripts, `llama.cpp`, `distcc`.
+- **Tier 2 (`services` pool)** — Rooted Native Debian 13 ARM64 chroot phones for Mosquitto MQTT, AdGuard Home DNS, Zigbee2MQTT, Tailscale/WireGuard.
+- **Tier 3 (`docker` pool)** — Custom Kernel + Droidspaces phones for Docker containers (Home Assistant Container, microservices).
+
+### Automatic Workload Routing
+By default, `pc run`, `pc map`, the Web Terminal (`Tab 2`), and `pc top` (`x` key) use `--target auto`:
+- Commands containing `docker`, `podman`, `k3s`, `kubectl` route **strictly** to **Tier 3 (`docker`)** — never failing on unrooted Termux phones.
+- Commands containing `apt`, `mosquitto_pub`, `systemctl`, `adguardhome`, `psql`, `redis-cli` route **strictly** to **Tier 2 (`services`)** (or Tier 3 Debian).
+- General compute, Python, compilers, and `llama.cpp` prefer **Tier 1 (`compute`)** and automatically **spill over** to cool Tier 2/3 phones if Tier 1 is busy or thermally throttled.
+
+You can also target any group explicitly:
+```bash
+pc pools                                            # Inspect all Tier/Pool capacities
+pc run --target tier:1 "python3 benchmark.py"       # Tier 1 Termux pool only
+pc run --target tier:2 "mosquitto_pub -h $PHONECLUSTER_MQTT_HOST -t test -m hi"
+pc run --target tier:3 "docker ps"                  # Tier 3 Docker pool only
+pc run --target pool:docker "docker compose ps"     # Target by pool name
+```
+
+### Cross-Tier Service Discovery & Pipelines
+Phones on different tiers communicate without hardcoded IPs:
+```bash
+pc services                         # Table of live services across all tiers
+eval "$(pc services --env)"         # Export $PHONECLUSTER_MQTT_HOST, $PHONECLUSTER_HOMEASSISTANT_URL, etc.
+pc services --hosts                 # Paste into AdGuard Home DNS Rewrites or /etc/hosts (mqtt.cluster, ha.cluster...)
+pc pipeline examples/cross_tier_pipeline.json   # Run Tier 1 -> Tier 2 -> Tier 3 chained workflow
+```
+In pipelines, every step automatically receives `$PHONECLUSTER_PREV_STDOUT`, `$PHONECLUSTER_PREV_NODE`, `$PHONECLUSTER_PREV_TIER`, and all live `$PHONECLUSTER_*` service URLs!
 
 ---
 

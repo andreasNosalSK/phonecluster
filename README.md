@@ -31,9 +31,12 @@ PhoneCluster gives you **one entry point** (Web UI + interactive terminal menu +
   - Dynamically ships & runs local Python/Bash scripts across all cool, ready phones (`pc map --script ...`) with automatic retry/failover if a phone throttles or disconnects.
   - **Thermal Gate with hysteresis** pauses jobs at `40 °C` and resumes at `37 °C`.
   - **24/7 Battery Guard** fires alerts or a smart-plug / Home Assistant webhook to keep unrooted Li-Po batteries in the safer `45–60%` range.
+- **Heterogeneous Multi-Tier Orchestration (One Seamless System!)**:
+  - Freely mix **Tier 1 (Unrooted Termux — compute/LLMs)** + **Tier 2 (Native Debian 13 ARM64 chroot — Mosquitto MQTT, AdGuard Home, glibc services)** + **Tier 3 (Custom Kernel + Droidspaces — Docker containers, Home Assistant)** inside the **same cluster**!
+  - **Automatic Smart Routing (`--target auto` default)**: Docker commands automatically go to Tier 3, Debian/MQTT/AdGuard service commands go to Tier 2, and parallel Python/AI/compiler tasks spread across Tier 1 (spilling over cleanly to cool Tier 2/3 phones if Tier 1 gets busy or warm).
+  - **Automatic Cross-Tier Service Mesh**: Every job on every tier automatically receives live `$PHONECLUSTER_MQTT_HOST`, `$PHONECLUSTER_HOMEASSISTANT_URL`, `$PHONECLUSTER_ADGUARD_URL`, `$PHONECLUSTER_LLAMA_API_URL`, `$PHONECLUSTER_POOL_*_HOSTS`, etc. — plus one-click `.cluster` DNS rewrites (`mqtt.cluster`, `ha.cluster`, `adguard.cluster`) and **Cross-Tier Pipelines** (`pc pipeline`).
 - **OS-Agnostic Upgrade Path**:
-  - Starts in 15 minutes on **unrooted Termux** (no bootloader unlock required).
-  - Runs unchanged when you upgrade to **Rooted Native Debian 13 ARM64 chroot** (automatically switching from `termux-battery-status` to `/sys/class/power_supply/*`) or **Droidspaces / Docker**.
+  - Starts in 15 minutes on **unrooted Termux** (no bootloader unlock required), and upgrades phone-by-phone to Tier 2 or Tier 3 whenever you're ready (`examples/mixed_cluster.example.json`).
 
 ---
 
@@ -91,9 +94,18 @@ pc update --sync                      # Pull latest updates from GitHub & push t
 pc doctor                             # Check SSH, security isolation, temps, 24/7 battery safety
 pc wizard                             # Guided interactive setup wizard
 
-# Run commands & parallel scripts across all phones
-pc run "uname -a && nproc"            # Run on coolest/best phone
-pc run --target all "uptime"          # Broadcast to all ready phones
+# Heterogeneous Multi-Tier Pools, Auto-Routing & Cross-Tier Pipelines
+pc pools                              # View Tier 1 (compute) / Tier 2 (services) / Tier 3 (docker) pools
+pc services                           # Discover live cross-tier services (MQTT, AdGuard, HA, AI, Docker)
+eval "$(pc services --env)"           # Export live $PHONECLUSTER_* service URLs into your shell
+pc services --hosts                   # Generate .cluster DNS rewrites for AdGuard Home / /etc/hosts
+pc pipeline examples/cross_tier_pipeline.json  # Chain Tier 1 -> Tier 2 -> Tier 3 in one workflow
+
+# Run commands & parallel scripts (auto-routes to ideal Tier/Pool by default!)
+pc run "uname -a && nproc"            # Auto-routes compute -> Tier 1 (spills over if warm)
+pc run "docker ps"                    # Auto-routes strictly -> Tier 3 (Docker pool)
+pc run --target tier:2 "apt-cache policy mosquitto"  # Explicitly target Tier 2 Debian pool
+pc run --target all "uptime"          # Broadcast to all ready phones across all tiers
 pc map --script examples/sample_job.py --args-file examples/sample_args.txt
 
 # Workload integrations

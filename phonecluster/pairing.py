@@ -48,7 +48,12 @@ from .config import (
     save_config,
 )
 from .discovery import DISCOVERY_PORT, _candidate_broadcast_addresses, detect_local_ip
-from .telemetry import detect_os_environment, read_memory_info
+from .telemetry import (
+    detect_capabilities,
+    detect_node_tier,
+    detect_os_environment,
+    read_memory_info,
+)
 
 LOG = logging.getLogger("phonecluster.pairing")
 
@@ -567,6 +572,9 @@ class PairingManager:
         cores = max(1, int(metadata.get("cpu_cores", 4)))
         mem_mb = max(0, int(metadata.get("mem_total_mb", 0)))
         max_conc = max(1, min(8, int(metadata.get("max_concurrency", 2))))
+        raw_tier = int(metadata.get("tier", 0))
+        node_tier = raw_tier if raw_tier in {0, 1, 2, 3} else 0
+        node_pool = str(metadata.get("pool", "auto")).strip().lower() or "auto"
         node_token = generate_auth_token()
 
         with self._lock:
@@ -584,8 +592,10 @@ class PairingManager:
                 existing.ssh_port = ssh_port
                 existing.ssh_user = ssh_user or existing.ssh_user
                 existing.max_concurrency = max_conc
+                existing.tier = node_tier
+                existing.pool = node_pool
                 existing.auth_token = node_token
-                existing.notes = f"Re-paired ({os_env}, {cores}c, {mem_mb} MB RAM)"
+                existing.notes = f"Re-paired ({os_env}, T{node_tier or '?'} {node_pool}, {cores}c, {mem_mb} MB RAM)"
                 assigned_node = existing
             else:
                 existing_ids = {n.id for n in self.config.nodes}
@@ -601,8 +611,10 @@ class PairingManager:
                     ssh_user=ssh_user,
                     max_concurrency=max_conc,
                     weight=1.0,
-                    tags=["worker", "paired"],
-                    notes=f"Securely paired ({os_env}, {cores}c, {mem_mb} MB RAM)",
+                    tier=node_tier,
+                    pool=node_pool,
+                    tags=["worker", "paired", f"tier{node_tier}" if node_tier else "auto"],
+                    notes=f"Securely paired ({os_env}, T{node_tier or '?'} {node_pool}, {cores}c, {mem_mb} MB RAM)",
                     auth_token=node_token,
                 )
                 self.config.nodes.append(assigned_node)
@@ -834,6 +846,8 @@ def join_cluster_via_pairing(
     ssh_user: str = "",
     max_concurrency: int = 2,
     trust_ssh_key: bool = False,
+    tier: int = 0,
+    pool: str = "auto",
 ) -> dict[str, Any]:
     """Perform authenticated DH pairing with Master and save a scoped worker config."""
     base_url = f"http://{master_host}:{pair_port}"
@@ -852,6 +866,14 @@ def join_cluster_via_pairing(
     k_auth, k_enc, k_mac = derive_pairing_keys(pin, shared_secret, salt_hex, session_id)
 
     os_env = detect_os_environment()
+    caps = detect_capabilities()
+    det_tier, det_pool = detect_node_tier(os_env, caps["tools"])
+    eff_tier = tier if tier in {1, 2, 3} else det_tier
+    eff_pool = (
+        pool.strip().lower()
+        if pool and pool.strip().lower() != "auto"
+        else ({1: "compute", 2: "services", 3: "docker"}.get(eff_tier, det_pool))
+    )
     actual_ssh_port = ssh_port if ssh_port is not None else (8022 if os_env == "termux" else 22)
     actual_user = ssh_user or os.environ.get("USER", "")
     mem = read_memory_info()
@@ -860,6 +882,8 @@ def join_cluster_via_pairing(
         "ssh_port": actual_ssh_port,
         "ssh_user": actual_user,
         "os_env": os_env,
+        "tier": eff_tier,
+        "pool": eff_pool,
         "cpu_cores": os.cpu_count() or 1,
         "mem_total_mb": mem["total_mb"],
         "max_concurrency": max_concurrency,
@@ -906,6 +930,8 @@ def join_cluster_via_pairing(
                 ssh_port=actual_ssh_port,
                 ssh_user=actual_user,
                 max_concurrency=max_concurrency,
+                tier=eff_tier,
+                pool=eff_pool,
                 tags=["worker", "paired"],
                 notes=f"Paired to Master {bundle.get('master_host', master_host)}",
                 auth_token=worker_token,
@@ -922,6 +948,8 @@ def join_cluster_via_pairing(
         "cluster_name": worker_cfg.cluster_name,
         "node_id": node_id,
         "node_host": worker_cfg.nodes[0].host,
+        "tier": eff_tier,
+        "pool": eff_pool,
         "master_host": str(bundle.get("master_host", master_host)),
         "config_path": str(config_out),
         "ssh_key_trusted": ssh_trusted,

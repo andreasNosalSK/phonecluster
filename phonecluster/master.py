@@ -12,12 +12,21 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from typing import Any, Callable
 
 from .auth import build_auth_headers
 from .config import ClusterConfig, NodeConfig
+from .routing import (
+    build_cluster_dns_hosts,
+    build_cross_tier_env,
+    build_service_registry,
+    classify_workload,
+    resolve_node_tier_and_pool,
+    select_snapshots_for_target,
+    summarize_pools,
+)
 
 LOG = logging.getLogger("phonecluster.master")
 
@@ -113,6 +122,9 @@ class JobOutcome:
     cancelled: bool = False
     attempts: int = 1
     error: str = ""
+    routing_reason: str = ""
+    node_tier: int = 0
+    node_pool: str = ""
 
     @property
     def ok(self) -> bool:
@@ -124,6 +136,9 @@ class JobOutcome:
             "job_id": self.job_id,
             "label": self.label,
             "node_id": self.node_id,
+            "node_tier": self.node_tier,
+            "node_pool": self.node_pool,
+            "routing_reason": self.routing_reason,
             "ok": self.ok,
             "returncode": self.returncode,
             "duration_sec": self.duration_sec,
@@ -319,14 +334,32 @@ class MasterController:
         except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
             return "retryable", {"error": str(exc)}
 
+    @staticmethod
+    def _with_cross_tier_env(spec: JobSpec, cross_env: dict[str, str]) -> JobSpec:
+        """Return a copy of `spec` enriched with live cross-tier service env vars."""
+        merged = dict(cross_env)
+        if spec.env:
+            merged.update(spec.env)
+        return replace(spec, env=merged)
+
     def run_single(
         self,
         spec: JobSpec,
-        target: str = "best",
+        target: str = "auto",
         tags: list[str] | None = None,
+        workload_hint: str = "",
     ) -> list[JobOutcome]:
-        """Run a job on the single best node (`best`), all ready nodes (`all`), or a specific node ID."""
+        """Run a job via smart auto-routing (`auto`), Tier/Pool (`tier:1|2|3`, `pool:<name>`),
+        best overall node (`best`), all ready nodes (`all`), or a specific node ID.
+
+        Automatically injects live cross-tier `PHONECLUSTER_*` service-discovery variables
+        into every job so Tier 1/2/3 workloads seamlessly communicate as one system.
+        """
         snapshots = self.poll_health(tags=tags)
+        cross_env = build_cross_tier_env(snapshots, self.config)
+        enriched = self._with_cross_tier_env(spec, cross_env)
+        snap_by_id = {s.node.id: s for s in snapshots}
+
         if target == "all":
             chosen = [s for s in snapshots if s.online and (s.ready_for_jobs or spec.force)]
             if not chosen:
@@ -339,22 +372,42 @@ class MasterController:
                         returncode=-1,
                         duration_sec=0.0,
                         error="No online, ready nodes available.",
+                        routing_reason="Broadcast requested across all ready phones",
                     )
                 ]
             outcomes: list[JobOutcome] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(chosen)) as pool:
                 fut_map = {
-                    pool.submit(self.exec_on_node, s.node, spec): s.node for s in chosen
+                    pool.submit(self.exec_on_node, s.node, enriched): s for s in chosen
                 }
                 for fut in concurrent.futures.as_completed(fut_map):
-                    node = fut_map[fut]
+                    snap = fut_map[fut]
                     kind, data = fut.result()
-                    outcomes.append(self._to_outcome(spec, node.id, kind, data, attempts=1))
+                    tier, pool_name = resolve_node_tier_and_pool(snap.node, snap.health)
+                    outcomes.append(
+                        self._to_outcome(
+                            spec,
+                            snap.node.id,
+                            kind,
+                            data,
+                            attempts=1,
+                            node_tier=tier,
+                            node_pool=pool_name,
+                            routing_reason="Broadcast to all ready phones",
+                        )
+                    )
             outcomes.sort(key=lambda o: o.node_id)
             return outcomes
 
-        if target == "best":
-            candidates = [s for s in snapshots if s.online and (s.ready_for_jobs or spec.force)]
+        if target in {"auto", "best"} or target.startswith(("tier:", "pool:")):
+            route = (
+                classify_workload(spec.command, spec.script_content, hint=workload_hint)
+                if target == "auto"
+                else None
+            )
+            candidates, reason = select_snapshots_for_target(
+                snapshots, target=target, route=route, force=spec.force
+            )
             if not candidates:
                 return [
                     JobOutcome(
@@ -364,21 +417,49 @@ class MasterController:
                         node_id="none",
                         returncode=-1,
                         duration_sec=0.0,
-                        error="No online, ready nodes available.",
+                        error=reason or "No online, ready nodes available.",
+                        routing_reason=reason,
                     )
                 ]
             candidates.sort(
                 key=lambda s: score_node(s, max_temp_c=self.config.safety.max_temp_c),
                 reverse=True,
             )
-            best_node = candidates[0].node
-            kind, data = self.exec_on_node(best_node, spec)
-            return [self._to_outcome(spec, best_node.id, kind, data, attempts=1)]
+            best_snap = candidates[0]
+            tier, pool_name = resolve_node_tier_and_pool(best_snap.node, best_snap.health)
+            kind, data = self.exec_on_node(best_snap.node, enriched)
+            return [
+                self._to_outcome(
+                    spec,
+                    best_snap.node.id,
+                    kind,
+                    data,
+                    attempts=1,
+                    node_tier=tier,
+                    node_pool=pool_name,
+                    routing_reason=reason,
+                )
+            ]
 
         # Specific node id
         node = self.config.get_node(target)
-        kind, data = self.exec_on_node(node, spec)
-        return [self._to_outcome(spec, node.id, kind, data, attempts=1)]
+        snap = snap_by_id.get(node.id)
+        tier, pool_name = resolve_node_tier_and_pool(
+            node, snap.health if snap and snap.online else None
+        )
+        kind, data = self.exec_on_node(node, enriched)
+        return [
+            self._to_outcome(
+                spec,
+                node.id,
+                kind,
+                data,
+                attempts=1,
+                node_tier=tier,
+                node_pool=pool_name,
+                routing_reason=f"Pinned to node '{node.id}'",
+            )
+        ]
 
     def map_jobs(
         self,
@@ -388,11 +469,16 @@ class MasterController:
         health_refresh_sec: float = 5.0,
         wait_for_ready_sec: float = 30.0,
         on_result: Callable[[JobOutcome, int, int], None] | None = None,
+        target: str = "auto",
+        workload_hint: str = "",
     ) -> list[JobOutcome]:
-        """Dynamically distribute a batch of jobs across all healthy cluster nodes.
+        """Dynamically distribute a batch of jobs across compatible healthy cluster nodes.
 
-        Automatically respects per-node max_concurrency, avoids overheated phones,
-        and retries/reroutes jobs if a worker throttles (HTTP 503) or disconnects.
+        With `target="auto"`, every job is classified individually and routed to its ideal
+        Tier/Pool (e.g., Docker -> Tier 3, Debian services -> Tier 2, general compute -> Tier 1
+        with automatic spillover). Respects per-node `max_concurrency`, avoids overheated phones,
+        avoids head-of-line blocking across pools, injects live cross-tier `PHONECLUSTER_*` env
+        variables, and retries/reroutes on worker throttle (HTTP 503) or disconnect.
         """
         if not jobs:
             return []
@@ -401,13 +487,15 @@ class MasterController:
             (job, 0, set()) for job in jobs
         )
         outcomes_by_index: dict[int, JobOutcome] = {}
+        last_reason_by_index: dict[int, str] = {}
         in_flight_per_node: dict[str, int] = collections.defaultdict(int)
         running_futures: dict[
             concurrent.futures.Future[tuple[str, dict[str, Any]]],
-            tuple[JobSpec, NodeConfig, int, set[str]],
+            tuple[JobSpec, NodeSnapshot, int, set[str], str],
         ] = {}
 
         snapshots = self.poll_health(tags=tags)
+        cross_env = build_cross_tier_env(snapshots, self.config)
         last_poll = time.monotonic()
         no_ready_since: float | None = None
         completed_count = 0
@@ -423,23 +511,32 @@ class MasterController:
                 now = time.monotonic()
                 if now - last_poll >= health_refresh_sec:
                     snapshots = self.poll_health(tags=tags)
+                    cross_env = build_cross_tier_env(snapshots, self.config)
                     last_poll = time.monotonic()
 
                 dispatched_any = False
-                # Dispatch as many pending jobs as there are free healthy slots
+                # Dispatch as many pending jobs as there are free compatible healthy slots
                 deferred: list[tuple[JobSpec, int, set[str]]] = []
                 while pending:
                     spec, attempt, failed_nodes = pending.popleft()
+                    route = (
+                        classify_workload(spec.command, spec.script_content, hint=workload_hint)
+                        if target == "auto"
+                        else None
+                    )
+                    pool_matched, reason = select_snapshots_for_target(
+                        snapshots, target=target, route=route, force=spec.force
+                    )
+                    last_reason_by_index[spec.index] = reason
                     eligible = [
                         s
-                        for s in snapshots
-                        if s.online
-                        and (s.ready_for_jobs or spec.force)
-                        and in_flight_per_node[s.node.id] < s.max_concurrency
+                        for s in pool_matched
+                        if in_flight_per_node[s.node.id] < s.max_concurrency
                     ]
                     if not eligible:
+                        # Continue inspecting remaining jobs so busy Tier X does not block Tier Y
                         deferred.append((spec, attempt, failed_nodes))
-                        break
+                        continue
 
                     # Prefer nodes that didn't just reject this job if alternatives exist
                     preferred = [s for s in eligible if s.node.id not in failed_nodes]
@@ -452,10 +549,11 @@ class MasterController:
                         ),
                         reverse=True,
                     )
-                    chosen = pool_candidates[0].node
-                    in_flight_per_node[chosen.id] += 1
-                    fut = pool.submit(self.exec_on_node, chosen, spec)
-                    running_futures[fut] = (spec, chosen, attempt + 1, failed_nodes)
+                    chosen_snap = pool_candidates[0]
+                    in_flight_per_node[chosen_snap.node.id] += 1
+                    enriched = self._with_cross_tier_env(spec, cross_env)
+                    fut = pool.submit(self.exec_on_node, chosen_snap.node, enriched)
+                    running_futures[fut] = (spec, chosen_snap, attempt + 1, failed_nodes, reason)
                     dispatched_any = True
                     no_ready_since = None
 
@@ -469,25 +567,38 @@ class MasterController:
                         return_when=concurrent.futures.FIRST_COMPLETED,
                     )
                     for fut in done:
-                        spec, node, attempt, failed_nodes = running_futures.pop(fut)
-                        in_flight_per_node[node.id] = max(0, in_flight_per_node[node.id] - 1)
+                        spec, snap, attempt, failed_nodes, reason = running_futures.pop(fut)
+                        in_flight_per_node[snap.node.id] = max(
+                            0, in_flight_per_node[snap.node.id] - 1
+                        )
                         kind, data = fut.result()
 
                         if kind == "retryable" and attempt <= retries:
-                            failed_nodes.add(node.id)
+                            failed_nodes.add(snap.node.id)
                             pending.appendleft((spec, attempt, failed_nodes))
                             # Refresh health immediately since a node likely throttled or dropped
                             snapshots = self.poll_health(tags=tags)
+                            cross_env = build_cross_tier_env(snapshots, self.config)
                             last_poll = time.monotonic()
                             continue
 
-                        outcome = self._to_outcome(spec, node.id, kind, data, attempts=attempt)
+                        tier, pool_name = resolve_node_tier_and_pool(snap.node, snap.health)
+                        outcome = self._to_outcome(
+                            spec,
+                            snap.node.id,
+                            kind,
+                            data,
+                            attempts=attempt,
+                            node_tier=tier,
+                            node_pool=pool_name,
+                            routing_reason=reason,
+                        )
                         outcomes_by_index[spec.index] = outcome
                         completed_count += 1
                         if on_result is not None:
                             on_result(outcome, completed_count, total_jobs)
                 elif pending and not dispatched_any:
-                    # No jobs running and no node currently ready (all hot/offline)
+                    # No jobs running and no compatible node currently ready (all hot/offline)
                     if no_ready_since is None:
                         no_ready_since = time.monotonic()
                     elapsed_wait = time.monotonic() - no_ready_since
@@ -495,6 +606,15 @@ class MasterController:
                         # Fail remaining jobs clearly instead of hanging forever
                         while pending:
                             spec, attempt, _ = pending.popleft()
+                            why = last_reason_by_index.get(spec.index, "")
+                            err_text = (
+                                f"{why} (waited {wait_for_ready_sec:.0f}s)"
+                                if why
+                                else (
+                                    f"No ready nodes became available within "
+                                    f"{wait_for_ready_sec:.0f}s (nodes offline or overheated)."
+                                )
+                            )
                             outcome = JobOutcome(
                                 index=spec.index,
                                 job_id=spec.job_id,
@@ -503,10 +623,8 @@ class MasterController:
                                 returncode=-1,
                                 duration_sec=0.0,
                                 attempts=attempt,
-                                error=(
-                                    f"No ready nodes became available within "
-                                    f"{wait_for_ready_sec:.0f}s (nodes offline or overheated)."
-                                ),
+                                error=err_text,
+                                routing_reason=why,
                             )
                             outcomes_by_index[spec.index] = outcome
                             completed_count += 1
@@ -515,9 +633,122 @@ class MasterController:
                         break
                     time.sleep(min(1.0, max(0.1, wait_for_ready_sec - elapsed_wait)))
                     snapshots = self.poll_health(tags=tags)
+                    cross_env = build_cross_tier_env(snapshots, self.config)
                     last_poll = time.monotonic()
 
         return [outcomes_by_index[i] for i in sorted(outcomes_by_index.keys())]
+
+    def run_pipeline(
+        self,
+        steps: list[dict[str, Any]],
+        stop_on_error: bool = True,
+    ) -> dict[str, Any]:
+        """Run a multi-step cross-tier workflow chaining outputs & live service env across tiers.
+
+        For example: Step 1 (Tier 1 compute/AI) -> Step 2 (Tier 2 Debian MQTT/services)
+        -> Step 3 (Tier 3 Docker/Home Assistant). Each step automatically receives:
+        - `PHONECLUSTER_PREV_STDOUT` (capped at 32 KiB)
+        - `PHONECLUSTER_PREV_NODE`, `PHONECLUSTER_PREV_TIER`, `PHONECLUSTER_PREV_POOL`, `PHONECLUSTER_PREV_RC`
+        - `PHONECLUSTER_PIPELINE_STEP`, `PHONECLUSTER_PIPELINE_STEP_NAME`
+        - Plus all live `PHONECLUSTER_*` cross-tier service discovery variables.
+        """
+        started = time.monotonic()
+        results: list[dict[str, Any]] = []
+        prev_stdout = ""
+        prev_node = ""
+        prev_tier = 0
+        prev_pool = ""
+        prev_rc = 0
+        all_ok = True
+
+        for idx, raw_step in enumerate(steps, start=1):
+            name = str(raw_step.get("name") or f"Step {idx}").strip()
+            command = str(raw_step.get("command") or "").strip()
+            target = str(raw_step.get("target") or "auto").strip()
+            workload_hint = str(raw_step.get("workload") or raw_step.get("workload_hint") or "").strip()
+            timeout_sec = float(raw_step.get("timeout_sec") or self.config.default_job_timeout_sec)
+            step_env = {
+                str(k): str(v)
+                for k, v in (raw_step.get("env") or {}).items()
+            }
+            step_env["PHONECLUSTER_PIPELINE_STEP"] = str(idx)
+            step_env["PHONECLUSTER_PIPELINE_STEP_NAME"] = name
+            if idx > 1:
+                step_env["PHONECLUSTER_PREV_STDOUT"] = prev_stdout[:32768]
+                step_env["PHONECLUSTER_PREV_NODE"] = prev_node
+                step_env["PHONECLUSTER_PREV_TIER"] = str(prev_tier)
+                step_env["PHONECLUSTER_PREV_POOL"] = prev_pool
+                step_env["PHONECLUSTER_PREV_RC"] = str(prev_rc)
+
+            if not command:
+                all_ok = False
+                results.append(
+                    {
+                        "step_index": idx,
+                        "name": name,
+                        "target": target,
+                        "workload": workload_hint,
+                        "ok": False,
+                        "node_id": "none",
+                        "node_tier": 0,
+                        "node_pool": "",
+                        "routing_reason": "Empty command in pipeline step",
+                        "returncode": -1,
+                        "duration_sec": 0.0,
+                        "stdout": "",
+                        "stderr": "",
+                        "error": "Pipeline step requires a non-empty 'command'.",
+                    }
+                )
+                if stop_on_error and not bool(raw_step.get("continue_on_error", False)):
+                    break
+                continue
+
+            spec = JobSpec(
+                index=idx - 1,
+                job_id=f"pipe-{idx}-{uuid.uuid4().hex[:6]}",
+                command=command,
+                timeout_sec=timeout_sec,
+                workdir=raw_step.get("workdir") or None,
+                env=step_env,
+                force=bool(raw_step.get("force", False)),
+            )
+            outcomes = self.run_single(spec, target=target, workload_hint=workload_hint)
+            primary = outcomes[0]
+            step_ok = all(o.ok for o in outcomes)
+            rec = primary.to_dict()
+            rec.update(
+                {
+                    "step_index": idx,
+                    "name": name,
+                    "target": target,
+                    "workload": workload_hint,
+                    "ok": step_ok,
+                }
+            )
+            if len(outcomes) > 1:
+                rec["outcomes"] = [o.to_dict() for o in outcomes]
+                rec["stdout"] = "\n".join(f"[{o.node_id}] {o.stdout.rstrip()}" for o in outcomes)
+            results.append(rec)
+
+            prev_stdout = rec["stdout"].strip()
+            prev_node = primary.node_id
+            prev_tier = primary.node_tier
+            prev_pool = primary.node_pool
+            prev_rc = primary.returncode
+
+            if not step_ok:
+                all_ok = False
+                if stop_on_error and not bool(raw_step.get("continue_on_error", False)):
+                    break
+
+        return {
+            "ok": all_ok,
+            "steps_total": len(steps),
+            "steps_completed": len(results),
+            "duration_sec": round(time.monotonic() - started, 3),
+            "results": results,
+        }
 
     @staticmethod
     def _to_outcome(
@@ -526,6 +757,9 @@ class MasterController:
         kind: str,
         data: dict[str, Any],
         attempts: int,
+        node_tier: int = 0,
+        node_pool: str = "",
+        routing_reason: str = "",
     ) -> JobOutcome:
         if kind == "ok":
             return JobOutcome(
@@ -540,6 +774,9 @@ class MasterController:
                 timed_out=bool(data.get("timed_out", False)),
                 cancelled=bool(data.get("cancelled", False)),
                 attempts=attempts,
+                routing_reason=routing_reason,
+                node_tier=node_tier,
+                node_pool=node_pool,
             )
         err_msg = data.get("error") or ", ".join(data.get("reasons", [])) or str(data)
         return JobOutcome(
@@ -551,6 +788,9 @@ class MasterController:
             duration_sec=0.0,
             attempts=attempts,
             error=str(err_msg),
+            routing_reason=routing_reason,
+            node_tier=node_tier,
+            node_pool=node_pool,
         )
 
     # ------------------------------------------------------------------
@@ -640,11 +880,16 @@ class MasterController:
                 t = snap.health.get("temp_c")
                 if t is not None:
                     temps.append(float(t))
+            eff_tier, eff_pool = resolve_node_tier_and_pool(snap.node, snap.health if snap.online else None)
             node_dicts.append(
                 {
                     "id": snap.node.id,
                     "host": snap.node.host,
                     "role": snap.node.role,
+                    "tier": eff_tier,
+                    "pool": eff_pool,
+                    "configured_tier": snap.node.tier,
+                    "configured_pool": snap.node.pool,
                     "worker_port": snap.node.worker_port,
                     "ssh_port": snap.node.ssh_port,
                     "ssh_user": snap.node.ssh_user,
@@ -683,6 +928,8 @@ class MasterController:
             "total_active_jobs": total_active_jobs,
             "total_net_rx_kbps": round(total_net_rx, 1),
             "total_net_tx_kbps": round(total_net_tx, 1),
+            "pools": summarize_pools(snapshots),
+            "services_registry": build_service_registry(snapshots, self.config),
             "safety": {
                 "max_temp_c": self.config.safety.max_temp_c,
                 "resume_temp_c": self.config.safety.resume_temp_c,
@@ -698,13 +945,24 @@ class MasterController:
             self.metrics_history.record(summary)
         return summary
 
+    def get_services_info(self) -> dict[str, Any]:
+        """Return live cross-tier service registry, `.env` vars, and DNS hosts block."""
+        snapshots = self.poll_health()
+        return {
+            "pools": summarize_pools(snapshots),
+            "services": build_service_registry(snapshots, self.config),
+            "env": build_cross_tier_env(snapshots, self.config),
+            "dns_hosts": build_cluster_dns_hosts(snapshots, self.config),
+        }
+
     def exec_terminal_command(
         self,
         command: str,
-        target: str = "best",
+        target: str = "auto",
         cwd: str | None = None,
         timeout_sec: float | None = None,
         job_id: str | None = None,
+        workload_hint: str = "",
     ) -> list[dict[str, Any]]:
         """Execute an interactive Web Terminal command while tracking persistent `cwd`."""
         marker = f"__PC_CWD_{uuid.uuid4().hex[:8]}__"
@@ -721,7 +979,7 @@ class MasterController:
             workdir=cwd or None,
             timeout_sec=float(timeout_sec or self.config.default_job_timeout_sec),
         )
-        outcomes = self.run_single(spec, target=target)
+        outcomes = self.run_single(spec, target=target, workload_hint=workload_hint)
         results: list[dict[str, Any]] = []
         for o in outcomes:
             out_text = o.stdout

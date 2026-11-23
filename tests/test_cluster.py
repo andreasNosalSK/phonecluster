@@ -18,6 +18,7 @@ from phonecluster.auth import (
     extract_bearer_token,
     verify_token,
 )
+from phonecluster.cli import main as cli_main
 from phonecluster.config import (
     ClusterConfig,
     NodeConfig,
@@ -916,6 +917,359 @@ class TestSecurePairingAndSecurity(unittest.TestCase):
         finally:
             dash.shutdown()
             dash.server_close()
+
+
+class TestHeterogeneousMultiTierCluster(unittest.TestCase):
+    """Tests mixed Tier 1 (Termux) + Tier 2 (Debian 13) + Tier 3 (Docker) cluster as ONE system."""
+
+    def setUp(self) -> None:
+        self.token = "mixed-tier-secret-token"
+        self.safety = SafetyConfig(max_temp_c=40.0, resume_temp_c=37.0)
+        self.temps = {"t1_compute": 33.0, "t2_services": 34.0, "t3_docker": 35.0}
+        self.servers = []
+        self.threads = []
+        self.stop_events = []
+        nodes_cfg: list[NodeConfig] = []
+
+        profiles = [
+            (
+                "t1_compute",
+                "master",
+                "termux",
+                1,
+                "compute",
+                {"python3": True, "distccd": True, "llama_cli": True},
+                {"sshd_8022": True, "llama_api_8081": True, "distccd_3632": True},
+            ),
+            (
+                "t2_services",
+                "worker",
+                "debian-13",
+                2,
+                "services",
+                {"python3": True, "apt": True, "mosquitto": True, "adguard": True},
+                {"sshd_22": True, "mosquitto_1883": True, "adguard_3000": True, "dns_53": True},
+            ),
+            (
+                "t3_docker",
+                "worker",
+                "debian-13",
+                3,
+                "docker",
+                {"python3": True, "docker": True, "apt": True},
+                {"sshd_22": True, "homeassistant_8123": True},
+            ),
+        ]
+
+        for nid, role, os_env, tier, pool_name, tools, svcs in profiles:
+            def _make_provider(
+                n_id: str,
+                r_name: str,
+                o_env: str,
+                t_num: int,
+                p_name: str,
+                tl: dict[str, bool],
+                sv: dict[str, bool],
+            ):
+                def _prov():
+                    temp = self.temps[n_id]
+                    hot = temp >= self.safety.max_temp_c
+                    return {
+                        "node_id": n_id,
+                        "role": r_name,
+                        "hostname": f"phone-{n_id}",
+                        "os_env": o_env,
+                        "tier": t_num,
+                        "pool": p_name,
+                        "arch": "aarch64",
+                        "uptime_sec": 3600,
+                        "cpu_cores": 8,
+                        "cpu_pct": 12.0,
+                        "per_core_pct": [10.0] * 8,
+                        "load_1m": 0.25,
+                        "mem_total_mb": 4096,
+                        "mem_available_mb": 2200,
+                        "battery_pct": 52,
+                        "temp_c": temp,
+                        "battery_status": "DISCHARGING",
+                        "overheated": hot,
+                        "ready_for_jobs": not hot,
+                        "not_ready_reasons": [f"overheated ({temp}C)"] if hot else [],
+                        "tools": dict(tl),
+                        "services": dict(sv),
+                    }
+
+                return _prov
+
+            state = WorkerState(
+                node_id=nid,
+                role=role,
+                auth_token=self.token,
+                safety=self.safety,
+                max_concurrency=2,
+                health_provider=_make_provider(nid, role, os_env, tier, pool_name, tools, svcs),
+            )
+            srv, _guard, stop_ev = create_worker_server("127.0.0.1", 0, state)
+            port = srv.server_address[1]
+            th = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            th.start()
+            self.servers.append(srv)
+            self.threads.append(th)
+            self.stop_events.append(stop_ev)
+            nodes_cfg.append(
+                NodeConfig(
+                    id=nid,
+                    host="127.0.0.1",
+                    role=role,
+                    worker_port=port,
+                    max_concurrency=2,
+                    tier=0,  # verify automatic detection from telemetry works seamlessly!
+                    pool="auto",
+                )
+            )
+
+        self.config = ClusterConfig(
+            cluster_name="mixed-tier-home",
+            auth_token=self.token,
+            safety=self.safety,
+            nodes=nodes_cfg,
+            custom_services={"custom_api": "http://192.168.1.209:9000"},
+        )
+        self.controller = MasterController(self.config)
+
+    def tearDown(self) -> None:
+        for ev in self.stop_events:
+            ev.set()
+        for srv in self.servers:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_smart_auto_routing_spillover_and_strict_docker_isolation(self) -> None:
+        # 1. Docker command routes strictly to Tier 3
+        out_docker = self.controller.run_single(
+            JobSpec(index=0, job_id="j-doc", command="true && echo docker-ok # docker ps"),
+            target="auto",
+            workload_hint="docker",
+        )[0]
+        self.assertTrue(out_docker.ok, out_docker.error)
+        self.assertEqual(out_docker.node_id, "t3_docker")
+        self.assertEqual(out_docker.node_tier, 3)
+        self.assertEqual(out_docker.node_pool, "docker")
+
+        # 2. Keyword auto-detection without explicit hint: mosquitto_pub -> Tier 2
+        out_svc = self.controller.run_single(
+            JobSpec(index=0, job_id="j-svc", command="echo mqtt-ok; false && mosquitto_pub -h localhost || true"),
+            target="auto",
+        )[0]
+        self.assertTrue(out_svc.ok, out_svc.error)
+        self.assertEqual(out_svc.node_id, "t2_services")
+        self.assertEqual(out_svc.node_tier, 2)
+        self.assertEqual(out_svc.node_pool, "services")
+        self.assertIn("mosquitto_pub", out_svc.routing_reason)
+
+        # 3. General compute prefers Tier 1
+        out_comp = self.controller.run_single(
+            JobSpec(index=0, job_id="j-comp", command="python3 -c 'print(2+2)'"),
+            target="auto",
+        )[0]
+        self.assertTrue(out_comp.ok, out_comp.error)
+        self.assertEqual(out_comp.node_id, "t1_compute")
+        self.assertEqual(out_comp.node_tier, 1)
+
+        # 4. Compute gracefully spills over to Tier 2/3 when Tier 1 overheats!
+        self.temps["t1_compute"] = 44.0
+        out_spill = self.controller.run_single(
+            JobSpec(index=0, job_id="j-spill", command="echo spillover-ok"),
+            target="auto",
+        )[0]
+        self.assertTrue(out_spill.ok, out_spill.error)
+        self.assertIn(out_spill.node_id, {"t2_services", "t3_docker"})
+        self.temps["t1_compute"] = 33.0
+
+        # 5. Strict isolation: when Tier 3 overheats, docker jobs NEVER run on Termux Tier 1!
+        self.temps["t3_docker"] = 44.5
+        out_no_doc = self.controller.run_single(
+            JobSpec(index=0, job_id="j-nodoc", command="docker ps"),
+            target="auto",
+        )[0]
+        self.assertFalse(out_no_doc.ok)
+        self.assertEqual(out_no_doc.node_id, "none")
+        self.assertIn("Tier 3", out_no_doc.error)
+
+    def test_cross_tier_service_mesh_env_injection_and_dns_hosts(self) -> None:
+        # Run a Tier 1 job and verify it automatically receives Tier 2 MQTT/AdGuard + Tier 3 HA URLs!
+        py_cmd = (
+            "python3 -c \"import json, os; "
+            "print(json.dumps({k: v for k, v in os.environ.items() if k.startswith('PHONECLUSTER_')}))\""
+        )
+        outcome = self.controller.run_single(
+            JobSpec(index=0, job_id="j-env", command=py_cmd),
+            target="tier:1",
+        )[0]
+        self.assertTrue(outcome.ok, outcome.error)
+        self.assertEqual(outcome.node_id, "t1_compute")
+        env_seen = json.loads(outcome.stdout)
+        self.assertEqual(env_seen["PHONECLUSTER_MQTT_HOST"], "127.0.0.1")
+        self.assertEqual(env_seen["PHONECLUSTER_MQTT_PORT"], "1883")
+        self.assertEqual(env_seen["PHONECLUSTER_MQTT_URL"], "mqtt://127.0.0.1:1883")
+        self.assertEqual(env_seen["PHONECLUSTER_HOMEASSISTANT_URL"], "http://127.0.0.1:8123")
+        self.assertEqual(env_seen["PHONECLUSTER_ADGUARD_URL"], "http://127.0.0.1:3000")
+        self.assertEqual(env_seen["PHONECLUSTER_LLAMA_API_URL"], "http://127.0.0.1:8081")
+        self.assertEqual(env_seen["PHONECLUSTER_POOL_COMPUTE_HOSTS"], "127.0.0.1")
+        self.assertEqual(env_seen["PHONECLUSTER_POOL_SERVICES_HOSTS"], "127.0.0.1")
+        self.assertEqual(env_seen["PHONECLUSTER_POOL_DOCKER_HOSTS"], "127.0.0.1")
+        self.assertEqual(env_seen["PHONECLUSTER_SVC_CUSTOM_API"], "http://192.168.1.209:9000")
+
+        svc_info = self.controller.get_services_info()
+        hosts_txt = svc_info["dns_hosts"]
+        for expected_alias in ("mqtt.cluster", "ha.cluster", "adguard.cluster", "ai.cluster", "t1_compute.cluster"):
+            self.assertIn(expected_alias, hosts_txt)
+
+    def test_mixed_parallel_map_and_cross_tier_pipeline(self) -> None:
+        # Mixed parallel map auto-routes each job to its exact Tier in one batch
+        jobs = [
+            JobSpec(index=0, job_id="m0", command="echo compute-job"),
+            JobSpec(index=1, job_id="m1", command="echo svc-job; false && apt-cache -v || true"),
+            JobSpec(index=2, job_id="m2", command="echo docker-job; false && docker --version || true"),
+        ]
+        outcomes = self.controller.map_jobs(jobs, target="auto", wait_for_ready_sec=3.0)
+        self.assertEqual(len(outcomes), 3)
+        self.assertTrue(all(o.ok for o in outcomes))
+        self.assertEqual(outcomes[0].node_id, "t1_compute")
+        self.assertEqual(outcomes[1].node_id, "t2_services")
+        self.assertEqual(outcomes[2].node_id, "t3_docker")
+
+        # 3-step Cross-Tier Pipeline: Tier 1 -> Tier 2 -> Tier 3
+        pipe = self.controller.run_pipeline(
+            [
+                {
+                    "name": "Step 1 Compute",
+                    "target": "tier:1",
+                    "command": "echo 'inference=sunny'",
+                },
+                {
+                    "name": "Step 2 MQTT Service",
+                    "target": "tier:2",
+                    "command": 'echo "relay:$PHONECLUSTER_PREV_STDOUT:from=$PHONECLUSTER_PREV_NODE:mqtt=$PHONECLUSTER_MQTT_PORT"',
+                },
+                {
+                    "name": "Step 3 Docker HA",
+                    "target": "tier:3",
+                    "command": 'echo "final:$PHONECLUSTER_PREV_STDOUT:ha=$PHONECLUSTER_HOMEASSISTANT_URL"',
+                },
+            ]
+        )
+        self.assertTrue(pipe["ok"], pipe)
+        self.assertEqual(pipe["steps_completed"], 3)
+        self.assertEqual(pipe["results"][0]["node_id"], "t1_compute")
+        self.assertEqual(pipe["results"][1]["node_id"], "t2_services")
+        self.assertEqual(pipe["results"][2]["node_id"], "t3_docker")
+        self.assertIn("relay:inference=sunny:from=t1_compute:mqtt=1883", pipe["results"][1]["stdout"])
+        self.assertIn("ha=http://127.0.0.1:8123", pipe["results"][2]["stdout"])
+
+    def test_dashboard_api_services_pipeline_node_update_and_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cluster.json"
+            save_config(self.config, cfg_path)
+            pipe_path = Path(tmp) / "pipe.json"
+            pipe_path.write_text(
+                json.dumps(
+                    [
+                        {"name": "S1", "target": "tier:1", "command": "echo hello-t1"},
+                        {"name": "S2", "target": "tier:3", "command": 'echo "got:$PHONECLUSTER_PREV_STDOUT"'},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            # CLI subcommands: pools, services (--env / --hosts), pipeline
+            self.assertEqual(cli_main(["--config", str(cfg_path), "pools"]), 0)
+            self.assertEqual(cli_main(["--config", str(cfg_path), "services", "--env"]), 0)
+            self.assertEqual(cli_main(["--config", str(cfg_path), "services", "--hosts"]), 0)
+            self.assertEqual(cli_main(["--config", str(cfg_path), "pipeline", str(pipe_path)]), 0)
+
+            # Verify shipped mixed-tier example config & pipeline JSON stay valid
+            repo_root = Path(__file__).resolve().parent.parent
+            mixed_cfg = ClusterConfig.from_dict(
+                json.loads((repo_root / "examples" / "mixed_cluster.example.json").read_text(encoding="utf-8"))
+            )
+            self.assertEqual(len(mixed_cfg.nodes), 9)
+            self.assertEqual(sum(1 for n in mixed_cfg.nodes if n.tier == 1), 3)
+            self.assertEqual(sum(1 for n in mixed_cfg.nodes if n.tier == 2), 2)
+            self.assertEqual(sum(1 for n in mixed_cfg.nodes if n.tier == 3), 4)
+            pipe_ex = json.loads((repo_root / "examples" / "cross_tier_pipeline.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(pipe_ex["steps"]), 3)
+
+            # TUI frame with Tier badges, POOLS/SVCS header, and pool_filter
+            summary = self.controller.cluster_summary()
+            frame_all = render_top_frame(summary, self.controller.metrics_history.snapshot(), [], use_color=False)
+            self.assertIn("T1:compute", frame_all)
+            self.assertIn("T2:services", frame_all)
+            self.assertIn("T3:docker", frame_all)
+            self.assertIn("POOLS", frame_all)
+            self.assertIn("SVCS", frame_all)
+            frame_doc = render_top_frame(
+                summary,
+                self.controller.metrics_history.snapshot(),
+                [],
+                use_color=False,
+                pool_filter="docker",
+            )
+            dev_section = frame_doc.split("DEVICES · POOL FILTER: DOCKER", 1)[1]
+            self.assertIn("t3_docker", dev_section)
+            self.assertNotIn("t1_compute", dev_section)
+            self.assertNotIn("t2_services", dev_section)
+
+            # Dashboard endpoints: /api/services, /api/pipeline, /api/nodes/update
+            dash = DashboardHTTPServer(
+                ("127.0.0.1", 0),
+                self.controller,
+                config_path=cfg_path,
+                enable_pairing_beacon=False,
+            )
+            port = dash.server_address[1]
+            t = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            t.start()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/services", timeout=5.0) as resp:
+                    svcs_api = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(len(svcs_api["pools"]), 3)
+                self.assertEqual(svcs_api["env"]["PHONECLUSTER_MQTT_PORT"], "1883")
+
+                req_pipe = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/pipeline",
+                    data=json.dumps(
+                        {
+                            "steps": [
+                                {"name": "Compute", "target": "tier:1", "command": "echo web-t1"},
+                                {"name": "Docker", "target": "tier:3", "command": 'echo "ok:$PHONECLUSTER_PREV_STDOUT"'},
+                            ]
+                        }
+                    ).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_pipe, timeout=5.0) as resp:
+                    p_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(p_res["ok"])
+                self.assertEqual(p_res["results"][1]["node_id"], "t3_docker")
+                self.assertIn("ok:web-t1", p_res["results"][1]["stdout"])
+
+                req_upd = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/nodes/update",
+                    data=json.dumps({"id": "t2_services", "tier": 2, "pool": "iot", "max_concurrency": 3}).encode("utf-8"),
+                    headers=build_auth_headers(self.token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_upd, timeout=5.0) as resp:
+                    u_res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(u_res["node"]["pool"], "iot")
+                reloaded = load_config(cfg_path)
+                self.assertEqual(reloaded.get_node("t2_services").pool, "iot")
+                self.assertEqual(reloaded.get_node("t2_services").max_concurrency, 3)
+            finally:
+                dash.shutdown()
+                dash.server_close()
 
 
 if __name__ == "__main__":
