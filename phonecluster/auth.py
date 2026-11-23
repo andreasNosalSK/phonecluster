@@ -4,9 +4,34 @@ from __future__ import annotations
 
 import collections
 import hmac
+import json
 import threading
 import time
-from typing import Mapping
+import urllib.request
+from typing import Any, Mapping
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse all HTTP redirects for Master<->Worker and Pairing calls (blocks SSRF via compromised workers)."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+def build_direct_opener() -> urllib.request.OpenerDirector:
+    """Return a direct LAN opener that ignores host `HTTP_PROXY` env vars and refuses HTTP redirects."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+
+
+def read_json_object_bounded(resp: Any, max_bytes: int) -> dict[str, Any]:
+    """Read an HTTP JSON response with a strict RAM cap and verify it is a JSON object (`dict`)."""
+    raw = resp.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"response exceeds {max_bytes} byte safety limit")
+    parsed = json.loads(raw.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError(f"expected JSON object, got {type(parsed).__name__}")
+    return parsed
 
 
 def build_auth_headers(token: str) -> dict[str, str]:

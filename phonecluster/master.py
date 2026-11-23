@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from typing import Any, Callable
 
-from .auth import build_auth_headers
+from .auth import build_auth_headers, build_direct_opener, read_json_object_bounded
 from .config import (
     ClusterConfig,
     NodeConfig,
@@ -39,8 +39,12 @@ from .routing import (
 
 LOG = logging.getLogger("phonecluster.master")
 
-# Direct LAN opener: Master <-> Worker traffic must NEVER be hijacked by host HTTP_PROXY env vars
-_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# Direct LAN opener: Master <-> Worker traffic ignores host HTTP_PROXY and refuses HTTP redirects (SSRF defense)
+_DIRECT_OPENER = build_direct_opener()
+_MAX_HEALTH_RESP_BYTES = 256 * 1024
+_MAX_JOBS_RESP_BYTES = 512 * 1024
+_MAX_CTRL_RESP_BYTES = 64 * 1024
+_MAX_EXEC_RESP_BYTES = 4 * 1024 * 1024  # Plenty for 512 KiB stdout + 512 KiB stderr + JSON overhead
 
 
 @dataclass
@@ -319,13 +323,12 @@ class MasterController:
         t0 = time.monotonic()
         try:
             with _DIRECT_OPENER.open(req, timeout=self.config.health_timeout_sec) as resp:
-                raw = resp.read().decode("utf-8")
-                data = json.loads(raw)
+                data = read_json_object_bounded(resp, _MAX_HEALTH_RESP_BYTES)
                 latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
                 return NodeSnapshot(node=node, online=True, latency_ms=latency_ms, health=data)
         except urllib.error.HTTPError as exc:
             try:
-                err_body = exc.read().decode("utf-8", errors="replace")[:200]
+                err_body = exc.read(4096).decode("utf-8", errors="replace")[:200]
             finally:
                 exc.close()
             return NodeSnapshot(
@@ -333,7 +336,7 @@ class MasterController:
                 online=False,
                 error=f"HTTP {exc.code}: {err_body}",
             )
-        except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
             return NodeSnapshot(node=node, online=False, error=str(exc))
 
     def poll_health(self, tags: list[str] | None = None) -> list[NodeSnapshot]:
@@ -364,21 +367,21 @@ class MasterController:
         http_timeout = max(spec.timeout_sec + 15.0, 30.0)
         try:
             with _DIRECT_OPENER.open(req, timeout=http_timeout) as resp:
-                raw = resp.read().decode("utf-8")
-                return "ok", json.loads(raw)
+                return "ok", read_json_object_bounded(resp, _MAX_EXEC_RESP_BYTES)
         except urllib.error.HTTPError as exc:
             try:
-                raw_err = exc.read().decode("utf-8", errors="replace")
+                raw_err = exc.read(65536).decode("utf-8", errors="replace")
             finally:
                 exc.close()
             try:
-                err_data = json.loads(raw_err)
+                parsed_err = json.loads(raw_err)
+                err_data = parsed_err if isinstance(parsed_err, dict) else {"error": raw_err[:300]}
             except json.JSONDecodeError:
                 err_data = {"error": raw_err[:300]}
             if exc.code in {HTTPStatus.SERVICE_UNAVAILABLE, HTTPStatus.TOO_MANY_REQUESTS}:
                 return "retryable", err_data
             return "error", {"http_status": exc.code, **err_data}
-        except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
             return "retryable", {"error": str(exc)}
 
     def _with_node_env(
@@ -1339,15 +1342,15 @@ class MasterController:
         req = urllib.request.Request(url, headers=self._headers_for(node), method="GET")
         try:
             with _DIRECT_OPENER.open(req, timeout=self.config.health_timeout_sec) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                data = read_json_object_bounded(resp, _MAX_JOBS_RESP_BYTES)
                 return {"node_id": node.id, "online": True, **data}
         except urllib.error.HTTPError as exc:
             try:
-                err = exc.read().decode("utf-8", errors="replace")[:200]
+                err = exc.read(4096).decode("utf-8", errors="replace")[:200]
             finally:
                 exc.close()
             return {"node_id": node.id, "online": False, "error": f"HTTP {exc.code}: {err}", "active": [], "recent": []}
-        except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
             return {"node_id": node.id, "online": False, "error": str(exc), "active": [], "recent": []}
 
     def get_all_jobs(self) -> list[dict[str, Any]]:
@@ -1408,15 +1411,15 @@ class MasterController:
         )
         try:
             with _DIRECT_OPENER.open(req, timeout=timeout_sec) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                data = read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES)
                 return {"node_id": node.id, "ok": True, **data}
         except urllib.error.HTTPError as exc:
             try:
-                raw = exc.read().decode("utf-8", errors="replace")[:200]
+                raw = exc.read(4096).decode("utf-8", errors="replace")[:200]
             finally:
                 exc.close()
             return {"node_id": node.id, "ok": False, "error": f"HTTP {exc.code}: {raw}"}
-        except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
             return {"node_id": node.id, "ok": False, "error": str(exc)}
 
     def push_config_to_all(
@@ -1449,16 +1452,17 @@ class MasterController:
         req = urllib.request.Request(url, data=body, headers=self._headers_for(node), method="POST")
         try:
             with _DIRECT_OPENER.open(req, timeout=5.0) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                return read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES)
         except urllib.error.HTTPError as exc:
             try:
-                raw = exc.read().decode("utf-8", errors="replace")
+                raw = exc.read(4096).decode("utf-8", errors="replace")
             finally:
                 exc.close()
             try:
-                data = json.loads(raw)
+                parsed = json.loads(raw)
+                data = parsed if isinstance(parsed, dict) else {"error": raw[:200]}
             except json.JSONDecodeError:
                 data = {"error": raw[:200]}
             return {"cancelled": False, "http_status": exc.code, **data}
-        except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
             return {"cancelled": False, "error": str(exc)}

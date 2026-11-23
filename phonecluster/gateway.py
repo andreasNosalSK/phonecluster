@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import re
 import select
 import socket
 import socketserver
@@ -46,6 +47,23 @@ LOG = logging.getLogger("phonecluster.gateway")
 MAX_HEADER_BYTES = 16 * 1024
 MAX_HTTP_BODY_BYTES = 32 * 1024 * 1024
 RELAY_CHUNK_BYTES = 16 * 1024
+_HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def _extract_host_header_hostname(host_val: str) -> str:
+    """Extract normalized hostname from an HTTP `Host:` header (IPv4, hostname, or `[IPv6]:port`)."""
+    raw = host_val.strip()
+    if not raw:
+        return ""
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end == -1:
+            return ""
+        return raw[1:end].strip().lower().rstrip(".")
+    if raw.count(":") == 1:
+        h_part, _ = raw.rsplit(":", 1)
+        return h_part.strip().lower().rstrip(".")
+    return raw.lower().rstrip(".")
 
 GATEWAY_PRESETS: dict[str, dict[str, Any]] = {
     "github": {
@@ -523,7 +541,9 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
         self.cluster_config = config
         self.audit_log = audit_log
         self.stop_event = threading.Event()
-        self.conn_sem = threading.BoundedSemaphore(max(4, config.gateway.max_connections))
+        max_conn = max(4, config.gateway.max_connections)
+        self.conn_sem = threading.BoundedSemaphore(max_conn)
+        self._thread_sem = threading.BoundedSemaphore(max(16, max_conn + 8))
         self.rate_limiter = AuthRateLimiter(max_failures=15, window_sec=60.0, block_sec=60.0)
         self._node_req_lock = threading.Lock()
         self._node_req_times: dict[str, collections.deque[float]] = {}
@@ -532,6 +552,22 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
         if ":" in str(addr[0]):
             self.address_family = socket.AF_INET6
         super().__init__(addr, _NetworkGuardHandler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._thread_sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._thread_sem.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._thread_sem.release()
 
     def register_node_sockets(self, node_id: str, *socks: socket.socket) -> None:
         with self._active_conns_lock:
@@ -608,6 +644,18 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
 
     def shutdown(self) -> None:
         self.stop_event.set()
+        with self._active_conns_lock:
+            all_socks = [s for bucket in self._active_node_sockets.values() for s in bucket]
+            self._active_node_sockets.clear()
+        for s in all_socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
         super().shutdown()
 
 
@@ -645,13 +693,25 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             _send_proxy_error(conn, 400, "Bad Request", "unsupported or malformed HTTP version")
             return
         method_u = method.upper()
+        if not _HTTP_TOKEN_RE.fullmatch(method_u):
+            _send_proxy_error(conn, 400, "Bad Request", "invalid HTTP method")
+            return
         header_pairs: list[tuple[str, str]] = []
         headers_lower: dict[str, str] = {}
         for hline in lines[1:]:
-            if ":" in hline:
-                k, v = hline.split(":", 1)
-                header_pairs.append((k.strip(), v.strip()))
-                headers_lower[k.strip().lower()] = v.strip()
+            if not hline:
+                continue
+            if "\r" in hline or "\n" in hline or ":" not in hline:
+                _send_proxy_error(conn, 400, "Bad Request", "malformed HTTP header line")
+                return
+            raw_k, raw_v = hline.split(":", 1)
+            # RFC 9112 §5.1: reject whitespace before colon or non-token header names (smuggling defense)
+            if not raw_k or not _HTTP_TOKEN_RE.fullmatch(raw_k):
+                _send_proxy_error(conn, 400, "Bad Request", "invalid HTTP header name")
+                return
+            v_clean = raw_v.strip()
+            header_pairs.append((raw_k, v_clean))
+            headers_lower[raw_k.lower()] = v_clean
 
         # 1. Authenticate worker phone (blocks unauthorized LAN strangers!)
         node_id, auth_reason = self.server.authenticate_worker(headers_lower, client_ip)
@@ -750,6 +810,52 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             forward_path = parsed.path or "/"
             if parsed.query:
                 forward_path = f"{forward_path}?{parsed.query}"
+            if not forward_path.startswith("/") or any(ord(c) < 32 or c == "\x7f" for c in forward_path):
+                _send_proxy_error(conn, 400, "Bad Request", "invalid request path")
+                return
+
+        # 2b. Validate HTTP request framing & anti-domain-fronting Host check BEFORE touching DNS/upstream
+        is_chunked = False
+        content_len = 0
+        if method_u != "CONNECT":
+            if "host" in headers_lower:
+                hdr_host = _extract_host_header_hostname(headers_lower["host"])
+                norm_dest = dest_host.strip().strip("[]").lower().rstrip(".")
+                if not hdr_host or hdr_host != norm_dest:
+                    self.server.audit_log.record(
+                        node_id=node_id,
+                        client_ip=client_ip,
+                        method=method_u,
+                        host=dest_host,
+                        port=dest_port,
+                        action="block",
+                        reason=f"Host header mismatch ({hdr_host or '?'} != {norm_dest})",
+                    )
+                    _send_proxy_error(conn, 400, "Bad Request", "Host header does not match target URL")
+                    return
+            cl_values = [v.strip() for k, v in header_pairs if k.lower() == "content-length"]
+            te_values = [v.strip() for k, v in header_pairs if k.lower() == "transfer-encoding"]
+            if te_values and cl_values:
+                _send_proxy_error(conn, 400, "Bad Request", "conflicting Transfer-Encoding and Content-Length")
+                return
+            is_chunked = any("chunked" in v.lower() for v in te_values)
+            if te_values and not is_chunked:
+                _send_proxy_error(conn, 501, "Not Implemented", "unsupported Transfer-Encoding")
+                return
+            if cl_values:
+                if len(set(cl_values)) > 1:
+                    _send_proxy_error(conn, 400, "Bad Request", "conflicting duplicate Content-Length headers")
+                    return
+                try:
+                    content_len = int(cl_values[0])
+                    if content_len < 0:
+                        raise ValueError("negative")
+                except ValueError:
+                    _send_proxy_error(conn, 400, "Bad Request", "invalid Content-Length header")
+                    return
+            if content_len > MAX_HTTP_BODY_BYTES:
+                _send_proxy_error(conn, 413, "Payload Too Large", "request body exceeds limit")
+                return
 
         # 3. Evaluate allowlist / blocklist / mode / port policy
         allowed, policy_reason = evaluate_policy(dest_host, dest_port, gw)
@@ -810,6 +916,9 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 raise last_conn_err or OSError("unable to connect to upstream")
 
             self.server.register_node_sockets(node_id, conn, upstream)
+            if node_id in self.server.cluster_config.gateway.quarantined_nodes:
+                _send_proxy_error(conn, 403, "Forbidden", f"node '{node_id}' is quarantined by Master")
+                return
             if method_u == "CONNECT":
                 conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 response_started = True
@@ -826,32 +935,6 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 bytes_in += r_in
                 bytes_out += r_out
             else:
-                # Reject ambiguous HTTP request framing (RFC 9112 smuggling defense: CL+TE or conflicting CL)
-                cl_values = [v.strip() for k, v in header_pairs if k.lower() == "content-length"]
-                te_values = [v.strip() for k, v in header_pairs if k.lower() == "transfer-encoding"]
-                if te_values and cl_values:
-                    _send_proxy_error(conn, 400, "Bad Request", "conflicting Transfer-Encoding and Content-Length")
-                    return
-                is_chunked = any("chunked" in v.lower() for v in te_values)
-                if te_values and not is_chunked:
-                    _send_proxy_error(conn, 501, "Not Implemented", "unsupported Transfer-Encoding")
-                    return
-                content_len = 0
-                if cl_values:
-                    if len(set(cl_values)) > 1:
-                        _send_proxy_error(conn, 400, "Bad Request", "conflicting duplicate Content-Length headers")
-                        return
-                    try:
-                        content_len = int(cl_values[0])
-                        if content_len < 0:
-                            raise ValueError("negative")
-                    except ValueError:
-                        _send_proxy_error(conn, 400, "Bad Request", "invalid Content-Length header")
-                        return
-                if content_len > MAX_HTTP_BODY_BYTES:
-                    _send_proxy_error(conn, 413, "Payload Too Large", "request body exceeds limit")
-                    return
-
                 # Strip Proxy-* / hop-by-hop headers so worker credentials NEVER leak upstream!
                 conn_tokens = {
                     tok.strip().lower()
@@ -916,7 +999,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     while remaining > 0 and not self.server.stop_event.is_set():
                         chunk = conn.recv(min(RELAY_CHUNK_BYTES, remaining))
                         if not chunk:
-                            break
+                            raise OSError("truncated request body")
                         upstream.sendall(chunk)
                         bytes_out += len(chunk)
                         remaining -= len(chunk)

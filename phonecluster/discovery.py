@@ -158,8 +158,9 @@ class DiscoveryResponder(threading.Thread):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except OSError:
                 pass
+        bind_addr = "0.0.0.0" if (not self.listen_host or ":" in self.listen_host) else self.listen_host
         try:
-            sock.bind((self.listen_host, self.discovery_port))
+            sock.bind((bind_addr, self.discovery_port))
             sock.settimeout(0.5)
             self._sock = sock
             self.bound_port = sock.getsockname()[1]
@@ -186,6 +187,8 @@ class DiscoveryResponder(threading.Thread):
             return
         assert self._sock is not None
         LOG.info("LAN discovery responder listening on UDP %s:%d", self.listen_host, self.bound_port)
+        win_start = time.monotonic()
+        replies = 0
         while not self._stop_event.is_set():
             try:
                 data, addr = self._sock.recvfrom(2048)
@@ -193,6 +196,14 @@ class DiscoveryResponder(threading.Thread):
                 continue
             except OSError:
                 break
+            if not addr or addr[1] <= 0:
+                continue
+            now_m = time.monotonic()
+            if now_m - win_start >= 1.0:
+                win_start = now_m
+                replies = 0
+            if replies >= 20:
+                continue
             try:
                 msg = json.loads(data.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -200,6 +211,7 @@ class DiscoveryResponder(threading.Thread):
             if isinstance(msg, dict) and msg.get("type") == PROBE_TYPE:
                 try:
                     self._sock.sendto(self._build_reply(), addr)
+                    replies += 1
                 except OSError:
                     pass
 

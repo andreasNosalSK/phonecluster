@@ -3250,6 +3250,298 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
                 srv1.server_close()
                 srv2.server_close()
 
+    def test_master_defends_against_compromised_worker_redirect_ssrf_oom_and_malformed_json(self) -> None:
+        """Verify Master refuses HTTP redirects from workers, caps oversized responses, and survives non-dict JSON."""
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        canary_hits: list[str] = []
+
+        class _CanaryHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                canary_hits.append(self.path)
+                body = b'{"leaked": true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        canary = ThreadingHTTPServer(("127.0.0.1", 0), _CanaryHandler)
+        canary_port = canary.server_address[1]
+        threading.Thread(target=canary.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        mode = ["redirect"]
+
+        class _RogueWorkerHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                if mode[0] == "redirect":
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{canary_port}/secret-ssrf")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif mode[0] == "oom":
+                    payload = b'{"blob":"' + (b"X" * (400 * 1024)) + b'"}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    payload = b'["not", "an", "object"]'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+        rogue = ThreadingHTTPServer(("127.0.0.1", 0), _RogueWorkerHandler)
+        rogue_port = rogue.server_address[1]
+        threading.Thread(target=rogue.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        cfg = ClusterConfig(
+            cluster_name="rogue-defense",
+            auth_token="master-tok-1234567890",
+            nodes=[
+                NodeConfig(id="rogue1", host="127.0.0.1", role="worker", worker_port=rogue_port, auth_token="rogue-tok-1234567890")
+            ],
+        )
+        ctrl = MasterController(cfg)
+        try:
+            # 1. HTTP 302 redirect from compromised worker MUST NOT be followed to Master localhost!
+            mode[0] = "redirect"
+            snap_r = ctrl.check_node_health(cfg.nodes[0])
+            self.assertFalse(snap_r.online)
+            self.assertIn("302", snap_r.error)
+            self.assertEqual(canary_hits, [], "Master MUST NOT follow redirects from worker nodes!")
+
+            # 2. Oversized 400 KiB /health response MUST be rejected cleanly by bounded reader!
+            mode[0] = "oom"
+            snap_o = ctrl.check_node_health(cfg.nodes[0])
+            self.assertFalse(snap_o.online)
+            self.assertIn("exceeds", snap_o.error)
+
+            # 3. Non-dict JSON (`[...]`) MUST NOT crash cluster_summary() or get_all_jobs()!
+            mode[0] = "list"
+            summary = ctrl.cluster_summary(record_history=False)
+            self.assertEqual(summary["nodes_online"], 0)
+            jobs = ctrl.get_all_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertFalse(jobs[0]["online"])
+        finally:
+            rogue.shutdown()
+            rogue.server_close()
+            canary.shutdown()
+            canary.server_close()
+
+    def test_pairing_parallel_pin_bruteforce_locked_strictly_at_5_attempts_and_csrf_blocked(self) -> None:
+        """Verify 15 concurrent wrong-PIN threads can NEVER exceed 5 guesses, oversized DH pub is blocked, and cross-origin CSRF is rejected."""
+        tok = "pair-race-tok-12345678"
+        cfg = ClusterConfig(
+            cluster_name="pair-race",
+            auth_token=tok,
+            nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765)],
+        )
+        ctrl = MasterController(cfg)
+        dash = DashboardHTTPServer(
+            ("127.0.0.1", 0), ctrl, enable_pairing_beacon=False, pairing_fail_delay_sec=0.02
+        )
+        d_port = dash.server_address[1]
+        threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        try:
+            st = dash.pairing_manager.open_session(ttl_sec=120, max_devices=1)
+            self.assertTrue(st["active"])
+            _, hello = dash.pairing_manager.public_hello()
+            sid = hello["session_id"]
+
+            # 1. Cross-origin browser POST to /api/pair/complete is rejected with 403 CSRF!
+            req_csrf = urllib.request.Request(
+                f"http://127.0.0.1:{d_port}/api/pair/complete",
+                data=json.dumps({"session_id": sid, "dh_pub": "2", "client_proof": "00", "metadata": {}}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Origin": "http://evil.example"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as csrf_exc:
+                urllib.request.urlopen(req_csrf, timeout=3.0)
+            try:
+                self.assertEqual(csrf_exc.exception.code, 403)
+            finally:
+                csrf_exc.exception.close()
+
+            # 2. Oversized dh_pub (> 600 hex chars) rejected fast with 400!
+            code_big, body_big = dash.pairing_manager.complete_pairing(
+                "127.0.0.1",
+                {"session_id": sid, "dh_pub": "a" * 1000, "client_proof": "00", "metadata": {}},
+            )
+            self.assertEqual(code_big, 400)
+            self.assertIn("Oversized", body_big["error"])
+
+            # 3. 15 concurrent attacker threads with valid DH pubkey & wrong PINs -> STRICTLY 5 evaluations!
+            from phonecluster.pairing import generate_dh_keypair
+
+            _priv, pub = generate_dh_keypair()
+            pub_hex = format(pub, "x")
+            barrier = threading.Barrier(15)
+            responses: list[tuple[int, dict[str, Any]]] = []
+            resp_lock = threading.Lock()
+
+            def _attack(i: int) -> None:
+                barrier.wait()
+                res = dash.pairing_manager.complete_pairing(
+                    "127.0.0.1",
+                    {
+                        "session_id": sid,
+                        "dh_pub": pub_hex,
+                        "client_proof": f"{i:064x}",
+                        "metadata": {"worker_port": 8765, "ssh_port": 8022},
+                    },
+                )
+                with resp_lock:
+                    responses.append(res)
+
+            threads = [threading.Thread(target=_attack, args=(i,)) for i in range(15)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15.0)
+
+            self.assertEqual(len(responses), 15)
+            # Exactly 5 attempts evaluated ("attempts_left" present -> 4, 3, 2, 1, 0), remaining 10 hit closed window!
+            evaluated = [r[1] for r in responses if "attempts_left" in r[1]]
+            closed_rejects = [r[1] for r in responses if "closed" in str(r[1].get("error", "")).lower() and "attempts_left" not in r[1]]
+            self.assertEqual(len(evaluated), 5, f"Expected strictly 5 PIN evaluations, got {len(evaluated)}: {responses}")
+            self.assertEqual(sorted(e["attempts_left"] for e in evaluated), [0, 1, 2, 3, 4])
+            self.assertEqual(len(closed_rejects), 10)
+            self.assertFalse(dash.pairing_manager.admin_status()["active"])
+        finally:
+            dash.shutdown()
+            dash.server_close()
+
+    def test_proxy_domain_fronting_header_injection_truncated_body_and_security_headers(self) -> None:
+        """Verify proxy blocks Host domain-fronting, whitespace-before-colon smuggling, truncated POST body, and dashboard enforces CSP + strict CIDR/webhook validation."""
+        import base64
+        import socketserver
+
+        class _SilentUpstream(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.settimeout(3.0)
+                try:
+                    while self.request.recv(4096):
+                        pass
+                except OSError:
+                    pass
+
+        class _ReuseServer(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        up_srv = _ReuseServer(("127.0.0.1", 0), _SilentUpstream)
+        up_port = up_srv.server_address[1]
+        threading.Thread(target=up_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        tok = "edge-sec-tok-1234567890"
+        w_tok = "edge-worker-tok-987654321"
+        cfg = ClusterConfig(
+            cluster_name="edge-sec",
+            auth_token=tok,
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=8766, auth_token=w_tok),
+            ],
+            gateway=GatewayConfig(
+                enabled=True,
+                bind_host="127.0.0.1",
+                port=0,
+                mode="allowlist",
+                allowed_domains=["127.0.0.1"],
+                allowed_ports=[up_port],
+                block_private_ips=False,
+                idle_timeout_sec=10.0,
+            ),
+        )
+        ctrl = MasterController(cfg)
+        dash = DashboardHTTPServer(
+            ("127.0.0.1", 0), ctrl, enable_pairing_beacon=False, pairing_fail_delay_sec=0.0
+        )
+        d_port = dash.server_address[1]
+        gw_port = dash.gateway_manager.bound_port
+        threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        secret = derive_proxy_password(w_tok, "node1")
+        auth_b64 = base64.b64encode(f"node1:{secret}".encode("utf-8")).decode("ascii")
+        try:
+            # 1. Domain fronting: Host header != target URL host -> 400 Bad Request
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"GET http://127.0.0.1:{up_port}/front HTTP/1.1\r\n"
+                    f"Host: attacker-c2.example.com\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+                )
+                r_front = s.recv(1024)
+                self.assertIn(b"400 Bad Request", r_front)
+                self.assertIn(b"Host header", r_front)
+
+            # 2. RFC 9112 space before colon in header name -> 400 Bad Request
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"POST http://127.0.0.1:{up_port}/ws HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                    f"Transfer-Encoding : chunked\r\n\r\n0\r\n\r\n".encode("ascii")
+                )
+                r_ws = s.recv(1024)
+                self.assertIn(b"400 Bad Request", r_ws)
+
+            # 3. Truncated fixed-length Content-Length body fails fast with 502 (does not hang 10s!)
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"POST http://127.0.0.1:{up_port}/short HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                    f"Content-Length: 500\r\n\r\nhello".encode("ascii")
+                )
+                s.shutdown(socket.SHUT_WR)
+                t0 = time.monotonic()
+                r_short = s.recv(1024)
+                self.assertLess(time.monotonic() - t0, 2.0)
+                self.assertIn(b"502 Bad Gateway", r_short)
+
+            # 4. Dashboard HTML sends Content-Security-Policy & security headers
+            with urllib.request.urlopen(f"http://127.0.0.1:{d_port}/", timeout=3.0) as resp:
+                self.assertIn("default-src 'self'", resp.headers.get("Content-Security-Policy", ""))
+                self.assertEqual(resp.headers.get("X-Frame-Options"), "DENY")
+                self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
+
+            # 5. Invalid CIDR in hardening & distcc-start rejected with 400; non-http webhook rejected!
+            for ep, payload in (
+                ("/api/network/hardening", {"lan_subnet": "192.168.1.0/99; rm -rf /"}),
+                ("/api/workloads/action", {"action": "distcc-start", "cidr": "not-a-cidr; id"}),
+            ):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}{ep}",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as bad_ctx:
+                    urllib.request.urlopen(req, timeout=3.0)
+                try:
+                    self.assertEqual(bad_ctx.exception.code, 400)
+                finally:
+                    bad_ctx.exception.close()
+
+            with self.assertRaises(ValueError):
+                SafetyConfig.from_dict({"battery_webhook_url": "file:///etc/passwd"})
+        finally:
+            dash.shutdown()
+            dash.server_close()
+            up_srv.shutdown()
+            up_srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

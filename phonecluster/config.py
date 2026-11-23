@@ -171,6 +171,11 @@ class SafetyConfig:
             raise ValueError(
                 "safety battery thresholds must satisfy 0 <= low < high <= 100"
             )
+        wb = cfg.battery_webhook_url.strip()
+        if wb:
+            if any(c.isspace() or ord(c) < 32 for c in wb) or not wb.startswith(("http://", "https://")):
+                raise ValueError("safety.battery_webhook_url must be empty or a valid http:// / https:// URL")
+        cfg.battery_webhook_url = wb
         return cfg
 
 

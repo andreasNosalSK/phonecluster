@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import math
@@ -2940,6 +2941,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.controller = controller
         self.config_path = config_path
         self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
+        self._conn_sem = threading.BoundedSemaphore(64)
         if ":" in str(addr[0]):
             self.address_family = socket.AF_INET6
         super().__init__(addr, DashboardRequestHandler)
@@ -2960,6 +2962,22 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             else:
                 LOG.warning("Master Network Guard failed to start on boot: %s", msg)
 
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._conn_sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_sem.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_sem.release()
+
     def server_close(self) -> None:
         try:
             self.pairing_manager.close_session()
@@ -2970,6 +2988,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
     server: DashboardHTTPServer
+    timeout = 15.0
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         LOG.info("dashboard %s - %s", self.address_string(), format % args)
@@ -2981,6 +3000,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        if content_type.startswith("text/html"):
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                "img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+            )
         if self.path.startswith("/api/"):
             self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -3015,7 +3040,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be an object")
             return body
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return None
 
@@ -3149,6 +3174,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path == "/api/pair/complete":
+            if not self._check_same_origin():
+                return
             body = self._read_json()
             if body is None:
                 return
@@ -3370,10 +3397,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             allowed_schemes = ("http://", "https://", "mqtt://", "tcp://", "redis://", "postgresql://", "ssh://")
-            if not url or not url.startswith(allowed_schemes):
+            if not url or any(c.isspace() or ord(c) < 32 for c in url) or not url.startswith(allowed_schemes):
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
-                    {"error": "url must start with http://, https://, mqtt://, tcp://, redis://, postgresql://, or ssh://"},
+                    {"error": "url must start with http://, https://, mqtt://, tcp://, redis://, postgresql://, or ssh:// (no spaces/control chars)"},
                 )
                 return
             with ctrl.config_lock:
@@ -3568,14 +3595,21 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if master_node.host and master_node.host not in ips:
                     ips.append(master_node.host)
                 ag_url = str(body.get("adguard_url", cur_net.adguard_url)).strip()
-                if ag_url and not ag_url.startswith(("http://", "https://")):
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https://"})
+                if ag_url and (any(c.isspace() or ord(c) < 32 for c in ag_url) or not ag_url.startswith(("http://", "https://"))):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https:// (no spaces/control chars)"})
                     return
+                lan_sub = str(body.get("lan_subnet", cur_net.lan_subnet)).strip()
+                if lan_sub:
+                    try:
+                        lan_sub = str(ipaddress.ip_network(lan_sub, strict=False))
+                    except ValueError:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid lan_subnet CIDR '{lan_sub}'"})
+                        return
                 ctrl.config.network = NetworkHardeningConfig(
                     enforce_worker_source_ip=bool(body.get("enforce_worker_source_ip", cur_net.enforce_worker_source_ip)),
                     allowed_master_ips=ips,
                     adguard_url=ag_url,
-                    lan_subnet=str(body.get("lan_subnet", cur_net.lan_subnet)).strip(),
+                    lan_subnet=lan_sub,
                 )
                 if self.server.config_path is not None:
                     save_config(ctrl.config, self.server.config_path)
@@ -3619,6 +3653,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
                     cfg_subnet = ctrl.config.network.lan_subnet
                 cidr = infer_lan_subnet(master_node.host or detect_local_ip(), cfg_subnet)
+            elif action == "distcc-start":
+                try:
+                    cidr = str(ipaddress.ip_network(cidr, strict=False))
+                except ValueError:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid CIDR subnet '{cidr}'"})
+                    return
             action_args_map = {
                 "distcc-start": ["distcc-start", cidr],
                 "distcc-stop": ["distcc-stop"],
@@ -3876,7 +3916,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/settings/test-webhook":
             url = str(body.get("battery_webhook_url") or ctrl.config.safety.battery_webhook_url).strip()
-            if not url or not url.startswith(("http://", "https://")):
+            if not url or any(c.isspace() or ord(c) < 32 for c in url) or not url.startswith(("http://", "https://")):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "enter a valid http:// or https:// webhook URL"})
                 return
             test_payload = {

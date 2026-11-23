@@ -484,10 +484,18 @@ def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
 
 def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> None:
     """Send a best-effort JSON webhook (e.g., Home Assistant, ntfy, smart plug bridge)."""
+    clean_url = str(url or "").strip()
+    if (
+        not clean_url
+        or any(c.isspace() or ord(c) < 32 for c in clean_url)
+        or not clean_url.startswith(("http://", "https://"))
+    ):
+        LOG.warning("Skipped invalid safety webhook URL (must be http:// or https://)")
+        return
     try:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            url,
+            clean_url,
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -495,7 +503,7 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> No
         with urllib.request.urlopen(req, timeout=timeout):
             pass
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        LOG.warning("Safety webhook POST to %s failed: %s", url, exc)
+        LOG.warning("Safety webhook POST to %s failed: %s", clean_url, exc)
 
 
 def _decode_capped(data: bytes | None, limit: int = MAX_OUTPUT_BYTES, overflow_bytes: int = 0) -> str:
@@ -782,7 +790,7 @@ class BatteryGuardLoop(threading.Thread):
 
 
 class WorkerHTTPServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer carrying a WorkerState reference."""
+    """ThreadingHTTPServer carrying a WorkerState reference with bounded concurrency."""
 
     allow_reuse_address = True
     daemon_threads = True
@@ -793,15 +801,33 @@ class WorkerHTTPServer(ThreadingHTTPServer):
         state: WorkerState,
     ) -> None:
         self.state = state
+        self._conn_sem = threading.BoundedSemaphore(64)
         if ":" in str(server_address[0]):
             self.address_family = socket.AF_INET6
         super().__init__(server_address, WorkerRequestHandler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._conn_sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_sem.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_sem.release()
 
 
 class WorkerRequestHandler(BaseHTTPRequestHandler):
     """HTTP JSON API for PhoneCluster workers."""
 
     server: WorkerHTTPServer
+    timeout = 15.0
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         LOG.info("%s - %s", self.address_string(), format % args)
@@ -853,10 +879,10 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
                 {"error": f"payload exceeds {MAX_REQUEST_BYTES} bytes"},
             )
             return None
-        raw = self.rfile.read(length) if length > 0 else b"{}"
         try:
+            raw = self.rfile.read(length) if length > 0 else b"{}"
             parsed = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return None
         if not isinstance(parsed, dict):
