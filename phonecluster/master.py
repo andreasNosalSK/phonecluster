@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 from .auth import build_auth_headers
 from .config import ClusterConfig, NodeConfig
+from .gateway import build_worker_proxy_env
 from .routing import (
     build_cluster_dns_hosts,
     build_cross_tier_env,
@@ -255,6 +256,7 @@ class MasterController:
         self.config = config
         self.headers = build_auth_headers(config.auth_token)
         self.metrics_history = MetricsHistory(maxlen=60)
+        self.gateway_port_override: int | None = None
 
     def _headers_for(self, node: NodeConfig) -> dict[str, str]:
         return build_auth_headers(self.config.token_for_node(node))
@@ -334,10 +336,16 @@ class MasterController:
         except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError) as exc:
             return "retryable", {"error": str(exc)}
 
-    @staticmethod
-    def _with_cross_tier_env(spec: JobSpec, cross_env: dict[str, str]) -> JobSpec:
-        """Return a copy of `spec` enriched with live cross-tier service env vars."""
+    def _with_node_env(
+        self, spec: JobSpec, node: NodeConfig, cross_env: dict[str, str]
+    ) -> JobSpec:
+        """Return a copy of `spec` enriched with cross-tier mesh + optional per-worker gateway proxy env."""
         merged = dict(cross_env)
+        proxy_env = build_worker_proxy_env(
+            self.config, node, port_override=self.gateway_port_override
+        )
+        if proxy_env:
+            merged.update(proxy_env)
         if spec.env:
             merged.update(spec.env)
         return replace(spec, env=merged)
@@ -357,7 +365,6 @@ class MasterController:
         """
         snapshots = self.poll_health(tags=tags)
         cross_env = build_cross_tier_env(snapshots, self.config)
-        enriched = self._with_cross_tier_env(spec, cross_env)
         snap_by_id = {s.node.id: s for s in snapshots}
 
         if target == "all":
@@ -378,7 +385,12 @@ class MasterController:
             outcomes: list[JobOutcome] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(chosen)) as pool:
                 fut_map = {
-                    pool.submit(self.exec_on_node, s.node, enriched): s for s in chosen
+                    pool.submit(
+                        self.exec_on_node,
+                        s.node,
+                        self._with_node_env(spec, s.node, cross_env),
+                    ): s
+                    for s in chosen
                 }
                 for fut in concurrent.futures.as_completed(fut_map):
                     snap = fut_map[fut]
@@ -427,7 +439,9 @@ class MasterController:
             )
             best_snap = candidates[0]
             tier, pool_name = resolve_node_tier_and_pool(best_snap.node, best_snap.health)
-            kind, data = self.exec_on_node(best_snap.node, enriched)
+            kind, data = self.exec_on_node(
+                best_snap.node, self._with_node_env(spec, best_snap.node, cross_env)
+            )
             return [
                 self._to_outcome(
                     spec,
@@ -461,7 +475,7 @@ class MasterController:
         tier, pool_name = resolve_node_tier_and_pool(
             node, snap.health if snap and snap.online else None
         )
-        kind, data = self.exec_on_node(node, enriched)
+        kind, data = self.exec_on_node(node, self._with_node_env(spec, node, cross_env))
         return [
             self._to_outcome(
                 spec,
@@ -565,7 +579,7 @@ class MasterController:
                     )
                     chosen_snap = pool_candidates[0]
                     in_flight_per_node[chosen_snap.node.id] += 1
-                    enriched = self._with_cross_tier_env(spec, cross_env)
+                    enriched = self._with_node_env(spec, chosen_snap.node, cross_env)
                     fut = pool.submit(self.exec_on_node, chosen_snap.node, enriched)
                     running_futures[fut] = (spec, chosen_snap, attempt + 1, failed_nodes, reason)
                     dispatched_any = True
@@ -1066,6 +1080,77 @@ class MasterController:
                 "port": int(port),
                 "error": str(exc),
             }
+
+    def check_workers_wan_isolation(
+        self,
+        probe_host: str = "1.1.1.1",
+        probe_port: int = 443,
+        timeout_sec: float = 2.0,
+    ) -> list[dict[str, Any]]:
+        """Check whether worker phones have direct WAN blocked by your router firewall.
+
+        Runs a raw TCP probe directly from each online worker (bypassing any proxy).
+        If the direct connection fails/times out, that worker is air-gapped from WAN.
+        """
+        workers = [n for n in self.config.nodes if n.role != "master"]
+        if not workers:
+            return []
+        probe_code = (
+            "import socket, sys\n"
+            f"try:\n"
+            f"    s = socket.create_connection(({probe_host!r}, {int(probe_port)}), timeout={float(timeout_sec)})\n"
+            "    s.close()\n"
+            "    print('DIRECT_WAN_OPEN')\n"
+            "except OSError as e:\n"
+            "    print(f'WAN_BLOCKED:{type(e).__name__}')\n"
+        )
+
+        def _probe_one(node: NodeConfig) -> dict[str, Any]:
+            spec = JobSpec(
+                index=0,
+                job_id=f"wancheck-{node.id}",
+                script_content=probe_code,
+                script_name="wan_check.py",
+                interpreter="python3",
+                timeout_sec=float(timeout_sec) + 4.0,
+                force=True,
+            )
+            kind, data = self.exec_on_node(node, spec)
+            if kind != "ok":
+                return {
+                    "node_id": node.id,
+                    "host": node.host,
+                    "online": False,
+                    "wan_blocked": None,
+                    "detail": str(data.get("error", "offline")),
+                }
+            out = str(data.get("stdout", "")).strip()
+            if out.startswith("WAN_BLOCKED"):
+                return {
+                    "node_id": node.id,
+                    "host": node.host,
+                    "online": True,
+                    "wan_blocked": True,
+                    "detail": f"Direct WAN blocked ({out.split(':', 1)[-1]}) — isolated on LAN!",
+                }
+            if "DIRECT_WAN_OPEN" in out:
+                return {
+                    "node_id": node.id,
+                    "host": node.host,
+                    "online": True,
+                    "wan_blocked": False,
+                    "detail": "Direct internet reachable — block this phone's MAC/IP on your router for air-gap isolation.",
+                }
+            return {
+                "node_id": node.id,
+                "host": node.host,
+                "online": True,
+                "wan_blocked": None,
+                "detail": (out or str(data.get("stderr", "")) or "unknown probe output")[:120],
+            }
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(workers))) as pool:
+            return list(pool.map(_probe_one, workers))
 
     def exec_terminal_command(
         self,

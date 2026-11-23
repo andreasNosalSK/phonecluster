@@ -196,6 +196,23 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                     )
             except OSError:
                 pass
+
+            if cfg.gateway.enabled:
+                checks.append(
+                    CheckResult(
+                        "Master Network Guard",
+                        "ok",
+                        f"Enabled (mode={cfg.gateway.mode}, port={cfg.gateway.port}, SSRF guard={'ON' if cfg.gateway.block_private_ips else 'OFF'})",
+                    )
+                )
+            else:
+                checks.append(
+                    CheckResult(
+                        "Master Network Guard",
+                        "ok",
+                        "Disabled (default direct LAN mode). Optional: enable in Web UI Tab 5 or `pc gateway --enable` to proxy & filter old worker WAN traffic.",
+                    )
+                )
         except Exception as exc:
             checks.append(
                 CheckResult(

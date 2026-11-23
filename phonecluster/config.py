@@ -12,7 +12,20 @@ from typing import Any
 
 DEFAULT_WORKER_PORT = 8765
 DEFAULT_SSH_PORT = 8022
+DEFAULT_GATEWAY_PORT = 8888
 DEFAULT_CONFIG_PATH = Path("config/cluster.json")
+
+DEFAULT_GATEWAY_ALLOWED_DOMAINS: list[str] = [
+    "github.com",
+    "*.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "packages-cf.termux.dev",
+    "deb.debian.org",
+    "security.debian.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+]
 
 
 @dataclass
@@ -106,6 +119,74 @@ class SafetyConfig:
 
 
 @dataclass
+class GatewayConfig:
+    """Optional Master Network Guard (authenticated allowlist HTTP/HTTPS proxy).
+
+    Disabled by default (`enabled=False`). When enabled on an updated Master phone
+    or Raspberry Pi Zero 2 W, you can block direct internet (WAN) access for older
+    unrooted worker phones on your router while letting approved package/API traffic
+    pass through Master with domain allowlisting, SSRF blocking, and live audit logs.
+    """
+
+    enabled: bool = False
+    bind_host: str = "0.0.0.0"
+    port: int = DEFAULT_GATEWAY_PORT
+    mode: str = "allowlist"  # "allowlist" (default-deny), "monitor" (log-all), "block_all" (strict airgap)
+    allowed_domains: list[str] = field(default_factory=lambda: list(DEFAULT_GATEWAY_ALLOWED_DOMAINS))
+    blocked_domains: list[str] = field(default_factory=list)
+    allowed_ports: list[int] = field(default_factory=lambda: [80, 443])
+    block_private_ips: bool = True
+    inject_proxy_env: bool = True
+    max_connections: int = 32
+    idle_timeout_sec: float = 30.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "GatewayConfig":
+        if not isinstance(data, dict):
+            return cls()
+        mode = str(data.get("mode", "allowlist")).strip().lower()
+        if mode not in {"allowlist", "monitor", "block_all"}:
+            raise ValueError("gateway.mode must be 'allowlist', 'monitor', or 'block_all'")
+        port = int(data.get("port", DEFAULT_GATEWAY_PORT))
+        if not (0 <= port <= 65535):
+            raise ValueError("gateway.port must be between 0 and 65535")
+        raw_allowed = data.get("allowed_domains")
+        allowed = (
+            [str(d).strip().lower() for d in raw_allowed if str(d).strip()]
+            if isinstance(raw_allowed, list)
+            else list(DEFAULT_GATEWAY_ALLOWED_DOMAINS)
+        )
+        raw_blocked = data.get("blocked_domains")
+        blocked = (
+            [str(d).strip().lower() for d in raw_blocked if str(d).strip()]
+            if isinstance(raw_blocked, list)
+            else []
+        )
+        raw_ports = data.get("allowed_ports")
+        if isinstance(raw_ports, list) and raw_ports:
+            ports = [int(p) for p in raw_ports if 1 <= int(p) <= 65535]
+            if not ports:
+                ports = [80, 443]
+        else:
+            ports = [80, 443]
+        max_conn = max(4, min(256, int(data.get("max_connections", 32))))
+        idle_to = max(5.0, float(data.get("idle_timeout_sec", 30.0)))
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            bind_host=str(data.get("bind_host", "0.0.0.0")).strip() or "0.0.0.0",
+            port=port,
+            mode=mode,
+            allowed_domains=allowed,
+            blocked_domains=blocked,
+            allowed_ports=ports,
+            block_private_ips=bool(data.get("block_private_ips", True)),
+            inject_proxy_env=bool(data.get("inject_proxy_env", True)),
+            max_connections=max_conn,
+            idle_timeout_sec=idle_to,
+        )
+
+
+@dataclass
 class ClusterConfig:
     """Top-level PhoneCluster configuration."""
 
@@ -113,6 +194,7 @@ class ClusterConfig:
     auth_token: str
     nodes: list[NodeConfig]
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    gateway: GatewayConfig = field(default_factory=GatewayConfig)
     default_job_timeout_sec: int = 600
     health_timeout_sec: float = 3.0
     dashboard_port: int = 8080
@@ -137,6 +219,7 @@ class ClusterConfig:
                 "Run `phonecluster init-config` to generate one."
             )
         safety = SafetyConfig.from_dict(data.get("safety", {}))
+        gateway = GatewayConfig.from_dict(data.get("gateway"))
         raw_svcs = data.get("custom_services") or {}
         custom_services = (
             {str(k): str(v) for k, v in raw_svcs.items()}
@@ -148,6 +231,7 @@ class ClusterConfig:
             auth_token=token,
             nodes=nodes,
             safety=safety,
+            gateway=gateway,
             default_job_timeout_sec=int(data.get("default_job_timeout_sec", 600)),
             health_timeout_sec=float(data.get("health_timeout_sec", 3.0)),
             dashboard_port=int(data.get("dashboard_port", 8080)),

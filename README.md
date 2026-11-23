@@ -27,6 +27,9 @@ PhoneCluster gives you **one entry point** (Web UI + interactive terminal menu +
   - Opening a temporary **2-minute Pairing Window** lets new phones auto-find your Master on Wi-Fi and join with a **6-digit PIN**, protected by **2048-bit Ephemeral Diffie-Hellman + PBKDF2-HMAC-SHA256 + Mutual Proof + Encrypt-then-MAC** (zero pip dependencies!).
   - Every paired phone gets its **own unique per-node 256-bit token** (least-privilege isolation), 5-attempt lockout, brute-force `429` rate limiting, and optional `pc dashboard --require-auth` lockdown for shared Wi-Fi.
   - Also includes a PC USB Fleet Provisioner ([`scripts/setup_all_via_adb.sh`](scripts/setup_all_via_adb.sh)), One-Line Installer ([`install.sh`](install.sh)), Guided Setup Wizard (`pc wizard`), and Cluster Doctor (`pc doctor`).
+- **Optional Master Network Guard (Air-Gap Old Phones from WAN)**:
+  - **OFF by default** — turn ON in Web UI (**Tab 5**) or via `pc gateway --enable` when you block direct internet (WAN) on your router for older unpatched worker phones.
+  - Routes approved worker traffic through Master's (or a Raspberry Pi Zero 2 W Master's) authenticated HTTP/HTTPS allowlist proxy with per-node derived credentials, SSRF private-IP blocking, live traffic audit logs, and one-click router WAN-isolation verification.
 - **Smart Parallel Scheduling & Hardware Safety**:
   - Dynamically ships & runs local Python/Bash scripts across all cool, ready phones (`pc map --script ...`) with automatic retry/failover if a phone throttles or disconnects.
   - **Thermal Gate with hysteresis** pauses jobs at `40 °C` and resumes at `37 °C`.

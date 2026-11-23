@@ -25,6 +25,7 @@ from .config import (
 from .dashboard import serve_dashboard
 from .discovery import discover_lan_nodes
 from .doctor import run_doctor
+from .gateway import GatewayManager
 from .master import JobOutcome, JobSpec, MasterController
 from .pairing import (
     DEFAULT_PAIR_PORT,
@@ -436,6 +437,86 @@ def _cmd_mpi_hostfile(args: argparse.Namespace) -> int:
         print(f"Wrote OpenMPI hostfile to {args.output}")
     else:
         print(content, end="")
+    return 0
+
+
+def _cmd_gateway(args: argparse.Namespace) -> int:
+    cfg_path = resolve_config_path(args.config)
+    cfg = load_config(cfg_path)
+
+    if args.enable or args.disable or args.mode or args.port:
+        if args.enable:
+            cfg.gateway.enabled = True
+        if args.disable:
+            cfg.gateway.enabled = False
+        if args.mode:
+            cfg.gateway.mode = args.mode
+        if args.port:
+            cfg.gateway.port = args.port
+        save_config(cfg, cfg_path)
+        state_txt = "ENABLED" if cfg.gateway.enabled else "DISABLED"
+        print(
+            f"Saved Network Guard config ({state_txt}, mode={cfg.gateway.mode}, "
+            f"port={cfg.gateway.port}) -> {cfg_path}"
+        )
+        if not args.serve:
+            return 0
+
+    if args.check_isolation:
+        ctrl = MasterController(cfg)
+        rows = ctrl.check_workers_wan_isolation()
+        if args.json:
+            print(json.dumps({"workers": rows}, indent=2))
+            return 0
+        if not rows:
+            print("No worker phones configured.")
+            return 0
+        tbl_rows = [
+            [
+                w["node_id"],
+                w["host"],
+                "WAN BLOCKED" if w["wan_blocked"] is True else ("DIRECT WAN OPEN" if w["wan_blocked"] is False else "UNKNOWN"),
+                w["detail"],
+            ]
+            for w in rows
+        ]
+        print(_fmt_table(["NODE", "HOST", "ISOLATION", "DETAIL"], tbl_rows))
+        return 0
+
+    if args.status:
+        gw = cfg.gateway
+        if args.json:
+            print(json.dumps(cfg.to_dict().get("gateway", {}), indent=2))
+        else:
+            print(f"Network Guard : {'ENABLED' if gw.enabled else 'DISABLED (OFF by default)'}")
+            print(f"Policy Mode   : {gw.mode}")
+            print(f"Proxy Listen  : {gw.bind_host}:{gw.port}")
+            print(f"SSRF Guard    : {'ON' if gw.block_private_ips else 'OFF'}")
+            print(f"Auto Proxy Env: {'ON' if gw.inject_proxy_env else 'OFF'}")
+            print(f"Allowlist ({len(gw.allowed_domains)}): {', '.join(gw.allowed_domains[:8])}" + (" ..." if len(gw.allowed_domains) > 8 else ""))
+        return 0
+
+    # Standalone foreground proxy mode (great for Master phone or Raspberry Pi Zero 2 W!)
+    cfg.gateway.enabled = True
+    if args.bind:
+        cfg.gateway.bind_host = args.bind
+    if args.port:
+        cfg.gateway.port = args.port
+    mgr = GatewayManager(cfg)
+    ok, msg = mgr.start()
+    if not ok:
+        print(f"Failed to start Network Guard: {msg}", file=sys.stderr)
+        return 1
+    print(f"PhoneCluster Master Network Guard listening on {cfg.gateway.bind_host}:{mgr.bound_port}")
+    print(f"Policy mode: {cfg.gateway.mode} | SSRF guard: {'ON' if cfg.gateway.block_private_ips else 'OFF'} | Allowlist: {len(cfg.gateway.allowed_domains)} domains")
+    print("Press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nStopping Network Guard...")
+    finally:
+        mgr.stop()
     return 0
 
 
@@ -1111,6 +1192,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_mpi.add_argument("-o", "--output", default=None, help="Write hostfile to path instead of stdout")
     p_mpi.set_defaults(func=_cmd_mpi_hostfile)
 
+    # gateway (optional Master Network Guard / Watchguard proxy)
+    p_gw = sub.add_parser(
+        "gateway",
+        help="Optional Master Network Guard (allowlist HTTP/HTTPS proxy & WAN isolation check for old workers)",
+    )
+    p_gw.add_argument("--enable", action="store_true", help="Enable Network Guard in cluster.json")
+    p_gw.add_argument("--disable", action="store_true", help="Disable Network Guard in cluster.json (OFF by default)")
+    p_gw.add_argument(
+        "--mode",
+        choices=["allowlist", "monitor", "block_all"],
+        default="",
+        help="Policy mode: allowlist (default-deny), monitor (log-all), or block_all (air-gap)",
+    )
+    p_gw.add_argument("--bind", default="", help="Override bind address when running standalone")
+    p_gw.add_argument("--port", type=int, default=0, help="Proxy port (default: 8888)")
+    p_gw.add_argument("--serve", action="store_true", help="Also run standalone proxy in foreground after saving")
+    p_gw.add_argument("--status", action="store_true", help="Show Network Guard configuration")
+    p_gw.add_argument("--check-isolation", action="store_true", help="Test if router blocks direct WAN on workers")
+    p_gw.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_gw.set_defaults(func=_cmd_gateway)
+
     # dashboard
     p_dash = sub.add_parser("dashboard", help="Start the Master web dashboard UI")
     p_dash.add_argument("--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
@@ -1129,7 +1231,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     subcmd = getattr(args, "subcommand", None)
-    _configure_logging(args.verbose, is_daemon=subcmd in {"worker", "dashboard"})
+    _configure_logging(args.verbose, is_daemon=subcmd in {"worker", "dashboard", "gateway"})
     if not subcmd:
         if sys.stdin.isatty():
             return run_interactive_menu(args.config)

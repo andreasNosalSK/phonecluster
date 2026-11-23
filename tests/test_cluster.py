@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -10,6 +12,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from phonecluster.auth import (
@@ -21,6 +24,7 @@ from phonecluster.auth import (
 from phonecluster.cli import main as cli_main
 from phonecluster.config import (
     ClusterConfig,
+    GatewayConfig,
     NodeConfig,
     SafetyConfig,
     create_default_config,
@@ -30,6 +34,14 @@ from phonecluster.config import (
 from phonecluster.dashboard import DashboardHTTPServer
 from phonecluster.discovery import DiscoveryResponder, discover_lan_nodes
 from phonecluster.doctor import run_doctor
+from phonecluster.gateway import (
+    GatewayManager,
+    build_worker_proxy_env,
+    derive_proxy_password,
+    domain_matches,
+    evaluate_policy,
+    resolve_and_validate_target,
+)
 from phonecluster.master import (
     JobSpec,
     MasterController,
@@ -1397,6 +1409,324 @@ class TestHeterogeneousMultiTierCluster(unittest.TestCase):
             finally:
                 dash.shutdown()
                 dash.server_close()
+
+
+class TestMasterNetworkGuard(unittest.TestCase):
+    """Tests optional Master Network Guard (allowlist HTTP/HTTPS proxy, SSRF guard, audit log, toggle)."""
+
+    def test_off_by_default_policy_matching_and_ssrf_guard(self) -> None:
+        cfg = create_default_config(master_host="127.0.0.1", worker_hosts=["127.0.0.2"])
+        self.assertFalse(cfg.gateway.enabled)
+        self.assertEqual(build_worker_proxy_env(cfg, cfg.get_node("node1")), {})
+
+        # Derived proxy secret must be distinct from both worker and master tokens
+        p_secret = derive_proxy_password(cfg.token_for_node(cfg.get_node("node1")), "node1")
+        self.assertNotEqual(p_secret, cfg.auth_token)
+        self.assertEqual(len(p_secret), 32)
+
+        # Strict domain matching (exact + wildcard + trailing dot, no substring tricks!)
+        self.assertTrue(domain_matches("github.com", "github.com"))
+        self.assertTrue(domain_matches("GITHUB.COM.", "github.com"))
+        self.assertTrue(domain_matches("api.github.com", "*.github.com"))
+        self.assertFalse(domain_matches("evilgithub.com", "*.github.com"))
+        self.assertFalse(domain_matches("github.com", "*.github.com"))
+
+        # Policy modes: allowlist, monitor, block_all, blocked_domains, port filter
+        gw = GatewayConfig(
+            enabled=True,
+            mode="allowlist",
+            allowed_domains=["github.com", "*.debian.org"],
+            blocked_domains=["bad.debian.org"],
+            allowed_ports=[80, 443],
+        )
+        self.assertTrue(evaluate_policy("github.com", 443, gw)[0])
+        self.assertTrue(evaluate_policy("deb.debian.org", 80, gw)[0])
+        self.assertFalse(evaluate_policy("bad.debian.org", 443, gw)[0])
+        self.assertFalse(evaluate_policy("evil.example", 443, gw)[0])
+        self.assertFalse(evaluate_policy("github.com", 22, gw)[0])
+
+        gw.mode = "monitor"
+        self.assertTrue(evaluate_policy("any-site.example", 443, gw)[0])
+        self.assertFalse(evaluate_policy("bad.debian.org", 443, gw)[0])
+
+        gw.mode = "block_all"
+        self.assertFalse(evaluate_policy("github.com", 443, gw)[0])
+
+        # SSRF private/loopback IP blocking
+        for priv in ("127.0.0.1", "192.168.1.1", "10.0.0.1", "::1", "::ffff:127.0.0.1"):
+            res, why = resolve_and_validate_target(priv, 80, block_private_ips=True)
+            self.assertIsNone(res)
+            self.assertIn("SSRF", why)
+
+    def test_live_proxy_auth_ssrf_http_connect_and_audit_log(self) -> None:
+        seen_headers: list[dict[str, str]] = []
+
+        class _DummyUpstream(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                seen_headers.append({k.lower(): v for k, v in self.headers.items()})
+                body = b"hello-from-upstream"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _DummyUpstream)
+        up_port = upstream.server_address[1]
+        up_thread = threading.Thread(target=upstream.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        up_thread.start()
+
+        cfg = create_default_config(master_host="127.0.0.1", worker_hosts=["127.0.0.1"])
+        cfg.get_node("node1").auth_token = "unique-worker-token-node1"
+        cfg.gateway = GatewayConfig(
+            enabled=True,
+            bind_host="127.0.0.1",
+            port=0,
+            mode="allowlist",
+            allowed_domains=["localhost"],
+            allowed_ports=[80, 443, up_port],
+            block_private_ips=True,
+        )
+        mgr = GatewayManager(cfg)
+        ok, msg = mgr.start()
+        self.assertTrue(ok, msg)
+        gw_port = mgr.bound_port
+
+        def _raw_proxy_req(req_bytes: bytes) -> bytes:
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(req_bytes)
+                s.settimeout(3.0)
+                chunks: list[bytes] = []
+                while True:
+                    try:
+                        chunk = s.recv(4096)
+                    except socket.timeout:
+                        break
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+        pw = derive_proxy_password("unique-worker-token-node1", "node1")
+        auth_b64 = base64.b64encode(f"node1:{pw}".encode("utf-8")).decode("ascii")
+
+        try:
+            # 1. Stranger without Proxy-Authorization -> 407
+            r_noauth = _raw_proxy_req(f"GET http://localhost:{up_port}/ HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+            self.assertTrue(r_noauth.startswith(b"HTTP/1.1 407"))
+
+            # 2. Authenticated worker blocked by SSRF guard (localhost -> 127.0.0.1) -> 403
+            r_ssrf = _raw_proxy_req(
+                f"GET http://localhost:{up_port}/ HTTP/1.1\r\n"
+                f"Host: localhost:{up_port}\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode()
+            )
+            self.assertTrue(r_ssrf.startswith(b"HTTP/1.1 403"))
+            self.assertIn(b"SSRF", r_ssrf)
+
+            # 3. Disable SSRF guard ONLY for local loopback upstream test; non-allowlisted domain -> 403
+            cfg.gateway.block_private_ips = False
+            r_denied = _raw_proxy_req(
+                f"GET http://evil.example:{up_port}/ HTTP/1.1\r\n"
+                f"Host: evil.example\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode()
+            )
+            self.assertTrue(r_denied.startswith(b"HTTP/1.1 403"))
+
+            # 4. Allowlisted plain HTTP succeeds AND strips Proxy-Authorization before forwarding upstream!
+            r_ok = _raw_proxy_req(
+                f"GET http://localhost:{up_port}/test HTTP/1.1\r\n"
+                f"Host: localhost:{up_port}\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode()
+            )
+            self.assertIn(b"200 OK", r_ok[:32], r_ok[:120])
+            self.assertIn(b"hello-from-upstream", r_ok)
+            self.assertTrue(seen_headers)
+            self.assertNotIn("proxy-authorization", seen_headers[-1])
+
+            # 5. HTTPS CONNECT tunnel works cleanly end-to-end
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(
+                    f"CONNECT localhost:{up_port} HTTP/1.1\r\n"
+                    f"Host: localhost:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode()
+                )
+                est = s.recv(1024)
+                self.assertIn(b"200 Connection Established", est)
+                s.sendall(f"GET /tun HTTP/1.1\r\nHost: localhost:{up_port}\r\nConnection: close\r\n\r\n".encode())
+                tun_resp = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    tun_resp += chunk
+                self.assertIn(b"hello-from-upstream", tun_resp)
+
+            # 6. Air-gap mode blocks everything
+            cfg.gateway.mode = "block_all"
+            r_airgap = _raw_proxy_req(
+                f"CONNECT localhost:{up_port} HTTP/1.1\r\n"
+                f"Host: localhost:{up_port}\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode()
+            )
+            self.assertTrue(r_airgap.startswith(b"HTTP/1.1 403"))
+
+            st = mgr.status()
+            self.assertEqual(st["stats"]["total_allowed"], 2)
+            self.assertEqual(st["stats"]["auth_failures"], 1)
+            self.assertGreaterEqual(st["stats"]["total_blocked"], 4)
+        finally:
+            mgr.stop()
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_dashboard_live_gateway_toggle_env_injection_and_cli(self) -> None:
+        token = "gw-master-secret"
+        w_token = "gw-worker1-secret"
+        safety = SafetyConfig()
+        servers = []
+        stop_evs = []
+        nodes: list[NodeConfig] = []
+
+        for nid, role, tok in [("node0", "master", token), ("node1", "worker", w_token)]:
+            def _make_cool_health(n_id: str, r_name: str):
+                return lambda: {
+                    "node_id": n_id,
+                    "role": r_name,
+                    "os_env": "debian-13" if r_name == "master" else "termux",
+                    "cpu_cores": 4,
+                    "load_1m": 0.2,
+                    "mem_total_mb": 4096,
+                    "mem_available_mb": 2048,
+                    "temp_c": 33.0,
+                    "battery_pct": 55,
+                    "battery_status": "DISCHARGING",
+                    "overheated": False,
+                    "ready_for_jobs": True,
+                    "not_ready_reasons": [],
+                    "tools": {"python3": True},
+                    "services": {},
+                }
+
+            st = WorkerState(
+                node_id=nid,
+                role=role,
+                auth_token=tok,
+                safety=safety,
+                health_provider=_make_cool_health(nid, role),
+            )
+            srv, _g, ev = create_worker_server("127.0.0.1", 0, st)
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+            servers.append(srv)
+            stop_evs.append(ev)
+            nodes.append(
+                NodeConfig(
+                    id=nid,
+                    host="127.0.0.1",
+                    role=role,
+                    worker_port=port,
+                    auth_token="" if role == "master" else tok,
+                )
+            )
+
+        cfg = ClusterConfig(cluster_name="gw-test", auth_token=token, nodes=nodes, safety=safety)
+        ctrl = MasterController(cfg)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cluster.json"
+            save_config(cfg, cfg_path)
+            dash = DashboardHTTPServer(("127.0.0.1", 0), ctrl, config_path=cfg_path, enable_pairing_beacon=False)
+            d_port = dash.server_address[1]
+            threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+            try:
+                # 1. OFF by default -> proxy not running!
+                self.assertFalse(dash.gateway_manager.is_running)
+
+                # 2. Toggle ON live via Dashboard API
+                req_on = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/gateway/settings",
+                    data=json.dumps({"enabled": True, "port": 0, "mode": "allowlist"}).encode("utf-8"),
+                    headers=build_auth_headers(token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_on, timeout=5.0) as resp:
+                    gw_st = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(gw_st["enabled"])
+                self.assertTrue(gw_st["running"])
+                self.assertTrue(dash.gateway_manager.is_running)
+
+                # 3. Worker job gets derived proxy env + NO_PROXY excluding LAN/.cluster, Master job does NOT!
+                env_cmd = (
+                    "python3 -c \"import json, os; "
+                    "print(json.dumps({k: os.environ.get(k, '') for k in ('HTTP_PROXY', 'NO_PROXY', 'PHONECLUSTER_GATEWAY_ENABLED')}))\""
+                )
+                w_out = ctrl.run_single(JobSpec(index=0, job_id="gw-w", command=env_cmd), target="node1")[0]
+                self.assertTrue(w_out.ok, w_out.error)
+                w_env = json.loads(w_out.stdout)
+                self.assertEqual(w_env["PHONECLUSTER_GATEWAY_ENABLED"], "1")
+                self.assertIn("node1:", w_env["HTTP_PROXY"])
+                self.assertNotIn(w_token, w_env["HTTP_PROXY"])  # Never leaks worker API token!
+                self.assertNotIn(token, w_env["HTTP_PROXY"])    # Never leaks master admin token!
+                self.assertIn(".cluster", w_env["NO_PROXY"])
+                self.assertIn("127.0.0.1", w_env["NO_PROXY"])
+
+                m_out = ctrl.run_single(JobSpec(index=0, job_id="gw-m", command=env_cmd), target="node0")[0]
+                self.assertTrue(m_out.ok, m_out.error)
+                self.assertEqual(json.loads(m_out.stdout)["PHONECLUSTER_GATEWAY_ENABLED"], "")
+
+                # 4. One-click allow-domain + clear logs + check-isolation
+                req_allow = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/gateway/allow-domain",
+                    data=json.dumps({"domain": "api.open-meteo.com"}).encode("utf-8"),
+                    headers=build_auth_headers(token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_allow, timeout=5.0) as resp:
+                    self.assertIn("api.open-meteo.com", json.loads(resp.read().decode("utf-8"))["allowed_domains"])
+
+                req_iso = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/gateway/check-isolation",
+                    data=b"{}",
+                    headers=build_auth_headers(token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_iso, timeout=10.0) as resp:
+                    iso = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(len(iso["workers"]), 1)
+                self.assertEqual(iso["workers"][0]["node_id"], "node1")
+
+                # 5. Toggle OFF live -> stops proxy cleanly and removes injected proxy env!
+                req_off = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/gateway/settings",
+                    data=json.dumps({"enabled": False}).encode("utf-8"),
+                    headers=build_auth_headers(token),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_off, timeout=5.0) as resp:
+                    gw_off = json.loads(resp.read().decode("utf-8"))
+                self.assertFalse(gw_off["enabled"])
+                self.assertFalse(gw_off["running"])
+                self.assertFalse(dash.gateway_manager.is_running)
+
+                # 6. CLI `pc gateway` toggle & status
+                self.assertEqual(cli_main(["--config", str(cfg_path), "gateway", "--status"]), 0)
+                self.assertEqual(cli_main(["--config", str(cfg_path), "gateway", "--enable", "--mode", "monitor"]), 0)
+                self.assertTrue(load_config(cfg_path).gateway.enabled)
+                self.assertEqual(load_config(cfg_path).gateway.mode, "monitor")
+                self.assertEqual(cli_main(["--config", str(cfg_path), "gateway", "--disable"]), 0)
+                self.assertFalse(load_config(cfg_path).gateway.enabled)
+            finally:
+                dash.shutdown()
+                dash.server_close()
+                for ev in stop_evs:
+                    ev.set()
+                for srv in servers:
+                    srv.shutdown()
+                    srv.server_close()
 
 
 if __name__ == "__main__":

@@ -54,3 +54,28 @@ Every pairing handshake uses pure Python 3 standard-library cryptography (zero p
     ```
     (or set `"dashboard_require_auth": true` in `config/cluster.json`). Every `/api/*` endpoint — including `/api/live`, `/api/status`, `/api/jobs`, and `/api/doctor` — will then require your Master `auth_token`.
 - **Over the Internet / Untrusted Networks:** Never port-forward HTTP `8080` or `8765` to the public internet. Use **Tailscale** or **WireGuard** (encrypted WireGuard mesh) for remote access!
+
+---
+
+## 5. Optional Master Network Guard (Air-Gapping Older Unrooted Phones from WAN)
+
+By default, all phones sit on your home Wi-Fi as LAN peers (`gateway.enabled = false`). However, older unrooted Android phones often stop receiving OS security patches — and **PhoneCluster workers do not need direct internet (WAN) access during normal operation**.
+
+### Recommended Air-Gapped Worker Topology
+1. **On your home router:** Assign static DHCP leases to all phones, then **block outbound & inbound WAN (internet)** for your older worker phones (via Router Firewall / Parental Controls / VLAN), while keeping **LAN traffic open** so workers talk freely to Master and Cross-Tier Service Mesh peers.
+2. **On your Master (updated modern phone OR Raspberry Pi Zero 2 W):** Enable **Network Guard** in **Web UI → Tab 5 → 4. Optional Network Guard** (or `pc gateway --enable`).
+   - Master runs a lightweight, zero-dependency, **authenticated HTTP/HTTPS (`CONNECT`) Allowlist Proxy** (default port `8888`).
+   - Every worker job automatically receives `HTTP_PROXY` / `HTTPS_PROXY` (authenticated with a **separate derived per-node HMAC proxy secret** — never exposing `/exec` or admin tokens) plus `NO_PROXY` excluding `localhost`, `.cluster`, and every LAN phone IP so cross-tier MQTT / Home Assistant / AdGuard traffic stays direct on LAN.
+   - **Three policy modes:**
+     - `allowlist` *(Recommended · Default-Deny)* — only explicitly approved domains (e.g., GitHub, Termux/Debian repos, PyPI, HuggingFace) and ports (`80, 443`) are allowed.
+     - `monitor` — logs every domain contacted by each worker so you can audit before locking down.
+     - `block_all` — strict air-gap blocking all outbound WAN even through the proxy.
+   - **SSRF / LAN Pivot Guard (`block_private_ips: true`):** Resolves DNS once and rejects private, loopback, link-local, and multicast IPs so a compromised old phone cannot use Master as a pivot into your router or localhost.
+   - **Router Verification:** Click **Verify Router WAN Block on Workers** (or `pc gateway --check-isolation`) to confirm your router firewall genuinely blocks direct WAN on every worker.
+   - **100% Optional:** Leave `gateway.enabled = false` (default) to keep zero extra ports open and zero proxy env vars injected.
+
+### Updated Master Phone vs. Raspberry Pi / Pi Zero 2 W as Master
+| Choice | Best When | Pros & Cons |
+| :--- | :--- | :--- |
+| **Updated Modern Android Phone as Master** *(€0 extra)* | You already have one newer phone receiving security updates (or rooted Debian 13). | Zero extra hardware, runs Dashboard + Scheduler + Network Guard unrooted on Termux; cannot do kernel-level L3 NAT routing without root (router handles WAN blocking instead). |
+| **Raspberry Pi Zero 2 W (~€15) / Pi 4 as Master** | **All** of your phones are old/unpatched, OR you want a zero-battery-swelling 24/7 controller. | Runs updated 64-bit Debian 13 natively, **no Li-Po battery risk**, uses ~1–2 W, runs PhoneCluster Master + Network Guard + optionally AdGuard Home DNS / WireGuard VPN / full `nftables` gateway! |

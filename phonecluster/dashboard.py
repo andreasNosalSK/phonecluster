@@ -19,12 +19,14 @@ from .auth import AuthRateLimiter, verify_token
 from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
+    GatewayConfig,
     NodeConfig,
     SafetyConfig,
     save_config,
 )
 from .discovery import detect_local_ip, discover_lan_nodes
 from .doctor import run_doctor
+from .gateway import GatewayManager
 from .master import JobSpec, MasterController
 from .pairing import PairingManager
 
@@ -500,7 +502,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button role="tab" id="tab-terminal" aria-selected="false" aria-controls="panel-terminal" onclick="selectTab('terminal')">2. Terminal Control</button>
     <button role="tab" id="tab-jobs" aria-selected="false" aria-controls="panel-jobs" onclick="selectTab('jobs')">3. Parallel Batch &amp; Pipelines</button>
     <button role="tab" id="tab-workloads" aria-selected="false" aria-controls="panel-workloads" onclick="selectTab('workloads')">4. Workloads &amp; Service Mesh</button>
-    <button role="tab" id="tab-setup" aria-selected="false" aria-controls="panel-setup" onclick="selectTab('setup')">5. Phones, Safety &amp; Doctor</button>
+    <button role="tab" id="tab-setup" aria-selected="false" aria-controls="panel-setup" onclick="selectTab('setup')">5. Phones, Network Guard &amp; Doctor</button>
   </nav>
 
   <main id="main-content">
@@ -893,6 +895,86 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
           <div id="doctor-list" aria-live="polite" class="hint">Click "Run Doctor Now" to inspect SSH, Termux:API, thermal, and battery safety.</div>
         </div>
       </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between; margin-bottom:6px;">
+          <h2 style="margin:0;">4. Optional Network Guard (Watchguard Proxy &amp; WAN Isolation)</h2>
+          <div class="row" style="margin:0;">
+            <span id="gw-status-pill" class="pill neutral">OFF (Direct LAN)</span>
+            <button class="small" onclick="loadGatewayStatus()">Refresh</button>
+          </div>
+        </div>
+        <p class="hint" style="margin-top:0;"><strong>Optional (OFF by default):</strong> If you have older unrooted Android worker phones, block their direct internet (WAN) on your home router and turn ON Network Guard on your updated Master phone (or a Raspberry Pi Zero 2 W Master). Approved worker traffic passes through Master's authenticated allowlist proxy with live monitoring and SSRF protection.</p>
+
+        <div class="chips" id="gw-stats-chips" style="margin-bottom:12px;"></div>
+
+        <div class="form-grid">
+          <div class="field">
+            <label for="gw-enabled">Network Guard State</label>
+            <select id="gw-enabled">
+              <option value="false">OFF — Disabled (Default)</option>
+              <option value="true">ON — Filter &amp; Monitor Worker WAN</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="gw-mode">Firewall Policy Mode</label>
+            <select id="gw-mode">
+              <option value="allowlist">Allowlist Only (Recommended · Default-Deny)</option>
+              <option value="monitor">Monitor &amp; Log All (Discover domains first)</option>
+              <option value="block_all">Strict Air-Gap (Block ALL WAN traffic)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="gw-port">Proxy Port on Master</label>
+            <input id="gw-port" type="number" min="1024" max="65535" value="8888" />
+          </div>
+        </div>
+
+        <div class="row" style="margin-bottom:8px;">
+          <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:5px;">
+            <input id="gw-ssrf" type="checkbox" checked style="width:auto; padding:0;" /> Block private/LAN IPs via proxy (SSRF Guard)
+          </label>
+          <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:5px;">
+            <input id="gw-inject" type="checkbox" checked style="width:auto; padding:0;" /> Auto-inject <code class="mono">HTTP_PROXY/NO_PROXY</code> into worker jobs
+          </label>
+        </div>
+
+        <div class="row" style="margin-bottom:8px;">
+          <span class="hint" style="margin:0;">1-Click Domain Presets:</span>
+          <div id="gw-preset-chips" class="chips" style="margin:0;"></div>
+        </div>
+
+        <div class="col-grid" style="margin-bottom:10px;">
+          <div>
+            <label for="gw-allowed" class="hint">Allowed Domains (one per line · supports <code class="mono">*.domain.com</code>):</label>
+            <textarea id="gw-allowed" style="min-height:105px;"></textarea>
+          </div>
+          <div>
+            <label for="gw-blocked" class="hint">Always-Blocked Domains (one per line · overrides Monitor mode):</label>
+            <textarea id="gw-blocked" style="min-height:105px;" placeholder="ads.example.com&#10;*.telemetry.vendor.com"></textarea>
+          </div>
+        </div>
+
+        <div class="row">
+          <button class="primary" onclick="saveGatewaySettings()">Save &amp; Apply Network Guard</button>
+          <button class="small" onclick="checkWanIsolation()">Verify Router WAN Block on Workers</button>
+          <button class="small danger" onclick="clearGatewayLogs()">Clear Audit Log</button>
+        </div>
+
+        <div id="gw-isolation-box" class="hint" style="margin-bottom:10px;"></div>
+
+        <h3 style="margin:12px 0 6px;">Live Worker Traffic Audit Log</h3>
+        <div id="gw-events-table" class="hint">Network Guard is currently OFF.</div>
+
+        <details style="margin-top:12px;">
+          <summary style="cursor:pointer; font-weight:700; font-size:0.88rem;">Router Isolation &amp; Raspberry Pi Zero 2 W Setup Tips</summary>
+          <div class="hint" style="margin-top:6px;">
+            1. <strong>Router rule:</strong> Give each phone a static DHCP lease, then block outbound WAN (Firewall / Parental Controls) for old worker MAC/IPs while keeping LAN traffic open to Master.<br/>
+            2. <strong>Master choice:</strong> Use your newest/updated Android phone as Master, <em>or</em> run PhoneCluster Master + Network Guard on a ~€15 <strong>Raspberry Pi Zero 2 W</strong> (updated Debian 13, zero battery-swelling risk, optional WireGuard/AdGuard).<br/>
+            3. <strong>LAN Mesh stays direct:</strong> <code class="mono">NO_PROXY</code> automatically excludes <code class="mono">.cluster</code> and every phone's LAN IP so MQTT, Home Assistant, and AdGuard stay fast and local.
+          </div>
+        </details>
+      </div>
     </section>
   </main>
 </div>
@@ -1169,7 +1251,10 @@ function selectTab(name) {
   if (name === 'terminal') document.getElementById('term-input').focus();
   if (name === 'jobs') renderPipeBuilder();
   if (name === 'workloads') loadWorkloads();
-  if (name === 'setup' && getToken()) { loadSafetySettings(); pollPairingStatus(); }
+  if (name === 'setup') {
+    loadGatewayStatus();
+    if (getToken()) { loadSafetySettings(); pollPairingStatus(); }
+  }
 }
 
 document.querySelector('nav.tabs').addEventListener('keydown', e => {
@@ -2393,6 +2478,135 @@ async function runDoctorUi() {
   }
 }
 
+let gwPresetsCache = {};
+
+async function loadGatewayStatus() {
+  try {
+    const r = await apiFetch('/api/gateway/status');
+    if (r.status === 401 || !r.ok) return;
+    const d = await r.json();
+    gwPresetsCache = d.presets || {};
+    const pill = document.getElementById('gw-status-pill');
+    if (d.enabled && d.running) {
+      pill.className = 'pill ok';
+      pill.textContent = '✓ ON · :' + d.port + ' (' + d.mode + ')';
+    } else if (d.enabled) {
+      pill.className = 'pill bad';
+      pill.textContent = '✕ Error: ' + (d.last_error || 'stopped');
+    } else {
+      pill.className = 'pill neutral';
+      pill.textContent = 'OFF (Direct LAN)';
+    }
+
+    document.getElementById('gw-enabled').value = d.enabled ? 'true' : 'false';
+    document.getElementById('gw-mode').value = d.mode || 'allowlist';
+    document.getElementById('gw-port').value = d.port || 8888;
+    document.getElementById('gw-ssrf').checked = Boolean(d.block_private_ips);
+    document.getElementById('gw-inject').checked = Boolean(d.inject_proxy_env);
+    document.getElementById('gw-allowed').value = (d.allowed_domains || []).join('\n');
+    document.getElementById('gw-blocked').value = (d.blocked_domains || []).join('\n');
+
+    const pBox = document.getElementById('gw-preset-chips');
+    if (pBox) {
+      pBox.innerHTML = Object.entries(gwPresetsCache).map(([key, p]) =>
+        '<button type="button" class="var-chip" onclick="addGatewayPreset(\'' + esc(key) + '\')">+ ' + esc(p.label) + '</button>'
+      ).join('');
+    }
+
+    const st = d.stats || {};
+    const kb = ((st.bytes_total || 0) / 1024).toFixed(1);
+    document.getElementById('gw-stats-chips').innerHTML =
+      '<span class="pill ok">Allowed: ' + esc(st.total_allowed || 0) + '</span>'
+      + '<span class="pill ' + ((st.total_blocked || 0) ? 'warn' : 'neutral') + '">Blocked: ' + esc(st.total_blocked || 0) + '</span>'
+      + '<span class="pill ' + ((st.auth_failures || 0) ? 'bad' : 'neutral') + '">Auth Denied: ' + esc(st.auth_failures || 0) + '</span>'
+      + '<span class="pill neutral mono">Relayed: ' + esc(kb) + ' KB</span>';
+
+    const tbl = document.getElementById('gw-events-table');
+    const evs = d.events || [];
+    if (!evs.length) {
+      tbl.innerHTML = d.enabled
+        ? '<p class="hint">No worker proxy traffic logged yet. Any worker job making HTTP/HTTPS requests will appear here live.</p>'
+        : '<p class="hint">Network Guard is currently OFF (default). Turn it ON above if you want Master to filter &amp; monitor worker internet traffic.</p>';
+    } else {
+      tbl.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Time</th><th>Phone</th><th>Destination</th><th>Action</th><th>Reason</th><th>Data</th><th>Quick Fix</th></tr></thead><tbody>'
+        + evs.slice(0, 40).map(ev => {
+            const tm = new Date((ev.ts || 0) * 1000).toLocaleTimeString();
+            const tone = ev.action === 'allow' ? 'ok' : (ev.action === 'auth_denied' ? 'bad' : 'warn');
+            const totalB = ((ev.bytes_in || 0) + (ev.bytes_out || 0));
+            const dataTxt = totalB > 1024 ? (totalB / 1024).toFixed(1) + ' KB' : totalB + ' B';
+            const canAllow = ev.action === 'block' && ev.host && !String(ev.reason || '').includes('SSRF') && !String(ev.reason || '').includes('port');
+            const fixBtn = canAllow
+              ? '<button class="small" onclick="allowBlockedDomain(\'' + esc(ev.host) + '\')">+ Allow</button>'
+              : '<span class="hint">-</span>';
+            return '<tr><td class="mono">' + esc(tm) + '</td><td><strong>' + esc(ev.node_id) + '</strong></td>'
+              + '<td class="mono">' + esc(ev.host) + (ev.port ? ':' + esc(ev.port) : '') + '</td>'
+              + '<td><span class="pill ' + tone + '">' + esc(ev.action.toUpperCase()) + '</span></td>'
+              + '<td>' + esc(ev.reason) + '</td><td class="mono">' + esc(dataTxt) + '</td><td>' + fixBtn + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>';
+    }
+  } catch (e) {}
+}
+
+function addGatewayPreset(key) {
+  const p = gwPresetsCache[key];
+  if (!p) return;
+  const el = document.getElementById('gw-allowed');
+  const existing = el.value.split('\n').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const set = new Set(existing);
+  for (const d of (p.domains || [])) set.add(d);
+  el.value = Array.from(set).join('\n');
+  showToast('Added ' + p.label + ' domains — click Save & Apply to activate.', 'ok');
+}
+
+async function saveGatewaySettings() {
+  const payload = {
+    enabled: document.getElementById('gw-enabled').value === 'true',
+    mode: document.getElementById('gw-mode').value,
+    port: Number(document.getElementById('gw-port').value || 8888),
+    block_private_ips: document.getElementById('gw-ssrf').checked,
+    inject_proxy_env: document.getElementById('gw-inject').checked,
+    allowed_domains: document.getElementById('gw-allowed').value.split('\n').map(s => s.trim()).filter(Boolean),
+    blocked_domains: document.getElementById('gw-blocked').value.split('\n').map(s => s.trim()).filter(Boolean),
+  };
+  const data = await authPost('/api/gateway/settings', payload);
+  if (data.error) { showToast('Network Guard error: ' + data.error, 'bad'); return; }
+  showToast(payload.enabled ? 'Network Guard ON (port ' + data.port + ', mode: ' + data.mode + ')!' : 'Network Guard turned OFF.', payload.enabled ? 'ok' : 'neutral');
+  loadGatewayStatus();
+}
+
+async function allowBlockedDomain(domain) {
+  const data = await authPost('/api/gateway/allow-domain', { domain });
+  if (data.error) { showToast('Allow failed: ' + data.error, 'bad'); return; }
+  showToast('Added "' + domain + '" to Network Guard allowlist!', 'ok');
+  loadGatewayStatus();
+}
+
+async function clearGatewayLogs() {
+  const data = await authPost('/api/gateway/logs/clear', {});
+  if (data.error) { showToast('Clear failed: ' + data.error, 'bad'); return; }
+  showToast('Cleared Network Guard audit log.', 'neutral');
+  loadGatewayStatus();
+}
+
+async function checkWanIsolation() {
+  const box = document.getElementById('gw-isolation-box');
+  box.innerHTML = 'Testing whether your router blocks direct WAN on worker phones...';
+  const data = await authPost('/api/gateway/check-isolation', {});
+  if (data.error) { box.textContent = 'Check failed: ' + data.error; showToast(data.error, 'bad'); return; }
+  const rows = data.workers || [];
+  if (!rows.length) {
+    box.innerHTML = '<p class="hint">No worker phones configured yet.</p>';
+    return;
+  }
+  box.innerHTML = rows.map(w => {
+    const cls = w.wan_blocked === true ? 'ok' : (w.wan_blocked === false ? 'warn' : 'neutral');
+    const tag = w.wan_blocked === true ? '✓ WAN BLOCKED' : (w.wan_blocked === false ? '⚠ DIRECT WAN OPEN' : 'OFFLINE / UNKNOWN');
+    return '<div class="check-item"><span class="pill ' + cls + '">' + tag + '</span> '
+      + '<strong>' + esc(w.node_id) + '</strong> (' + esc(w.host) + '): ' + esc(w.detail) + '</div>';
+  }).join('');
+}
+
 function copyEl(id) {
   const txt = document.getElementById(id).textContent;
   if (navigator.clipboard) {
@@ -2441,10 +2655,18 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             fail_delay_sec=pairing_fail_delay_sec,
             enable_beacon=enable_pairing_beacon,
         )
+        self.gateway_manager = GatewayManager(controller.config)
+        if controller.config.gateway.enabled:
+            ok, msg = self.gateway_manager.start()
+            if ok:
+                controller.gateway_port_override = self.gateway_manager.bound_port
+            else:
+                LOG.warning("Master Network Guard failed to start on boot: %s", msg)
 
     def server_close(self) -> None:
         try:
             self.pairing_manager.close_session()
+            self.gateway_manager.stop()
         finally:
             super().server_close()
 
@@ -2529,7 +2751,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "battery_webhook_url": s.battery_webhook_url,
                 },
             )
-        elif path in {"/api/status", "/api/metrics", "/api/live", "/api/jobs", "/api/doctor", "/api/workloads", "/api/services", "/api/discover"}:
+        elif path in {
+            "/api/status",
+            "/api/metrics",
+            "/api/live",
+            "/api/jobs",
+            "/api/doctor",
+            "/api/workloads",
+            "/api/services",
+            "/api/gateway/status",
+            "/api/discover",
+        }:
             if not self._require_read_auth_if_locked():
                 return
             if path == "/api/status":
@@ -2545,6 +2777,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {"nodes": self.server.controller.get_all_jobs()})
             elif path == "/api/services":
                 self._send_json(HTTPStatus.OK, self.server.controller.get_services_info())
+            elif path == "/api/gateway/status":
+                self._send_json(HTTPStatus.OK, self.server.gateway_manager.status())
             elif path == "/api/doctor":
                 report = run_doctor(config_path=self.server.config_path, check_remote=True)
                 self._send_json(HTTPStatus.OK, report)
@@ -2598,6 +2832,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/services/custom",
             "/api/services/custom/remove",
             "/api/services/probe",
+            "/api/gateway/settings",
+            "/api/gateway/logs/clear",
+            "/api/gateway/allow-domain",
+            "/api/gateway/check-isolation",
             "/api/jobs/cancel",
             "/api/nodes/add",
             "/api/nodes/update",
@@ -2818,6 +3056,62 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._send_json(HTTPStatus.OK, ctrl.probe_tcp_endpoint(host, port))
+
+        elif path == "/api/gateway/settings":
+            cur = ctrl.config.gateway
+            merged = {
+                "enabled": body.get("enabled", cur.enabled),
+                "bind_host": body.get("bind_host", cur.bind_host),
+                "port": body.get("port", cur.port),
+                "mode": body.get("mode", cur.mode),
+                "allowed_domains": body.get("allowed_domains", cur.allowed_domains),
+                "blocked_domains": body.get("blocked_domains", cur.blocked_domains),
+                "allowed_ports": body.get("allowed_ports", cur.allowed_ports),
+                "block_private_ips": body.get("block_private_ips", cur.block_private_ips),
+                "inject_proxy_env": body.get("inject_proxy_env", cur.inject_proxy_env),
+                "max_connections": body.get("max_connections", cur.max_connections),
+                "idle_timeout_sec": body.get("idle_timeout_sec", cur.idle_timeout_sec),
+            }
+            try:
+                updated_gw = GatewayConfig.from_dict(merged)
+            except (ValueError, TypeError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            ctrl.config.gateway = updated_gw
+            ok, msg = self.server.gateway_manager.sync_with_config()
+            if not ok:
+                ctrl.config.gateway.enabled = False
+                ctrl.gateway_port_override = None
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": msg})
+                return
+            ctrl.gateway_port_override = (
+                self.server.gateway_manager.bound_port if updated_gw.enabled else None
+            )
+            if self.server.config_path is not None:
+                save_config(ctrl.config, self.server.config_path)
+            self._send_json(HTTPStatus.OK, self.server.gateway_manager.status())
+
+        elif path == "/api/gateway/logs/clear":
+            self.server.gateway_manager.audit_log.clear()
+            self._send_json(HTTPStatus.OK, {"cleared": True})
+
+        elif path == "/api/gateway/allow-domain":
+            dom = str(body.get("domain", "")).strip().lower().rstrip(".")
+            if not dom or len(dom) > 253 or any(c.isspace() for c in dom):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid domain"})
+                return
+            if dom not in ctrl.config.gateway.allowed_domains:
+                ctrl.config.gateway.allowed_domains.append(dom)
+            ctrl.config.gateway.blocked_domains = [
+                d for d in ctrl.config.gateway.blocked_domains if d != dom
+            ]
+            if self.server.config_path is not None:
+                save_config(ctrl.config, self.server.config_path)
+            self._send_json(HTTPStatus.OK, {"allowed": dom, "allowed_domains": ctrl.config.gateway.allowed_domains})
+
+        elif path == "/api/gateway/check-isolation":
+            results = ctrl.check_workers_wan_isolation()
+            self._send_json(HTTPStatus.OK, {"workers": results})
 
         elif path == "/api/jobs/cancel":
             node_id = str(body.get("node_id", "")).strip()
