@@ -3542,6 +3542,240 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
             up_srv.shutdown()
             up_srv.server_close()
 
+    def test_hmac_signed_master_worker_auth_replay_tamper_expiry_and_strict_mode(self) -> None:
+        """Verify Master signs requests with HMAC-SHA256 (zero raw token on wire), workers reject replay/tamper/expired, lockdown disables Bearer, and server banners hide Python version."""
+        from phonecluster.auth import build_signed_auth_headers
+
+        m_tok = "master-hmac-secret-123456"
+        w_tok = "worker-hmac-secret-654321"
+        with tempfile.TemporaryDirectory() as tmp:
+            w_cfg_path = Path(tmp) / "worker.json"
+            m_cfg_path = Path(tmp) / "master.json"
+            st = WorkerState(
+                node_id="node1",
+                role="worker",
+                auth_token=w_tok,
+                safety=SafetyConfig(),
+                max_concurrency=2,
+                config_path=w_cfg_path,
+                health_provider=lambda: {
+                    "node_id": "node1",
+                    "role": "worker",
+                    "os_env": "termux",
+                    "tier": 1,
+                    "pool": "compute",
+                    "ready_for_jobs": True,
+                    "not_ready_reasons": [],
+                    "cpu_cores": 8,
+                    "mem_total_mb": 4096,
+                    "mem_available_mb": 2048,
+                    "tools": {},
+                    "services": {},
+                },
+            )
+            srv, _g, ev = create_worker_server("127.0.0.1", 0, st)
+            w_port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+            save_config(
+                ClusterConfig(
+                    cluster_name="hmac-test",
+                    auth_token=w_tok,
+                    nodes=[NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=w_port, auth_token=w_tok)],
+                ),
+                w_cfg_path,
+            )
+            m_cfg = ClusterConfig(
+                cluster_name="hmac-test",
+                auth_token=m_tok,
+                nodes=[
+                    NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=59994),
+                    NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=w_port, auth_token=w_tok),
+                ],
+            )
+            save_config(m_cfg, m_cfg_path)
+            ctrl = MasterController(m_cfg)
+            dash = DashboardHTTPServer(
+                ("127.0.0.1", 0), ctrl, config_path=m_cfg_path, enable_pairing_beacon=False, pairing_fail_delay_sec=0.0
+            )
+            d_port = dash.server_address[1]
+            threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+            try:
+                # 1. Master headers use PC-HMAC-SHA256 and NEVER contain the raw worker token!
+                hdrs = ctrl._headers_for(m_cfg.get_node("node1"), "POST", "/exec", b'{"command":"echo ok"}')
+                self.assertTrue(hdrs["Authorization"].startswith("PC-HMAC-SHA256 "))
+                self.assertNotIn(w_tok, hdrs["Authorization"])
+
+                # 2. Signed POST /exec succeeds once, then EXACT REPLAY is rejected with 401!
+                exec_body = json.dumps({"job_id": "hmac-j1", "command": "echo signed-ok"}).encode("utf-8")
+                signed_hdrs = build_signed_auth_headers(w_tok, "POST", "/exec", exec_body)
+                req1 = urllib.request.Request(
+                    f"http://127.0.0.1:{w_port}/exec", data=exec_body, headers=signed_hdrs, method="POST"
+                )
+                with urllib.request.urlopen(req1, timeout=5.0) as resp:
+                    self.assertEqual(resp.headers.get("Server"), "PhoneCluster")
+                    d1 = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(d1["stdout"].strip(), "signed-ok")
+
+                # Exact replay of captured signed request -> 401!
+                req_replay = urllib.request.Request(
+                    f"http://127.0.0.1:{w_port}/exec", data=exec_body, headers=signed_hdrs, method="POST"
+                )
+                with self.assertRaises(urllib.error.HTTPError) as rep_exc:
+                    urllib.request.urlopen(req_replay, timeout=5.0)
+                try:
+                    self.assertEqual(rep_exc.exception.code, 401)
+                    self.assertIn("replayed", rep_exc.exception.read().decode("utf-8").lower())
+                finally:
+                    rep_exc.exception.close()
+
+                # 3. Body tampering (different command with valid header) -> 401!
+                tampered_body = json.dumps({"job_id": "hmac-j2", "command": "echo pwned"}).encode("utf-8")
+                fresh_for_orig = build_signed_auth_headers(w_tok, "POST", "/exec", exec_body)
+                req_tamp = urllib.request.Request(
+                    f"http://127.0.0.1:{w_port}/exec", data=tampered_body, headers=fresh_for_orig, method="POST"
+                )
+                with self.assertRaises(urllib.error.HTTPError) as tamp_exc:
+                    urllib.request.urlopen(req_tamp, timeout=5.0)
+                try:
+                    self.assertEqual(tamp_exc.exception.code, 401)
+                finally:
+                    tamp_exc.exception.close()
+
+                # 4. Expired timestamp (> 60s old) -> 401!
+                expired_hdrs = build_signed_auth_headers(
+                    w_tok, "GET", "/health", b"", ts=int(time.time()) - 180
+                )
+                req_exp = urllib.request.Request(
+                    f"http://127.0.0.1:{w_port}/health", headers=expired_hdrs, method="GET"
+                )
+                with self.assertRaises(urllib.error.HTTPError) as exp_exc:
+                    urllib.request.urlopen(req_exp, timeout=5.0)
+                try:
+                    self.assertEqual(exp_exc.exception.code, 401)
+                finally:
+                    exp_exc.exception.close()
+
+                # 5. Lockdown / strict HMAC-only pushed live -> legacy raw Bearer is REJECTED while Master still works!
+                req_hard = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/network/hardening",
+                    data=json.dumps({"require_signed_requests": True}).encode("utf-8"),
+                    headers=build_auth_headers(m_tok),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_hard, timeout=5.0) as r_h:
+                    self.assertEqual(r_h.headers.get("Server"), "PhoneCluster")
+                    h_res = json.loads(r_h.read().decode("utf-8"))
+                    self.assertTrue(h_res["require_signed_requests"])
+                self.assertTrue(st.require_signed_requests)
+                self.assertTrue(load_config(w_cfg_path).network.require_signed_requests)
+
+                # Legacy Bearer rejected with 401 now!
+                req_bearer = urllib.request.Request(
+                    f"http://127.0.0.1:{w_port}/health", headers=build_auth_headers(w_tok), method="GET"
+                )
+                with self.assertRaises(urllib.error.HTTPError) as b_exc:
+                    urllib.request.urlopen(req_bearer, timeout=5.0)
+                try:
+                    self.assertEqual(b_exc.exception.code, 401)
+                finally:
+                    b_exc.exception.close()
+
+                # MasterController (signed HMAC) still runs jobs seamlessly!
+                out = ctrl.run_single(JobSpec(index=0, job_id="strict-ok", command="echo strict-hmac"), target="node1")[0]
+                self.assertTrue(out.ok, out.error)
+                self.assertEqual(out.stdout.strip(), "strict-hmac")
+            finally:
+                dash.shutdown()
+                dash.server_close()
+                ev.set()
+                srv.shutdown()
+                srv.server_close()
+
+    def test_nat64_6to4_teredo_scoped_ipv6_ssrf_and_ssh_node_injection_blocked(self) -> None:
+        """Verify NAT64/6to4/Teredo/zone-ID SSRF bypasses are blocked and SSH/node/host injection is rejected everywhere."""
+        from phonecluster.gateway import _is_disallowed_ip
+        from phonecluster.pairing import compute_proof, compute_shared_secret, derive_pairing_keys, generate_dh_keypair
+
+        # 1. NAT64 (64:ff9b::/96), 6to4, Teredo, scoped IPv6 %zone SSRF vectors
+        for bad_ip in (
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::192.168.1.1",
+            "64:ff9b::100.64.0.1",
+            "64:ff9b::169.254.169.254",
+            "2002:7f00:0001::1",
+            "2002:c0a8:0101::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "fe80::1%eth0",
+        ):
+            self.assertTrue(_is_disallowed_ip(bad_ip), f"Expected SSRF guard to block {bad_ip}")
+        self.assertFalse(_is_disallowed_ip("64:ff9b::1.1.1.1"))
+        self.assertFalse(_is_disallowed_ip("2606:4700:4700::1111"))
+
+        # 2. NodeConfig.from_dict rejects SSH option injection, colon/path node IDs, and host injection
+        for bad_node in (
+            {"id": "node1", "host": "192.168.1.20", "ssh_user": "-oProxyCommand=id"},
+            {"id": "node1", "host": "-oProxyCommand=id"},
+            {"id": "node1", "host": "192.168.1.20\n127.0.0.1 evil.com"},
+            {"id": "node:1", "host": "192.168.1.20"},
+            {"id": "../evil", "host": "192.168.1.20"},
+            {"id": "node1", "host": "192.168.1.20", "pool": "bad pool!"},
+        ):
+            with self.assertRaises(ValueError, msg=f"Should reject {bad_node}"):
+                NodeConfig.from_dict(bad_node)
+
+        # 3. Dashboard /api/nodes/add & Pairing complete_pairing reject SSH option injection with 400
+        tok = "inj-test-tok-1234567890"
+        cfg = ClusterConfig(
+            cluster_name="inj-test",
+            auth_token=tok,
+            nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765)],
+        )
+        ctrl = MasterController(cfg)
+        dash = DashboardHTTPServer(
+            ("127.0.0.1", 0), ctrl, enable_pairing_beacon=False, pairing_fail_delay_sec=0.0
+        )
+        d_port = dash.server_address[1]
+        threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        try:
+            for payload in (
+                {"host": "192.168.1.50", "ssh_user": "-oProxyCommand=id"},
+                {"id": "bad:id", "host": "192.168.1.50"},
+                {"host": "evil@127.0.0.1"},
+            ):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/nodes/add",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=build_auth_headers(tok),
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as exc_ctx:
+                    urllib.request.urlopen(req, timeout=3.0)
+                try:
+                    self.assertEqual(exc_ctx.exception.code, 400)
+                finally:
+                    exc_ctx.exception.close()
+
+            # Pairing with valid PIN but malicious ssh_user="-oProxyCommand=id" -> 400 Bad Request!
+            p_info = dash.pairing_manager.open_session(ttl_sec=120, max_devices=1)
+            _, hello = dash.pairing_manager.public_hello()
+            priv_b, pub_b = generate_dh_keypair()
+            pub_b_hex = format(pub_b, "x")
+            shared = compute_shared_secret(priv_b, int(hello["dh_pub"], 16))
+            k_auth, _ke, _km = derive_pairing_keys(p_info["pin"], shared, hello["salt"], hello["session_id"])
+            bad_meta = {"worker_port": 8765, "ssh_port": 8022, "ssh_user": "-oProxyCommand=id"}
+            meta_can = json.dumps(bad_meta, sort_keys=True, separators=(",", ":"))
+            proof = compute_proof(k_auth, "client", hello["session_id"], hello["dh_pub"], pub_b_hex, meta_can)
+            status, reply = dash.pairing_manager.complete_pairing(
+                "192.168.1.99",
+                {"session_id": hello["session_id"], "dh_pub": pub_b_hex, "client_proof": proof, "metadata": bad_meta},
+            )
+            self.assertEqual(status, 400)
+            self.assertIn("ssh_user", reply["error"])
+        finally:
+            dash.shutdown()
+            dash.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

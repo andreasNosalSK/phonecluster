@@ -66,7 +66,7 @@ while IFS=$'\t' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
   echo "=== Syncing '${NODE_ID}' (${ROLE}) -> ${TARGET}:${SSH_PORT} ==="
 
   if [[ "${SETUP_KEYS}" -eq 1 ]]; then
-    ssh-copy-id -p "${SSH_PORT}" "${TARGET}"
+    ssh-copy-id -p "${SSH_PORT}" -- "${TARGET}"
   fi
 
   # Stream project code via tar over SSH (without shipping Master's full cluster.json to workers)
@@ -75,12 +75,12 @@ while IFS=$'\t' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
     phonecluster_cli.py \
     scripts \
     examples \
-    | ssh -p "${SSH_PORT}" "${TARGET}" \
+    | ssh -p "${SSH_PORT}" -- "${TARGET}" \
       "mkdir -p ${REMOTE_DIR}/config ${REMOTE_DIR}/logs && tar -xf - -C ${REMOTE_DIR}"
 
   # Push least-privilege scoped config (workers ONLY receive their own node token, never Master's admin token)
   python3 - "${CONFIG_PATH}" "${NODE_ID}" "${ROLE}" <<'PY' \
-    | ssh -p "${SSH_PORT}" "${TARGET}" \
+    | ssh -p "${SSH_PORT}" -- "${TARGET}" \
       "umask 077 && cat > ${REMOTE_DIR}/config/cluster.json && chmod 600 ${REMOTE_DIR}/config/cluster.json"
 import json, socket, sys
 cfg_path, node_id, role = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -120,6 +120,7 @@ else:
         "safety": cfg.get("safety", {}),
         "network": {
             "enforce_worker_source_ip": bool(net_cfg.get("enforce_worker_source_ip", False)),
+            "require_signed_requests": bool(net_cfg.get("require_signed_requests", False)),
             "allowed_master_ips": allowed_masters,
         },
         "nodes": [scoped_node],
@@ -128,7 +129,7 @@ print(json.dumps(out, indent=2))
 PY
 
   # Restart worker daemon cleanly on remote node
-  ssh -p "${SSH_PORT}" "${TARGET}" bash -s -- "${NODE_ID}" "${REMOTE_DIR}" <<'REMOTE'
+  ssh -p "${SSH_PORT}" -- "${TARGET}" bash -s -- "${NODE_ID}" "${REMOTE_DIR}" <<'REMOTE'
 set -euo pipefail
 NODE_ID="$1"
 REMOTE_DIR="${2/#\~/$HOME}"

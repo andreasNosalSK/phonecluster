@@ -25,7 +25,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from .auth import AuthRateLimiter, verify_token
+from .auth import (
+    HMAC_AUTH_SCHEME,
+    AuthRateLimiter,
+    ReplayCache,
+    build_webhook_opener,
+    extract_auth_scheme,
+    parse_hmac_auth_header,
+    verify_hmac_request,
+    verify_token,
+)
 from .config import (
     NetworkHardeningConfig,
     SafetyConfig,
@@ -65,6 +74,7 @@ class WorkerState:
     workdir: Path = field(default_factory=lambda: Path.cwd())
     health_provider: Callable[[], dict[str, Any]] | None = None
     allowed_client_ips: set[str] = field(default_factory=set)
+    require_signed_requests: bool = False
     config_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -76,6 +86,7 @@ class WorkerState:
         self.cpu_sampler = CpuSampler()
         self.net_sampler = NetSampler()
         self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
+        self.replay_cache = ReplayCache(ttl_sec=150.0, max_entries=4096)
         self.lock = threading.Lock()
         self.active_jobs: dict[str, ActiveJob] = {}
         self.recent_jobs: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
@@ -174,6 +185,7 @@ class WorkerState:
             health["active_job_list"] = active_list
             health["max_concurrency"] = self.max_concurrency
             health["source_ip_allowlist_active"] = bool(self.allowed_client_ips)
+            health["require_signed_requests"] = bool(self.require_signed_requests)
             if active_count >= self.max_concurrency:
                 health["ready_for_jobs"] = False
                 reasons = list(health.get("not_ready_reasons", []))
@@ -193,6 +205,7 @@ class WorkerState:
             active_job_list=active_list,
         )
         health["source_ip_allowlist_active"] = bool(self.allowed_client_ips)
+        health["require_signed_requests"] = bool(self.require_signed_requests)
         return health
 
     def try_reserve_slot(
@@ -379,6 +392,8 @@ class WorkerState:
             if new_allowed_ips is not None and compiled_clients is not None:
                 self.allowed_client_ips = new_allowed_ips
                 self._allowed_exact_ips, self._allowed_networks = compiled_clients
+            if new_net_cfg is not None:
+                self.require_signed_requests = bool(new_net_cfg.require_signed_requests)
 
             if self.config_path is not None and self.config_path.exists():
                 try:
@@ -391,6 +406,7 @@ class WorkerState:
                                 n.max_concurrency = new_max_conc
                     if new_net_cfg is not None:
                         disk_cfg.network.enforce_worker_source_ip = new_net_cfg.enforce_worker_source_ip
+                        disk_cfg.network.require_signed_requests = new_net_cfg.require_signed_requests
                         if new_net_cfg.allowed_master_ips:
                             disk_cfg.network.allowed_master_ips = list(new_net_cfg.allowed_master_ips)
                     save_config(disk_cfg, self.config_path)
@@ -399,11 +415,12 @@ class WorkerState:
                     LOG.warning("Live config applied in memory but disk save failed: %s", exc)
 
         LOG.info(
-            "[%s] Applied live Master config push (max_conc=%d, max_temp=%.1fC, ip_lock=%s, persisted=%s)",
+            "[%s] Applied live Master config push (max_conc=%d, max_temp=%.1fC, ip_lock=%s, signed_only=%s, persisted=%s)",
             self.node_id,
             self.max_concurrency,
             self.safety.max_temp_c,
             bool(self.allowed_client_ips),
+            bool(self.require_signed_requests),
             persisted,
         )
         return HTTPStatus.OK, {
@@ -413,6 +430,7 @@ class WorkerState:
             "max_temp_c": self.safety.max_temp_c,
             "resume_temp_c": self.safety.resume_temp_c,
             "source_ip_allowlist_active": bool(self.allowed_client_ips),
+            "require_signed_requests": bool(self.require_signed_requests),
             "persisted": persisted,
         }
 
@@ -482,6 +500,9 @@ def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
                 pass
 
 
+_WEBHOOK_OPENER = build_webhook_opener()
+
+
 def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> None:
     """Send a best-effort JSON webhook (e.g., Home Assistant, ntfy, smart plug bridge)."""
     clean_url = str(url or "").strip()
@@ -500,7 +521,7 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> No
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout):
+        with _WEBHOOK_OPENER.open(req, timeout=timeout):
             pass
     except (urllib.error.URLError, OSError, ValueError) as exc:
         LOG.warning("Safety webhook POST to %s failed: %s", clean_url, exc)
@@ -644,9 +665,12 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
         env["PHONECLUSTER_NODE_ID"] = state.node_id
         env["PHONECLUSTER_JOB_ID"] = job_id
 
-        if script_content is not None:
-            script_name = Path(str(payload.get("script_name") or "job.py")).name
-            suffix = Path(script_name).suffix or ".py"
+        if state.is_cancelled(job_id):
+            returncode = -15
+        elif script_content is not None:
+            script_name = Path(str(payload.get("script_name") or "job.py").replace("\x00", "")).name
+            raw_suffix = Path(script_name).suffix
+            suffix = raw_suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,10}", raw_suffix) else ".py"
             interpreter = payload.get("interpreter")
             if not interpreter:
                 interpreter = "python3" if suffix == ".py" else "sh"
@@ -668,6 +692,8 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             os.chmod(temp_script_path, 0o700)
 
             cmd_list = shlex.split(str(interpreter)) + [str(temp_script_path)] + args
+            if not cmd_list:
+                raise ValueError("empty interpreter")
             proc = subprocess.Popen(
                 cmd_list,
                 cwd=str(cwd),
@@ -675,6 +701,10 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+            )
+            state.attach_process(job_id, proc)
+            returncode, stdout_text, stderr_text, timed_out = _run_process_bounded(
+                proc, timeout_sec=timeout_sec, max_bytes=MAX_OUTPUT_BYTES
             )
         else:
             proc = subprocess.Popen(
@@ -686,11 +716,10 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
-
-        state.attach_process(job_id, proc)
-        returncode, stdout_text, stderr_text, timed_out = _run_process_bounded(
-            proc, timeout_sec=timeout_sec, max_bytes=MAX_OUTPUT_BYTES
-        )
+            state.attach_process(job_id, proc)
+            returncode, stdout_text, stderr_text, timed_out = _run_process_bounded(
+                proc, timeout_sec=timeout_sec, max_bytes=MAX_OUTPUT_BYTES
+            )
     except (OSError, ValueError) as exc:
         stderr_text = f"Execution error: {exc}"
         returncode = 127
@@ -829,6 +858,9 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
     server: WorkerHTTPServer
     timeout = 15.0
 
+    def version_string(self) -> str:
+        return "PhoneCluster"
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         LOG.info("%s - %s", self.address_string(), format % args)
 
@@ -843,31 +875,7 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _check_auth(self) -> bool:
-        client_ip = str(self.client_address[0])
-        norm_ip = normalize_host(client_ip)
-        if not self.server.state.is_client_ip_allowed(client_ip):
-            LOG.warning("Rejected worker HTTP request from non-Master IP %s", client_ip)
-            self._send_json(
-                HTTPStatus.FORBIDDEN,
-                {"error": "forbidden: source IP not in Master allowlist"},
-            )
-            return False
-        blocked, retry_after = self.server.state.rate_limiter.is_blocked(norm_ip)
-        if blocked:
-            self._send_json(
-                HTTPStatus.TOO_MANY_REQUESTS,
-                {"error": "too many failed auth attempts", "retry_after_sec": retry_after},
-            )
-            return False
-        if not verify_token(self.headers, self.server.state.auth_token):
-            self.server.state.rate_limiter.record_failure(norm_ip)
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
-            return False
-        self.server.state.rate_limiter.record_success(norm_ip)
-        return True
-
-    def _read_json_body(self) -> dict[str, Any] | None:
+    def _read_raw_body(self) -> bytes | None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -880,9 +888,80 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
             )
             return None
         try:
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            parsed = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+            return self.rfile.read(length) if length > 0 else b""
+        except OSError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"failed reading request body: {exc}"})
+            return None
+
+    def _authenticate(self, method: str, path: str, read_body: bool) -> tuple[bool, bytes]:
+        client_ip = str(self.client_address[0])
+        norm_ip = normalize_host(client_ip)
+        if not self.server.state.is_client_ip_allowed(client_ip):
+            LOG.warning("Rejected worker HTTP request from non-Master IP %s", client_ip)
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "forbidden: source IP not in Master allowlist"},
+            )
+            return False, b""
+        blocked, retry_after = self.server.state.rate_limiter.is_blocked(norm_ip)
+        if blocked:
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "too many failed auth attempts", "retry_after_sec": retry_after},
+            )
+            return False, b""
+
+        scheme = extract_auth_scheme(self.headers)
+        if scheme == "bearer":
+            if self.server.state.require_signed_requests:
+                self.server.state.rate_limiter.record_failure(norm_ip)
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "unauthorized: HMAC-signed request required (legacy Bearer disabled)"},
+                )
+                return False, b""
+            if not verify_token(self.headers, self.server.state.auth_token):
+                self.server.state.rate_limiter.record_failure(norm_ip)
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return False, b""
+            self.server.state.rate_limiter.record_success(norm_ip)
+            if not read_body:
+                return True, b""
+            raw_body = self._read_raw_body()
+            return (raw_body is not None), (raw_body or b"")
+
+        if scheme == HMAC_AUTH_SCHEME.lower():
+            parsed_hdr = parse_hmac_auth_header(self.headers)
+            if parsed_hdr is None or abs(time.time() - parsed_hdr[0]) > 60.0:
+                self.server.state.rate_limiter.record_failure(norm_ip)
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized: invalid or expired HMAC header"})
+                return False, b""
+            raw_body = self._read_raw_body() if read_body else b""
+            if raw_body is None:
+                return False, b""
+            ok, reason = verify_hmac_request(
+                self.headers,
+                method,
+                path,
+                raw_body,
+                self.server.state.auth_token,
+                replay_cache=self.server.state.replay_cache,
+            )
+            if not ok:
+                self.server.state.rate_limiter.record_failure(norm_ip)
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": f"unauthorized: {reason}"})
+                return False, b""
+            self.server.state.rate_limiter.record_success(norm_ip)
+            return True, raw_body
+
+        self.server.state.rate_limiter.record_failure(norm_ip)
+        self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+        return False, b""
+
+    def _parse_json_body(self, raw: bytes) -> dict[str, Any] | None:
+        try:
+            parsed = json.loads((raw or b"{}").decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return None
         if not isinstance(parsed, dict):
@@ -891,9 +970,10 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         return parsed
 
     def do_GET(self) -> None:  # noqa: N802
-        if not self._check_auth():
-            return
         path = self.path.split("?", 1)[0]
+        ok, _ = self._authenticate("GET", path, read_body=False)
+        if not ok:
+            return
         if path == "/health":
             health = self.server.state.get_health()
             with self.server.state.lock:
@@ -905,10 +985,11 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if not self._check_auth():
-            return
         path = self.path.split("?", 1)[0]
-        payload = self._read_json_body()
+        ok, raw_body = self._authenticate("POST", path, read_body=True)
+        if not ok:
+            return
+        payload = self._parse_json_body(raw_body)
         if payload is None:
             return
         if path == "/exec":

@@ -614,7 +614,7 @@ def run_top_tui(
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                 sys.stdout.write("\033[?25h\033[?1049l")
                 sys.stdout.flush()
-                subprocess.call(["ssh", "-p", str(sel_node.ssh_port), target_ssh])
+                subprocess.call(["ssh", "-p", str(sel_node.ssh_port), "--", target_ssh])
                 tty.setcbreak(fd)
                 sys.stdout.write("\033[?1049h\033[?25l")
                 sys.stdout.flush()

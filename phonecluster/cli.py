@@ -112,6 +112,7 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         max_concurrency=max_conc,
         workdir=Path(args.workdir),
         allowed_client_ips=allowed_ips,
+        require_signed_requests=bool(cfg.network.require_signed_requests),
         config_path=cfg_path,
     )
     serve_worker(
@@ -889,7 +890,7 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     target = f"{node.ssh_user}@{node.host}" if node.ssh_user else node.host
-    cmd = ["ssh", "-p", str(node.ssh_port), target] + (args.remote_cmd or [])
+    cmd = ["ssh", "-p", str(node.ssh_port), "--", target] + (args.remote_cmd or [])
     return subprocess.call(cmd)
 
 
@@ -917,7 +918,7 @@ def _cmd_copy(args: argparse.Namespace) -> int:
         scp_cmd = ["scp", "-P", str(node.ssh_port)]
         if src.is_dir():
             scp_cmd.append("-r")
-        scp_cmd.extend([str(src), f"{target}:{args.dest}"])
+        scp_cmd.extend(["--", str(src), f"{target}:{args.dest}"])
         print(f"Copying {src} -> {node.id} ({target}:{args.dest})...")
         rc = subprocess.call(scp_cmd)
         if rc != 0:

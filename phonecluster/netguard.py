@@ -357,7 +357,8 @@ def apply_security_profile(config: ClusterConfig, profile: str) -> dict[str, Any
         config.gateway.enabled = False
         config.dashboard_require_auth = False
         config.network.enforce_worker_source_ip = False
-        desc = "Standard Home LAN — Network Guard OFF, direct LAN communication."
+        config.network.require_signed_requests = False
+        desc = "Standard Home LAN — Network Guard OFF, direct LAN communication (HMAC-signed Master requests)."
     elif clean == "airgap_workers":
         config.gateway.enabled = True
         config.gateway.mode = "allowlist"
@@ -373,7 +374,8 @@ def apply_security_profile(config: ClusterConfig, profile: str) -> dict[str, Any
         config.gateway.max_requests_per_min_per_node = 60
         config.dashboard_require_auth = True
         config.network.enforce_worker_source_ip = True
-        desc = "Maximum Lockdown — Strict Air-Gap (block_all), Dashboard Read-Auth Lock ON, Worker Master-IP Allowlist ON."
+        config.network.require_signed_requests = True
+        desc = "Maximum Lockdown — Strict Air-Gap (block_all), Dashboard Read-Auth Lock ON, Worker Master-IP Allowlist ON, Strict Signed-Only HMAC Auth ON."
     else:
         raise ValueError("profile must be 'standard', 'airgap_workers', or 'lockdown'")
 
@@ -616,6 +618,35 @@ def audit_cluster_network(
             "fix": "Inspect running services on those phones (`pc top`) or quarantine if unrecognized.",
         })
 
+    # 8. Replay-Proof HMAC-SHA256 Master->Worker Request Signing status (informational / strict enforcement check)
+    if config.network.require_signed_requests:
+        unsynced_hmac = [
+            s.node.id
+            for s in online_workers
+            if not bool((s.health or {}).get("require_signed_requests", False))
+        ]
+        if unsynced_hmac:
+            checks.append({
+                "name": "HMAC-Signed Master->Worker Auth",
+                "status": "warn",
+                "detail": f"Strict HMAC-only mode enabled in Master config, pending live push to: {', '.join(unsynced_hmac)}",
+                "fix": "Click 'Push Live Policy to All Workers' (or run `pc push-config`) to disable legacy Bearer fallback.",
+            })
+        else:
+            checks.append({
+                "name": "HMAC-Signed Master->Worker Auth",
+                "status": "ok",
+                "detail": "Strict mode active — Master signs all requests with replay-proof HMAC-SHA256 and workers reject raw Bearer tokens.",
+                "fix": "",
+            })
+    else:
+        checks.append({
+            "name": "HMAC-Signed Master->Worker Auth",
+            "status": "ok",
+            "detail": "Master signs all worker requests with replay-proof HMAC-SHA256 (zero raw tokens on Wi-Fi; legacy Bearer fallback still allowed unless Lockdown is enabled).",
+            "fix": "",
+        })
+
     grade = "Strong" if score >= 80 else ("Good" if score >= 55 else "Basic")
 
     return {
@@ -627,6 +658,7 @@ def audit_cluster_network(
         "hardening": {
             "dashboard_require_auth": config.dashboard_require_auth,
             "enforce_worker_source_ip": config.network.enforce_worker_source_ip,
+            "require_signed_requests": config.network.require_signed_requests,
             "allowed_master_ips": list(config.network.allowed_master_ips),
             "adguard_url": config.network.adguard_url,
             "lan_subnet": host_info["lan_subnet"],

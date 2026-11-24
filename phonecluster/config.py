@@ -6,6 +6,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import secrets
 import tempfile
 from dataclasses import asdict, dataclass, field
@@ -53,6 +54,60 @@ def format_host_for_url(host: str) -> str:
     return h
 
 
+_NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
+_SSH_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
+_POOL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+def validate_node_id(node_id: str) -> str:
+    """Validate and return a safe cluster node_id (blocks `:`, `/`, whitespace, and leading `-`)."""
+    clean = str(node_id or "").strip()
+    if not _NODE_ID_RE.fullmatch(clean):
+        raise ValueError(
+            f"Invalid node id '{clean}' (must start with alphanumeric and contain only A-Za-z0-9._-, max 40 chars)"
+        )
+    return clean
+
+
+def validate_host(host: str) -> str:
+    """Validate and return a safe IPv4, IPv6, or RFC hostname (blocks URL/SSH/hosts injection)."""
+    raw = str(host or "").strip()
+    clean = normalize_host(raw)
+    if not clean or len(clean) > 253 or clean.startswith("-"):
+        raise ValueError(f"Invalid host '{raw}'")
+    if any(c.isspace() or ord(c) < 32 or c in "@/\\?#;'\"" for c in clean):
+        raise ValueError(f"Invalid characters in host '{raw}'")
+    try:
+        ipaddress.ip_address(clean)
+        return clean
+    except ValueError:
+        pass
+    if not _HOSTNAME_RE.fullmatch(clean.rstrip(".")):
+        raise ValueError(f"Invalid host/IP '{raw}'")
+    return clean
+
+
+def validate_ssh_user(ssh_user: str) -> str:
+    """Validate optional SSH username (strictly blocks leading `-` SSH option injection)."""
+    clean = str(ssh_user or "").strip()
+    if not clean:
+        return ""
+    if not _SSH_USER_RE.fullmatch(clean):
+        raise ValueError(
+            f"Invalid ssh_user '{clean}' (must start with alphanumeric/underscore, max 64 chars)"
+        )
+    return clean
+
+
+def validate_pool_name(pool: str) -> str:
+    """Validate workload pool slug (e.g. 'auto', 'compute', 'services', 'docker')."""
+    clean = str(pool or "auto").strip().lower() or "auto"
+    if not _POOL_NAME_RE.fullmatch(clean):
+        raise ValueError(f"Invalid pool name '{pool}' (use lowercase letters, digits, '_' or '-', max 32 chars)")
+    return clean
+
+
 def format_host_port(host: str, port: int) -> str:
     """Format `host:port` safely for both IPv4/hostnames and IPv6 (`[addr]:port`)."""
     return f"{format_host_for_url(host)}:{int(port)}"
@@ -96,10 +151,8 @@ class NodeConfig:
     def from_dict(cls, data: dict[str, Any]) -> "NodeConfig":
         if "id" not in data or "host" not in data:
             raise ValueError(f"Node entry must define 'id' and 'host': {data}")
-        node_id = str(data["id"]).strip()
-        host = str(data["host"]).strip()
-        if not node_id or not host:
-            raise ValueError(f"Node 'id' and 'host' must be non-empty: {data}")
+        node_id = validate_node_id(str(data["id"]))
+        host = validate_host(str(data["host"]))
         role = str(data.get("role", "worker")).lower()
         if role not in {"master", "worker"}:
             raise ValueError(f"Invalid role '{role}' for node '{node_id}'")
@@ -118,14 +171,15 @@ class NodeConfig:
         tier = int(data.get("tier", 0))
         if tier not in {0, 1, 2, 3}:
             raise ValueError(f"tier must be 0 (auto), 1, 2, or 3 for node '{node_id}'")
-        pool = str(data.get("pool", "auto")).strip().lower() or "auto"
+        pool = validate_pool_name(str(data.get("pool", "auto")))
+        ssh_user = validate_ssh_user(str(data.get("ssh_user", "")))
         return cls(
             id=node_id,
             host=host,
             role=role,
             worker_port=worker_port,
             ssh_port=ssh_port,
-            ssh_user=str(data.get("ssh_user", "")),
+            ssh_user=ssh_user,
             max_concurrency=max_conc,
             weight=weight,
             tier=tier,
@@ -263,6 +317,7 @@ class NetworkHardeningConfig:
     """Optional Master & Worker network hardening controls (OFF by default)."""
 
     enforce_worker_source_ip: bool = False  # Workers only accept HTTP :8765 from allowed_master_ips
+    require_signed_requests: bool = False   # Workers reject legacy Bearer and accept ONLY HMAC-SHA256 signed requests
     allowed_master_ips: list[str] = field(default_factory=list)
     adguard_url: str = ""  # Optional custom AdGuard Home URL (e.g. http://192.168.1.200:3000)
     lan_subnet: str = ""   # Optional LAN CIDR for firewall generation (e.g. 192.168.1.0/24)
@@ -273,12 +328,13 @@ class NetworkHardeningConfig:
             return cls()
         raw_ips = data.get("allowed_master_ips")
         ips = (
-            [str(ip).strip() for ip in raw_ips if str(ip).strip()]
+            [str(ip).strip() for ip in raw_ips if str(ip).strip()][:32]
             if isinstance(raw_ips, list)
             else []
         )
         return cls(
             enforce_worker_source_ip=bool(data.get("enforce_worker_source_ip", False)),
+            require_signed_requests=bool(data.get("require_signed_requests", False)),
             allowed_master_ips=ips,
             adguard_url=str(data.get("adguard_url", "")).strip(),
             lan_subnet=str(data.get("lan_subnet", "")).strip(),

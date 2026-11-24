@@ -16,7 +16,12 @@ from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from typing import Any, Callable
 
-from .auth import build_auth_headers, build_direct_opener, read_json_object_bounded
+from .auth import (
+    build_auth_headers,
+    build_direct_opener,
+    build_signed_auth_headers,
+    read_json_object_bounded,
+)
 from .config import (
     ClusterConfig,
     NodeConfig,
@@ -290,10 +295,13 @@ class MasterController:
         self.metrics_history = MetricsHistory(maxlen=60)
         self.gateway_port_override: int | None = None
 
-    def _headers_for(self, node: NodeConfig) -> dict[str, str]:
+    def _headers_for(
+        self, node: NodeConfig, method: str = "GET", path: str = "/", body: bytes = b""
+    ) -> dict[str, str]:
+        """Build replay-proof HMAC-SHA256 signed headers for Master -> Worker calls (never sends raw token on wire)."""
         with self.config_lock:
             tok = self.config.token_for_node(node)
-        return build_auth_headers(tok)
+        return build_signed_auth_headers(tok, method=method, path=path, body=body)
 
     def _quarantined_ids(self) -> set[str]:
         with self.config_lock:
@@ -319,7 +327,9 @@ class MasterController:
     def check_node_health(self, node: NodeConfig) -> NodeSnapshot:
         """Query GET /health on a single worker node."""
         url = f"{node.base_url}/health"
-        req = urllib.request.Request(url, headers=self._headers_for(node), method="GET")
+        req = urllib.request.Request(
+            url, headers=self._headers_for(node, "GET", "/health"), method="GET"
+        )
         t0 = time.monotonic()
         try:
             with _DIRECT_OPENER.open(req, timeout=self.config.health_timeout_sec) as resp:
@@ -363,7 +373,9 @@ class MasterController:
         """
         url = f"{node.base_url}/exec"
         body = json.dumps(spec.to_payload()).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers=self._headers_for(node), method="POST")
+        req = urllib.request.Request(
+            url, data=body, headers=self._headers_for(node, "POST", "/exec", body), method="POST"
+        )
         http_timeout = max(spec.timeout_sec + 15.0, 30.0)
         try:
             with _DIRECT_OPENER.open(req, timeout=http_timeout) as resp:
@@ -1339,7 +1351,9 @@ class MasterController:
     def get_node_jobs(self, node: NodeConfig) -> dict[str, Any]:
         """Fetch active and recent jobs from one worker node."""
         url = f"{node.base_url}/jobs"
-        req = urllib.request.Request(url, headers=self._headers_for(node), method="GET")
+        req = urllib.request.Request(
+            url, headers=self._headers_for(node, "GET", "/jobs"), method="GET"
+        )
         try:
             with _DIRECT_OPENER.open(req, timeout=self.config.health_timeout_sec) as resp:
                 data = read_json_object_bounded(resp, _MAX_JOBS_RESP_BYTES)
@@ -1399,14 +1413,16 @@ class MasterController:
                 },
                 "network": {
                     "enforce_worker_source_ip": net.enforce_worker_source_ip,
+                    "require_signed_requests": net.require_signed_requests,
                     "allowed_master_ips": allowed_ips,
                 },
             }
         url = f"{node.base_url}/config"
+        body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=self._headers_for(node),
+            data=body,
+            headers=self._headers_for(node, "POST", "/config", body),
             method="POST",
         )
         try:
@@ -1449,7 +1465,9 @@ class MasterController:
             node = self.config.get_node(node_id)
         url = f"{node.base_url}/cancel"
         body = json.dumps({"job_id": job_id}).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers=self._headers_for(node), method="POST")
+        req = urllib.request.Request(
+            url, data=body, headers=self._headers_for(node, "POST", "/cancel", body), method="POST"
+        )
         try:
             with _DIRECT_OPENER.open(req, timeout=5.0) as resp:
                 return read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES)

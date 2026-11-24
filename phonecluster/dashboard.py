@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .auth import AuthRateLimiter, verify_token
+from .auth import AuthRateLimiter, build_webhook_opener, verify_token
 from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
@@ -32,6 +32,10 @@ from .config import (
     format_host_port,
     normalize_host,
     save_config,
+    validate_host,
+    validate_node_id,
+    validate_pool_name,
+    validate_ssh_user,
 )
 from .discovery import detect_local_ip, discover_lan_nodes
 from .doctor import run_doctor
@@ -45,6 +49,7 @@ LOG = logging.getLogger("phonecluster.dashboard")
 
 MAX_DASHBOARD_BODY = 2 * 1024 * 1024
 WORKLOAD_HELPER_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "05_workload_helpers.sh"
+_WEBHOOK_OPENER = build_webhook_opener()
 
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en" data-theme="dark" data-scale="normal">
@@ -1066,9 +1071,14 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
               <input id="hard-req-auth" type="checkbox" style="width:auto; padding:0;" /> Lock read-only Dashboard stats behind token (<code class="mono">dashboard_require_auth</code>)
             </label>
           </div>
-          <div class="row" style="margin-bottom:10px;">
+          <div class="row" style="margin-bottom:8px;">
             <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:5px;">
               <input id="hard-src-ip" type="checkbox" style="width:auto; padding:0;" /> Workers accept HTTP <code class="mono">:8765</code> ONLY from Master IP (pushed live to online workers automatically)
+            </label>
+          </div>
+          <div class="row" style="margin-bottom:10px;">
+            <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:5px;">
+              <input id="hard-signed-only" type="checkbox" style="width:auto; padding:0;" /> Strict replay-proof HMAC-SHA256 only on workers (disable legacy raw <code class="mono">Bearer</code> fallback)
             </label>
           </div>
           <div class="row">
@@ -2720,6 +2730,8 @@ async function loadNetworkAudit() {
     document.getElementById('hard-ag-url').value = hd.adguard_url || '';
     document.getElementById('hard-req-auth').checked = Boolean(hd.dashboard_require_auth);
     document.getElementById('hard-src-ip').checked = Boolean(hd.enforce_worker_source_ip);
+    const signedEl = document.getElementById('hard-signed-only');
+    if (signedEl) signedEl.checked = Boolean(hd.require_signed_requests);
 
     const cBox = document.getElementById('net-checks-list');
     const cIcons = { ok: '✓ OK', warn: '⚠ WARN', info: 'ℹ TIP' };
@@ -2755,6 +2767,7 @@ async function saveHardeningSettings() {
   const payload = {
     dashboard_require_auth: document.getElementById('hard-req-auth').checked,
     enforce_worker_source_ip: document.getElementById('hard-src-ip').checked,
+    require_signed_requests: Boolean(document.getElementById('hard-signed-only')?.checked),
     lan_subnet: document.getElementById('hard-subnet').value.trim(),
     adguard_url: document.getElementById('hard-ag-url').value.trim(),
   };
@@ -2989,6 +3002,9 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 class DashboardRequestHandler(BaseHTTPRequestHandler):
     server: DashboardHTTPServer
     timeout = 15.0
+
+    def version_string(self) -> str:
+        return "PhoneCluster"
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         LOG.info("dashboard %s - %s", self.address_string(), format % args)
@@ -3607,7 +3623,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         return
                 ctrl.config.network = NetworkHardeningConfig(
                     enforce_worker_source_ip=bool(body.get("enforce_worker_source_ip", cur_net.enforce_worker_source_ip)),
-                    allowed_master_ips=ips,
+                    require_signed_requests=bool(body.get("require_signed_requests", cur_net.require_signed_requests)),
+                    allowed_master_ips=ips[:32],
                     adguard_url=ag_url,
                     lan_subnet=lan_sub,
                 )
@@ -3617,6 +3634,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "saved": True,
                     "dashboard_require_auth": ctrl.config.dashboard_require_auth,
                     "enforce_worker_source_ip": ctrl.config.network.enforce_worker_source_ip,
+                    "require_signed_requests": ctrl.config.network.require_signed_requests,
                     "allowed_master_ips": list(ctrl.config.network.allowed_master_ips),
                 }
             resp_hardening["pushed"] = ctrl.push_config_to_all()
@@ -3758,9 +3776,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"action": action, "results": [o.to_dict() for o in outcomes]})
 
         elif path == "/api/nodes/add":
-            host = normalize_host(str(body.get("host", "")))
-            if not host:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing host"})
+            try:
+                host = validate_host(str(body.get("host", "")))
+                ssh_user = validate_ssh_user(str(body.get("ssh_user", "")))
+                pool_name = validate_pool_name(str(body.get("pool", "auto")))
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             try:
                 tier = int(body.get("tier", 0))
@@ -3779,13 +3800,16 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not (1 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "ports must be between 1 and 65535"})
                 return
-            pool_name = str(body.get("pool", "auto")).strip().lower() or "auto"
             with ctrl.config_lock:
                 existing_ids = {n.id for n in ctrl.config.nodes}
                 idx = len(ctrl.config.nodes)
                 while f"node{idx}" in existing_ids:
                     idx += 1
-                node_id = str(body.get("id") or f"node{idx}").strip()
+                try:
+                    node_id = validate_node_id(str(body.get("id") or f"node{idx}"))
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
                 if node_id in existing_ids:
                     self._send_json(HTTPStatus.CONFLICT, {"error": f"node id '{node_id}' already exists"})
                     return
@@ -3795,7 +3819,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     role="worker",
                     worker_port=worker_port,
                     ssh_port=ssh_port,
-                    ssh_user=str(body.get("ssh_user", "")),
+                    ssh_user=ssh_user,
                     max_concurrency=max_conc,
                     weight=weight,
                     tier=tier,
@@ -3832,7 +3856,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         return
                     target_node.tier = t_val
                 if "pool" in body:
-                    target_node.pool = str(body["pool"]).strip().lower() or "auto"
+                    try:
+                        target_node.pool = validate_pool_name(str(body["pool"]))
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
                 if "max_concurrency" in body:
                     try:
                         mc_val = int(body["max_concurrency"])
@@ -3932,7 +3960,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                with _WEBHOOK_OPENER.open(req, timeout=5.0) as resp:
                     self._send_json(HTTPStatus.OK, {"delivered": True, "http_status": resp.status})
             except urllib.error.HTTPError as exc:
                 code = exc.code

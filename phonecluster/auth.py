@@ -1,14 +1,22 @@
-"""Shared-secret bearer token authentication and brute-force rate limiting."""
+"""Shared-secret HMAC request signing, replay protection, bearer auth, and brute-force rate limiting."""
 
 from __future__ import annotations
 
 import collections
+import hashlib
 import hmac
 import json
+import re
+import secrets
 import threading
 import time
+import urllib.parse
 import urllib.request
 from typing import Any, Mapping
+
+HMAC_AUTH_SCHEME = "PC-HMAC-SHA256"
+_NONCE_RE = re.compile(r"^[A-Fa-f0-9]{16,64}$")
+_SIG_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -18,9 +26,24 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _HttpOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow only http:// or https:// redirects for user-configured outbound webhooks (blocks file:///ftp://)."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        scheme = urllib.parse.urlsplit(newurl).scheme.lower()
+        if scheme not in {"http", "https"}:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def build_direct_opener() -> urllib.request.OpenerDirector:
     """Return a direct LAN opener that ignores host `HTTP_PROXY` env vars and refuses HTTP redirects."""
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+
+
+def build_webhook_opener() -> urllib.request.OpenerDirector:
+    """Return an opener for user webhooks that blocks non-HTTP(S) redirect schemes."""
+    return urllib.request.build_opener(_HttpOnlyRedirectHandler())
 
 
 def read_json_object_bounded(resp: Any, max_bytes: int) -> dict[str, Any]:
@@ -34,6 +57,22 @@ def read_json_object_bounded(resp: Any, max_bytes: int) -> dict[str, Any]:
     return parsed
 
 
+def _get_auth_header(headers: Mapping[str, str]) -> str | None:
+    for key, val in headers.items():
+        if key.lower() == "authorization":
+            return val
+    return None
+
+
+def extract_auth_scheme(headers: Mapping[str, str]) -> str:
+    """Return the normalized HTTP Authorization scheme (e.g. 'pc-hmac-sha256', 'bearer', or '')."""
+    auth_val = _get_auth_header(headers)
+    if not auth_val:
+        return ""
+    parts = auth_val.strip().split(None, 1)
+    return parts[0].lower() if parts else ""
+
+
 def build_auth_headers(token: str) -> dict[str, str]:
     """Return HTTP headers containing the cluster bearer token."""
     return {
@@ -42,13 +81,121 @@ def build_auth_headers(token: str) -> dict[str, str]:
     }
 
 
+def _canonical_signing_input(
+    method: str, path: str, ts: str, nonce: str, body: bytes
+) -> bytes:
+    clean_path = path.split("?", 1)[0] or "/"
+    body_hash = hashlib.sha256(body).hexdigest()
+    return f"PC-V1|{method.upper()}|{clean_path}|{ts}|{nonce}|{body_hash}".encode("utf-8")
+
+
+def build_signed_auth_headers(
+    token: str,
+    method: str,
+    path: str,
+    body: bytes = b"",
+    *,
+    ts: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    """Return replay-resistant HMAC-SHA256 Authorization headers without putting the raw token on the wire."""
+    ts_str = str(int(time.time()) if ts is None else int(ts))
+    nonce_str = nonce if nonce is not None else secrets.token_hex(12)
+    msg = _canonical_signing_input(method, path, ts_str, nonce_str, body)
+    sig = hmac.new(token.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return {
+        "Authorization": f"{HMAC_AUTH_SCHEME} ts={ts_str},nonce={nonce_str},sig={sig}",
+        "Content-Type": "application/json",
+    }
+
+
+def parse_hmac_auth_header(headers: Mapping[str, str]) -> tuple[int, str, str] | None:
+    """Parse `Authorization: PC-HMAC-SHA256 ts=<int>,nonce=<hex>,sig=<hex64>` safely."""
+    auth_val = _get_auth_header(headers)
+    if not auth_val:
+        return None
+    parts = auth_val.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != HMAC_AUTH_SCHEME.lower():
+        return None
+    kv: dict[str, str] = {}
+    for piece in parts[1].split(","):
+        if "=" not in piece:
+            return None
+        k, v = piece.split("=", 1)
+        kv[k.strip().lower()] = v.strip()
+    if set(kv.keys()) != {"ts", "nonce", "sig"}:
+        return None
+    try:
+        ts = int(kv["ts"])
+    except ValueError:
+        return None
+    nonce = kv["nonce"]
+    sig = kv["sig"].lower()
+    if not _NONCE_RE.fullmatch(nonce) or not _SIG_RE.fullmatch(sig):
+        return None
+    return ts, nonce, sig
+
+
+class ReplayCache:
+    """Thread-safe bounded single-use nonce cache preventing captured-request replay attacks."""
+
+    def __init__(self, ttl_sec: float = 150.0, max_entries: int = 4096) -> None:
+        self.ttl_sec = max(10.0, float(ttl_sec))
+        self.max_entries = max(64, int(max_entries))
+        self._lock = threading.Lock()
+        self._seen: dict[str, float] = {}
+
+    def check_and_record(self, nonce: str) -> bool:
+        """Atomically record `nonce` and return True if fresh, False if already replayed."""
+        now = time.monotonic()
+        with self._lock:
+            if len(self._seen) >= self.max_entries:
+                expired = [k for k, exp in self._seen.items() if exp <= now]
+                for k in expired:
+                    self._seen.pop(k, None)
+                if len(self._seen) >= self.max_entries:
+                    # Drop oldest quarter if flooded within window
+                    oldest = sorted(self._seen.items(), key=lambda kv: kv[1])[: self.max_entries // 4]
+                    for k, _ in oldest:
+                        self._seen.pop(k, None)
+            exp = self._seen.get(nonce)
+            if exp is not None and exp > now:
+                return False
+            self._seen[nonce] = now + self.ttl_sec
+            return True
+
+
+def verify_hmac_request(
+    headers: Mapping[str, str],
+    method: str,
+    path: str,
+    body: bytes,
+    expected_token: str,
+    replay_cache: ReplayCache | None = None,
+    max_skew_sec: float = 60.0,
+) -> tuple[bool, str]:
+    """Verify an HMAC-SHA256 signed request (timestamp freshness, body integrity, and single-use nonce)."""
+    if not expected_token:
+        return False, "missing expected token"
+    parsed = parse_hmac_auth_header(headers)
+    if parsed is None:
+        return False, "malformed HMAC authorization header"
+    ts, nonce, provided_sig = parsed
+    now = time.time()
+    if abs(now - ts) > max_skew_sec:
+        return False, "expired or future-dated request timestamp"
+    msg = _canonical_signing_input(method, path, str(ts), nonce, body)
+    expected_sig = hmac.new(expected_token.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(provided_sig, expected_sig):
+        return False, "invalid HMAC request signature"
+    if replay_cache is not None and not replay_cache.check_and_record(nonce):
+        return False, "replayed request nonce rejected"
+    return True, "ok"
+
+
 def extract_bearer_token(headers: Mapping[str, str]) -> str | None:
     """Extract a Bearer token from HTTP request headers (case-insensitive)."""
-    auth_val = None
-    for key, val in headers.items():
-        if key.lower() == "authorization":
-            auth_val = val
-            break
+    auth_val = _get_auth_header(headers)
     if not auth_val:
         return None
     parts = auth_val.strip().split(None, 1)

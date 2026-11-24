@@ -51,6 +51,8 @@ from .config import (
     is_loopback_or_unspecified_host,
     normalize_host,
     save_config,
+    validate_pool_name,
+    validate_ssh_user,
 )
 from .discovery import DISCOVERY_PORT, _candidate_broadcast_addresses, detect_local_ip
 from .telemetry import (
@@ -612,10 +614,13 @@ class PairingManager:
             return HTTPStatus.BAD_REQUEST, {"error": f"Invalid numeric pairing metadata: {exc}"}
         if not (0 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
             return HTTPStatus.BAD_REQUEST, {"error": "worker_port must be 0..65535 and ssh_port must be 1..65535."}
-        ssh_user = str(metadata.get("ssh_user", ""))[:64]
-        os_env = str(metadata.get("os_env", "unknown"))[:32]
+        try:
+            ssh_user = validate_ssh_user(str(metadata.get("ssh_user", ""))[:64])
+            node_pool = validate_pool_name(str(metadata.get("pool", "auto")))
+        except ValueError as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+        os_env = re.sub(r"[^A-Za-z0-9._-]", "", str(metadata.get("os_env", "unknown")))[:32] or "unknown"
         node_tier = raw_tier if raw_tier in {0, 1, 2, 3} else 0
-        node_pool = str(metadata.get("pool", "auto")).strip().lower() or "auto"
         node_token = generate_auth_token()
 
         with self._lock, self.config_lock:
@@ -699,6 +704,7 @@ class PairingManager:
                 },
                 "network": {
                     "enforce_worker_source_ip": self.config.network.enforce_worker_source_ip,
+                    "require_signed_requests": self.config.network.require_signed_requests,
                     "allowed_master_ips": sorted(allowed_master_set),
                 },
                 "master_ssh_pubkey": _read_master_ssh_pubkey(),
@@ -767,6 +773,9 @@ class StandalonePairingServer(ThreadingHTTPServer):
 class StandalonePairingHandler(BaseHTTPRequestHandler):
     server: StandalonePairingServer
     timeout = 15.0
+
+    def version_string(self) -> str:
+        return "PhoneCluster"
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         LOG.info("pair %s - %s", self.address_string(), format % args)

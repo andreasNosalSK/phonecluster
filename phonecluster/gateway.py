@@ -223,15 +223,42 @@ def evaluate_policy(host: str, port: int, gw: GatewayConfig) -> tuple[bool, str]
     return True, "allowed (monitor mode)"
 
 
+_NAT64_WELL_KNOWN_NET = ipaddress.IPv6Network("64:ff9b::/96")
+
+
+def _is_disallowed_addr(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True if an IPv4/IPv6 address (or embedded IPv4 via NAT64/6to4/Teredo/mapped) is non-public."""
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return _is_disallowed_addr(addr.ipv4_mapped)
+        if addr.sixtofour is not None:
+            return True  # Block deprecated 6to4 tunneling (RFC 7526) to prevent SSRF bypass
+        if addr.teredo is not None:
+            return True  # Block Teredo tunneling to prevent SSRF bypass
+        if addr in _NAT64_WELL_KNOWN_NET:
+            embedded_v4 = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+            return _is_disallowed_addr(embedded_v4)
+    return bool(
+        (not addr.is_global)
+        or addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_unspecified
+        or addr.is_reserved
+    )
+
+
 def _is_disallowed_ip(ip_str: str) -> bool:
-    """Block all non-public/internal IPs including LAN, loopback, link-local, Tailscale/CGNAT (100.64.0.0/10)."""
+    """Block all non-public/internal IPs including LAN, loopback, link-local, Tailscale/CGNAT, NAT64, 6to4, Teredo, and scoped IPv6."""
+    raw = str(ip_str or "").strip()
+    if not raw or "%" in raw:
+        return True
     try:
-        addr = ipaddress.ip_address(ip_str)
+        addr = ipaddress.ip_address(raw)
     except ValueError:
         return True
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
-    return bool((not addr.is_global) or addr.is_multicast or addr.is_unspecified)
+    return _is_disallowed_addr(addr)
 
 
 def resolve_and_validate_target(
