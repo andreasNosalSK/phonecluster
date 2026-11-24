@@ -12,11 +12,47 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from http import HTTPStatus
 from typing import Any, Mapping
 
 HMAC_AUTH_SCHEME = "PC-HMAC-SHA256"
 _NONCE_RE = re.compile(r"^[A-Fa-f0-9]{16,64}$")
 _SIG_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
+_ASCII_UINT_RE = re.compile(r"^[0-9]{1,10}$")
+_ASCII_TS_RE = re.compile(r"^[0-9]{1,12}$")
+
+
+def parse_strict_content_length(
+    headers: Mapping[str, str], max_bytes: int
+) -> tuple[int | None, int, str]:
+    """Strictly parse RFC 9110 Content-Length and reject Transfer-Encoding / smuggling forms.
+
+    Returns `(length, http_status, error_msg)`. On success `length` is an `int >= 0`
+    and `error_msg` is `""`. Rejects Python `int()` edge forms like `1_0`, `+5`, and
+    Unicode digits, as well as duplicate/conflicting `Content-Length` headers and
+    unsupported `Transfer-Encoding` on JSON API endpoints.
+    """
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        te_vals = [str(v).strip() for v in (get_all("Transfer-Encoding") or []) if str(v).strip()]
+        cl_vals = [str(v).strip() for v in (get_all("Content-Length") or [])]
+    else:
+        te_vals = [str(v).strip() for k, v in headers.items() if k.lower() == "transfer-encoding" and str(v).strip()]
+        cl_vals = [str(v).strip() for k, v in headers.items() if k.lower() == "content-length"]
+
+    if te_vals:
+        return None, int(HTTPStatus.NOT_IMPLEMENTED), "Transfer-Encoding is not supported on this endpoint"
+    if not cl_vals:
+        return 0, int(HTTPStatus.OK), ""
+    if len(cl_vals) > 1:
+        return None, int(HTTPStatus.BAD_REQUEST), "duplicate Content-Length headers rejected"
+    raw = cl_vals[0]
+    if not _ASCII_UINT_RE.fullmatch(raw):
+        return None, int(HTTPStatus.BAD_REQUEST), "invalid Content-Length header"
+    length = int(raw)
+    if length > max_bytes:
+        return None, int(HTTPStatus.REQUEST_ENTITY_TOO_LARGE), f"payload exceeds {max_bytes} bytes"
+    return length, int(HTTPStatus.OK), ""
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -125,10 +161,9 @@ def parse_hmac_auth_header(headers: Mapping[str, str]) -> tuple[int, str, str] |
         kv[k.strip().lower()] = v.strip()
     if set(kv.keys()) != {"ts", "nonce", "sig"}:
         return None
-    try:
-        ts = int(kv["ts"])
-    except ValueError:
+    if not _ASCII_TS_RE.fullmatch(kv["ts"]):
         return None
+    ts = int(kv["ts"])
     nonce = kv["nonce"]
     sig = kv["sig"].lower()
     if not _NONCE_RE.fullmatch(nonce) or not _SIG_RE.fullmatch(sig):

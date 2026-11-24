@@ -46,8 +46,19 @@ LOG = logging.getLogger("phonecluster.gateway")
 
 MAX_HEADER_BYTES = 16 * 1024
 MAX_HTTP_BODY_BYTES = 32 * 1024 * 1024
+MAX_TRAILER_BYTES = 16 * 1024
+MAX_TRAILER_LINES = 64
 RELAY_CHUNK_BYTES = 16 * 1024
 _HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_ASCII_UINT_RE = re.compile(r"^[0-9]{1,10}$")
+_ASCII_PORT_RE = re.compile(r"^[0-9]{1,5}$")
+_ASCII_HEX_RE = re.compile(rb"^[0-9A-Fa-f]{1,8}$")
+_CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_log_text(value: str, max_len: int = 200) -> str:
+    """Strip ASCII control chars (including ESC/ANSI sequences, CR, LF, NUL) before audit logging."""
+    return _CTRL_CHAR_RE.sub("?", str(value or ""))[:max_len]
 
 
 def _extract_host_header_hostname(host_val: str) -> str:
@@ -313,15 +324,15 @@ class GatewayAuditLog:
     ) -> None:
         entry = {
             "ts": int(time.time()),
-            "node_id": node_id,
-            "client_ip": client_ip,
-            "method": method,
-            "host": host,
-            "port": port,
-            "action": action,
-            "reason": reason,
-            "bytes_in": bytes_in,
-            "bytes_out": bytes_out,
+            "node_id": _sanitize_log_text(node_id, 64),
+            "client_ip": _sanitize_log_text(client_ip, 64),
+            "method": _sanitize_log_text(method, 24),
+            "host": _sanitize_log_text(host, 160),
+            "port": int(port),
+            "action": _sanitize_log_text(action, 32),
+            "reason": _sanitize_log_text(reason, 240),
+            "bytes_in": int(bytes_in),
+            "bytes_out": int(bytes_out),
         }
         with self._lock:
             self._events.appendleft(entry)
@@ -507,11 +518,10 @@ def _relay_chunked_request_body(
         size_line = bytes(buf[: line_end + 2])
         del buf[: line_end + 2]
 
-        size_token = size_line[:-2].split(b";", 1)[0].strip()
-        try:
-            chunk_size = int(size_token, 16)
-        except ValueError as exc:
-            raise ValueError("malformed chunk size") from exc
+        size_token = size_line[:-2].split(b";", 1)[0].rstrip(b" \t")
+        if not _ASCII_HEX_RE.fullmatch(size_token):
+            raise ValueError("malformed chunk size")
+        chunk_size = int(size_token, 16)
         if chunk_size < 0 or total_body + chunk_size > MAX_HTTP_BODY_BYTES:
             raise ValueError("payload exceeds limit")
 
@@ -519,13 +529,19 @@ def _relay_chunked_request_body(
         bytes_forwarded += len(size_line)
 
         if chunk_size == 0:
-            # Forward optional trailers until terminating CRLF
+            # Forward optional trailers until terminating CRLF (with strict line & byte caps)
+            trailer_lines = 0
+            trailer_bytes = 0
             while not stop_event.is_set():
                 if not _fill_until(b"\r\n"):
                     raise OSError("truncated chunked trailers")
                 tr_end = buf.find(b"\r\n")
                 tr_line = bytes(buf[: tr_end + 2])
                 del buf[: tr_end + 2]
+                trailer_lines += 1
+                trailer_bytes += len(tr_line)
+                if trailer_lines > MAX_TRAILER_LINES or trailer_bytes > MAX_TRAILER_BYTES:
+                    raise ValueError("chunked trailers exceed limit")
                 upstream.sendall(tr_line)
                 bytes_forwarded += len(tr_line)
                 if tr_line == b"\r\n":
@@ -533,7 +549,7 @@ def _relay_chunked_request_body(
                     break
             break
 
-        need = chunk_size + 2  # payload + trailing CRLF
+        need = chunk_size
         total_body += chunk_size
         while need > 0 and not stop_event.is_set():
             if not buf:
@@ -547,6 +563,18 @@ def _relay_chunked_request_body(
             upstream.sendall(piece)
             bytes_forwarded += take
             need -= take
+
+        # Strictly verify the 2-byte CRLF terminator after chunk payload (blocks chunk framing desync)
+        while len(buf) < 2 and not stop_event.is_set():
+            more = conn.recv(2 - len(buf))
+            if not more:
+                raise OSError("unexpected EOF before chunk CRLF")
+            buf.extend(more)
+        if bytes(buf[:2]) != b"\r\n":
+            raise ValueError("malformed chunk terminator (expected CRLF)")
+        del buf[:2]
+        upstream.sendall(b"\r\n")
+        bytes_forwarded += 2
 
     if not saw_final_chunk:
         raise OSError("incomplete chunked request body")
@@ -799,29 +827,39 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
 
         # 2. Extract destination host & port
         if method_u == "CONNECT":
+            if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in target):
+                _send_proxy_error(conn, 400, "Bad Request", "invalid CONNECT target")
+                return
             if target.startswith("["):
-                if "]:" in target:
-                    h_part, p_str = target.rsplit("]:", 1)
-                    dest_host = h_part.lstrip("[")
-                    try:
-                        dest_port = int(p_str)
-                    except ValueError:
-                        _send_proxy_error(conn, 400, "Bad Request", "invalid CONNECT port")
-                        return
-                else:
-                    dest_host = target.strip("[]")
+                close_idx = target.find("]")
+                if close_idx == -1:
+                    _send_proxy_error(conn, 400, "Bad Request", "malformed bracketed IPv6 CONNECT target")
+                    return
+                dest_host = target[1:close_idx]
+                rest = target[close_idx + 1 :]
+                if not rest:
                     dest_port = 443
-            elif ":" in target:
-                h_part, p_str = target.rsplit(":", 1)
-                dest_host = h_part.strip("[]")
-                try:
-                    dest_port = int(p_str)
-                except ValueError:
+                elif rest.startswith(":") and _ASCII_PORT_RE.fullmatch(rest[1:]):
+                    dest_port = int(rest[1:])
+                else:
                     _send_proxy_error(conn, 400, "Bad Request", "invalid CONNECT port")
                     return
+            elif target.count(":") > 1:
+                _send_proxy_error(conn, 400, "Bad Request", "IPv6 CONNECT target must be bracketed")
+                return
+            elif ":" in target:
+                h_part, p_str = target.rsplit(":", 1)
+                if not _ASCII_PORT_RE.fullmatch(p_str):
+                    _send_proxy_error(conn, 400, "Bad Request", "invalid CONNECT port")
+                    return
+                dest_host = h_part
+                dest_port = int(p_str)
             else:
-                dest_host = target.strip("[]")
+                dest_host = target
                 dest_port = 443
+            if not dest_host or "[" in dest_host or "]" in dest_host or not (1 <= dest_port <= 65535):
+                _send_proxy_error(conn, 400, "Bad Request", "invalid CONNECT host or port")
+                return
             forward_path = ""
         else:
             parsed = urllib.parse.urlsplit(target)
@@ -834,6 +872,9 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             except ValueError:
                 _send_proxy_error(conn, 400, "Bad Request", "invalid URL port")
                 return
+            if not (1 <= dest_port <= 65535):
+                _send_proxy_error(conn, 400, "Bad Request", "invalid URL port")
+                return
             forward_path = parsed.path or "/"
             if parsed.query:
                 forward_path = f"{forward_path}?{parsed.query}"
@@ -841,45 +882,51 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 _send_proxy_error(conn, 400, "Bad Request", "invalid request path")
                 return
 
-        # 2b. Validate HTTP request framing & anti-domain-fronting Host check BEFORE touching DNS/upstream
+        # 2b. Validate Host consistency & HTTP request framing BEFORE touching DNS/upstream
+        host_values = [v for k, v in header_pairs if k.lower() == "host"]
+        if len(host_values) > 1:
+            _send_proxy_error(conn, 400, "Bad Request", "duplicate Host headers rejected")
+            return
+        if host_values:
+            hdr_host = _extract_host_header_hostname(host_values[0])
+            norm_dest = dest_host.strip().strip("[]").lower().rstrip(".")
+            if not hdr_host or hdr_host != norm_dest:
+                self.server.audit_log.record(
+                    node_id=node_id,
+                    client_ip=client_ip,
+                    method=method_u,
+                    host=dest_host,
+                    port=dest_port,
+                    action="block",
+                    reason=f"Host header mismatch ({hdr_host or '?'} != {norm_dest})",
+                )
+                _send_proxy_error(conn, 400, "Bad Request", "Host header does not match target URL")
+                return
+
         is_chunked = False
         content_len = 0
         if method_u != "CONNECT":
-            if "host" in headers_lower:
-                hdr_host = _extract_host_header_hostname(headers_lower["host"])
-                norm_dest = dest_host.strip().strip("[]").lower().rstrip(".")
-                if not hdr_host or hdr_host != norm_dest:
-                    self.server.audit_log.record(
-                        node_id=node_id,
-                        client_ip=client_ip,
-                        method=method_u,
-                        host=dest_host,
-                        port=dest_port,
-                        action="block",
-                        reason=f"Host header mismatch ({hdr_host or '?'} != {norm_dest})",
-                    )
-                    _send_proxy_error(conn, 400, "Bad Request", "Host header does not match target URL")
-                    return
             cl_values = [v.strip() for k, v in header_pairs if k.lower() == "content-length"]
             te_values = [v.strip() for k, v in header_pairs if k.lower() == "transfer-encoding"]
             if te_values and cl_values:
                 _send_proxy_error(conn, 400, "Bad Request", "conflicting Transfer-Encoding and Content-Length")
                 return
-            is_chunked = any("chunked" in v.lower() for v in te_values)
-            if te_values and not is_chunked:
-                _send_proxy_error(conn, 501, "Not Implemented", "unsupported Transfer-Encoding")
+            if len(te_values) > 1:
+                _send_proxy_error(conn, 400, "Bad Request", "multiple Transfer-Encoding headers not supported")
                 return
-            if cl_values:
-                if len(set(cl_values)) > 1:
-                    _send_proxy_error(conn, 400, "Bad Request", "conflicting duplicate Content-Length headers")
+            if te_values:
+                if te_values[0].lower() != "chunked":
+                    _send_proxy_error(conn, 501, "Not Implemented", "only Transfer-Encoding: chunked is supported")
                     return
-                try:
-                    content_len = int(cl_values[0])
-                    if content_len < 0:
-                        raise ValueError("negative")
-                except ValueError:
+                is_chunked = True
+            if cl_values:
+                if len(cl_values) > 1:
+                    _send_proxy_error(conn, 400, "Bad Request", "duplicate Content-Length headers rejected")
+                    return
+                if not _ASCII_UINT_RE.fullmatch(cl_values[0]):
                     _send_proxy_error(conn, 400, "Bad Request", "invalid Content-Length header")
                     return
+                content_len = int(cl_values[0])
             if content_len > MAX_HTTP_BODY_BYTES:
                 _send_proxy_error(conn, 413, "Payload Too Large", "request body exceeds limit")
                 return

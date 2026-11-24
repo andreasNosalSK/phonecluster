@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .auth import AuthRateLimiter, build_webhook_opener, verify_token
+from .auth import AuthRateLimiter, build_webhook_opener, parse_strict_content_length, verify_token
 from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
@@ -32,6 +32,7 @@ from .config import (
     format_host_port,
     normalize_host,
     save_config,
+    validate_domain_pattern,
     validate_host,
     validate_node_id,
     validate_pool_name,
@@ -3024,34 +3025,66 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
         if self.path.startswith("/api/"):
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.end_headers()
         self.wfile.write(raw)
 
     def _check_same_origin(self) -> bool:
         """Block cross-site browser POSTs (CSRF defense) while keeping non-browser API clients working."""
-        origin = self.headers.get("Origin", "").strip()
-        if not origin:
-            return True
-        host_hdr = self.headers.get("Host", "").strip().lower()
-        parsed = urllib.parse.urlparse(origin)
-        if not host_hdr or parsed.netloc.lower() != host_hdr:
+        sec_fetch_site = self.headers.get("Sec-Fetch-Site", "").strip().lower()
+        if sec_fetch_site == "cross-site":
             self._send_json(
                 HTTPStatus.FORBIDDEN,
-                {"error": "forbidden: cross-origin browser POST rejected"},
+                {"error": "forbidden: cross-site browser POST rejected"},
             )
             return False
+        host_hdr = self.headers.get("Host", "").strip().lower()
+        origin = self.headers.get("Origin", "").strip()
+        if origin:
+            parsed = urllib.parse.urlparse(origin)
+            if (
+                parsed.scheme.lower() not in {"http", "https"}
+                or not host_hdr
+                or parsed.netloc.lower() != host_hdr
+            ):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "forbidden: cross-origin browser POST rejected"},
+                )
+                return False
+            return True
+        referer = self.headers.get("Referer", "").strip()
+        if referer:
+            parsed_ref = urllib.parse.urlparse(referer)
+            if (
+                parsed_ref.scheme.lower() not in {"http", "https"}
+                or not host_hdr
+                or parsed_ref.netloc.lower() != host_hdr
+            ):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "forbidden: cross-origin Referer on browser POST rejected"},
+                )
+                return False
         return True
 
     def _send_json(self, status: int, data: dict[str, Any]) -> None:
         self._send(status, "application/json", json.dumps(data).encode("utf-8"))
 
     def _read_json(self) -> dict[str, Any] | None:
+        length, err_status, err_msg = parse_strict_content_length(self.headers, MAX_DASHBOARD_BODY)
+        if length is None:
+            self._send_json(err_status, {"error": err_msg})
+            return None
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 0 or length > MAX_DASHBOARD_BODY:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid Content-Length"})
-                return None
-            raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+            if length > 0:
+                raw_bytes = self.rfile.read(length)
+                if len(raw_bytes) != length:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "truncated request body"})
+                    return None
+                raw = raw_bytes.decode("utf-8")
+            else:
+                raw = "{}"
             body = json.loads(raw)
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be an object")
@@ -3516,9 +3549,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"cleared": True})
 
         elif path == "/api/gateway/allow-domain":
-            dom = str(body.get("domain", "")).strip().lower().rstrip(".")
-            if not dom or len(dom) > 253 or any(c.isspace() for c in dom):
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid domain"})
+            try:
+                dom = validate_domain_pattern(str(body.get("domain", "")))
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             with ctrl.config_lock:
                 if dom not in ctrl.config.gateway.allowed_domains:

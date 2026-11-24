@@ -6,6 +6,7 @@ import collections
 import concurrent.futures
 import json
 import logging
+import math
 import socket
 import threading
 import time
@@ -184,6 +185,24 @@ class JobOutcome:
         }
 
 
+def _safe_int(val: Any, default: int) -> int:
+    try:
+        if isinstance(val, bool):
+            return int(val)
+        f = float(val)
+        return int(f) if math.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(val: Any, default: float) -> float:
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
+
+
 def score_node(
     snapshot: NodeSnapshot, in_flight_local: int | None = None, max_temp_c: float = 40.0
 ) -> float:
@@ -198,14 +217,19 @@ def score_node(
         return -1e6
 
     health = snapshot.health
-    cores = max(1, int(health.get("cpu_cores", 1)))
-    load_1m = float(health.get("load_1m", 0.0))
+    cores = max(1, _safe_int(health.get("cpu_cores", 1), 1))
+    load_1m = max(0.0, _safe_float(health.get("load_1m", 0.0), 0.0))
     load_ratio = min(load_1m / cores, 2.0)
 
-    temp_c = health.get("temp_c")
-    temp_bonus = max(0.0, (max_temp_c - float(temp_c)) / 10.0) if temp_c is not None else 0.5
+    temp_raw = health.get("temp_c")
+    temp_val = _safe_float(temp_raw, -999.0) if temp_raw is not None else None
+    temp_bonus = (
+        max(0.0, (max_temp_c - temp_val) / 10.0)
+        if temp_val is not None and temp_val > -500.0
+        else 0.5
+    )
 
-    avail_ram_gb = float(health.get("mem_available_mb", 512)) / 1024.0
+    avail_ram_gb = max(0.0, _safe_float(health.get("mem_available_mb", 512), 512.0)) / 1024.0
     slot_ratio = free_slots / max(1, snapshot.max_concurrency)
 
     return (
@@ -612,16 +636,73 @@ class MasterController:
         if not jobs:
             return []
 
-        pending: collections.deque[tuple[JobSpec, int, set[str]]] = collections.deque(
-            (job, 0, set()) for job in jobs
-        )
-        outcomes_by_index: dict[int, JobOutcome] = {}
-        last_reason_by_index: dict[int, str] = {}
+        total_jobs = len(jobs)
+        outcomes_by_slot: dict[int, JobOutcome] = {}
+        last_reason_by_slot: dict[int, str] = {}
+        completed_count = 0
+
+        def _record_immediate_fail(slot_idx: int, spec: JobSpec, node_id: str, err: str, why: str) -> None:
+            nonlocal completed_count
+            outcome = JobOutcome(
+                index=spec.index,
+                job_id=spec.job_id,
+                label=spec.label,
+                node_id=node_id,
+                returncode=-1,
+                duration_sec=0.0,
+                attempts=0,
+                error=err,
+                routing_reason=why,
+            )
+            outcomes_by_slot[slot_idx] = outcome
+            completed_count += 1
+            if on_result is not None:
+                on_result(outcome, completed_count, total_jobs)
+
+        # Fail fast on syntactically invalid tier, unknown pinned node ID, or quarantined pinned node
+        if target.startswith("tier:"):
+            raw_t = target.split(":", 1)[1].strip()
+            if raw_t not in {"1", "2", "3"}:
+                msg = f"Invalid tier target '{target}' (expected tier:1, tier:2, or tier:3)"
+                for slot_idx, job in enumerate(jobs):
+                    _record_immediate_fail(slot_idx, job, "none", msg, msg)
+                return [outcomes_by_slot[i] for i in range(total_jobs)]
+
+        pending: collections.deque[tuple[int, JobSpec, int, set[str]]] = collections.deque()
+        if target not in {"auto", "best", "all"} and not target.startswith(("tier:", "pool:")):
+            with self.config_lock:
+                known_ids = {n.id for n in self.config.nodes}
+            if target not in known_ids:
+                msg = f"Unknown node id '{target}'. Check cluster.json or `pc status`."
+                for slot_idx, job in enumerate(jobs):
+                    _record_immediate_fail(slot_idx, job, target, msg, f"Node '{target}' not found in cluster config")
+                return [outcomes_by_slot[i] for i in range(total_jobs)]
+            q_now = self._quarantined_ids()
+            for slot_idx, job in enumerate(jobs):
+                if target in q_now and not job.force:
+                    _record_immediate_fail(
+                        slot_idx,
+                        job,
+                        target,
+                        (
+                            f"Node '{target}' is quarantined by Master. "
+                            "Unblock it in Network & Pi Guard (Tab 5) or pass --force for inspection."
+                        ),
+                        f"Blocked: node '{target}' is quarantined",
+                    )
+                else:
+                    pending.append((slot_idx, job, 0, set()))
+            if not pending:
+                return [outcomes_by_slot[i] for i in range(total_jobs)]
+        else:
+            for slot_idx, job in enumerate(jobs):
+                pending.append((slot_idx, job, 0, set()))
+
         in_flight_per_node: dict[str, int] = collections.defaultdict(int)
         external_active: dict[str, int] = collections.defaultdict(int)
         running_futures: dict[
             concurrent.futures.Future[tuple[str, dict[str, Any]]],
-            tuple[JobSpec, NodeSnapshot, int, set[str], str],
+            tuple[int, JobSpec, NodeSnapshot, int, set[str], str],
         ] = {}
 
         snapshots: list[NodeSnapshot] = []
@@ -639,8 +720,6 @@ class MasterController:
 
         _refresh_health()
         no_ready_since: float | None = None
-        completed_count = 0
-        total_jobs = len(jobs)
 
         max_workers = max(
             1,
@@ -657,9 +736,9 @@ class MasterController:
                 dispatched_any = False
                 quarantined = self._quarantined_ids()
                 # Dispatch as many pending jobs as there are free compatible healthy slots
-                deferred: list[tuple[JobSpec, int, set[str]]] = []
+                deferred: list[tuple[int, JobSpec, int, set[str]]] = []
                 while pending:
-                    spec, attempt, failed_nodes = pending.popleft()
+                    slot_idx, spec, attempt, failed_nodes = pending.popleft()
                     route = (
                         classify_workload(spec.command, spec.script_content, hint=workload_hint)
                         if target == "auto"
@@ -678,10 +757,10 @@ class MasterController:
                         busy_node_ids=busy_ids,
                         excluded_node_ids=quarantined,
                     )
-                    last_reason_by_index[spec.index] = reason
+                    last_reason_by_slot[slot_idx] = reason
                     if not eligible:
                         # Continue inspecting remaining jobs so busy Tier X does not block Tier Y
-                        deferred.append((spec, attempt, failed_nodes))
+                        deferred.append((slot_idx, spec, attempt, failed_nodes))
                         continue
 
                     # Prefer nodes that didn't just reject this job if alternatives exist
@@ -699,7 +778,7 @@ class MasterController:
                     in_flight_per_node[chosen_snap.node.id] += 1
                     enriched = self._with_node_env(spec, chosen_snap.node, cross_env)
                     fut = pool.submit(self.exec_on_node, chosen_snap.node, enriched)
-                    running_futures[fut] = (spec, chosen_snap, attempt + 1, failed_nodes, reason)
+                    running_futures[fut] = (slot_idx, spec, chosen_snap, attempt + 1, failed_nodes, reason)
                     dispatched_any = True
                     no_ready_since = None
 
@@ -714,7 +793,7 @@ class MasterController:
                     )
                     needs_refresh = False
                     for fut in done:
-                        spec, snap, attempt, failed_nodes, reason = running_futures.pop(fut)
+                        slot_idx, spec, snap, attempt, failed_nodes, reason = running_futures.pop(fut)
                         in_flight_per_node[snap.node.id] = max(
                             0, in_flight_per_node[snap.node.id] - 1
                         )
@@ -722,7 +801,7 @@ class MasterController:
 
                         if kind == "retryable" and attempt <= retries:
                             failed_nodes.add(snap.node.id)
-                            pending.appendleft((spec, attempt, failed_nodes))
+                            pending.appendleft((slot_idx, spec, attempt, failed_nodes))
                             needs_refresh = True
                             continue
 
@@ -737,7 +816,7 @@ class MasterController:
                             node_pool=pool_name,
                             routing_reason=reason,
                         )
-                        outcomes_by_index[spec.index] = outcome
+                        outcomes_by_slot[slot_idx] = outcome
                         completed_count += 1
                         if on_result is not None:
                             on_result(outcome, completed_count, total_jobs)
@@ -752,8 +831,8 @@ class MasterController:
                     if elapsed_wait >= wait_for_ready_sec:
                         # Fail remaining jobs clearly instead of hanging forever
                         while pending:
-                            spec, attempt, _ = pending.popleft()
-                            why = last_reason_by_index.get(spec.index, "")
+                            slot_idx, spec, attempt, _ = pending.popleft()
+                            why = last_reason_by_slot.get(slot_idx, "")
                             err_text = (
                                 f"{why} (waited {wait_for_ready_sec:.0f}s)"
                                 if why
@@ -773,7 +852,7 @@ class MasterController:
                                 error=err_text,
                                 routing_reason=why,
                             )
-                            outcomes_by_index[spec.index] = outcome
+                            outcomes_by_slot[slot_idx] = outcome
                             completed_count += 1
                             if on_result is not None:
                                 on_result(outcome, completed_count, total_jobs)
@@ -781,7 +860,7 @@ class MasterController:
                     time.sleep(min(1.0, max(0.1, wait_for_ready_sec - elapsed_wait)))
                     _refresh_health()
 
-        return [outcomes_by_index[i] for i in sorted(outcomes_by_index.keys())]
+        return [outcomes_by_slot[i] for i in range(total_jobs)]
 
     def run_pipeline(
         self,
@@ -822,8 +901,8 @@ class MasterController:
             else:
                 try:
                     timeout_sec = float(raw_timeout)
-                    if timeout_sec <= 0:
-                        raise ValueError("must be > 0")
+                    if not math.isfinite(timeout_sec) or timeout_sec <= 0:
+                        raise ValueError("must be a finite number > 0")
                 except (TypeError, ValueError):
                     all_ok = False
                     failed_steps += 1
@@ -992,8 +1071,8 @@ class MasterController:
                 job_id=str(data.get("job_id", spec.job_id)),
                 label=spec.label,
                 node_id=node_id,
-                returncode=int(data.get("returncode", -1)),
-                duration_sec=float(data.get("duration_sec", 0.0)),
+                returncode=_safe_int(data.get("returncode", -1), -1),
+                duration_sec=max(0.0, _safe_float(data.get("duration_sec", 0.0), 0.0)),
                 stdout=str(data.get("stdout", "")),
                 stderr=str(data.get("stderr", "")),
                 timed_out=bool(data.get("timed_out", False)),
@@ -1308,8 +1387,11 @@ class MasterController:
     ) -> list[dict[str, Any]]:
         """Execute an interactive Web Terminal command while tracking persistent `cwd`."""
         marker = f"__PC_CWD_{uuid.uuid4().hex[:8]}__"
+        norm_cmd = command.replace("\r\n", "\n").replace("\r", "\n")
+        # Double newline ensures a dangling trailing `\` line continuation only consumes
+        # the extra blank line and never swallows `__pc_rc=$?` or cwd tracking.
         wrapped = (
-            f"{command}\n"
+            f"{norm_cmd}\n\n"
             f"__pc_rc=$?\n"
             f"printf '\\n{marker}%s\\n' \"$PWD\"\n"
             f"exit $__pc_rc"

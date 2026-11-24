@@ -58,6 +58,32 @@ _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 _SSH_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
 _POOL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
+
+
+def validate_domain_pattern(pattern: str) -> str:
+    """Validate a Network Guard domain rule (`example.com`, `*.example.com`, or IP literal)."""
+    raw = str(pattern or "").strip().lower()
+    if not raw or len(raw) > 253 or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in raw):
+        raise ValueError(f"Invalid domain pattern '{pattern}'")
+    if raw.startswith("*."):
+        base = raw[2:].rstrip(".")
+        if not base or "*" in base or not _DOMAIN_LABEL_RE.fullmatch(base):
+            raise ValueError(f"Invalid wildcard domain pattern '{pattern}' (use e.g. '*.github.com')")
+        return f"*.{base}"
+    if "*" in raw or any(c in raw for c in "@/\\?#;'\""):
+        raise ValueError(f"Invalid domain pattern '{pattern}'")
+    clean = raw.rstrip(".")
+    if not clean:
+        raise ValueError(f"Invalid domain pattern '{pattern}'")
+    try:
+        ipaddress.ip_address(clean.strip("[]"))
+        return clean.strip("[]")
+    except ValueError:
+        pass
+    if not _DOMAIN_LABEL_RE.fullmatch(clean):
+        raise ValueError(f"Invalid domain pattern '{pattern}'")
+    return clean
 
 
 def validate_node_id(node_id: str) -> str:
@@ -269,19 +295,19 @@ class GatewayConfig:
             raise ValueError("gateway.port must be between 0 and 65535")
         raw_allowed = data.get("allowed_domains")
         allowed = (
-            [str(d).strip().lower() for d in raw_allowed if str(d).strip()]
+            [validate_domain_pattern(str(d)) for d in raw_allowed if str(d).strip()]
             if isinstance(raw_allowed, list)
             else list(DEFAULT_GATEWAY_ALLOWED_DOMAINS)
         )
         raw_blocked = data.get("blocked_domains")
         blocked = (
-            [str(d).strip().lower() for d in raw_blocked if str(d).strip()]
+            [validate_domain_pattern(str(d)) for d in raw_blocked if str(d).strip()]
             if isinstance(raw_blocked, list)
             else []
         )
         raw_ports = data.get("allowed_ports")
         if isinstance(raw_ports, list) and raw_ports:
-            ports = [int(p) for p in raw_ports if 1 <= int(p) <= 65535]
+            ports = sorted({int(p) for p in raw_ports if 1 <= int(p) <= 65535})
             if not ports:
                 ports = [80, 443]
         else:
@@ -293,7 +319,10 @@ class GatewayConfig:
             else []
         )
         max_conn = max(4, min(256, int(data.get("max_connections", 32))))
-        idle_to = max(5.0, float(data.get("idle_timeout_sec", 30.0)))
+        raw_idle = float(data.get("idle_timeout_sec", 30.0))
+        if not math.isfinite(raw_idle) or raw_idle <= 0:
+            raise ValueError("gateway.idle_timeout_sec must be a finite number > 0")
+        idle_to = max(5.0, min(3600.0, raw_idle))
         rpm = max(0, min(10000, int(data.get("max_requests_per_min_per_node", 120))))
         return cls(
             enabled=bool(data.get("enabled", False)),
@@ -332,12 +361,21 @@ class NetworkHardeningConfig:
             if isinstance(raw_ips, list)
             else []
         )
+        ag_url = str(data.get("adguard_url", "")).strip()
+        if ag_url and (any(c.isspace() or ord(c) < 32 for c in ag_url) or not ag_url.startswith(("http://", "https://"))):
+            raise ValueError("network.adguard_url must be empty or a valid http:// / https:// URL")
+        lan_sub = str(data.get("lan_subnet", "")).strip()
+        if lan_sub:
+            try:
+                lan_sub = str(ipaddress.ip_network(lan_sub, strict=False))
+            except ValueError as exc:
+                raise ValueError(f"Invalid network.lan_subnet CIDR '{lan_sub}'") from exc
         return cls(
             enforce_worker_source_ip=bool(data.get("enforce_worker_source_ip", False)),
             require_signed_requests=bool(data.get("require_signed_requests", False)),
             allowed_master_ips=ips,
-            adguard_url=str(data.get("adguard_url", "")).strip(),
-            lan_subnet=str(data.get("lan_subnet", "")).strip(),
+            adguard_url=ag_url,
+            lan_subnet=lan_sub,
         )
 
 

@@ -25,8 +25,12 @@ while [[ $# -gt 0 ]]; do
     --with-adguard) WITH_ADGUARD=1; shift ;;
     --with-firewall) WITH_FIREWALL=1; shift ;;
     --enable-gateway) ENABLE_GATEWAY=1; shift ;;
-    --lan-subnet) LAN_SUBNET="$2"; shift 2 ;;
-    --user) RUN_USER="$2"; shift 2 ;;
+    --lan-subnet)
+      [[ $# -ge 2 ]] || { echo "Error: --lan-subnet requires a CIDR value (e.g. 192.168.1.0/24)" >&2; exit 2; }
+      LAN_SUBNET="$2"; shift 2 ;;
+    --user)
+      [[ $# -ge 2 ]] || { echo "Error: --user requires a username" >&2; exit 2; }
+      RUN_USER="$2"; shift 2 ;;
     -h|--help)
       sed -n '2,15p' "$0"
       exit 0
@@ -41,7 +45,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 USER_HOME="$(getent passwd "${RUN_USER}" | cut -d: -f6 || echo "/home/${RUN_USER}")"
-MASTER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+MASTER_IP="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./) {print $i; exit}}')"
 MASTER_IP="${MASTER_IP:-192.168.1.200}"
 if [[ -z "${LAN_SUBNET}" ]]; then
   LAN_SUBNET="$(echo "${MASTER_IP}" | awk -F. '{print $1"."$2"."$3".0/24"}')"
@@ -111,7 +115,7 @@ Wants=network-online.target
 Type=simple
 User=${RUN_USER}
 WorkingDirectory=${REPO_DIR}
-ExecStart=/usr/bin/python3 ${REPO_DIR}/phonecluster_cli.py --config ${CFG_PATH} worker --node-id node0 --bind 0.0.0.0
+ExecStart=/usr/bin/python3 "${REPO_DIR}/phonecluster_cli.py" --config "${CFG_PATH}" worker --node-id node0 --bind 0.0.0.0
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -131,7 +135,7 @@ Wants=network-online.target
 Type=simple
 User=${RUN_USER}
 WorkingDirectory=${REPO_DIR}
-ExecStart=/usr/bin/python3 ${REPO_DIR}/phonecluster_cli.py --config ${CFG_PATH} dashboard --bind 0.0.0.0
+ExecStart=/usr/bin/python3 "${REPO_DIR}/phonecluster_cli.py" --config "${CFG_PATH}" dashboard --bind 0.0.0.0
 Restart=always
 RestartSec=3
 NoNewPrivileges=true

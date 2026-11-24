@@ -32,6 +32,7 @@ from .auth import (
     build_webhook_opener,
     extract_auth_scheme,
     parse_hmac_auth_header,
+    parse_strict_content_length,
     verify_hmac_request,
     verify_token,
 )
@@ -478,7 +479,8 @@ class WorkerState:
 
 
 def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
-    """Safely terminate a subprocess and all of its children."""
+    """Safely terminate a subprocess and ALL of its children (including SIGTERM-ignoring grandchildren)."""
+    pgid: int | None = None
     try:
         pgid = os.getpgid(proc.pid)
         os.killpg(pgid, signal.SIGTERM)
@@ -490,12 +492,46 @@ def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
     try:
         proc.wait(timeout=3.0)
     except subprocess.TimeoutExpired:
-        try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGKILL)
-        except OSError:
+        if pgid is not None:
             try:
-                proc.kill()
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        return
+
+    # Even if the session leader exited promptly on SIGTERM, stubborn grandchildren
+    # in `pgid` may ignore SIGTERM and keep stdout/stderr pipes open. Wait briefly,
+    # then escalate to SIGKILL on the process group if any members remain alive.
+    if pgid is not None:
+        deadline = time.monotonic() + 0.35
+        still_alive = False
+        while True:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                still_alive = False
+                break
+            except PermissionError:
+                still_alive = False
+                break
+            except OSError:
+                still_alive = False
+                break
+            still_alive = True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        if still_alive:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
             except OSError:
                 pass
 
@@ -635,9 +671,9 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
         return HTTPStatus.BAD_REQUEST, {"error": f"workdir does not exist: {cwd}"}
 
     preview = (
-        str(command).strip()[:120]
-        if command
-        else f"script:{payload.get('script_name', 'inline')}"
+        f"script:{payload.get('script_name', 'inline')}"
+        if script_content
+        else str(command).strip()[:120]
     )
 
     reserved, reject_info = state.try_reserve_slot(job_id, preview, force=force)
@@ -667,7 +703,7 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
 
         if state.is_cancelled(job_id):
             returncode = -15
-        elif script_content is not None:
+        elif script_content:
             script_name = Path(str(payload.get("script_name") or "job.py").replace("\x00", "")).name
             raw_suffix = Path(script_name).suffix
             suffix = raw_suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,10}", raw_suffix) else ".py"
@@ -871,29 +907,38 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(raw)
 
     def _read_raw_body(self) -> bytes | None:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid Content-Length"})
+        length, err_status, err_msg = parse_strict_content_length(self.headers, MAX_REQUEST_BYTES)
+        if length is None:
+            self._send_json(err_status, {"error": err_msg})
             return None
-        if length < 0 or length > MAX_REQUEST_BYTES:
-            self._send_json(
-                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                {"error": f"payload exceeds {MAX_REQUEST_BYTES} bytes"},
-            )
-            return None
+        if length == 0:
+            return b""
         try:
-            return self.rfile.read(length) if length > 0 else b""
+            raw = self.rfile.read(length)
         except OSError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"failed reading request body: {exc}"})
             return None
+        if len(raw) != length:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "truncated request body"})
+            return None
+        return raw
 
     def _authenticate(self, method: str, path: str, read_body: bool) -> tuple[bool, bytes]:
+        # Workers are strictly machine-to-machine (Master -> Worker); reject browser CSRF/DNS-rebinding calls.
+        origin_hdr = self.headers.get("Origin", "").strip()
+        sec_fetch_site = self.headers.get("Sec-Fetch-Site", "").strip().lower()
+        if origin_hdr or sec_fetch_site == "cross-site":
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "forbidden: browser cross-origin request rejected on worker API"},
+            )
+            return False, b""
         client_ip = str(self.client_address[0])
         norm_ip = normalize_host(client_ip)
         if not self.server.state.is_client_ip_allowed(client_ip):

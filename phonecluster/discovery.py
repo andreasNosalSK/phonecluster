@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import threading
@@ -26,6 +27,8 @@ LOG = logging.getLogger("phonecluster.discovery")
 DISCOVERY_PORT = 8766
 PROBE_TYPE = "phonecluster_discover_v1"
 REPLY_TYPE = "phonecluster_announce_v1"
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_MAX_DISCOVERED_NODES = 128
 
 _SIOCGIFADDR = 0x8915
 
@@ -259,21 +262,30 @@ def discover_lan_nodes(
                 continue
             if not isinstance(msg, dict) or msg.get("type") != REPLY_TYPE:
                 continue
-            host_ip = addr[0]
-            worker_port = int(msg.get("worker_port", 8765))
+            try:
+                worker_port = int(msg.get("worker_port", 8765))
+                ssh_port = int(msg.get("ssh_port", 8022))
+                cpu_cores = max(1, min(1024, int(msg.get("cpu_cores", 1))))
+                mem_total_mb = max(0, int(msg.get("mem_total_mb", 0)))
+            except (TypeError, ValueError):
+                continue
+            if not (1 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
+                continue
+            host_ip = str(addr[0])
             key = (host_ip, worker_port)
-            if key not in found:
+            if key not in found and len(found) < _MAX_DISCOVERED_NODES:
+                role_raw = _CTRL_RE.sub("", str(msg.get("role", "worker"))).strip().lower()
                 found[key] = {
                     "host": host_ip,
-                    "node_id": str(msg.get("node_id", "")),
-                    "role": str(msg.get("role", "worker")),
-                    "hostname": str(msg.get("hostname", "")),
+                    "node_id": _CTRL_RE.sub("", str(msg.get("node_id", ""))).strip()[:40],
+                    "role": role_raw if role_raw in {"master", "worker"} else "worker",
+                    "hostname": _CTRL_RE.sub("", str(msg.get("hostname", ""))).strip()[:64],
                     "worker_port": worker_port,
-                    "ssh_port": int(msg.get("ssh_port", 8022)),
-                    "ssh_user": str(msg.get("ssh_user", "")),
-                    "os_env": str(msg.get("os_env", "unknown")),
-                    "cpu_cores": int(msg.get("cpu_cores", 1)),
-                    "mem_total_mb": int(msg.get("mem_total_mb", 0)),
+                    "ssh_port": ssh_port,
+                    "ssh_user": _CTRL_RE.sub("", str(msg.get("ssh_user", ""))).strip()[:64],
+                    "os_env": _CTRL_RE.sub("", str(msg.get("os_env", "unknown"))).strip()[:32] or "unknown",
+                    "cpu_cores": cpu_cores,
+                    "mem_total_mb": mem_total_mb,
                 }
     finally:
         sock.close()

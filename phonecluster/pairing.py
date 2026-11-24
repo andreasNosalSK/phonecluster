@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from .auth import build_direct_opener, read_json_object_bounded
+from .auth import build_direct_opener, parse_strict_content_length, read_json_object_bounded
 from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
@@ -350,17 +350,23 @@ def discover_pairing_masters(
                 continue
             if not isinstance(msg, dict) or msg.get("type") != PAIR_BEACON_TYPE:
                 continue
-            host_ip = addr[0]
-            pair_port = int(msg.get("pair_port", DEFAULT_PAIR_PORT))
+            try:
+                pair_port = int(msg.get("pair_port", DEFAULT_PAIR_PORT))
+                expires_in_sec = max(0, int(msg.get("expires_in_sec", 0)))
+            except (TypeError, ValueError):
+                continue
+            if not (1 <= pair_port <= 65535):
+                continue
+            host_ip = str(addr[0])
             key = (host_ip, pair_port)
-            if key not in found:
+            if key not in found and len(found) < 64:
                 found[key] = {
                     "host": host_ip,
                     "pair_port": pair_port,
-                    "cluster_name": str(msg.get("cluster_name", "phonecluster")),
-                    "session_id": str(msg.get("session_id", "")),
-                    "fingerprint": str(msg.get("fingerprint", "")),
-                    "expires_in_sec": int(msg.get("expires_in_sec", 0)),
+                    "cluster_name": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("cluster_name", "phonecluster")))[:64],
+                    "session_id": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("session_id", "")))[:64],
+                    "fingerprint": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("fingerprint", "")))[:64],
+                    "expires_in_sec": expires_in_sec,
                 }
     finally:
         sock.close()
@@ -786,6 +792,8 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(raw)
@@ -802,15 +810,24 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
         origin = self.headers.get("Origin", "").strip()
-        if origin:
+        referer = self.headers.get("Referer", "").strip()
+        sec_fetch_site = self.headers.get("Sec-Fetch-Site", "").strip().lower()
+        if origin or referer or sec_fetch_site == "cross-site":
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "browser cross-origin pairing POST rejected"})
             return
+        length, err_status, err_msg = parse_strict_content_length(self.headers, 64 * 1024)
+        if length is None:
+            self._send_json(err_status, {"error": err_msg})
+            return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 0 or length > 64 * 1024:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid Content-Length"})
-                return
-            body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            if length > 0:
+                raw_bytes = self.rfile.read(length)
+                if len(raw_bytes) != length:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "truncated request body"})
+                    return
+                body = json.loads(raw_bytes.decode("utf-8"))
+            else:
+                body = {}
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be an object")
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:

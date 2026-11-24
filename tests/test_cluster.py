@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import json
+import math
+import os
 import socket
 import sys
 import tempfile
@@ -3775,6 +3777,573 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
         finally:
             dash.shutdown()
             dash.server_close()
+
+    def test_strict_http_smuggling_defense_chunk_framing_connect_ipv6_and_audit_sanitization(self) -> None:
+        """Verify RFC-strict Content-Length/chunk-size parsing, Host/TE/CONNECT checks, truncated-body rejection, and ANSI log sanitization."""
+        import base64
+        import socketserver
+        from phonecluster.pairing import PairingManager, StandalonePairingServer
+
+        class _OkHttpHandler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.settimeout(3.0)
+                try:
+                    self.request.recv(4096)
+                    self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                except OSError:
+                    pass
+
+        class _ReuseTCP(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        up_srv = _ReuseTCP(("127.0.0.1", 0), _OkHttpHandler)
+        up_port = up_srv.server_address[1]
+        threading.Thread(target=up_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        tok = "pass5-smug-tok-12345678"
+        w_tok = "pass5-worker-tok-87654321"
+        st = WorkerState(
+            node_id="node1",
+            role="worker",
+            auth_token=w_tok,
+            safety=SafetyConfig(),
+            max_concurrency=2,
+            health_provider=lambda: {
+                "node_id": "node1",
+                "role": "worker",
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "cpu_cores": 4,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 2048,
+                "tools": {},
+                "services": {},
+            },
+        )
+        w_srv, _g, w_ev = create_worker_server("127.0.0.1", 0, st)
+        w_port = w_srv.server_address[1]
+        threading.Thread(target=w_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        cfg = ClusterConfig(
+            cluster_name="smug-strict",
+            auth_token=tok,
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=w_port, auth_token=w_tok),
+            ],
+            gateway=GatewayConfig(
+                enabled=True,
+                bind_host="127.0.0.1",
+                port=0,
+                mode="allowlist",
+                allowed_domains=["127.0.0.1"],
+                allowed_ports=[up_port],
+                block_private_ips=False,
+                idle_timeout_sec=10.0,
+            ),
+        )
+        ctrl = MasterController(cfg)
+        dash = DashboardHTTPServer(
+            ("127.0.0.1", 0), ctrl, enable_pairing_beacon=False, pairing_fail_delay_sec=0.0
+        )
+        d_port = dash.server_address[1]
+        threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        gw_port = dash.gateway_manager.bound_port
+
+        pm = PairingManager(config=cfg, pair_port=0, enable_beacon=False, fail_delay_sec=0.0)
+        p_srv = StandalonePairingServer(("127.0.0.1", 0), pm)
+        p_port = p_srv.server_address[1]
+        threading.Thread(target=p_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        secret = derive_proxy_password(w_tok, "node1")
+        auth_b64 = base64.b64encode(f"node1:{secret}".encode("utf-8")).decode("ascii")
+
+        def _raw_exchange(port: int, payload: bytes, half_close: bool = False) -> bytes:
+            with socket.create_connection(("127.0.0.1", port), timeout=4.0) as s:
+                s.sendall(payload)
+                if half_close:
+                    s.shutdown(socket.SHUT_WR)
+                s.settimeout(3.0)
+                return s.recv(4096)
+
+        try:
+            # 1. Proxy rejects Python int() smuggling (1_0, +5), duplicate CL, bad TE, duplicate Host, unbracketed IPv6 CONNECT
+            bad_proxy_cases: list[tuple[bytes, bytes, str]] = [
+                (
+                    f"POST http://127.0.0.1:{up_port}/a HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\nContent-Length: 1_0\r\n\r\n0123456789".encode("ascii"),
+                    b"400 Bad Request",
+                    "underscore CL",
+                ),
+                (
+                    f"POST http://127.0.0.1:{up_port}/b HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\nContent-Length: +2\r\n\r\nhi".encode("ascii"),
+                    b"400 Bad Request",
+                    "plus CL",
+                ),
+                (
+                    f"POST http://127.0.0.1:{up_port}/c HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nhi".encode("ascii"),
+                    b"400 Bad Request",
+                    "duplicate identical CL",
+                ),
+                (
+                    f"POST http://127.0.0.1:{up_port}/d HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n".encode("ascii"),
+                    b"501 Not Implemented",
+                    "xchunked TE",
+                ),
+                (
+                    f"POST http://127.0.0.1:{up_port}/e HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\nTransfer-Encoding: chunked, identity\r\n\r\n0\r\n\r\n".encode("ascii"),
+                    b"501 Not Implemented",
+                    "compound TE",
+                ),
+                (
+                    f"GET http://127.0.0.1:{up_port}/f HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Host: evil.example\r\nProxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii"),
+                    b"400 Bad Request",
+                    "duplicate Host",
+                ),
+                (
+                    f"CONNECT 2001:db8::1 HTTP/1.1\r\nProxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii"),
+                    b"400 Bad Request",
+                    "unbracketed IPv6 CONNECT",
+                ),
+                (
+                    f"CONNECT 127.0.0.1:4_43 HTTP/1.1\r\nProxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii"),
+                    b"400 Bad Request",
+                    "underscore CONNECT port",
+                ),
+                (
+                    f"CONNECT 127.0.0.1:{up_port} HTTP/1.1\r\nHost: evil.example:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii"),
+                    b"400 Bad Request",
+                    "CONNECT Host mismatch",
+                ),
+                (
+                    f"POST http://127.0.0.1:{up_port}/hex HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\nTransfer-Encoding: chunked\r\n\r\n0x5\r\nhello\r\n0\r\n\r\n".encode("ascii"),
+                    b"400 Bad Request",
+                    "0x hex chunk size",
+                ),
+                (
+                    f"POST http://127.0.0.1:{up_port}/crlf HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n".encode("ascii"),
+                    b"400 Bad Request",
+                    "missing chunk CRLF",
+                ),
+            ]
+            for raw_req, expected, desc in bad_proxy_cases:
+                resp = _raw_exchange(gw_port, raw_req)
+                self.assertIn(expected, resp, f"Proxy failed case '{desc}': {resp!r}")
+
+            # 2. Proxy audit log strips ANSI escape / control chars from untrusted request targets
+            _raw_exchange(gw_port, b"GET http://\x1b[31mevil\x07.test/ HTTP/1.1\r\nHost: test\r\n\r\n")
+            evs = dash.gateway_manager.status()["events"]
+            self.assertTrue(evs)
+            self.assertNotIn("\x1b", evs[0]["host"])
+            self.assertNotIn("\x07", evs[0]["host"])
+
+            # 3. Worker, Dashboard, and Standalone Pairing reject 1_0 / +5 / duplicate CL / TE / truncated bodies
+            for port, path, auth_hdr in (
+                (w_port, "/exec", f"Authorization: Bearer {w_tok}\r\n"),
+                (d_port, "/api/exec", f"Authorization: Bearer {tok}\r\n"),
+                (p_port, "/api/pair/complete", ""),
+            ):
+                r_under = _raw_exchange(
+                    port,
+                    f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_hdr}Content-Length: 1_0\r\n\r\n0123456789".encode("ascii"),
+                )
+                self.assertIn(b"400", r_under, f"{path} accepted underscore CL: {r_under!r}")
+
+                r_plus = _raw_exchange(
+                    port,
+                    f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_hdr}Content-Length: +2\r\n\r\n{{}}".encode("ascii"),
+                )
+                self.assertIn(b"400", r_plus, f"{path} accepted +CL: {r_plus!r}")
+
+                r_dup = _raw_exchange(
+                    port,
+                    f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_hdr}Content-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}".encode("ascii"),
+                )
+                self.assertIn(b"400", r_dup, f"{path} accepted duplicate CL: {r_dup!r}")
+
+                r_te = _raw_exchange(
+                    port,
+                    f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_hdr}Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n".encode("ascii"),
+                )
+                self.assertIn(b"501", r_te, f"{path} accepted TE: {r_te!r}")
+
+                r_trunc = _raw_exchange(
+                    port,
+                    f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_hdr}Content-Length: 40\r\n\r\n{{}}".encode("ascii"),
+                    half_close=True,
+                )
+                self.assertIn(b"400", r_trunc, f"{path} accepted truncated body: {r_trunc!r}")
+        finally:
+            p_srv.shutdown()
+            p_srv.server_close()
+            dash.shutdown()
+            dash.server_close()
+            w_ev.set()
+            w_srv.shutdown()
+            w_srv.server_close()
+            up_srv.shutdown()
+            up_srv.server_close()
+
+    def test_csrf_dns_rebinding_udp_poisoning_and_config_domain_validation(self) -> None:
+        """Verify Worker/Dashboard/Pairing CSRF & CORP headers, strict domain/config validation, and UDP poison resilience."""
+        from phonecluster.config import NetworkHardeningConfig, validate_domain_pattern
+        from phonecluster.discovery import REPLY_TYPE, discover_lan_nodes
+        from phonecluster.pairing import PAIR_BEACON_TYPE, PairingManager, StandalonePairingServer, discover_pairing_masters
+
+        # 1. Domain & config validation rejects wildcards '*', inf/NaN idle timeout, bad CIDR, file:// adguard_url
+        for bad_dom in ("*", "*.", "*.bad_domain/x", "http://evil.com", "evil.com\x00", "-bad.com"):
+            with self.assertRaises(ValueError, msg=f"Should reject domain {bad_dom!r}"):
+                validate_domain_pattern(bad_dom)
+        self.assertEqual(validate_domain_pattern("*.GitHub.com."), "*.github.com")
+        self.assertEqual(validate_domain_pattern("127.0.0.1"), "127.0.0.1")
+
+        with self.assertRaises(ValueError):
+            GatewayConfig.from_dict({"idle_timeout_sec": float("inf")})
+        with self.assertRaises(ValueError):
+            GatewayConfig.from_dict({"idle_timeout_sec": float("nan")})
+        with self.assertRaises(ValueError):
+            GatewayConfig.from_dict({"allowed_domains": ["*"]})
+        with self.assertRaises(ValueError):
+            NetworkHardeningConfig.from_dict({"lan_subnet": "not-a-cidr"})
+        with self.assertRaises(ValueError):
+            NetworkHardeningConfig.from_dict({"adguard_url": "file:///etc/passwd"})
+
+        # 2. Worker rejects browser Origin / Sec-Fetch-Site: cross-site (DNS-rebinding/CSRF), sets CORP header
+        tok = "csrf-pass5-tok-12345678"
+        st = WorkerState(
+            node_id="w_csrf",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=2,
+            health_provider=lambda: {
+                "node_id": "w_csrf",
+                "role": "worker",
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "cpu_cores": 4,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 2048,
+                "tools": {},
+                "services": {},
+            },
+        )
+        w_srv, _g, w_ev = create_worker_server("127.0.0.1", 0, st)
+        w_port = w_srv.server_address[1]
+        threading.Thread(target=w_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        cfg = ClusterConfig(
+            cluster_name="csrf-test",
+            auth_token=tok,
+            nodes=[NodeConfig(id="w_csrf", host="127.0.0.1", role="master", worker_port=w_port)],
+        )
+        ctrl = MasterController(cfg)
+        dash = DashboardHTTPServer(
+            ("127.0.0.1", 0), ctrl, enable_pairing_beacon=False, pairing_fail_delay_sec=0.0
+        )
+        d_port = dash.server_address[1]
+        threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        pm = PairingManager(config=cfg, pair_port=0, enable_beacon=False, fail_delay_sec=0.0)
+        p_srv = StandalonePairingServer(("127.0.0.1", 0), pm)
+        p_port = p_srv.server_address[1]
+        threading.Thread(target=p_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        try:
+            # Worker normal GET returns CORP header
+            req_ok = urllib.request.Request(f"http://127.0.0.1:{w_port}/health", headers=build_auth_headers(tok))
+            with urllib.request.urlopen(req_ok, timeout=3.0) as resp_ok:
+                self.assertEqual(resp_ok.headers.get("Cross-Origin-Resource-Policy"), "same-origin")
+
+            # Worker rejects Origin or Sec-Fetch-Site: cross-site with 403
+            for bad_hdrs in (
+                {**build_auth_headers(tok), "Origin": "http://evil.example"},
+                {**build_auth_headers(tok), "Sec-Fetch-Site": "cross-site"},
+            ):
+                req_bad = urllib.request.Request(f"http://127.0.0.1:{w_port}/health", headers=bad_hdrs)
+                with self.assertRaises(urllib.error.HTTPError) as exc_ctx:
+                    urllib.request.urlopen(req_bad, timeout=3.0)
+                try:
+                    self.assertEqual(exc_ctx.exception.code, 403)
+                finally:
+                    exc_ctx.exception.close()
+
+            # Dashboard /api/status returns CORP header
+            with urllib.request.urlopen(f"http://127.0.0.1:{d_port}/api/status", timeout=3.0) as d_resp:
+                self.assertEqual(d_resp.headers.get("Cross-Origin-Resource-Policy"), "same-origin")
+
+            # Dashboard rejects Sec-Fetch-Site: cross-site, Origin: null, cross-origin Referer
+            for bad_hdrs in (
+                {**build_auth_headers(tok), "Sec-Fetch-Site": "cross-site"},
+                {**build_auth_headers(tok), "Origin": "null"},
+                {**build_auth_headers(tok), "Referer": "http://evil.example/attack.html"},
+            ):
+                req_d = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}/api/exec",
+                    data=b'{"command":"echo nope"}',
+                    headers=bad_hdrs,
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as exc_ctx:
+                    urllib.request.urlopen(req_d, timeout=3.0)
+                try:
+                    self.assertEqual(exc_ctx.exception.code, 403)
+                finally:
+                    exc_ctx.exception.close()
+
+            # Dashboard /api/gateway/allow-domain rejects wildcard "*"
+            req_dom = urllib.request.Request(
+                f"http://127.0.0.1:{d_port}/api/gateway/allow-domain",
+                data=b'{"domain":"*"}',
+                headers=build_auth_headers(tok),
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as dom_exc:
+                urllib.request.urlopen(req_dom, timeout=3.0)
+            try:
+                self.assertEqual(dom_exc.exception.code, 400)
+            finally:
+                dom_exc.exception.close()
+
+            # Standalone pairing rejects Referer & Sec-Fetch-Site: cross-site
+            for bad_hdrs in (
+                {"Content-Type": "application/json", "Sec-Fetch-Site": "cross-site"},
+                {"Content-Type": "application/json", "Referer": "http://evil.example/"},
+            ):
+                req_p = urllib.request.Request(
+                    f"http://127.0.0.1:{p_port}/api/pair/complete",
+                    data=b"{}",
+                    headers=bad_hdrs,
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as p_exc:
+                    urllib.request.urlopen(req_p, timeout=3.0)
+                try:
+                    self.assertEqual(p_exc.exception.code, 403)
+                finally:
+                    p_exc.exception.close()
+
+            # 3. Malformed UDP poison packets NEVER crash discover_lan_nodes() or discover_pairing_masters()
+            udp_srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_srv.bind(("127.0.0.1", 0))
+            udp_port = udp_srv.getsockname()[1]
+            udp_srv.settimeout(0.2)
+            stop_udp = threading.Event()
+
+            def _poison_responder() -> None:
+                while not stop_udp.is_set():
+                    try:
+                        raw, addr = udp_srv.recvfrom(2048)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    msg = json.loads(raw.decode("utf-8"))
+                    if msg.get("type") == "phonecluster_discover_v1":
+                        for pkt in (
+                            {"type": REPLY_TYPE, "worker_port": "crash_me"},
+                            {"type": REPLY_TYPE, "worker_port": 99999},
+                            {"type": REPLY_TYPE, "worker_port": 8765, "ssh_port": "bad"},
+                            {"type": REPLY_TYPE, "node_id": "ok\x1bnode", "worker_port": 8765, "ssh_port": 8022, "cpu_cores": 8, "mem_total_mb": 4096},
+                        ):
+                            udp_srv.sendto(json.dumps(pkt).encode("utf-8"), addr)
+                    else:
+                        for pkt in (
+                            {"type": PAIR_BEACON_TYPE, "pair_port": None},
+                            {"type": PAIR_BEACON_TYPE, "pair_port": -1},
+                            {"type": PAIR_BEACON_TYPE, "pair_port": 8767, "expires_in_sec": "bad"},
+                            {"type": PAIR_BEACON_TYPE, "pair_port": 8767, "cluster_name": "good\x07c", "session_id": "s1", "fingerprint": "fp", "expires_in_sec": 60},
+                        ):
+                            udp_srv.sendto(json.dumps(pkt).encode("utf-8"), addr)
+
+            t_udp = threading.Thread(target=_poison_responder, daemon=True)
+            t_udp.start()
+            try:
+                nodes_found = discover_lan_nodes(timeout_sec=0.4, discovery_port=udp_port, targets=["127.0.0.1"])
+                self.assertEqual(len(nodes_found), 1)
+                self.assertEqual(nodes_found[0]["node_id"], "oknode")
+
+                masters_found = discover_pairing_masters(timeout_sec=0.4, discovery_port=udp_port, targets=["127.0.0.1"])
+                self.assertEqual(len(masters_found), 1)
+                self.assertEqual(masters_found[0]["cluster_name"], "goodc")
+            finally:
+                stop_udp.set()
+                udp_srv.close()
+                t_udp.join(timeout=2.0)
+        finally:
+            p_srv.shutdown()
+            p_srv.server_close()
+            dash.shutdown()
+            dash.server_close()
+            w_ev.set()
+            w_srv.shutdown()
+            w_srv.server_close()
+
+    def test_thermal_hottest_cpu_zone_grandchild_sigkill_empty_script_scheduler_and_terminal_backslash(self) -> None:
+        """Verify hottest CPU thermal zone selection, SIGTERM-ignoring grandchild SIGKILL, empty script_content fallback, terminal backslash/CRLF safety, and map_jobs duplicate-index/fast-fail."""
+        from phonecluster.telemetry import read_thermal_zone_temp
+
+        # 1. read_thermal_zone_temp returns HOTTEST CPU zone (47.0C), not first cool zone (28.0C)
+        with tempfile.TemporaryDirectory() as tmp:
+            tdir = Path(tmp)
+            z0 = tdir / "thermal_zone0"
+            z1 = tdir / "thermal_zone1"
+            z2 = tdir / "thermal_zone2"
+            for z in (z0, z1, z2):
+                z.mkdir()
+            (z0 / "type").write_text("cpu-0-0\n", encoding="utf-8")
+            (z0 / "temp").write_text("28000\n", encoding="utf-8")
+            (z1 / "type").write_text("cpu-1-0\n", encoding="utf-8")
+            (z1 / "temp").write_text("47000\n", encoding="utf-8")
+            (z2 / "type").write_text("battery-skin\n", encoding="utf-8")
+            (z2 / "temp").write_text("55000\n", encoding="utf-8")
+            self.assertEqual(read_thermal_zone_temp(tdir), 47.0)
+
+        # 2. Live worker tests: empty script_content, stubborn grandchild SIGKILL, terminal backslash/CRLF, map_jobs & pipeline
+        tok = "pass5-exec-tok-12345678"
+        st = WorkerState(
+            node_id="w_exec",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=2,
+            health_provider=lambda: {
+                "node_id": "w_exec",
+                "role": "worker",
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "cpu_cores": 4,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 2048,
+                "tools": {},
+                "services": {},
+            },
+        )
+        srv, _g, ev = create_worker_server("127.0.0.1", 0, st)
+        w_port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        cfg = ClusterConfig(
+            cluster_name="exec-pass5",
+            auth_token=tok,
+            nodes=[NodeConfig(id="w_exec", host="127.0.0.1", role="worker", worker_port=w_port, max_concurrency=2)],
+        )
+        ctrl = MasterController(cfg)
+        try:
+            # 2a. Empty script_content="" must fall through to `command`
+            req_empty = urllib.request.Request(
+                f"http://127.0.0.1:{w_port}/exec",
+                data=json.dumps({"command": "echo cmd_ran", "script_content": ""}).encode("utf-8"),
+                headers=build_auth_headers(tok),
+                method="POST",
+            )
+            with urllib.request.urlopen(req_empty, timeout=5.0) as resp_empty:
+                res_empty = json.loads(resp_empty.read().decode("utf-8"))
+                self.assertEqual(res_empty["returncode"], 0)
+                self.assertEqual(res_empty["stdout"].strip(), "cmd_ran")
+
+            # 2b. Stubborn grandchild ignoring SIGTERM gets SIGKILLed when parent exits on SIGTERM!
+            with tempfile.TemporaryDirectory() as tmp:
+                pid_file = Path(tmp) / "grandchild.pid"
+                spawn_cmd = (
+                    f"{sys.executable} -c \""
+                    "import os, signal, subprocess, sys, time\n"
+                    f"p = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'])\n"
+                    f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+                    "time.sleep(30)\""
+                )
+                t_gc = time.monotonic()
+                out_to = ctrl.run_single(
+                    JobSpec(index=0, job_id="sigterm-gc", command=spawn_cmd, timeout_sec=0.6),
+                    target="w_exec",
+                )[0]
+                gc_elapsed = time.monotonic() - t_gc
+                self.assertTrue(out_to.timed_out)
+                self.assertLess(gc_elapsed, 3.0, f"Stubborn grandchild held pipes open ({gc_elapsed:.2f}s)")
+                self.assertTrue(pid_file.exists(), "Grandchild PID file should have been written")
+                gc_pid = int(pid_file.read_text(encoding="utf-8").strip())
+                # Verify grandchild is dead (gone or zombie 'Z' if sandbox PID 1 hasn't reaped yet)
+                alive = True
+                for _ in range(20):
+                    try:
+                        os.kill(gc_pid, 0)
+                    except ProcessLookupError:
+                        alive = False
+                        break
+                    stat_path = Path(f"/proc/{gc_pid}/stat")
+                    if stat_path.exists():
+                        st_txt = stat_path.read_text(encoding="utf-8", errors="ignore")
+                        rp = st_txt.rfind(")")
+                        if rp != -1 and st_txt[rp + 2 : rp + 3] in {"Z", "X"}:
+                            alive = False
+                            break
+                    time.sleep(0.05)
+                self.assertFalse(alive, f"SIGTERM-ignoring grandchild PID {gc_pid} survived timeout!")
+
+            # 2c. Terminal exec with trailing backslash and CRLF preserves stdout, rc=0, and cwd tracking
+            with tempfile.TemporaryDirectory() as tmp:
+                r_bs = ctrl.exec_terminal_command(f"cd {tmp} && echo bs_ok \\", target="w_exec")
+                self.assertEqual(len(r_bs), 1)
+                self.assertTrue(r_bs[0]["ok"], r_bs[0])
+                self.assertEqual(r_bs[0]["stdout"].strip(), "bs_ok")
+                self.assertEqual(Path(r_bs[0]["cwd"]).resolve(), Path(tmp).resolve())
+
+                r_crlf = ctrl.exec_terminal_command("echo crlf_ok\r\n", target="w_exec")
+                self.assertTrue(r_crlf[0]["ok"], r_crlf[0])
+                self.assertEqual(r_crlf[0]["stdout"].strip(), "crlf_ok")
+
+            # 2d. map_jobs preserves duplicate spec.index outcomes & fails fast on unknown/tier:9/quarantined pinned targets
+            dup_jobs = [
+                JobSpec(index=0, job_id="dupidx-a", command="echo first_job", timeout_sec=5.0),
+                JobSpec(index=0, job_id="dupidx-b", command="echo second_job", timeout_sec=5.0),
+            ]
+            dup_outs = ctrl.map_jobs(dup_jobs, target="w_exec")
+            self.assertEqual(len(dup_outs), 2)
+            self.assertEqual([o.stdout.strip() for o in dup_outs], ["first_job", "second_job"])
+
+            t0 = time.monotonic()
+            unk_outs = ctrl.map_jobs([JobSpec(index=0, job_id="u1", command="echo x")], target="no_such_node", wait_for_ready_sec=15.0)
+            self.assertLess(time.monotonic() - t0, 1.0)
+            self.assertFalse(unk_outs[0].ok)
+            self.assertIn("Unknown node", unk_outs[0].error)
+
+            t0 = time.monotonic()
+            bad_t_outs = ctrl.map_jobs([JobSpec(index=0, job_id="t9", command="echo x")], target="tier:9", wait_for_ready_sec=15.0)
+            self.assertLess(time.monotonic() - t0, 1.0)
+            self.assertFalse(bad_t_outs[0].ok)
+
+            cfg.gateway.quarantined_nodes = ["w_exec"]
+            t0 = time.monotonic()
+            q_outs = ctrl.map_jobs([JobSpec(index=0, job_id="q1", command="echo x")], target="w_exec", wait_for_ready_sec=15.0)
+            self.assertLess(time.monotonic() - t0, 1.0)
+            self.assertFalse(q_outs[0].ok)
+            self.assertIn("quarantined", q_outs[0].error.lower())
+            cfg.gateway.quarantined_nodes = []
+
+            # 2e. run_pipeline rejects NaN/Inf timeouts and score_node survives malformed NaN health fields
+            pipe_res = ctrl.run_pipeline([{"name": "nan-step", "command": "echo hi", "timeout_sec": "NaN"}])
+            self.assertFalse(pipe_res["ok"])
+            self.assertIn("Invalid timeout_sec", pipe_res["results"][0]["error"])
+
+            weird_snap = NodeSnapshot(
+                node=cfg.nodes[0],
+                online=True,
+                health={"cpu_cores": "bad", "load_1m": "NaN", "temp_c": "inf", "mem_available_mb": "bad"},
+            )
+            self.assertTrue(math.isfinite(score_node(weird_snap, in_flight_local=0)))
+        finally:
+            ev.set()
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

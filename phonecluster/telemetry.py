@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 import platform
 import shutil
@@ -138,11 +139,29 @@ def read_battery_via_termux(timeout_sec: float = 4.0) -> BatteryInfo | None:
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
         return None
 
+    if not isinstance(data, dict):
+        return None
     pct_raw = data.get("percentage")
     temp_raw = data.get("temperature")
+    pct: int | None = None
+    if pct_raw is not None:
+        try:
+            pct_f = float(pct_raw)
+            if math.isfinite(pct_f):
+                pct = int(pct_f)
+        except (TypeError, ValueError):
+            pct = None
+    temp_c: float | None = None
+    if temp_raw is not None:
+        try:
+            tf = float(temp_raw)
+            if math.isfinite(tf):
+                temp_c = round(tf, 2)
+        except (TypeError, ValueError):
+            temp_c = None
     return BatteryInfo(
-        percentage=int(pct_raw) if pct_raw is not None else None,
-        temperature_c=round(float(temp_raw), 2) if temp_raw is not None else None,
+        percentage=pct,
+        temperature_c=temp_c,
         status=str(data.get("status", "UNKNOWN")).upper(),
         health=str(data.get("health", "UNKNOWN")).upper(),
         plugged=str(data.get("plugged", "UNKNOWN")).upper(),
@@ -201,10 +220,11 @@ def read_battery_via_sysfs(base_dir: Path = POWER_SUPPLY_DIR) -> BatteryInfo | N
 
 
 def read_thermal_zone_temp(base_dir: Path = THERMAL_DIR) -> float | None:
-    """Fallback temperature sensor reading from /sys/class/thermal."""
+    """Fallback temperature sensor reading from /sys/class/thermal (uses hottest CPU/SoC zone)."""
     if not base_dir.exists():
         return None
-    readings: list[float] = []
+    cpu_readings: list[float] = []
+    other_readings: list[float] = []
     try:
         zones = sorted(base_dir.glob("thermal_zone*"))
     except OSError:
@@ -217,9 +237,12 @@ def read_thermal_zone_temp(base_dir: Path = THERMAL_DIR) -> float | None:
         if norm is not None and norm > 5.0:
             ztype = (_read_text_safe(zone / "type") or "").lower()
             if any(k in ztype for k in ("cpu", "soc", "ap", "mtk", "tsens", "x86_pkg", "acpitz")):
-                return norm
-            readings.append(norm)
-    return max(readings) if readings else None
+                cpu_readings.append(norm)
+            else:
+                other_readings.append(norm)
+    if cpu_readings:
+        return max(cpu_readings)
+    return max(other_readings) if other_readings else None
 
 
 def read_battery_info() -> BatteryInfo:
