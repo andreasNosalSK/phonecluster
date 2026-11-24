@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import tempfile
+import urllib.parse
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,15 +21,18 @@ DEFAULT_CONFIG_PATH = Path("config/cluster.json")
 
 
 def normalize_host(host: str) -> str:
-    """Normalize a host/IP string (strip whitespace, brackets, and `::ffff:` IPv4-mapped prefix)."""
+    """Normalize a host/IP string (strip whitespace/brackets and canonicalize IPv4/IPv6/IPv4-mapped literals)."""
     h = str(host or "").strip()
     if h.startswith("[") and h.endswith("]"):
         h = h[1:-1].strip()
-    if h.lower().startswith("::ffff:"):
-        mapped = h[7:]
+    if not h:
+        return ""
+    if "%" not in h:
         try:
-            ipaddress.IPv4Address(mapped)
-            return mapped
+            addr = ipaddress.ip_address(h)
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+                return str(addr.ipv4_mapped)
+            return str(addr)
         except ValueError:
             pass
     return h
@@ -253,7 +257,12 @@ class SafetyConfig:
             )
         wb = cfg.battery_webhook_url.strip()
         if wb:
-            if any(c.isspace() or ord(c) < 32 for c in wb) or not wb.startswith(("http://", "https://")):
+            p_wb = urllib.parse.urlsplit(wb)
+            if (
+                any(c.isspace() or ord(c) < 32 for c in wb)
+                or p_wb.scheme.lower() not in {"http", "https"}
+                or not p_wb.hostname
+            ):
                 raise ValueError("safety.battery_webhook_url must be empty or a valid http:// / https:// URL")
         cfg.battery_webhook_url = wb
         return cfg

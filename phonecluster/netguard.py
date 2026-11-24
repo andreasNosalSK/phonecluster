@@ -407,7 +407,8 @@ def audit_cluster_network(
             for s in snaps:
                 if not s.online or s.node.id in quarantined_set:
                     continue
-                svcs = (s.health or {}).get("services") or {}
+                raw_svcs = (s.health or {}).get("services") if isinstance(s.health, dict) else None
+                svcs = raw_svcs if isinstance(raw_svcs, dict) else {}
                 if svcs.get("adguard_80"):
                     adguard_url = f"http://{format_host_for_url(s.node.host)}"
                     adguard_node = s.node.id
@@ -575,10 +576,19 @@ def audit_cluster_network(
     worker_surface: list[dict[str, Any]] = []
     any_unexpected = False
     for snap in snaps:
-        h = snap.health if snap.online else {}
+        h = snap.health if (snap.online and isinstance(snap.health, dict)) else {}
         tier, pool = resolve_node_tier_and_pool(snap.node, h if snap.online else None)
-        raw_ports = h.get("listening_ports") or []
-        exposed_ports = [int(p["port"]) for p in raw_ports if p.get("exposed")]
+        raw_ports = h.get("listening_ports")
+        exposed_ports: list[int] = []
+        if isinstance(raw_ports, list):
+            for p in raw_ports:
+                if isinstance(p, dict) and p.get("exposed"):
+                    try:
+                        pv = int(p.get("port", 0))
+                        if 1 <= pv <= 65535:
+                            exposed_ports.append(pv)
+                    except (TypeError, ValueError):
+                        pass
         unexpected = [p for p in exposed_ports if p not in allowed_ports]
         if unexpected:
             any_unexpected = True

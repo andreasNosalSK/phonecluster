@@ -9,6 +9,7 @@ tier can talk to services hosted on every other tier without hardcoded IPs.
 from __future__ import annotations
 
 import ipaddress
+import math
 import re
 import urllib.parse
 from dataclasses import dataclass, field
@@ -66,18 +67,33 @@ class WorkloadRoute:
     preferred_service: str = ""
 
 
+_SAFE_POOL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def _safe_nonneg_int(val: Any, default: int = 0) -> int:
+    try:
+        if isinstance(val, bool):
+            return default
+        f = float(val)
+        return max(0, int(f)) if math.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
+
+
 def resolve_node_tier_and_pool(
     node: NodeConfig, health: dict[str, Any] | None = None
 ) -> tuple[int, str]:
     """Resolve effective `(tier, pool)` from explicit config override or live telemetry."""
-    h = health or {}
+    h = health if isinstance(health, dict) else {}
+    h_tier = h.get("tier")
     if node.tier in {1, 2, 3}:
         tier = node.tier
-    elif h.get("tier") in {1, 2, 3}:
-        tier = int(h["tier"])
+    elif isinstance(h_tier, int) and not isinstance(h_tier, bool) and h_tier in {1, 2, 3}:
+        tier = h_tier
     else:
         os_env = str(h.get("os_env", "")).lower()
-        tools = h.get("tools") or {}
+        raw_tools = h.get("tools")
+        tools = raw_tools if isinstance(raw_tools, dict) else {}
         if os_env == "termux":
             tier = 1
         elif tools.get("docker"):
@@ -90,7 +106,8 @@ def resolve_node_tier_and_pool(
     if node.pool and node.pool != "auto":
         pool = node.pool
     elif h.get("pool") and h.get("pool") != "auto" and node.tier == 0:
-        pool = str(h["pool"]).lower()
+        cand_pool = str(h["pool"]).strip().lower()
+        pool = cand_pool if _SAFE_POOL_RE.fullmatch(cand_pool) else DEFAULT_POOL_BY_TIER.get(tier, "compute")
     else:
         pool = DEFAULT_POOL_BY_TIER.get(tier, "compute")
 
@@ -248,7 +265,8 @@ def select_snapshots_for_target(
     def _has_required_tool(snap: Any) -> bool:
         if not route.required_tool:
             return True
-        tools = (snap.health or {}).get("tools") or {}
+        raw_tools = (snap.health or {}).get("tools") if isinstance(snap.health, dict) else None
+        tools = raw_tools if isinstance(raw_tools, dict) else {}
         t_num, p_name = resolve_node_tier_and_pool(snap.node, snap.health)
         return bool(tools.get(route.required_tool)) or (
             route.required_tool == "docker" and (t_num == 3 or p_name == "docker")
@@ -314,18 +332,20 @@ def build_service_registry(
     for snap in snapshots:
         if not snap.online or snap.node.id in quarantined:
             continue
-        h = snap.health or {}
+        h = snap.health if isinstance(snap.health, dict) else {}
         tier, pool = resolve_node_tier_and_pool(snap.node, h)
-        svcs = h.get("services") or {}
-        tools = h.get("tools") or {}
+        raw_svcs = h.get("services")
+        svcs = raw_svcs if isinstance(raw_svcs, dict) else {}
+        raw_tools = h.get("tools")
+        tools = raw_tools if isinstance(raw_tools, dict) else {}
         # Build port -> exposed map if telemetry included `/proc/net/tcp*` listening ports
         lp_exposed: dict[int, bool] = {}
-        for item in h.get("listening_ports") or []:
+        raw_lp = h.get("listening_ports")
+        for item in (raw_lp if isinstance(raw_lp, list) else []):
             if isinstance(item, dict) and "port" in item:
-                try:
-                    lp_exposed[int(item["port"])] = bool(item.get("exposed", True))
-                except (TypeError, ValueError):
-                    pass
+                pv = _safe_nonneg_int(item.get("port"), 0)
+                if 1 <= pv <= 65535:
+                    lp_exposed[pv] = bool(item.get("exposed", True))
         node_is_local = is_loopback_or_unspecified_host(snap.node.host)
         seen_on_node: set[str] = set()
 
@@ -348,7 +368,7 @@ def build_service_registry(
                     "pool": pool,
                     "ready": snap.ready_for_jobs,
                     "loopback_only": loopback_only,
-                    "cpu_cores": max(1, int(h.get("cpu_cores", 4))),
+                    "cpu_cores": max(1, _safe_nonneg_int(h.get("cpu_cores", 4), 4)),
                     "role": snap.node.role,
                     "source": "auto",
                 }
@@ -600,12 +620,12 @@ def summarize_pools(
         g["nodes_total"] += 1
         g["node_ids"].append(snap.node.id)
         if snap.online:
-            h = snap.health or {}
+            h = snap.health if isinstance(snap.health, dict) else {}
             g["nodes_online"] += 1
             if snap.ready_for_jobs and snap.node.id not in quarantined:
                 g["nodes_ready"] += 1
-            g["total_cores"] += int(h.get("cpu_cores", 0))
-            g["mem_total_mb"] += int(h.get("mem_total_mb", 0))
-            g["mem_available_mb"] += int(h.get("mem_available_mb", 0))
-            g["active_jobs"] += int(h.get("active_jobs", 0))
+            g["total_cores"] += _safe_nonneg_int(h.get("cpu_cores", 0), 0)
+            g["mem_total_mb"] += _safe_nonneg_int(h.get("mem_total_mb", 0), 0)
+            g["mem_available_mb"] += _safe_nonneg_int(h.get("mem_available_mb", 0), 0)
+            g["active_jobs"] += _safe_nonneg_int(h.get("active_jobs", 0), 0)
     return [groups[k] for k in sorted(groups.keys())]

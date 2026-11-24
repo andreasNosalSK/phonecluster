@@ -54,6 +54,7 @@ _ASCII_UINT_RE = re.compile(r"^[0-9]{1,10}$")
 _ASCII_PORT_RE = re.compile(r"^[0-9]{1,5}$")
 _ASCII_HEX_RE = re.compile(rb"^[0-9A-Fa-f]{1,8}$")
 _CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_PROTECTED_END_TO_END_HEADERS = frozenset({"host", "content-length", "transfer-encoding"})
 
 
 def _sanitize_log_text(value: str, max_len: int = 200) -> str:
@@ -493,6 +494,7 @@ def _relay_chunked_request_body(
     initial: bytes,
     idle_timeout: float,
     stop_event: threading.Event,
+    abort_check: Any | None = None,
 ) -> int:
     """Stream an HTTP/1.1 `Transfer-Encoding: chunked` request body safely to upstream."""
     buf = bytearray(initial)
@@ -500,9 +502,15 @@ def _relay_chunked_request_body(
     bytes_forwarded = 0
     saw_final_chunk = False
     conn.settimeout(idle_timeout)
+    upstream.settimeout(idle_timeout)
+
+    def _check_abort() -> None:
+        if abort_check is not None and abort_check():
+            raise OSError("node quarantined during request relay")
 
     def _fill_until(needle: bytes, max_line: int = 8192) -> bool:
         while needle not in buf:
+            _check_abort()
             if len(buf) > max_line or stop_event.is_set():
                 return False
             more = conn.recv(4096)
@@ -512,6 +520,7 @@ def _relay_chunked_request_body(
         return True
 
     while not stop_event.is_set():
+        _check_abort()
         if not _fill_until(b"\r\n"):
             raise OSError("truncated chunked request body")
         line_end = buf.find(b"\r\n")
@@ -552,6 +561,7 @@ def _relay_chunked_request_body(
         need = chunk_size
         total_body += chunk_size
         while need > 0 and not stop_event.is_set():
+            _check_abort()
             if not buf:
                 more = conn.recv(min(RELAY_CHUNK_BYTES, need))
                 if not more:
@@ -739,12 +749,12 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
         leftover = raw[sep_idx + 4 :]
 
         lines = head_bytes.decode("iso-8859-1", errors="replace").split("\r\n")
-        req_parts = lines[0].split()
-        if len(req_parts) != 3:
+        req_parts = lines[0].split(" ")
+        if len(req_parts) != 3 or not all(req_parts):
             _send_proxy_error(conn, 400, "Bad Request", "malformed HTTP proxy request")
             return
         method, target, version = req_parts
-        if any(c in "\r\n" for c in (method + target + version)) or not version.upper().startswith("HTTP/1."):
+        if any(c in "\r\n\t\x00" for c in (method + target + version)) or version not in {"HTTP/1.0", "HTTP/1.1"}:
             _send_proxy_error(conn, 400, "Bad Request", "unsupported or malformed HTTP version")
             return
         method_u = method.upper()
@@ -765,6 +775,9 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 _send_proxy_error(conn, 400, "Bad Request", "invalid HTTP header name")
                 return
             v_clean = raw_v.strip()
+            if any((ord(c) < 32 and c != "\t") or ord(c) == 127 for c in v_clean):
+                _send_proxy_error(conn, 400, "Bad Request", "invalid control character in HTTP header value")
+                return
             header_pairs.append((raw_k, v_clean))
             headers_lower[raw_k.lower()] = v_clean
 
@@ -965,6 +978,25 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             return
 
         candidates = resolved
+        # 4b. Also enforce `blocked_domains` against resolved IPs (defeats octal/hex/decimal/mapped IP & DNS indirection)
+        if gw.blocked_domains:
+            for _fam, sa in candidates:
+                resolved_ip = normalize_host(str(sa[0]))
+                for pat in gw.blocked_domains:
+                    if domain_matches(resolved_ip, pat):
+                        blk_reason = f"resolved IP {resolved_ip} matched blocked rule '{pat}'"
+                        self.server.audit_log.record(
+                            node_id=node_id,
+                            client_ip=client_ip,
+                            method=method_u,
+                            host=dest_host,
+                            port=dest_port,
+                            action="block",
+                            reason=blk_reason,
+                        )
+                        _send_proxy_error(conn, 403, "Forbidden", blk_reason)
+                        return
+
         upstream: socket.socket | None = None
         bytes_in = 0
         bytes_out = 0
@@ -993,6 +1025,8 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             if node_id in self.server.cluster_config.gateway.quarantined_nodes:
                 _send_proxy_error(conn, 403, "Forbidden", f"node '{node_id}' is quarantined by Master")
                 return
+            conn.settimeout(gw.idle_timeout_sec)
+            upstream.settimeout(gw.idle_timeout_sec)
             if method_u == "CONNECT":
                 conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 response_started = True
@@ -1009,7 +1043,8 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 bytes_in += r_in
                 bytes_out += r_out
             else:
-                # Strip Proxy-* / hop-by-hop headers so worker credentials NEVER leak upstream!
+                # Strip Proxy-* / hop-by-hop headers so worker credentials NEVER leak upstream,
+                # while NEVER letting malicious `Connection: Content-Length/Host/Transfer-Encoding` strip framing!
                 conn_tokens = {
                     tok.strip().lower()
                     for k, v in header_pairs
@@ -1017,14 +1052,17 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     for tok in v.split(",")
                     if tok.strip()
                 }
-                hop_headers = {
-                    "connection",
-                    "keep-alive",
-                    "te",
-                    "trailers",
-                    "upgrade",
-                    "expect",
-                } | conn_tokens
+                hop_headers = (
+                    {
+                        "connection",
+                        "keep-alive",
+                        "te",
+                        "trailers",
+                        "upgrade",
+                        "expect",
+                    }
+                    | conn_tokens
+                ) - _PROTECTED_END_TO_END_HEADERS
                 out_headers = [
                     f"{k}: {v}"
                     for k, v in header_pairs
@@ -1058,6 +1096,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                             leftover,
                             idle_timeout=gw.idle_timeout_sec,
                             stop_event=self.server.stop_event,
+                            abort_check=lambda: node_id in self.server.cluster_config.gateway.quarantined_nodes,
                         )
                     except ValueError as exc:
                         code = 413 if "limit" in str(exc) else 400
@@ -1071,6 +1110,8 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     remaining = max(0, content_len - len(initial_body))
                     conn.settimeout(gw.idle_timeout_sec)
                     while remaining > 0 and not self.server.stop_event.is_set():
+                        if node_id in self.server.cluster_config.gateway.quarantined_nodes:
+                            raise OSError("node quarantined during upload")
                         chunk = conn.recv(min(RELAY_CHUNK_BYTES, remaining))
                         if not chunk:
                             raise OSError("truncated request body")
@@ -1078,7 +1119,8 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                         bytes_out += len(chunk)
                         remaining -= len(chunk)
 
-                # Relay upstream HTTP response back to worker
+                # Relay upstream HTTP response back to worker (both sockets have explicit idle timeout)
+                conn.settimeout(gw.idle_timeout_sec)
                 upstream.settimeout(gw.idle_timeout_sec)
                 while not self.server.stop_event.is_set():
                     if node_id in self.server.cluster_config.gateway.quarantined_nodes:

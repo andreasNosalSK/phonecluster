@@ -23,10 +23,16 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -c|--config) CONFIG_PATH="$2"; shift 2 ;;
+    -c|--config)
+      [[ $# -ge 2 ]] || { echo "Error: $1 requires a path" >&2; exit 2; }
+      CONFIG_PATH="$2"; shift 2 ;;
     --setup-keys) SETUP_KEYS=1; shift ;;
-    --skip-node) SKIP_LOCAL="$2"; shift 2 ;;
-    --remote-dir) REMOTE_DIR="$2"; shift 2 ;;
+    --skip-node)
+      [[ $# -ge 2 ]] || { echo "Error: --skip-node requires a node id" >&2; exit 2; }
+      SKIP_LOCAL="$2"; shift 2 ;;
+    --remote-dir)
+      [[ $# -ge 2 ]] || { echo "Error: --remote-dir requires a path" >&2; exit 2; }
+      REMOTE_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
   esac
@@ -69,6 +75,9 @@ while IFS=$'\t' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
     ssh-copy-id -p "${SSH_PORT}" -- "${TARGET}"
   fi
 
+  # POSIX-safe single-quote escape of REMOTE_DIR via Python shlex.quote (immune to spaces/metacharacters/quotes)
+  SQ_RDIR="$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "${REMOTE_DIR}")"
+
   # Stream project code via tar over SSH (without shipping Master's full cluster.json to workers)
   tar -C "${REPO_ROOT}" -cf - \
     phonecluster \
@@ -76,12 +85,12 @@ while IFS=$'\t' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
     scripts \
     examples \
     | ssh -p "${SSH_PORT}" -- "${TARGET}" \
-      "mkdir -p ${REMOTE_DIR}/config ${REMOTE_DIR}/logs && tar -xf - -C ${REMOTE_DIR}"
+      "set -eu; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#'~/'}\" ;; esac; mkdir -p \"\$RDIR/config\" \"\$RDIR/logs\"; tar -xf - -C \"\$RDIR\""
 
-  # Push least-privilege scoped config (workers ONLY receive their own node token, never Master's admin token)
+  # Push least-privilege scoped config atomically (0600, workers ONLY receive their own node token)
   python3 - "${CONFIG_PATH}" "${NODE_ID}" "${ROLE}" <<'PY' \
     | ssh -p "${SSH_PORT}" -- "${TARGET}" \
-      "umask 077 && cat > ${REMOTE_DIR}/config/cluster.json && chmod 600 ${REMOTE_DIR}/config/cluster.json"
+      "set -eu; umask 077; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#'~/'}\" ;; esac; TMP=\"\$RDIR/config/.cluster.json.tmp.\$\$\"; cat > \"\$TMP\"; chmod 600 \"\$TMP\"; mv -f \"\$TMP\" \"\$RDIR/config/cluster.json\""
 import json, socket, sys
 cfg_path, node_id, role = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(cfg_path, "r", encoding="utf-8") as fh:
@@ -154,7 +163,8 @@ fi
 
 # Also clean up any orphaned worker for the same node_id started outside PID file
 if command -v pkill >/dev/null 2>&1; then
-  pkill -f "phonecluster_cli\.py.*worker --node-id ${NODE_ID}(\$| )" 2>/dev/null || true
+  NODE_ID_RE="${NODE_ID//./\\.}"
+  pkill -f "phonecluster_cli\.py.*worker --node-id ${NODE_ID_RE}(\$| )" 2>/dev/null || true
   sleep 0.2
 fi
 

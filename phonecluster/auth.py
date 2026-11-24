@@ -5,9 +5,11 @@ from __future__ import annotations
 import collections
 import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import secrets
+import socket
 import threading
 import time
 import urllib.parse
@@ -62,12 +64,60 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
+    """Block webhook redirects to non-HTTP(S), link-local/cloud metadata, or cross-origin loopback."""
+    parsed_new = urllib.parse.urlsplit(new_url)
+    if parsed_new.scheme.lower() not in {"http", "https"} or not parsed_new.hostname:
+        return True
+    new_host = parsed_new.hostname.strip().strip("[]").lower()
+    if "%" in new_host:
+        return True
+    orig_host = (urllib.parse.urlsplit(orig_url).hostname or "").strip().strip("[]").lower()
+
+    def _is_loopback_name(h: str) -> bool:
+        if h == "localhost":
+            return True
+        try:
+            a = ipaddress.ip_address(h)
+            if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped is not None:
+                a = a.ipv4_mapped
+            return bool(a.is_loopback or a.is_unspecified)
+        except ValueError:
+            return False
+
+    orig_is_loopback = _is_loopback_name(orig_host)
+    if new_host == "localhost" and not orig_is_loopback:
+        return True
+    try:
+        infos = socket.getaddrinfo(new_host, parsed_new.port or 80, type=socket.SOCK_STREAM)
+    except OSError:
+        return True
+    for _fam, _st, _pr, _cn, sa in infos:
+        ip_raw = str(sa[0])
+        if "%" in ip_raw:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip_raw)
+        except ValueError:
+            return True
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+        # Always block link-local / cloud metadata (169.254.0.0/16, fe80::/10) & unspecified on redirects
+        if addr.is_link_local or addr.is_unspecified or addr.is_multicast:
+            return True
+        # Block remote webhooks redirecting into local Master/Worker loopback services
+        if addr.is_loopback and not orig_is_loopback:
+            return True
+    return False
+
+
 class _HttpOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Allow only http:// or https:// redirects for user-configured outbound webhooks (blocks file:///ftp://)."""
+    """Allow safe HTTP(S) redirects for webhooks while blocking file://, metadata, and remote->loopback SSRF."""
+
+    max_redirections = 5
 
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
-        scheme = urllib.parse.urlsplit(newurl).scheme.lower()
-        if scheme not in {"http", "https"}:
+        if _is_webhook_redirect_target_unsafe(req.full_url, newurl):
             return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 

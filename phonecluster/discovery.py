@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import select
 import socket
 import struct
 import threading
@@ -229,66 +230,83 @@ def discover_lan_nodes(
     local_ip = detect_local_ip()
     dests = targets if targets is not None else _candidate_broadcast_addresses(local_ip)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(0.25)
+    def _open_probe_sock() -> socket.socket:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.setblocking(False)
+        return s
 
+    socks: list[socket.socket] = [_open_probe_sock()]
     found: dict[tuple[str, int], dict[str, Any]] = {}
     try:
-        def _send_probes() -> None:
+        def _send_probes(s: socket.socket) -> None:
             for dest in dests:
                 try:
-                    sock.sendto(probe, (dest, discovery_port))
+                    s.sendto(probe, (dest, discovery_port))
                 except OSError as exc:
                     LOG.debug("Broadcast to %s:%d failed: %s", dest, discovery_port, exc)
 
-        _send_probes()
+        _send_probes(socks[0])
         started = time.monotonic()
         deadline = started + max(0.2, timeout_sec)
         resent = False
         while time.monotonic() < deadline:
             if not resent and timeout_sec >= 0.8 and (time.monotonic() - started) >= (timeout_sec * 0.45):
-                _send_probes()
+                # Fresh ephemeral source port avoids SO_REUSEPORT hash-pinning if pairing beacon shares port 8766
+                try:
+                    s2 = _open_probe_sock()
+                    socks.append(s2)
+                    _send_probes(s2)
+                except OSError:
+                    _send_probes(socks[0])
                 resent = True
+            rem_t = max(0.02, min(0.25, deadline - time.monotonic()))
             try:
-                data, addr = sock.recvfrom(4096)
-            except socket.timeout:
-                continue
-            except OSError:
+                readable, _, _ = select.select(socks, [], [], rem_t)
+            except (OSError, ValueError):
                 break
-            try:
-                msg = json.loads(data.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(msg, dict) or msg.get("type") != REPLY_TYPE:
-                continue
-            try:
-                worker_port = int(msg.get("worker_port", 8765))
-                ssh_port = int(msg.get("ssh_port", 8022))
-                cpu_cores = max(1, min(1024, int(msg.get("cpu_cores", 1))))
-                mem_total_mb = max(0, int(msg.get("mem_total_mb", 0)))
-            except (TypeError, ValueError):
-                continue
-            if not (1 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
-                continue
-            host_ip = str(addr[0])
-            key = (host_ip, worker_port)
-            if key not in found and len(found) < _MAX_DISCOVERED_NODES:
-                role_raw = _CTRL_RE.sub("", str(msg.get("role", "worker"))).strip().lower()
-                found[key] = {
-                    "host": host_ip,
-                    "node_id": _CTRL_RE.sub("", str(msg.get("node_id", ""))).strip()[:40],
-                    "role": role_raw if role_raw in {"master", "worker"} else "worker",
-                    "hostname": _CTRL_RE.sub("", str(msg.get("hostname", ""))).strip()[:64],
-                    "worker_port": worker_port,
-                    "ssh_port": ssh_port,
-                    "ssh_user": _CTRL_RE.sub("", str(msg.get("ssh_user", ""))).strip()[:64],
-                    "os_env": _CTRL_RE.sub("", str(msg.get("os_env", "unknown"))).strip()[:32] or "unknown",
-                    "cpu_cores": cpu_cores,
-                    "mem_total_mb": mem_total_mb,
-                }
+            for rs in readable:
+                try:
+                    data, addr = rs.recvfrom(4096)
+                except OSError:
+                    continue
+                try:
+                    msg = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(msg, dict) or msg.get("type") != REPLY_TYPE:
+                    continue
+                try:
+                    worker_port = int(msg.get("worker_port", 8765))
+                    ssh_port = int(msg.get("ssh_port", 8022))
+                    cpu_cores = max(1, min(1024, int(msg.get("cpu_cores", 1))))
+                    mem_total_mb = max(0, int(msg.get("mem_total_mb", 0)))
+                except (TypeError, ValueError):
+                    continue
+                if not (1 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
+                    continue
+                host_ip = str(addr[0])
+                key = (host_ip, worker_port)
+                if key not in found and len(found) < _MAX_DISCOVERED_NODES:
+                    role_raw = _CTRL_RE.sub("", str(msg.get("role", "worker"))).strip().lower()
+                    found[key] = {
+                        "host": host_ip,
+                        "node_id": _CTRL_RE.sub("", str(msg.get("node_id", ""))).strip()[:40],
+                        "role": role_raw if role_raw in {"master", "worker"} else "worker",
+                        "hostname": _CTRL_RE.sub("", str(msg.get("hostname", ""))).strip()[:64],
+                        "worker_port": worker_port,
+                        "ssh_port": ssh_port,
+                        "ssh_user": _CTRL_RE.sub("", str(msg.get("ssh_user", ""))).strip()[:64],
+                        "os_env": _CTRL_RE.sub("", str(msg.get("os_env", "unknown"))).strip()[:32] or "unknown",
+                        "cpu_cores": cpu_cores,
+                        "mem_total_mb": mem_total_mb,
+                    }
     finally:
-        sock.close()
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
 
     return sorted(found.values(), key=lambda x: (x["host"], x["worker_port"]))
 

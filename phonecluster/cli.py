@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -178,7 +180,8 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
         bat_str = f"{bat}% {h.get('battery_status', '')[:4]}" if bat is not None else "N/A"
         temp = h.get("temp_c")
         temp_str = f"{temp:.1f}C" if temp is not None else "N/A"
-        svcs = [k.split("_")[0] for k, v in (h.get("services") or {}).items() if v]
+        raw_svcs = h.get("services") if isinstance(h, dict) else None
+        svcs = [k.split("_")[0] for k, v in (raw_svcs.items() if isinstance(raw_svcs, dict) else ()) if v]
         svc_str = ",".join(svcs) if svcs else "-"
         rows.append(
             [
@@ -465,6 +468,9 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
     cfg_path = resolve_config_path(args.config)
     cfg = load_config(cfg_path)
 
+    if args.port is not None and not (0 <= int(args.port) <= 65535):
+        print(f"Error: --port must be between 0 and 65535 (got {args.port})", file=sys.stderr)
+        return 2
     if args.enable or args.disable or args.mode or args.port:
         if args.enable:
             cfg.gateway.enabled = True
@@ -473,7 +479,7 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
         if args.mode:
             cfg.gateway.mode = args.mode
         if args.port:
-            cfg.gateway.port = args.port
+            cfg.gateway.port = int(args.port)
         save_config(cfg, cfg_path)
         state_txt = "ENABLED" if cfg.gateway.enabled else "DISABLED"
         print(
@@ -555,7 +561,12 @@ def _cmd_net_audit(args: argparse.Namespace) -> int:
     cfg_path = resolve_config_path(args.config)
     cfg = load_config(cfg_path)
     if getattr(args, "lan_subnet", ""):
-        cfg.network.lan_subnet = str(args.lan_subnet).strip()
+        raw_sub = str(args.lan_subnet).strip()
+        try:
+            cfg.network.lan_subnet = str(ipaddress.ip_network(raw_sub, strict=False))
+        except ValueError:
+            print(f"Error: invalid --lan-subnet CIDR '{raw_sub}' (example: 192.168.1.0/24)", file=sys.stderr)
+            return 2
         save_config(cfg, cfg_path)
     if args.profile:
         res = apply_security_profile(cfg, args.profile)
@@ -644,20 +655,40 @@ def _cmd_join(args: argparse.Namespace) -> int:
 
     if args.master:
         raw_m = args.master.strip()
-        if raw_m.startswith("["):
+        if raw_m.lower().startswith(("http://", "https://")):
+            parsed_m = urllib.parse.urlsplit(raw_m)
+            master_host = normalize_host(parsed_m.hostname or "")
+            try:
+                if parsed_m.port is not None:
+                    pair_port = parsed_m.port
+            except ValueError:
+                print(f"Error: invalid port in --master '{raw_m}'", file=sys.stderr)
+                return 2
+        elif raw_m.startswith("["):
             if "]:" in raw_m:
                 h_part, p_str = raw_m.rsplit("]:", 1)
                 master_host = normalize_host(h_part.lstrip("["))
-                pair_port = int(p_str)
+                try:
+                    pair_port = int(p_str.rstrip("/"))
+                except ValueError:
+                    print(f"Error: invalid port in --master '{raw_m}'", file=sys.stderr)
+                    return 2
             else:
-                master_host = normalize_host(raw_m)
+                master_host = normalize_host(raw_m.rstrip("/"))
         elif raw_m.count(":") == 1:
             h_part, p_str = raw_m.rsplit(":", 1)
             master_host = normalize_host(h_part)
-            pair_port = int(p_str)
+            try:
+                pair_port = int(p_str.rstrip("/"))
+            except ValueError:
+                print(f"Error: invalid port in --master '{raw_m}'", file=sys.stderr)
+                return 2
         else:
             # Hostname, IPv4 without port, or bare IPv6 literal (multiple ':')
-            master_host = normalize_host(raw_m)
+            master_host = normalize_host(raw_m.rstrip("/"))
+        if not master_host or not (1 <= pair_port <= 65535):
+            print(f"Error: invalid --master address '{raw_m}' (expected host[:port] with port 1..65535)", file=sys.stderr)
+            return 2
     else:
         print("Searching local Wi-Fi for a Master phone with an open Pairing Window...")
         found = discover_pairing_masters(timeout_sec=args.timeout)
@@ -714,7 +745,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
             tier=args.tier,
             pool=args.pool,
         )
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(f"Pairing failed: {exc}", file=sys.stderr)
         return 1
 

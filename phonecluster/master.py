@@ -81,11 +81,11 @@ class NodeSnapshot:
 
     @property
     def active_jobs(self) -> int:
-        return int(self.health.get("active_jobs", 0))
+        return max(0, _safe_int(self.health.get("active_jobs", 0), 0))
 
     @property
     def max_concurrency(self) -> int:
-        return int(self.health.get("max_concurrency", self.node.max_concurrency))
+        return max(1, _safe_int(self.health.get("max_concurrency", self.node.max_concurrency), self.node.max_concurrency))
 
     @property
     def available_slots(self) -> int:
@@ -270,22 +270,26 @@ class MetricsHistory:
                     self._nodes[nid] = collections.deque(maxlen=self.maxlen)
                 h = n.get("health") or {}
                 if n.get("online"):
-                    mem_tot = h.get("mem_total_mb") or 0
-                    mem_avail = h.get("mem_available_mb") or 0
+                    mem_tot = max(0, _safe_int(h.get("mem_total_mb", 0), 0))
+                    mem_avail = max(0, _safe_int(h.get("mem_available_mb", 0), 0))
                     ram_pct = round(((mem_tot - mem_avail) / mem_tot) * 100.0, 1) if mem_tot else 0.0
-                    cpu_pct = h.get("cpu_pct")
-                    if cpu_pct is None:
-                        cores = max(1, int(h.get("cpu_cores", 1)))
-                        cpu_pct = min(100.0, round((float(h.get("load_1m", 0.0)) / cores) * 100.0, 1))
+                    cpu_raw = h.get("cpu_pct")
+                    cpu_val = _safe_float(cpu_raw, -1.0) if cpu_raw is not None else -1.0
+                    if cpu_val < 0.0:
+                        cores = max(1, _safe_int(h.get("cpu_cores", 1), 1))
+                        load_val = max(0.0, _safe_float(h.get("load_1m", 0.0), 0.0))
+                        cpu_val = min(100.0, round((load_val / cores) * 100.0, 1))
+                    temp_raw = h.get("temp_c")
+                    temp_clean = _safe_float(temp_raw, -999.0) if temp_raw is not None else None
                     self._nodes[nid].append(
                         {
                             "ts": ts,
                             "online": True,
-                            "cpu_pct": float(cpu_pct),
+                            "cpu_pct": min(100.0, max(0.0, cpu_val)),
                             "ram_pct": ram_pct,
-                            "temp_c": h.get("temp_c"),
+                            "temp_c": temp_clean if temp_clean is not None and temp_clean > -500.0 else None,
                             "battery_pct": h.get("battery_pct"),
-                            "active_jobs": int(h.get("active_jobs", 0)),
+                            "active_jobs": max(0, _safe_int(h.get("active_jobs", 0), 0)),
                         }
                     )
                 else:
@@ -335,7 +339,8 @@ class MasterController:
     def _is_remote_port_loopback_only(snap: NodeSnapshot, port: int) -> bool:
         if is_loopback_or_unspecified_host(snap.node.host):
             return False
-        for item in snap.health.get("listening_ports") or []:
+        raw_lp = snap.health.get("listening_ports") if isinstance(snap.health, dict) else None
+        for item in (raw_lp if isinstance(raw_lp, list) else []):
             if isinstance(item, dict) and item.get("port") == port:
                 return not bool(item.get("exposed", True))
         return False
@@ -1111,15 +1116,17 @@ class MasterController:
         for snap in snaps:
             if not snap.ready_for_jobs or snap.node.id in quarantined:
                 continue
-            services = snap.health.get("services", {})
-            tools = snap.health.get("tools", {})
+            raw_svcs = snap.health.get("services")
+            services = raw_svcs if isinstance(raw_svcs, dict) else {}
+            raw_tools = snap.health.get("tools")
+            tools = raw_tools if isinstance(raw_tools, dict) else {}
             running = bool(services.get("distccd_3632"))
             installed = bool(tools.get("distccd"))
             if not running and not (include_stopped and installed):
                 continue
             if running and self._is_remote_port_loopback_only(snap, 3632):
                 continue
-            cores = max(1, int(snap.health.get("cpu_cores", 4)))
+            cores = max(1, _safe_int(snap.health.get("cpu_cores", 4), 4))
             if snap.node.role == "master" or snap.node.host in {"127.0.0.1", "localhost"}:
                 slots = max(1, cores - 2)
                 entries.append(f"localhost/{slots}")
@@ -1142,12 +1149,16 @@ class MasterController:
                 continue
             if not include_master and snap.node.role == "master":
                 continue
-            svcs = snap.health.get("services", {})
-            lp_ports = {
-                int(p["port"])
-                for p in (snap.health.get("listening_ports") or [])
-                if isinstance(p, dict) and "port" in p
-            }
+            raw_svcs = snap.health.get("services")
+            svcs = raw_svcs if isinstance(raw_svcs, dict) else {}
+            raw_lp = snap.health.get("listening_ports")
+            lp_ports: set[int] = set()
+            if isinstance(raw_lp, list):
+                for p in raw_lp:
+                    if isinstance(p, dict) and "port" in p:
+                        pv = _safe_int(p.get("port"), 0)
+                        if 1 <= pv <= 65535:
+                            lp_ports.add(pv)
             active = (port == 50052 and bool(svcs.get("llama_rpc_50052"))) or (port in lp_ports)
             if active and not self._is_remote_port_loopback_only(snap, port):
                 endpoints.append(format_host_port(snap.node.host, port))
@@ -1158,11 +1169,14 @@ class MasterController:
         snaps = snapshots if snapshots is not None else self.poll_health()
         quarantined = self._quarantined_ids()
         ready_snaps = [s for s in snaps if s.ready_for_jobs and s.node.id not in quarantined]
-        mpi_snaps = [s for s in ready_snaps if (s.health.get("tools") or {}).get("mpirun")]
+        mpi_snaps = [
+            s for s in ready_snaps
+            if isinstance(s.health.get("tools"), dict) and s.health["tools"].get("mpirun")
+        ]
         chosen = mpi_snaps if mpi_snaps else ready_snaps
         lines: list[str] = []
         for snap in chosen:
-            cores = max(1, int(snap.health.get("cpu_cores", 4)))
+            cores = max(1, _safe_int(snap.health.get("cpu_cores", 4), 4))
             lines.append(f"{snap.node.host} slots={cores}")
         return "\n".join(lines) + ("\n" if lines else "")
 
@@ -1187,25 +1201,29 @@ class MasterController:
             is_q = snap.node.id in quarantined
             if snap.online:
                 online_count += 1
-                cores = int(snap.health.get("cpu_cores", 0))
+                cores = max(0, _safe_int(snap.health.get("cpu_cores", 0), 0))
                 total_cores += cores
-                total_ram_mb += int(snap.health.get("mem_total_mb", 0))
-                avail_ram_mb += int(snap.health.get("mem_available_mb", 0))
-                total_active_jobs += int(snap.health.get("active_jobs", 0))
-                latencies.append(float(snap.latency_ms))
+                total_ram_mb += max(0, _safe_int(snap.health.get("mem_total_mb", 0), 0))
+                avail_ram_mb += max(0, _safe_int(snap.health.get("mem_available_mb", 0), 0))
+                total_active_jobs += max(0, _safe_int(snap.health.get("active_jobs", 0), 0))
+                latencies.append(max(0.0, _safe_float(snap.latency_ms, 0.0)))
                 if snap.ready_for_jobs and not is_q:
                     ready_count += 1
-                cpu_pct = snap.health.get("cpu_pct")
-                if cpu_pct is None:
-                    cpu_pct = min(100.0, (float(snap.health.get("load_1m", 0.0)) / max(1, cores)) * 100.0)
-                weighted_cpu_sum += float(cpu_pct) * max(1, cores)
+                cpu_raw = snap.health.get("cpu_pct")
+                cpu_pct = _safe_float(cpu_raw, -1.0) if cpu_raw is not None else -1.0
+                if cpu_pct < 0.0:
+                    load_1m = max(0.0, _safe_float(snap.health.get("load_1m", 0.0), 0.0))
+                    cpu_pct = min(100.0, (load_1m / max(1, cores)) * 100.0)
+                weighted_cpu_sum += min(100.0, max(0.0, cpu_pct)) * max(1, cores)
                 if snap.health.get("net_rx_kbps") is not None:
-                    total_net_rx += float(snap.health["net_rx_kbps"])
+                    total_net_rx += max(0.0, _safe_float(snap.health.get("net_rx_kbps"), 0.0))
                 if snap.health.get("net_tx_kbps") is not None:
-                    total_net_tx += float(snap.health["net_tx_kbps"])
-                t = snap.health.get("temp_c")
-                if t is not None:
-                    temps.append(float(t))
+                    total_net_tx += max(0.0, _safe_float(snap.health.get("net_tx_kbps"), 0.0))
+                t_raw = snap.health.get("temp_c")
+                if t_raw is not None:
+                    t_val = _safe_float(t_raw, -999.0)
+                    if t_val > -500.0:
+                        temps.append(t_val)
             eff_tier, eff_pool = resolve_node_tier_and_pool(snap.node, snap.health if snap.online else None)
             node_dicts.append(
                 {

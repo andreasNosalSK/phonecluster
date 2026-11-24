@@ -3191,9 +3191,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 for s in snaps:
                     if not s.online or s.node.id in quarantined:
                         continue
-                    if s.health.get("services", {}).get("homeassistant_8123"):
+                    raw_svcs = s.health.get("services") if isinstance(s.health, dict) else None
+                    svcs_d = raw_svcs if isinstance(raw_svcs, dict) else {}
+                    raw_tools = s.health.get("tools") if isinstance(s.health, dict) else None
+                    tools_d = raw_tools if isinstance(raw_tools, dict) else {}
+                    if svcs_d.get("homeassistant_8123"):
                         ha_urls.append(f"http://{format_host_port(s.node.host, 8123)}")
-                    if s.health.get("tools", {}).get("docker") or resolve_node_tier_and_pool(s.node, s.health)[0] == 3:
+                    if tools_d.get("docker") or resolve_node_tier_and_pool(s.node, s.health)[0] == 3:
                         docker_nodes.append(s.node.id)
                 with ctrl.config_lock:
                     master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
@@ -3978,7 +3982,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/settings/test-webhook":
             url = str(body.get("battery_webhook_url") or ctrl.config.safety.battery_webhook_url).strip()
-            if not url or any(c.isspace() or ord(c) < 32 for c in url) or not url.startswith(("http://", "https://")):
+            p_url = urllib.parse.urlsplit(url)
+            if (
+                not url
+                or any(c.isspace() or ord(c) < 32 for c in url)
+                or p_url.scheme.lower() not in {"http", "https"}
+                or not p_url.hostname
+            ):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "enter a valid http:// or https:// webhook URL"})
                 return
             test_payload = {

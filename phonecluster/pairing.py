@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import secrets
+import select
 import socket
 import threading
 import time
@@ -51,6 +52,8 @@ from .config import (
     is_loopback_or_unspecified_host,
     normalize_host,
     save_config,
+    validate_host,
+    validate_node_id,
     validate_pool_name,
     validate_ssh_user,
 )
@@ -317,59 +320,77 @@ def discover_pairing_masters(
     local_ip = detect_local_ip()
     dests = targets if targets is not None else _candidate_broadcast_addresses(local_ip)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(0.25)
+    def _open_probe_sock() -> socket.socket:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.setblocking(False)
+        return s
 
+    socks: list[socket.socket] = [_open_probe_sock()]
     found: dict[tuple[str, int], dict[str, Any]] = {}
     try:
-        def _send_probes() -> None:
+        def _send_probes(s: socket.socket) -> None:
             for dest in dests:
                 try:
-                    sock.sendto(probe, (dest, discovery_port))
+                    s.sendto(probe, (dest, discovery_port))
                 except OSError:
                     pass
 
-        _send_probes()
+        _send_probes(socks[0])
         started = time.monotonic()
         deadline = started + max(0.2, timeout_sec)
         resent = False
         while time.monotonic() < deadline:
             if not resent and timeout_sec >= 0.8 and (time.monotonic() - started) >= (timeout_sec * 0.45):
-                _send_probes()
+                # Use a fresh ephemeral source port on retry to bypass Linux SO_REUSEPORT 4-tuple pinning
+                # when both DiscoveryResponder and PairingBeaconResponder share UDP 8766 on Master!
+                try:
+                    s2 = _open_probe_sock()
+                    socks.append(s2)
+                    _send_probes(s2)
+                except OSError:
+                    _send_probes(socks[0])
                 resent = True
+            rem_t = max(0.02, min(0.25, deadline - time.monotonic()))
             try:
-                data, addr = sock.recvfrom(4096)
-            except socket.timeout:
-                continue
-            except OSError:
+                readable, _, _ = select.select(socks, [], [], rem_t)
+            except (OSError, ValueError):
                 break
-            try:
-                msg = json.loads(data.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(msg, dict) or msg.get("type") != PAIR_BEACON_TYPE:
-                continue
-            try:
-                pair_port = int(msg.get("pair_port", DEFAULT_PAIR_PORT))
-                expires_in_sec = max(0, int(msg.get("expires_in_sec", 0)))
-            except (TypeError, ValueError):
-                continue
-            if not (1 <= pair_port <= 65535):
-                continue
-            host_ip = str(addr[0])
-            key = (host_ip, pair_port)
-            if key not in found and len(found) < 64:
-                found[key] = {
-                    "host": host_ip,
-                    "pair_port": pair_port,
-                    "cluster_name": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("cluster_name", "phonecluster")))[:64],
-                    "session_id": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("session_id", "")))[:64],
-                    "fingerprint": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("fingerprint", "")))[:64],
-                    "expires_in_sec": expires_in_sec,
-                }
+            for rs in readable:
+                try:
+                    data, addr = rs.recvfrom(4096)
+                except OSError:
+                    continue
+                try:
+                    msg = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(msg, dict) or msg.get("type") != PAIR_BEACON_TYPE:
+                    continue
+                try:
+                    pair_port = int(msg.get("pair_port", DEFAULT_PAIR_PORT))
+                    expires_in_sec = max(0, int(msg.get("expires_in_sec", 0)))
+                except (TypeError, ValueError):
+                    continue
+                if not (1 <= pair_port <= 65535):
+                    continue
+                host_ip = str(addr[0])
+                key = (host_ip, pair_port)
+                if key not in found and len(found) < 64:
+                    found[key] = {
+                        "host": host_ip,
+                        "pair_port": pair_port,
+                        "cluster_name": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("cluster_name", "phonecluster")))[:64],
+                        "session_id": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("session_id", "")))[:64],
+                        "fingerprint": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("fingerprint", "")))[:64],
+                        "expires_in_sec": expires_in_sec,
+                    }
     finally:
-        sock.close()
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
 
     return sorted(found.values(), key=lambda x: (x["host"], x["pair_port"]))
 
@@ -976,9 +997,18 @@ def join_cluster_via_pairing(
     if status != HTTPStatus.OK:
         raise RuntimeError(hello.get("error", f"Master refused pairing hello (HTTP {status})"))
 
-    session_id = str(hello["session_id"])
-    pub_a_hex = str(hello["dh_pub"]).lower()
-    salt_hex = str(hello["salt"])
+    session_id = str(hello.get("session_id") or "").strip()
+    pub_a_hex = str(hello.get("dh_pub") or "").strip().lower()
+    salt_hex = str(hello.get("salt") or "").strip().lower()
+    if (
+        not session_id
+        or len(session_id) > 64
+        or not pub_a_hex
+        or len(pub_a_hex) > 600
+        or not re.fullmatch(r"[0-9a-f]+", pub_a_hex)
+        or not re.fullmatch(r"[0-9a-f]{16,128}", salt_hex)
+    ):
+        raise RuntimeError("Malformed pairing hello from Master (invalid session_id, dh_pub, or salt).")
     pub_a = int(pub_a_hex, 16)
 
     priv_b, pub_b = generate_dh_keypair()
@@ -1032,12 +1062,19 @@ def join_cluster_via_pairing(
     if not hmac.compare_digest(str(reply.get("server_proof", "")).lower(), expected_server_proof):
         raise RuntimeError("Master authentication proof failed! Possible rogue/spoofed Master — aborting.")
 
-    node_id = str(reply["node_id"])
+    raw_node_id = str(reply.get("node_id") or "").strip()
+    enc_bundle = reply.get("encrypted_bundle")
+    if not raw_node_id or not isinstance(enc_bundle, dict):
+        raise RuntimeError("Malformed pairing completion reply from Master.")
+    node_id = validate_node_id(raw_node_id)
     aad = f"{session_id}|{node_id}|{pub_a_hex[:16]}|{pub_b_hex[:16]}"
-    bundle = decrypt_bundle(k_enc, k_mac, reply["encrypted_bundle"], aad=aad)
+    bundle = decrypt_bundle(k_enc, k_mac, enc_bundle, aad=aad)
 
     # Write LEAST-PRIVILEGE worker config containing ONLY this worker's own unique token!
-    worker_token = str(bundle["node_token"])
+    worker_token = str(bundle.get("node_token") or "").strip()
+    if not worker_token:
+        raise RuntimeError("Master pairing bundle missing node_token.")
+    assigned_host = validate_host(str(bundle.get("node_host") or detect_local_ip()))
     raw_net = dict(bundle.get("network") or {})
     master_ips = list(raw_net.get("allowed_master_ips") or [])
     for m_ip in (str(bundle.get("master_host") or ""), master_host):
@@ -1045,14 +1082,14 @@ def join_cluster_via_pairing(
             master_ips.append(m_ip)
     raw_net["allowed_master_ips"] = master_ips
     worker_cfg = ClusterConfig(
-        cluster_name=str(bundle["cluster_name"]),
+        cluster_name=str(bundle.get("cluster_name") or "phonecluster"),
         auth_token=worker_token,
         safety=SafetyConfig.from_dict(bundle.get("safety") or {}),
         network=NetworkHardeningConfig.from_dict(raw_net),
         nodes=[
             NodeConfig(
                 id=node_id,
-                host=str(bundle.get("node_host") or detect_local_ip()),
+                host=assigned_host,
                 role="worker",
                 worker_port=worker_port,
                 ssh_port=actual_ssh_port,

@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -542,12 +543,14 @@ _WEBHOOK_OPENER = build_webhook_opener()
 def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> None:
     """Send a best-effort JSON webhook (e.g., Home Assistant, ntfy, smart plug bridge)."""
     clean_url = str(url or "").strip()
+    parsed_wb = urllib.parse.urlsplit(clean_url)
     if (
         not clean_url
         or any(c.isspace() or ord(c) < 32 for c in clean_url)
-        or not clean_url.startswith(("http://", "https://"))
+        or parsed_wb.scheme.lower() not in {"http", "https"}
+        or not parsed_wb.hostname
     ):
-        LOG.warning("Skipped invalid safety webhook URL (must be http:// or https://)")
+        LOG.warning("Skipped invalid safety webhook URL (must be http:// or https:// with hostname)")
         return
     try:
         body = json.dumps(payload).encode("utf-8")

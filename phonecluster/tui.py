@@ -334,7 +334,8 @@ def render_top_frame(
         rx_v = h.get("net_rx_kbps")
         tx_v = h.get("net_tx_kbps")
         net_txt = f"↓{rx_v:.0f} ↑{tx_v:.0f}KB/s" if rx_v is not None and tx_v is not None else ""
-        svcs = ",".join(k.split("_")[0] for k, v in (h.get("services") or {}).items() if v)
+        raw_svcs = h.get("services") if isinstance(h, dict) else None
+        svcs = ",".join(k.split("_")[0] for k, v in (raw_svcs.items() if isinstance(raw_svcs, dict) else ()) if v)
         device_lines.append(
             f"    TMP {t_txt} {t_bar}  BAT {bat_txt}  "
             f"{pal.cyan(net_txt)}  {pal.dim(svcs)}"

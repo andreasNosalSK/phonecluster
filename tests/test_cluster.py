@@ -3786,9 +3786,19 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
 
         class _OkHttpHandler(socketserver.BaseRequestHandler):
             def handle(self) -> None:
-                self.request.settimeout(3.0)
+                self.request.settimeout(0.4)
                 try:
-                    self.request.recv(4096)
+                    buf = b""
+                    while len(buf) < 8192:
+                        try:
+                            chunk = self.request.recv(4096)
+                        except socket.timeout:
+                            break
+                        if not chunk:
+                            break
+                        buf += chunk
+                        if b"0\r\n\r\n" in buf:
+                            break
                     self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 except OSError:
                     pass
@@ -4344,6 +4354,378 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
             ev.set()
             srv.shutdown()
             srv.server_close()
+
+    def test_proxy_hop_by_hop_abuse_request_line_strictness_post_dns_ip_block_and_upload_quarantine(self) -> None:
+        """Verify Connection: header cannot strip Host/Content-Length, strict HTTP version/tabs/NUL checks, post-DNS IP blocklist, and mid-upload quarantine."""
+        import socketserver
+
+        captured_reqs: list[bytes] = []
+
+        class _CaptureHandler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.settimeout(1.5)
+                try:
+                    buf = bytearray()
+                    while b"\r\n\r\n" not in buf:
+                        chunk = self.request.recv(4096)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                    sep = buf.find(b"\r\n\r\n")
+                    if sep != -1:
+                        head = buf[:sep].decode("iso-8859-1", errors="replace")
+                        want = 0
+                        for ln in head.split("\r\n")[1:]:
+                            if ln.lower().startswith("content-length:"):
+                                try:
+                                    want = int(ln.split(":", 1)[1].strip())
+                                except ValueError:
+                                    want = 0
+                        while len(buf) < sep + 4 + want:
+                            chunk = self.request.recv(4096)
+                            if not chunk:
+                                break
+                            buf.extend(chunk)
+                    captured_reqs.append(bytes(buf))
+                    self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                except OSError:
+                    pass
+
+        class _ReuseTCP(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        up_srv = _ReuseTCP(("127.0.0.1", 0), _CaptureHandler)
+        up_port = up_srv.server_address[1]
+        threading.Thread(target=up_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        tok = "pass6-gw-tok-12345678"
+        w_tok = "pass6-w-tok-87654321"
+        cfg = ClusterConfig(
+            cluster_name="pass6-gw",
+            auth_token=tok,
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=8766, auth_token=w_tok),
+            ],
+            gateway=GatewayConfig(
+                enabled=True,
+                bind_host="127.0.0.1",
+                port=0,
+                mode="monitor",
+                allowed_ports=[up_port],
+                block_private_ips=False,
+                idle_timeout_sec=10.0,
+            ),
+        )
+        gw_mgr = GatewayManager(cfg)
+        ok, msg = gw_mgr.start()
+        self.assertTrue(ok, msg)
+        gw_port = gw_mgr.bound_port
+        secret = derive_proxy_password(w_tok, "node1")
+        auth_b64 = base64.b64encode(f"node1:{secret}".encode("utf-8")).decode("ascii")
+
+        def _raw_send(payload: bytes) -> bytes:
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=4.0) as s:
+                s.sendall(payload)
+                s.settimeout(3.0)
+                return s.recv(4096)
+
+        try:
+            # 1. Malicious Connection: Content-Length, Host MUST NOT strip Host or Content-Length!
+            captured_reqs.clear()
+            r_hop = _raw_send(
+                f"POST http://127.0.0.1:{up_port}/hop HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{up_port}\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                f"Connection: Content-Length, Host, X-Custom-Hop\r\n"
+                f"X-Custom-Hop: should-strip\r\n"
+                f"Content-Length: 5\r\n\r\nhello".encode("ascii")
+            )
+            self.assertIn(b"200 OK", r_hop)
+            self.assertTrue(captured_reqs)
+            fwd = captured_reqs[-1]
+            self.assertIn(b"Content-Length: 5", fwd)
+            self.assertIn(f"Host: 127.0.0.1:{up_port}".encode("ascii"), fwd)
+            self.assertIn(b"hello", fwd)
+            self.assertNotIn(b"X-Custom-Hop", fwd)
+            self.assertNotIn(b"Proxy-Authorization", fwd)
+
+            # 2. Strict request-line & header-value checks: HTTP/1.9, tab separators, NUL/BEL in header value
+            for raw_bad, label in (
+                (
+                    f"GET http://127.0.0.1:{up_port}/v HTTP/1.9\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii"),
+                    "HTTP/1.9",
+                ),
+                (
+                    f"GET\thttp://127.0.0.1:{up_port}/t\tHTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii"),
+                    "tab request-line",
+                ),
+                (
+                    f"GET http://127.0.0.1:{up_port}/nul HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\nX-Evil: a\x00b\r\n\r\n".encode("latin-1"),
+                    "NUL header value",
+                ),
+            ):
+                r_bad = _raw_send(raw_bad)
+                self.assertIn(b"400 Bad Request", r_bad, f"Proxy accepted {label}: {r_bad!r}")
+
+            # 3. Post-DNS blocked_domains enforcement defeats hex/decimal/IPv4-mapped IPv6 bypasses
+            cfg.gateway.blocked_domains = ["127.0.0.1"]
+            for bypass_req, label in (
+                (
+                    f"GET http://0x7f000001:{up_port}/hex HTTP/1.1\r\nHost: 0x7f000001:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii"),
+                    "hex IP",
+                ),
+                (
+                    f"GET http://2130706433:{up_port}/dec HTTP/1.1\r\nHost: 2130706433:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii"),
+                    "decimal IP",
+                ),
+                (
+                    f"CONNECT [::ffff:127.0.0.1]:{up_port} HTTP/1.1\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii"),
+                    "IPv4-mapped IPv6",
+                ),
+            ):
+                r_blk = _raw_send(bypass_req)
+                self.assertIn(b"403 Forbidden", r_blk, f"Post-DNS blocklist missed {label}: {r_blk!r}")
+            cfg.gateway.blocked_domains = []
+
+            # 4. Mid-upload quarantine aborts active fixed-length POST body immediately
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=4.0) as s:
+                s.sendall(
+                    f"POST http://127.0.0.1:{up_port}/upload HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                    f"Content-Length: 50000\r\n\r\npart1".encode("ascii")
+                )
+                time.sleep(0.1)
+                cfg.gateway.quarantined_nodes = ["node1"]
+                gw_mgr.disconnect_node("node1")
+                s.settimeout(2.0)
+                t0 = time.monotonic()
+                try:
+                    s.sendall(b"more-data")
+                    tail = s.recv(1024)
+                    self.assertTrue(tail == b"" or b"502" in tail or b"403" in tail)
+                except OSError:
+                    pass
+                self.assertLess(time.monotonic() - t0, 1.5)
+        finally:
+            gw_mgr.stop()
+            up_srv.shutdown()
+            up_srv.server_close()
+
+    def test_webhook_redirect_ssrf_canonical_ip_normalization_and_rogue_pairing_master(self) -> None:
+        """Verify webhook redirect SSRF guard, canonical IPv6/IPv4-mapped normalization, rogue pairing hello defense, and CLI validation."""
+        from phonecluster.auth import _is_webhook_redirect_target_unsafe, build_webhook_opener
+        from phonecluster.config import normalize_host
+        from phonecluster.pairing import join_cluster_via_pairing
+
+        # 1. Canonical IP normalization across IPv4-mapped IPv6 and expanded/uppercase IPv6
+        self.assertEqual(normalize_host("0:0:0:0:0:ffff:7f00:1"), "127.0.0.1")
+        self.assertEqual(normalize_host("::FFFF:192.168.1.20"), "192.168.1.20")
+        self.assertEqual(normalize_host("[2001:DB8:0:0::1]"), "2001:db8::1")
+
+        # 2. Webhook redirect SSRF classifier blocks file://, cloud metadata, link-local, and remote->loopback
+        self.assertTrue(_is_webhook_redirect_target_unsafe("https://ntfy.sh/x", "file:///etc/passwd"))
+        self.assertTrue(_is_webhook_redirect_target_unsafe("https://ntfy.sh/x", "http://169.254.169.254/latest/meta-data"))
+        self.assertTrue(_is_webhook_redirect_target_unsafe("https://ntfy.sh/x", "http://[fe80::1]/"))
+        self.assertTrue(_is_webhook_redirect_target_unsafe("https://ntfy.sh/x", "http://127.0.0.1:8765/exec"))
+        self.assertTrue(_is_webhook_redirect_target_unsafe("https://ntfy.sh/x", "http://[::1]:8765/health"))
+        self.assertTrue(_is_webhook_redirect_target_unsafe("http://192.168.1.50:8123/hook", "http://localhost:8080/api/exec"))
+        # Same-loopback test redirect and public->public HTTPS remain allowed
+        self.assertFalse(_is_webhook_redirect_target_unsafe("http://127.0.0.1:9000/a", "http://127.0.0.1:9000/b"))
+        self.assertFalse(_is_webhook_redirect_target_unsafe("https://ntfy.sh/a", "https://1.1.1.1/b"))
+
+        # Empty-hostname webhook URL rejected in SafetyConfig
+        with self.assertRaises(ValueError):
+            SafetyConfig.from_dict({"battery_webhook_url": "http://"})
+
+        # Live test: webhook opener refuses 302 redirect to cloud metadata 169.254.169.254
+        class _RedirectAndRogueMasterHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", "http://169.254.169.254/latest/meta-data")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/api/pair/hello":
+                    # Oversized dh_pub DoS payload from rogue Master
+                    raw = json.dumps({"session_id": "rogue1", "dh_pub": "a" * 5000, "salt": "00" * 16}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        class _ReuseHTTP(ThreadingHTTPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        evil_srv = _ReuseHTTP(("127.0.0.1", 0), _RedirectAndRogueMasterHandler)
+        evil_port = evil_srv.server_address[1]
+        threading.Thread(target=evil_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        try:
+            wb_opener = build_webhook_opener()
+            req = urllib.request.Request(f"http://127.0.0.1:{evil_port}/hook", data=b"{}", method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as redir_exc:
+                wb_opener.open(req, timeout=3.0)
+            try:
+                self.assertEqual(redir_exc.exception.code, 302)
+            finally:
+                redir_exc.exception.close()
+
+            # 3. Rogue Master oversized dh_pub on /api/pair/hello rejected cleanly before big-int math
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(RuntimeError) as pair_exc:
+                    join_cluster_via_pairing("127.0.0.1", evil_port, "123456", Path(tmp) / "w.json")
+                self.assertIn("Malformed pairing hello", str(pair_exc.exception))
+
+                # 4. CLI rejects invalid gateway --port, invalid net-audit --lan-subnet, and bad --master port without bricking cluster.json
+                cfg_p = Path(tmp) / "cluster.json"
+                save_config(create_default_config(master_host="127.0.0.1", worker_hosts=[]), cfg_p)
+                self.assertEqual(cli_main(["--config", str(cfg_p), "gateway", "--port", "99999"]), 2)
+                self.assertEqual(cli_main(["--config", str(cfg_p), "net-audit", "--lan-subnet", "not-a-cidr"]), 2)
+                self.assertEqual(cli_main(["--config", str(cfg_p), "join", "--master", "http://127.0.0.1:99999", "--pin", "123456"]), 2)
+                # Config file remained valid and uncorrupted!
+                loaded = load_config(cfg_p)
+                self.assertEqual(loaded.network.lan_subnet, "")
+        finally:
+            evil_srv.shutdown()
+            evil_srv.server_close()
+
+    def test_poisoned_worker_telemetry_resilience_and_shared_udp_discovery_coexistence(self) -> None:
+        """Verify Master survives poisoned worker /health JSON everywhere, and UDP discovery + pairing beacon coexist on the same port."""
+        from phonecluster.netguard import audit_cluster_network
+        from phonecluster.pairing import PairingBeaconResponder, discover_pairing_masters
+
+        tok = "poison-tel-tok-12345678"
+
+        class _PoisonHealthHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                raw = json.dumps(
+                    {
+                        "node_id": "poison1",
+                        "role": "worker",
+                        "ready_for_jobs": True,
+                        "tier": True,  # bool! Must NOT coerce to Tier 1 via `True in {1,2,3}`
+                        "pool": "evil pool;rm -rf /",
+                        "active_jobs": "not-an-int",
+                        "max_concurrency": "NaN",
+                        "cpu_cores": "bad",
+                        "mem_total_mb": None,
+                        "mem_available_mb": "NaN",
+                        "load_1m": "inf",
+                        "cpu_pct": "bad",
+                        "temp_c": "NaN",
+                        "net_rx_kbps": "bad",
+                        "net_tx_kbps": "inf",
+                        "services": ["not", "a", "dict"],
+                        "tools": "not-a-dict",
+                        "listening_ports": [{"port": "abc", "exposed": True}, "junk", {"port": 99999, "exposed": True}],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        class _ReuseHTTP(ThreadingHTTPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        p_srv = _ReuseHTTP(("127.0.0.1", 0), _PoisonHealthHandler)
+        p_port = p_srv.server_address[1]
+        threading.Thread(target=p_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        cfg = ClusterConfig(
+            cluster_name="poison-resilience",
+            auth_token=tok,
+            nodes=[NodeConfig(id="poison1", host="127.0.0.1", role="worker", worker_port=p_port)],
+        )
+        ctrl = MasterController(cfg)
+        try:
+            snaps = ctrl.poll_health()
+            self.assertEqual(len(snaps), 1)
+            self.assertTrue(snaps[0].online)
+            self.assertEqual(snaps[0].active_jobs, 0)
+            self.assertGreaterEqual(snaps[0].max_concurrency, 1)
+
+            summary = ctrl.cluster_summary(record_history=True)
+            self.assertEqual(summary["nodes_online"], 1)
+            self.assertTrue(math.isfinite(summary["cluster_cpu_pct"]))
+            self.assertEqual(summary["nodes"][0]["pool"], "compute")  # Unsafe pool sanitized to default!
+
+            svcs_info = ctrl.get_services_info(snapshots=snaps)
+            self.assertIn("services", svcs_info)
+            self.assertEqual(ctrl.build_distcc_hosts(snapshots=snaps), "")
+            self.assertEqual(ctrl.build_llama_rpc_arg(snapshots=snaps), "")
+            self.assertIn("slots=4", ctrl.build_mpi_hostfile(snapshots=snaps))
+
+            audit = audit_cluster_network(ctrl, snapshots=snaps)
+            self.assertIn("score", audit)
+            self.assertEqual(audit["nodes"][0]["exposed_ports"], [])
+        finally:
+            p_srv.shutdown()
+            p_srv.server_close()
+
+        # 2. UDP DiscoveryResponder and PairingBeaconResponder coexisting on the SAME port (SO_REUSEPORT retry test)
+        disc = DiscoveryResponder(
+            node_id="node0",
+            role="master",
+            worker_port=8765,
+            listen_host="127.0.0.1",
+            discovery_port=0,
+        )
+        self.assertTrue(disc.bind())
+        shared_port = disc.bound_port
+        beacon = PairingBeaconResponder(
+            cluster_name="coexist-net",
+            pair_port=8767,
+            session_id="sess1234",
+            fingerprint="ABCD-1234",
+            expires_at=time.time() + 60.0,
+            listen_host="127.0.0.1",
+            discovery_port=shared_port,
+        )
+        disc.start()
+        bound_both = beacon.bind()
+        if bound_both:
+            beacon.start()
+        try:
+            # Verify fresh-socket retry reliably discovers even when both sockets share the same UDP port!
+            got_disc = False
+            for _ in range(4):
+                if discover_lan_nodes(timeout_sec=0.85, discovery_port=shared_port, targets=["127.0.0.1"]):
+                    got_disc = True
+                    break
+            self.assertTrue(got_disc, "discover_lan_nodes failed with shared UDP port")
+            if bound_both:
+                got_pair = False
+                for _ in range(4):
+                    if discover_pairing_masters(timeout_sec=0.85, discovery_port=shared_port, targets=["127.0.0.1"]):
+                        got_pair = True
+                        break
+                self.assertTrue(got_pair, "discover_pairing_masters failed with shared UDP port")
+        finally:
+            disc.stop()
+            beacon.stop()
 
 
 if __name__ == "__main__":
