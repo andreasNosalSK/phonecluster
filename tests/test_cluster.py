@@ -4949,6 +4949,250 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
             proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
             self.assertEqual(proc.returncode, 2, f"Expected exit 2 for {cmd}, got {proc.returncode}: {proc.stderr}")
 
+    def test_worker_stdin_devnull_whitespace_interpreter_and_readonly_workdir_script(self) -> None:
+        """Verify worker detaches stdin (no interactive hang), handles whitespace interpreter, and falls back to system tmp on read-only workdir."""
+        tok = "pass8-worker-tok-123456"
+        with tempfile.TemporaryDirectory() as tmp:
+            ro_dir = Path(tmp) / "ro_work"
+            ro_dir.mkdir()
+            st = WorkerState(
+                node_id="node0",
+                role="master",
+                auth_token=tok,
+                safety=SafetyConfig(max_temp_c=95.0, resume_temp_c=90.0, min_free_ram_mb=0),
+                max_concurrency=2,
+                workdir=Path(tmp),
+            )
+            srv, _guard, stop_ev = create_worker_server("127.0.0.1", 0, st)
+            w_port = srv.server_address[1]
+            t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            t.start()
+            cfg = ClusterConfig(
+                cluster_name="pass8-worker",
+                auth_token=tok,
+                nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=w_port)],
+            )
+            ctrl = MasterController(cfg)
+            try:
+                # 1. Interactive stdin command returns EOF immediately instead of hanging until timeout
+                t0 = time.monotonic()
+                out_stdin = ctrl.run_single(
+                    JobSpec(index=0, job_id="p8-stdin", command="read line || true; echo done_eof", timeout_sec=5.0),
+                    target="node0",
+                )[0]
+                self.assertTrue(out_stdin.ok, out_stdin.to_dict())
+                self.assertIn("done_eof", out_stdin.stdout)
+                self.assertLess(time.monotonic() - t0, 3.0)
+
+                # 2. Whitespace-only interpreter falls back cleanly to python3 for .py script
+                out_ws = ctrl.run_single(
+                    JobSpec(
+                        index=0,
+                        job_id="p8-ws-interp",
+                        script_content="print('ws_interp_ok')\n",
+                        script_name="test.py",
+                        interpreter="   ",
+                        timeout_sec=5.0,
+                    ),
+                    target="node0",
+                )[0]
+                self.assertTrue(out_ws.ok, out_ws.to_dict())
+                self.assertIn("ws_interp_ok", out_ws.stdout)
+
+                # 3. Script executed inside a read-only workdir falls back to system tmp dir and succeeds
+                os.chmod(ro_dir, 0o555)
+                try:
+                    out_ro = ctrl.run_single(
+                        JobSpec(
+                            index=0,
+                            job_id="p8-ro-dir",
+                            script_content="import os; print('cwd=' + os.getcwd())\n",
+                            script_name="ro.py",
+                            workdir=str(ro_dir),
+                            timeout_sec=5.0,
+                        ),
+                        target="node0",
+                    )[0]
+                    self.assertTrue(out_ro.ok, out_ro.to_dict())
+                    self.assertIn(f"cwd={ro_dir.resolve()}", out_ro.stdout)
+                finally:
+                    os.chmod(ro_dir, 0o755)
+            finally:
+                stop_ev.set()
+                srv.shutdown()
+                srv.server_close()
+                t.join(timeout=2.0)
+
+    def test_pass8_json_null_safety_concurrency_clamp_failed_gateway_proxy_and_cli_flags(self) -> None:
+        """Verify JSON null never becomes 'None', max_concurrency is clamped, failed gateway suppresses dead proxy env, and bad CLI flags exit 2."""
+        from phonecluster.cli import main as cli_main
+        from phonecluster.gateway import build_worker_proxy_env
+
+        # 1. Config JSON null safety
+        with self.assertRaises(ValueError):
+            ClusterConfig.from_dict({"auth_token": None, "nodes": [{"id": "n0", "host": "127.0.0.1"}]})
+        safe_cfg = ClusterConfig.from_dict(
+            {
+                "cluster_name": None,
+                "auth_token": "tok-pass8-abcdef",
+                "nodes": [{"id": "n0", "host": "127.0.0.1", "ssh_user": None, "pool": None, "tags": None, "notes": None, "auth_token": None}],
+                "safety": None,
+                "gateway": {"bind_host": None, "allowed_domains": [None, "pypi.org"], "blocked_domains": [None], "quarantined_nodes": [None]},
+                "network": {"adguard_url": None, "lan_subnet": None},
+            }
+        )
+        self.assertEqual(safe_cfg.cluster_name, "phonecluster")
+        self.assertEqual(safe_cfg.nodes[0].ssh_user, "")
+        self.assertEqual(safe_cfg.nodes[0].pool, "auto")
+        self.assertEqual(safe_cfg.nodes[0].notes, "")
+        self.assertEqual(safe_cfg.safety.battery_webhook_url, "")
+        self.assertEqual(safe_cfg.gateway.bind_host, "0.0.0.0")
+        self.assertEqual(safe_cfg.gateway.allowed_domains, ["pypi.org"])
+        self.assertEqual(safe_cfg.gateway.blocked_domains, [])
+        self.assertEqual(safe_cfg.gateway.quarantined_nodes, [])
+        self.assertEqual(safe_cfg.network.adguard_url, "")
+        self.assertEqual(safe_cfg.network.lan_subnet, "")
+        self.assertEqual(SafetyConfig.from_dict({"battery_webhook_url": None}).battery_webhook_url, "")
+
+        # 2. Poisoned worker max_concurrency clamped to 32
+        snap_huge = NodeSnapshot(
+            node=NodeConfig(id="w1", host="127.0.0.1", role="worker", max_concurrency=2),
+            online=True,
+            health={"max_concurrency": 1_000_000},
+        )
+        self.assertEqual(snap_huge.max_concurrency, 32)
+
+        # 3. Failed gateway port_override=-1 suppresses dead proxy injection
+        gw_cfg = ClusterConfig(
+            cluster_name="gw-fail",
+            auth_token="tok-gw-fail-123456",
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=8766),
+            ],
+            gateway=GatewayConfig(enabled=True, bind_host="127.0.0.1", port=8888, inject_proxy_env=True),
+        )
+        self.assertEqual(build_worker_proxy_env(gw_cfg, gw_cfg.nodes[1], port_override=-1), {})
+        self.assertIn("HTTP_PROXY", build_worker_proxy_env(gw_cfg, gw_cfg.nodes[1], port_override=None))
+
+        # 4. Dashboard backend JSON null handling + failed gateway boot override=-1
+        tok = "pass8-dash-tok-123456"
+        st = WorkerState(
+            node_id="node0",
+            role="master",
+            auth_token=tok,
+            safety=SafetyConfig(max_temp_c=95.0, resume_temp_c=90.0, min_free_ram_mb=0),
+            max_concurrency=2,
+        )
+        wsrv, _wg, w_ev = create_worker_server("127.0.0.1", 0, st)
+        w_port = wsrv.server_address[1]
+        wt = threading.Thread(target=wsrv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        wt.start()
+
+        # Occupy a TCP port to force Dashboard's gateway_manager.start() to fail on boot
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        busy_port = blocker.getsockname()[1]
+
+        d_cfg = ClusterConfig(
+            cluster_name="pass8-dash",
+            auth_token=tok,
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=w_port),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=w_port),
+            ],
+            gateway=GatewayConfig(enabled=True, bind_host="127.0.0.1", port=busy_port, inject_proxy_env=True),
+        )
+        d_ctrl = MasterController(d_cfg)
+        dash = DashboardHTTPServer(
+            ("127.0.0.1", 0), d_ctrl, enable_pairing_beacon=False, pairing_fail_delay_sec=0.0
+        )
+        d_port = dash.server_address[1]
+        dt = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        dt.start()
+
+        def _post_dash(path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{d_port}{path}",
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    return resp.status, json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                raw = exc.read().decode("utf-8")
+                exc.close()
+                return exc.code, json.loads(raw)
+
+        try:
+            # Failed gateway on boot sets gateway_port_override=-1 so workers don't get broken proxy env
+            self.assertEqual(d_ctrl.gateway_port_override, -1)
+            self.assertEqual(build_worker_proxy_env(d_cfg, d_cfg.nodes[1], port_override=d_ctrl.gateway_port_override), {})
+
+            # POST /api/exec with command=None returns 400 (does NOT run shell command "None")
+            code, data = _post_dash("/api/exec", {"command": None, "target": None})
+            self.assertEqual(code, 400, data)
+
+            # POST /api/terminal/exec with cwd=None, job_id=None, target=None works cleanly
+            code, data = _post_dash(
+                "/api/terminal/exec",
+                {"command": "echo ok_null_safe", "cwd": None, "job_id": None, "target": None},
+            )
+            self.assertEqual(code, 200, data)
+            self.assertIn("ok_null_safe", data["results"][0]["stdout"])
+
+            # POST /api/map with commands=[None, ""] returns 400
+            code, data = _post_dash("/api/map", {"mode": "commands", "commands": [None, "   "]})
+            self.assertEqual(code, 400, data)
+
+            # POST /api/services/custom with name=None, url=None returns 400
+            code, data = _post_dash("/api/services/custom", {"name": None, "url": None})
+            self.assertEqual(code, 400, data)
+
+            # POST /api/network/hardening with adguard_url=None, lan_subnet=None clears to "" (NOT "None")
+            code, data = _post_dash("/api/network/hardening", {"adguard_url": None, "lan_subnet": None})
+            self.assertEqual(code, 200, data)
+            self.assertEqual(d_cfg.network.adguard_url, "")
+            self.assertEqual(d_cfg.network.lan_subnet, "")
+        finally:
+            dash.shutdown()
+            dash.server_close()
+            blocker.close()
+            w_ev.set()
+            wsrv.shutdown()
+            wsrv.server_close()
+            dt.join(timeout=2.0)
+            wt.join(timeout=2.0)
+
+        # 5. CLI flag validation returns exit code 2 cleanly on negative/NaN/out-of-range/bad-quote inputs
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "c.json"
+            save_config(safe_cfg, cfg_p)
+            script_p = Path(tmp) / "ok.py"
+            script_p.write_text("print(1)\n", encoding="utf-8")
+            bad_args_p = Path(tmp) / "bad_args.txt"
+            bad_args_p.write_text('valid arg\n"unclosed quote\n', encoding="utf-8")
+            for argv in (
+                ["--config", str(cfg_p), "run", "--timeout", "-1", "echo", "x"],
+                ["--config", str(cfg_p), "run", "--timeout", "nan", "echo", "x"],
+                ["--config", str(cfg_p), "map", "--timeout", "-5", "--repeat", "1", "echo", "x"],
+                ["--config", str(cfg_p), "map", "--retries", "-1", "--repeat", "1", "echo", "x"],
+                ["--config", str(cfg_p), "map", "--wait-ready", "nan", "--repeat", "1", "echo", "x"],
+                ["--config", str(cfg_p), "map", "--script", str(script_p), "--args-file", str(bad_args_p)],
+                ["--config", str(cfg_p), "status", "--watch", "nan"],
+                ["--config", str(cfg_p), "top", "--interval", "nan", "--once"],
+                ["--config", str(cfg_p), "discover", "--timeout", "nan"],
+                ["--config", str(cfg_p), "dashboard", "--port", "99999"],
+                ["--config", str(cfg_p), "pair", "--port", "99999"],
+                ["--config", str(cfg_p), "join", "--timeout", "nan"],
+                ["--config", str(cfg_p), "join", "--worker-port", "99999"],
+                ["--config", str(cfg_p), "llama-rpc", "--port", "99999"],
+            ):
+                self.assertEqual(cli_main(argv), 2, f"Expected exit 2 for CLI args: {argv}")
+
 
 if __name__ == "__main__":
     unittest.main()

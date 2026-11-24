@@ -642,11 +642,11 @@ class PairingManager:
         if not (0 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
             return HTTPStatus.BAD_REQUEST, {"error": "worker_port must be 0..65535 and ssh_port must be 1..65535."}
         try:
-            ssh_user = validate_ssh_user(str(metadata.get("ssh_user", ""))[:64])
-            node_pool = validate_pool_name(str(metadata.get("pool", "auto")))
+            ssh_user = validate_ssh_user(str(metadata.get("ssh_user") or "")[:64])
+            node_pool = validate_pool_name(str(metadata.get("pool") or "auto"))
         except ValueError as exc:
             return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
-        os_env = re.sub(r"[^A-Za-z0-9._-]", "", str(metadata.get("os_env", "unknown")))[:32] or "unknown"
+        os_env = re.sub(r"[^A-Za-z0-9._-]", "", str(metadata.get("os_env") or "unknown"))[:32] or "unknown"
         node_tier = raw_tier if raw_tier in {0, 1, 2, 3} else 0
         node_token = generate_auth_token()
 

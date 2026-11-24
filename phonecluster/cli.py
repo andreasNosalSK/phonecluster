@@ -6,6 +6,7 @@ import argparse
 import ipaddress
 import json
 import logging
+import math
 import os
 import shlex
 import signal
@@ -230,8 +231,13 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
 def _cmd_status(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
-    watch_sec = getattr(args, "watch", 0.0) or 0.0
-    if watch_sec <= 0:
+    watch_sec = getattr(args, "watch", 0.0)
+    if watch_sec is None:
+        watch_sec = 0.0
+    if not math.isfinite(watch_sec) or watch_sec < 0:
+        print(f"Error: --watch must be a finite number >= 0 (got {watch_sec})", file=sys.stderr)
+        return 2
+    if watch_sec == 0:
         _render_status_once(ctrl, args.json)
         return 0
     try:
@@ -250,6 +256,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
 
+    if not math.isfinite(args.timeout) or args.timeout < 0:
+        print(f"Error: --timeout must be a finite number >= 0 (got {args.timeout})", file=sys.stderr)
+        return 2
     if not args.command and not args.script:
         print("Provide a shell command or --script <path>.", file=sys.stderr)
         return 2
@@ -258,8 +267,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     script_name = None
     if args.script:
         sp = Path(args.script)
-        if not sp.exists():
-            print(f"Script not found: {sp}", file=sys.stderr)
+        if not sp.is_file():
+            print(f"Script not found or not a file: {sp}", file=sys.stderr)
             return 2
         script_content = sp.read_text(encoding="utf-8")
         script_name = sp.name
@@ -318,19 +327,40 @@ def _load_lines(source: str) -> list[str]:
 def _cmd_map(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
+    if not math.isfinite(args.timeout) or args.timeout < 0:
+        print(f"Error: --timeout must be a finite number >= 0 (got {args.timeout})", file=sys.stderr)
+        return 2
+    if args.retries < 0:
+        print(f"Error: --retries must be >= 0 (got {args.retries})", file=sys.stderr)
+        return 2
+    if not math.isfinite(args.wait_ready) or args.wait_ready < 0:
+        print(f"Error: --wait-ready must be a finite number >= 0 (got {args.wait_ready})", file=sys.stderr)
+        return 2
+    if args.repeat < 0:
+        print(f"Error: --repeat must be >= 0 (got {args.repeat})", file=sys.stderr)
+        return 2
     timeout = args.timeout or cfg.default_job_timeout_sec
 
     jobs: list[JobSpec] = []
     batch_id = uuid.uuid4().hex[:6]
     if args.script:
         sp = Path(args.script)
-        if not sp.exists():
-            print(f"Script not found: {sp}", file=sys.stderr)
+        if not sp.is_file():
+            print(f"Script not found or not a file: {sp}", file=sys.stderr)
             return 2
         content = sp.read_text(encoding="utf-8")
         if args.args_file:
-            arg_lines = _load_lines(args.args_file)
+            try:
+                arg_lines = _load_lines(args.args_file)
+            except OSError as exc:
+                print(f"Could not read --args-file '{args.args_file}': {exc}", file=sys.stderr)
+                return 2
             for idx, line in enumerate(arg_lines):
+                try:
+                    parsed_args = shlex.split(line)
+                except ValueError as exc:
+                    print(f"Invalid arguments in --args-file on line {idx + 1}: {exc}", file=sys.stderr)
+                    return 2
                 jobs.append(
                     JobSpec(
                         index=idx,
@@ -338,7 +368,7 @@ def _cmd_map(args: argparse.Namespace) -> int:
                         script_content=content,
                         script_name=sp.name,
                         interpreter=args.interpreter,
-                        args=shlex.split(line),
+                        args=parsed_args,
                         timeout_sec=timeout,
                         workdir=args.workdir,
                         env={"PHONECLUSTER_TASK_INDEX": str(idx)},
@@ -365,7 +395,11 @@ def _cmd_map(args: argparse.Namespace) -> int:
             print("With --script, provide either --args-file <file> or --repeat <N>.", file=sys.stderr)
             return 2
     elif args.jobs_file:
-        cmd_lines = _load_lines(args.jobs_file)
+        try:
+            cmd_lines = _load_lines(args.jobs_file)
+        except OSError as exc:
+            print(f"Could not read --jobs-file '{args.jobs_file}': {exc}", file=sys.stderr)
+            return 2
         for idx, cmd in enumerate(cmd_lines):
             jobs.append(
                 JobSpec(
@@ -459,6 +493,9 @@ def _cmd_distcc_env(args: argparse.Namespace) -> int:
 
 
 def _cmd_llama_rpc(args: argparse.Namespace) -> int:
+    if not (1 <= int(args.port) <= 65535):
+        print(f"Error: --port must be between 1 and 65535 (got {args.port})", file=sys.stderr)
+        return 2
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
     rpc = ctrl.build_llama_rpc_arg(port=args.port, include_master=args.include_master)
@@ -644,6 +681,9 @@ def _cmd_net_audit(args: argparse.Namespace) -> int:
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
+    if not (0 <= int(args.port) <= 65535):
+        print(f"Error: --port must be between 0 and 65535 (got {args.port})", file=sys.stderr)
+        return 2
     cfg_path = resolve_config_path(args.config)
     cfg = load_config(cfg_path)
     if args.require_auth:
@@ -655,6 +695,9 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
 
 def _cmd_pair(args: argparse.Namespace) -> int:
+    if not (0 <= int(args.port) <= 65535):
+        print(f"Error: --port must be between 0 and 65535 (got {args.port})", file=sys.stderr)
+        return 2
     cfg_path = resolve_config_path(args.config)
     cfg = load_config(cfg_path)
     return run_cli_pairing_host(
@@ -667,6 +710,15 @@ def _cmd_pair(args: argparse.Namespace) -> int:
 
 
 def _cmd_join(args: argparse.Namespace) -> int:
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        print(f"Error: --timeout must be a finite number > 0 (got {args.timeout})", file=sys.stderr)
+        return 2
+    if not (1 <= int(args.worker_port) <= 65535):
+        print(f"Error: --worker-port must be between 1 and 65535 (got {args.worker_port})", file=sys.stderr)
+        return 2
+    if not (1 <= int(args.max_concurrency) <= 32):
+        print(f"Error: --max-concurrency must be between 1 and 32 (got {args.max_concurrency})", file=sys.stderr)
+        return 2
     cfg_path = resolve_config_path(args.config)
     master_host = ""
     pair_port = DEFAULT_PAIR_PORT
@@ -842,6 +894,9 @@ def _cmd_menu(args: argparse.Namespace) -> int:
 
 
 def _cmd_discover(args: argparse.Namespace) -> int:
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        print(f"Error: --timeout must be a finite number > 0 (got {args.timeout})", file=sys.stderr)
+        return 2
     found = discover_lan_nodes(timeout_sec=args.timeout)
     if args.json:
         print(json.dumps(found, indent=2))
@@ -876,6 +931,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_top(args: argparse.Namespace) -> int:
+    if not math.isfinite(args.interval) or args.interval <= 0:
+        print(f"Error: --interval must be a finite number > 0 (got {args.interval})", file=sys.stderr)
+        return 2
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
     return run_top_tui(ctrl, refresh_sec=args.interval, once=args.once)
@@ -888,12 +946,13 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps({"nodes": all_nodes}, indent=2))
         return 0
+    limit = max(0, int(args.limit))
     rows: list[list[str]] = []
     for n in all_nodes:
         nid = n["node_id"]
         for j in n.get("active", []):
-            rows.append([nid, j["job_id"], "RUNNING", f"{j['running_sec']}s", j["command"][:50]])
-        for j in n.get("recent", [])[: args.limit]:
+            rows.append([nid, j["job_id"], "RUNNING", f"{j['running_sec']}s", str(j.get("command", ""))[:50]])
+        for j in n.get("recent", [])[:limit]:
             st = (
                 "CANCELLED"
                 if j.get("cancelled")
@@ -1082,8 +1141,8 @@ def _cmd_pipeline(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
     path = Path(args.pipeline_file)
-    if not path.exists():
-        print(f"Pipeline file not found: {path}", file=sys.stderr)
+    if not path.is_file():
+        print(f"Pipeline file not found or not a file: {path}", file=sys.stderr)
         return 2
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))

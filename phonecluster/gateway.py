@@ -159,7 +159,10 @@ def build_worker_proxy_env(
     if not m_host:
         return {}
 
-    port = int(port_override) if port_override else int(gw.port)
+    if port_override is not None:
+        port = int(port_override)
+    else:
+        port = int(gw.port)
     if port <= 0:
         return {}
 

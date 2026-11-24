@@ -201,8 +201,10 @@ class NodeConfig:
         tier = int(data.get("tier", 0))
         if tier not in {0, 1, 2, 3}:
             raise ValueError(f"tier must be 0 (auto), 1, 2, or 3 for node '{node_id}'")
-        pool = validate_pool_name(str(data.get("pool", "auto")))
-        ssh_user = validate_ssh_user(str(data.get("ssh_user", "")))
+        pool = validate_pool_name(str(data.get("pool") or "auto"))
+        ssh_user = validate_ssh_user(str(data.get("ssh_user") or ""))
+        raw_tags = data.get("tags")
+        tags = [str(t) for t in raw_tags if t is not None] if isinstance(raw_tags, list) else []
         return cls(
             id=node_id,
             host=host,
@@ -214,9 +216,9 @@ class NodeConfig:
             weight=weight,
             tier=tier,
             pool=pool,
-            tags=[str(t) for t in data.get("tags", [])],
-            notes=str(data.get("notes", "")),
-            auth_token=str(data.get("auth_token", "")).strip(),
+            tags=tags,
+            notes=str(data.get("notes") or ""),
+            auth_token=str(data.get("auth_token") or "").strip(),
         )
 
 
@@ -243,7 +245,7 @@ class SafetyConfig:
             battery_high_pct=int(data.get("battery_high_pct", 60)),
             battery_poll_sec=int(data.get("battery_poll_sec", 60)),
             webhook_cooldown_sec=int(data.get("webhook_cooldown_sec", 900)),
-            battery_webhook_url=str(data.get("battery_webhook_url", "")),
+            battery_webhook_url=str(data.get("battery_webhook_url") or ""),
         )
         if not (math.isfinite(cfg.max_temp_c) and math.isfinite(cfg.resume_temp_c)):
             raise ValueError("safety temperatures must be finite numbers")
@@ -304,13 +306,13 @@ class GatewayConfig:
             raise ValueError("gateway.port must be between 0 and 65535")
         raw_allowed = data.get("allowed_domains")
         allowed = (
-            [validate_domain_pattern(str(d)) for d in raw_allowed if str(d).strip()]
+            [validate_domain_pattern(str(d)) for d in raw_allowed if d is not None and str(d).strip()]
             if isinstance(raw_allowed, list)
             else list(DEFAULT_GATEWAY_ALLOWED_DOMAINS)
         )
         raw_blocked = data.get("blocked_domains")
         blocked = (
-            [validate_domain_pattern(str(d)) for d in raw_blocked if str(d).strip()]
+            [validate_domain_pattern(str(d)) for d in raw_blocked if d is not None and str(d).strip()]
             if isinstance(raw_blocked, list)
             else []
         )
@@ -323,7 +325,7 @@ class GatewayConfig:
             ports = [80, 443]
         raw_q = data.get("quarantined_nodes")
         quarantined = (
-            sorted({str(n).strip() for n in raw_q if str(n).strip()})
+            sorted({str(n).strip() for n in raw_q if n is not None and str(n).strip()})
             if isinstance(raw_q, list)
             else []
         )
@@ -335,7 +337,7 @@ class GatewayConfig:
         rpm = max(0, min(10000, int(data.get("max_requests_per_min_per_node", 120))))
         return cls(
             enabled=bool(data.get("enabled", False)),
-            bind_host=str(data.get("bind_host", "0.0.0.0")).strip() or "0.0.0.0",
+            bind_host=str(data.get("bind_host") or "0.0.0.0").strip() or "0.0.0.0",
             port=port,
             mode=mode,
             allowed_domains=allowed,
@@ -370,10 +372,10 @@ class NetworkHardeningConfig:
             if isinstance(raw_ips, list)
             else []
         )
-        ag_url = str(data.get("adguard_url", "")).strip()
+        ag_url = str(data.get("adguard_url") or "").strip()
         if ag_url and (any(c.isspace() or ord(c) < 32 for c in ag_url) or not ag_url.startswith(("http://", "https://"))):
             raise ValueError("network.adguard_url must be empty or a valid http:// / https:// URL")
-        lan_sub = str(data.get("lan_subnet", "")).strip()
+        lan_sub = str(data.get("lan_subnet") or "").strip()
         if lan_sub:
             try:
                 lan_sub = str(ipaddress.ip_network(lan_sub, strict=False))
@@ -406,27 +408,30 @@ class ClusterConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ClusterConfig":
+        if not isinstance(data, dict):
+            raise ValueError("Configuration root must be a JSON object.")
         raw_nodes = data.get("nodes", [])
-        if not isinstance(raw_nodes, list) or not raw_nodes:
-            raise ValueError("Configuration must contain a non-empty 'nodes' list.")
+        if not isinstance(raw_nodes, list) or not raw_nodes or not all(isinstance(item, dict) for item in raw_nodes):
+            raise ValueError("Configuration must contain a non-empty 'nodes' list of node objects.")
         nodes = [NodeConfig.from_dict(item) for item in raw_nodes]
         seen_ids: set[str] = set()
         for node in nodes:
             if node.id in seen_ids:
                 raise ValueError(f"Duplicate node id '{node.id}' in configuration.")
             seen_ids.add(node.id)
-        token = str(data.get("auth_token", "")).strip()
+        token = str(data.get("auth_token") or "").strip()
         if not token:
             raise ValueError(
                 "Configuration must define a non-empty 'auth_token'. "
                 "Run `phonecluster init-config` to generate one."
             )
-        safety = SafetyConfig.from_dict(data.get("safety", {}))
+        raw_safety = data.get("safety")
+        safety = SafetyConfig.from_dict(raw_safety if isinstance(raw_safety, dict) else {})
         gateway = GatewayConfig.from_dict(data.get("gateway"))
         network = NetworkHardeningConfig.from_dict(data.get("network"))
         raw_svcs = data.get("custom_services") or {}
         custom_services = (
-            {str(k): str(v) for k, v in raw_svcs.items()}
+            {str(k): str(v) for k, v in raw_svcs.items() if k is not None and v is not None}
             if isinstance(raw_svcs, dict)
             else {}
         )
@@ -440,7 +445,7 @@ class ClusterConfig:
         if not (0 <= dash_port <= 65535):
             raise ValueError("dashboard_port must be between 0 and 65535")
         return cls(
-            cluster_name=str(data.get("cluster_name", "phonecluster")),
+            cluster_name=str(data.get("cluster_name") or "phonecluster"),
             auth_token=token,
             nodes=nodes,
             safety=safety,

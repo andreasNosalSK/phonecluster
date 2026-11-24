@@ -86,7 +86,8 @@ def detect_controller_host_info(config: ClusterConfig) -> dict[str, Any]:
     is_pi = "raspberry pi" in model.lower()
     is_termux = os_env == "termux"
 
-    master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
+    nodes_list = list(config.nodes)
+    master_node = next((n for n in nodes_list if n.role == "master"), nodes_list[0])
     subnet = infer_lan_subnet(master_node.host or lan_ip, config.network.lan_subnet)
 
     adguard_bin = bool(

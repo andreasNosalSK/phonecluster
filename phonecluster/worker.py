@@ -722,9 +722,10 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             script_name = Path(str(payload.get("script_name") or "job.py").replace("\x00", "")).name
             raw_suffix = Path(script_name).suffix
             suffix = raw_suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,10}", raw_suffix) else ".py"
-            interpreter = payload.get("interpreter")
-            if not interpreter:
-                interpreter = "python3" if suffix == ".py" else "sh"
+            interpreter = str(payload.get("interpreter") or "").strip()
+            interp_parts = shlex.split(interpreter) if interpreter else []
+            if not interp_parts:
+                interp_parts = ["python3" if suffix == ".py" else "sh"]
             raw_args = payload.get("args") or []
             if isinstance(raw_args, str):
                 args = shlex.split(raw_args)
@@ -734,21 +735,26 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
                 args = []
 
             safe_job_prefix = re.sub(r"[^A-Za-z0-9._-]+", "_", job_id).strip("._")[:40] or "job"
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=f"pc_{safe_job_prefix}_", suffix=suffix, dir=str(cwd)
-            )
+            try:
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f"pc_{safe_job_prefix}_", suffix=suffix, dir=str(cwd)
+                )
+            except OSError:
+                # Fall back to system temp dir when `cwd` is read-only (e.g. `/` or `/etc`)
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f"pc_{safe_job_prefix}_", suffix=suffix
+                )
             temp_script_path = Path(tmp_name)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(str(script_content))
             os.chmod(temp_script_path, 0o700)
 
-            cmd_list = shlex.split(str(interpreter)) + [str(temp_script_path)] + args
-            if not cmd_list:
-                raise ValueError("empty interpreter")
+            cmd_list = interp_parts + [str(temp_script_path)] + args
             proc = subprocess.Popen(
                 cmd_list,
                 cwd=str(cwd),
                 env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
@@ -763,6 +769,7 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
                 shell=True,
                 cwd=str(cwd),
                 env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
@@ -1064,7 +1071,7 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
             status, body = _execute_job_payload(self.server.state, payload)
             self._send_json(status, body)
         elif path == "/cancel":
-            job_id = str(payload.get("job_id", "")).strip()
+            job_id = str(payload.get("job_id") or "").strip()
             if not job_id:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing job_id"})
                 return

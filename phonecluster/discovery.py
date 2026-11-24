@@ -289,21 +289,21 @@ def discover_lan_nodes(
                 host_ip = str(addr[0])
                 key = (host_ip, worker_port)
                 if key not in found and len(found) < _MAX_DISCOVERED_NODES:
-                    role_raw = _CTRL_RE.sub("", str(msg.get("role", "worker"))).strip().lower()
-                    raw_ssh_u = _CTRL_RE.sub("", str(msg.get("ssh_user", ""))).strip()[:64]
+                    role_raw = _CTRL_RE.sub("", str(msg.get("role") or "worker")).strip().lower()
+                    raw_ssh_u = _CTRL_RE.sub("", str(msg.get("ssh_user") or "")).strip()[:64]
                     try:
                         safe_ssh_u = validate_ssh_user(raw_ssh_u)
                     except ValueError:
                         safe_ssh_u = ""
                     found[key] = {
                         "host": host_ip,
-                        "node_id": _CTRL_RE.sub("", str(msg.get("node_id", ""))).strip()[:40],
+                        "node_id": _CTRL_RE.sub("", str(msg.get("node_id") or "")).strip()[:40],
                         "role": role_raw if role_raw in {"master", "worker"} else "worker",
-                        "hostname": _CTRL_RE.sub("", str(msg.get("hostname", ""))).strip()[:64],
+                        "hostname": _CTRL_RE.sub("", str(msg.get("hostname") or "")).strip()[:64],
                         "worker_port": worker_port,
                         "ssh_port": ssh_port,
                         "ssh_user": safe_ssh_u,
-                        "os_env": _CTRL_RE.sub("", str(msg.get("os_env", "unknown"))).strip()[:32] or "unknown",
+                        "os_env": _CTRL_RE.sub("", str(msg.get("os_env") or "unknown")).strip()[:32] or "unknown",
                         "cpu_cores": cpu_cores,
                         "mem_total_mb": mem_total_mb,
                     }

@@ -85,7 +85,7 @@ class NodeSnapshot:
 
     @property
     def max_concurrency(self) -> int:
-        return max(1, _safe_int(self.health.get("max_concurrency", self.node.max_concurrency), self.node.max_concurrency))
+        return min(32, max(1, _safe_int(self.health.get("max_concurrency", self.node.max_concurrency), self.node.max_concurrency)))
 
     @property
     def available_slots(self) -> int:
@@ -478,7 +478,7 @@ class MasterController:
                     )
                 ]
             outcomes: list[JobOutcome] = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(chosen)) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, len(chosen))) as pool:
                 fut_map = {
                     pool.submit(
                         self.exec_on_node,
@@ -726,10 +726,14 @@ class MasterController:
         _refresh_health()
         no_ready_since: float | None = None
 
-        max_workers = max(
-            1,
-            sum(n.max_concurrency for n in self._filter_nodes(tags)),
-            sum(s.max_concurrency for s in snapshots if s.online),
+        max_workers = min(
+            64,
+            total_jobs,
+            max(
+                1,
+                sum(n.max_concurrency for n in self._filter_nodes(tags)),
+                sum(s.max_concurrency for s in snapshots if s.online),
+            ),
         )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:

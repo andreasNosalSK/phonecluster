@@ -1289,7 +1289,7 @@ async function verifyAndSaveToken() {
     }
     updateAuthBadge();
     loadSafetySettings();
-    refreshLive();
+    refreshAll();
     showToast('Token verified — Terminal & Cluster controls unlocked!', 'ok');
   } catch (e) {
     showToast('Could not reach Master to verify token: ' + e, 'bad');
@@ -1481,11 +1481,19 @@ async function apiFetch(url) {
   return await fetch(url, { headers });
 }
 
+let liveInFlight = false;
+
 async function refreshLive() {
+  if (liveInFlight) return;
+  liveInFlight = true;
   try {
     const r = await apiFetch('/api/live');
     if (r.status === 401) {
       document.getElementById('last-updated').textContent = 'Dashboard locked — paste auth_token above and click Unlock.';
+      return;
+    }
+    if (!r.ok) {
+      document.getElementById('last-updated').textContent = 'Dashboard error (HTTP ' + r.status + ')';
       return;
     }
     const live = await r.json();
@@ -1502,30 +1510,35 @@ async function refreshLive() {
 
     // Hero KPIs + Sparklines
     const cHist = hist.cluster || [];
-    document.getElementById('k-cpu').textContent = (d.cluster_cpu_pct ?? 0).toFixed(1) + '%';
+    const clusterCpuNum = Number(d.cluster_cpu_pct ?? 0);
+    document.getElementById('k-cpu').textContent = (Number.isFinite(clusterCpuNum) ? clusterCpuNum : 0).toFixed(1) + '%';
     document.getElementById('k-cores').textContent = d.total_cores + ' cores';
     document.getElementById('spark-cpu').innerHTML = renderSparklineSvg(
       cHist.map(p => p.cpu_pct), 100, '#58a6ff', 'rgba(88,166,255,0.18)'
     );
 
-    const usedGb = ((d.mem_total_mb - d.mem_available_mb) / 1024).toFixed(2);
-    const totGb = (d.mem_total_mb / 1024).toFixed(2);
+    const memTot = Number(d.mem_total_mb || 0);
+    const memAvail = Number(d.mem_available_mb || 0);
+    const usedGb = (Math.max(0, memTot - memAvail) / 1024).toFixed(2);
+    const totGb = (Math.max(0, memTot) / 1024).toFixed(2);
     document.getElementById('k-ram').textContent = usedGb + ' / ' + totGb + ' GB';
-    document.getElementById('k-ram-pct').textContent = (d.cluster_ram_pct ?? 0).toFixed(0) + '%';
+    const clusterRamNum = Number(d.cluster_ram_pct ?? 0);
+    document.getElementById('k-ram-pct').textContent = (Number.isFinite(clusterRamNum) ? clusterRamNum : 0).toFixed(0) + '%';
     document.getElementById('spark-ram').innerHTML = renderSparklineSvg(
       cHist.map(p => p.ram_pct), 100, '#a371f7', 'rgba(163,113,247,0.18)'
     );
 
     const peakT = d.max_temp_c;
-    document.getElementById('k-temp').textContent = peakT !== null ? peakT.toFixed(1) + ' °C' : 'N/A';
+    const hasPeakT = typeof peakT === 'number' && Number.isFinite(peakT);
+    document.getElementById('k-temp').textContent = hasPeakT ? peakT.toFixed(1) + ' °C' : 'N/A';
     const tp = document.getElementById('k-temp-pill');
-    if (peakT === null) { tp.textContent = 'N/A'; tp.className = 'pill neutral'; }
+    if (!hasPeakT) { tp.textContent = 'N/A'; tp.className = 'pill neutral'; }
     else if (peakT >= maxTemp) { tp.textContent = '⚠ HOT'; tp.className = 'pill bad'; }
     else if (peakT >= resTemp) { tp.textContent = 'Warm'; tp.className = 'pill warn'; }
     else { tp.textContent = '✓ Cool'; tp.className = 'pill ok'; }
     document.getElementById('spark-temp').innerHTML = renderSparklineSvg(
-      cHist.map(p => p.max_temp_c ?? 0), 55, peakT >= maxTemp ? '#f85149' : '#3fb950',
-      peakT >= maxTemp ? 'rgba(248,81,73,0.18)' : 'rgba(63,185,80,0.16)'
+      cHist.map(p => p.max_temp_c ?? 0), 55, (hasPeakT && peakT >= maxTemp) ? '#f85149' : '#3fb950',
+      (hasPeakT && peakT >= maxTemp) ? 'rgba(248,81,73,0.18)' : 'rgba(63,185,80,0.16)'
     );
 
     document.getElementById('k-tasks').textContent = String(d.total_active_jobs || 0);
@@ -1584,6 +1597,8 @@ async function refreshLive() {
     renderTasksBoard(live);
   } catch (e) {
     document.getElementById('last-updated').textContent = 'Connection error: ' + e;
+  } finally {
+    liveInFlight = false;
   }
 }
 
@@ -1622,7 +1637,8 @@ function renderNodesGrid(live) {
         badge = '<span class="pill ok">✓ READY (' + (h.active_jobs || 0) + '/' + (h.max_concurrency || n.max_concurrency || 2) + ')</span>';
         cardCls = 'node-card';
       } else if (n.online) {
-        badge = '<span class="pill warn">⚠ ' + esc((h.not_ready_reasons || ['PAUSED']).join(', ')) + '</span>';
+        const reasons = (Array.isArray(h.not_ready_reasons) && h.not_ready_reasons.length) ? h.not_ready_reasons : ['PAUSED'];
+        badge = '<span class="pill warn">⚠ ' + esc(reasons.join(', ')) + '</span>';
         cardCls = 'node-card hot';
       }
 
@@ -1631,13 +1647,15 @@ function renderNodesGrid(live) {
         bodyHtml = '<p class="hint">Unreachable: ' + esc(n.error || 'connection refused') + '</p>';
       } else {
         const cores = h.cpu_cores || 1;
-        const cpuPct = h.cpu_pct != null ? Number(h.cpu_pct) : Math.min(100, ((h.load_1m || 0) / cores) * 100);
-        const perCore = h.per_core_pct || [];
+        const rawCpu = h.cpu_pct != null ? Number(h.cpu_pct) : Math.min(100, ((Number(h.load_1m) || 0) / cores) * 100);
+        const cpuPct = Number.isFinite(rawCpu) ? rawCpu : 0;
+        const perCore = Array.isArray(h.per_core_pct) ? h.per_core_pct : [];
         const coreCols = perCore.length
           ? '<div class="core-grid" title="Per-core CPU utilization">'
             + perCore.slice(0, 16).map(p => {
-                const c = p >= 85 ? 'bad' : (p >= 60 ? 'warn' : '');
-                return '<div class="core-col"><span class="' + c + '" style="height:' + Math.max(6, Math.round(p)) + '%"></span></div>';
+                const pNum = Number.isFinite(Number(p)) ? Number(p) : 0;
+                const c = pNum >= 85 ? 'bad' : (pNum >= 60 ? 'warn' : '');
+                return '<div class="core-col"><span class="' + c + '" style="height:' + Math.max(6, Math.min(100, Math.round(pNum))) + '%"></span></div>';
               }).join('')
             + '</div>'
           : '';
@@ -1651,20 +1669,21 @@ function renderNodesGrid(live) {
 
         const ramUsedMb = Math.max(0, (h.mem_total_mb || 0) - (h.mem_available_mb || 0));
         const ramUsedPct = h.mem_total_mb ? (ramUsedMb / h.mem_total_mb) * 100 : 0;
-        const temp = h.temp_c;
-        const tempTone = temp == null ? '' : (temp >= maxTemp ? 'bad' : (temp >= resTemp ? 'warn' : 'ok'));
+        const tempNum = Number(h.temp_c);
+        const hasTemp = h.temp_c != null && Number.isFinite(tempNum);
+        const tempTone = !hasTemp ? '' : (tempNum >= maxTemp ? 'bad' : (tempNum >= resTemp ? 'warn' : 'ok'));
         const bat = h.battery_pct;
         const batTone = bat == null ? '' : (bat >= batHigh && (h.battery_status === 'CHARGING' || h.battery_status === 'FULL') ? 'warn' : (bat < 20 ? 'bad' : 'ok'));
 
         bodyHtml += metricBar('Memory', ramUsedMb + ' / ' + (h.mem_total_mb || 0) + ' MB (' + ramUsedPct.toFixed(0) + '%)', ramUsedPct, ramUsedPct > 85 ? 'bad' : '');
-        bodyHtml += metricBar('Temperature', temp != null ? temp.toFixed(1) + ' °C' : 'N/A', temp != null ? (temp / 50) * 100 : 0, tempTone);
+        bodyHtml += metricBar('Temperature', hasTemp ? tempNum.toFixed(1) + ' °C' : 'N/A', hasTemp ? (tempNum / 50) * 100 : 0, tempTone);
         bodyHtml += metricBar('Battery', bat != null ? bat + '% · ' + (h.battery_status || '?') : 'N/A', bat ?? 0, batTone);
 
         // Inline running tasks badge
-        const activeJobs = h.active_job_list || [];
+        const activeJobs = Array.isArray(h.active_job_list) ? h.active_job_list : [];
         if (activeJobs.length) {
           bodyHtml += '<div class="chips">' + activeJobs.map(j =>
-            '<span class="pill accent mono">▶ ' + esc(j.command.slice(0, 26)) + ' (' + esc(j.running_sec) + 's)</span>'
+            '<span class="pill accent mono">▶ ' + esc(String(j.command ?? '').slice(0, 26)) + ' (' + esc(j.running_sec) + 's)</span>'
           ).join('') + '</div>';
         }
 
@@ -1714,11 +1733,18 @@ function renderNodesGrid(live) {
 }
 
 /* ---------------- Interactive Multi-Node Web Terminal ---------------- */
+function shortCwd(cwd) {
+  if (!cwd) return '~';
+  const s = String(cwd);
+  if (s === '/') return '/';
+  return s.replace(/\/+$/, '').split('/').slice(-1)[0] || '~';
+}
+
 function onTermTargetChange() {
   const target = document.getElementById('term-target').value;
   const cwd = termCwds[target] || '~';
   document.getElementById('term-cwd-pill').textContent = cwd;
-  document.getElementById('term-prompt').textContent = target + ':' + cwd.split('/').slice(-1)[0] + ' $';
+  document.getElementById('term-prompt').textContent = target + ':' + shortCwd(cwd) + ' $';
 }
 
 function openNodeTerminal(nodeId, prefillCmd) {
@@ -1765,7 +1791,7 @@ async function submitTerminalCommand() {
   const screen = document.getElementById('term-screen');
   const entry = document.createElement('div');
   entry.className = 'term-entry';
-  const promptText = target + ':' + (cwd ? cwd.split('/').slice(-1)[0] : '~') + ' $ ' + cmd;
+  const promptText = target + ':' + shortCwd(cwd) + ' $ ' + cmd;
   entry.innerHTML = '<div class="term-cmd-line">' + esc(promptText) + '<span class="term-meta">running...</span></div>';
   screen.appendChild(entry);
   screen.scrollTop = screen.scrollHeight;
@@ -2314,7 +2340,14 @@ function downloadLastMapJson() {
 async function loadWorkloads() {
   try {
     const r = await apiFetch('/api/workloads');
-    if (r.status === 401) return;
+    if (r.status === 401) {
+      document.getElementById('wl-distcc').textContent = '# Dashboard locked — paste auth_token above and click Unlock.';
+      return;
+    }
+    if (!r.ok) {
+      document.getElementById('wl-distcc').textContent = '# Error loading workloads (HTTP ' + r.status + ')';
+      return;
+    }
     const d = await r.json();
     const cidrInput = document.getElementById('distcc-cidr');
     if (cidrInput && d.lan_subnet && (!cidrInput.dataset.edited || cidrInput.value === '192.168.1.0/24')) {
@@ -2534,6 +2567,14 @@ async function scanLan() {
   box.innerHTML = 'Scanning Wi-Fi (2 seconds)...';
   try {
     const r = await apiFetch('/api/discover');
+    if (r.status === 401) {
+      box.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
+      return;
+    }
+    if (!r.ok) {
+      box.innerHTML = '<p class="hint">Discovery failed (HTTP ' + r.status + ').</p>';
+      return;
+    }
     const d = await r.json();
     if (!d.discovered || !d.discovered.length) {
       box.innerHTML = '<p class="hint">No phones answered UDP discovery on port 8766. Make sure workers are running on the same Wi-Fi, or use Manual Add below.</p>';
@@ -2625,12 +2666,20 @@ async function runDoctorUi() {
   box.innerHTML = 'Running diagnostics...';
   try {
     const r = await apiFetch('/api/doctor');
+    if (r.status === 401) {
+      box.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
+      return;
+    }
+    if (!r.ok) {
+      box.innerHTML = '<p class="hint">Doctor failed (HTTP ' + r.status + ').</p>';
+      return;
+    }
     const d = await r.json();
     const icons = { ok: '✓ OK', warn: '⚠ WARN', fail: '✕ FAIL' };
     const cls = { ok: 'ok', warn: 'warn', fail: 'bad' };
     box.innerHTML = (d.checks || []).map(c =>
       '<div class="check-item">'
-      + '<span class="pill ' + (cls[c.status] || 'neutral') + '">' + (icons[c.status] || c.status) + '</span> '
+      + '<span class="pill ' + (cls[c.status] || 'neutral') + '">' + (icons[c.status] || esc(c.status)) + '</span> '
       + '<strong>' + esc(c.name) + '</strong>: ' + esc(c.detail)
       + (c.fix_hint ? '<div class="hint">Fix: ' + esc(c.fix_hint) + '</div>' : '')
       + '</div>'
@@ -2664,7 +2713,15 @@ async function loadNetworkCenter() {
 async function loadNetworkAudit() {
   try {
     const r = await apiFetch('/api/network/audit');
-    if (r.status === 401 || !r.ok) return;
+    if (r.status === 401) {
+      const msg = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
+      const nb = document.getElementById('net-nodes-table');
+      const cb = document.getElementById('net-checks-list');
+      if (nb) nb.innerHTML = msg;
+      if (cb) cb.innerHTML = msg;
+      return;
+    }
+    if (!r.ok) return;
     const d = await r.json();
     lastNetAudit = d;
     const hi = d.host_info || {};
@@ -2797,7 +2854,12 @@ async function pushLivePolicyToWorkers() {
 async function loadGatewayStatus() {
   try {
     const r = await apiFetch('/api/gateway/status');
-    if (r.status === 401 || !r.ok) return;
+    if (r.status === 401) {
+      const tbl = document.getElementById('gw-events-table');
+      if (tbl) tbl.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
+      return;
+    }
+    if (!r.ok) return;
     const d = await r.json();
     gwPresetsCache = d.presets || {};
     const pill = document.getElementById('gw-status-pill');
@@ -2924,15 +2986,41 @@ async function checkWanIsolation() {
 }
 
 function copyEl(id) {
-  const txt = document.getElementById(id).textContent;
-  if (navigator.clipboard) {
-    navigator.clipboard.writeText(txt).then(() => showToast('Copied to clipboard!', 'ok'));
+  const el = document.getElementById(id);
+  if (!el) return;
+  const txt = el.textContent || '';
+  const fallbackCopy = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = txt;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand && document.execCommand('copy');
+      document.body.removeChild(ta);
+      if (ok) showToast('Copied to clipboard!', 'ok');
+      else showToast('Copy blocked by browser — select text manually.', 'warn');
+    } catch (e) {
+      showToast('Copy failed — select text manually.', 'warn');
+    }
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(txt).then(() => showToast('Copied to clipboard!', 'ok')).catch(fallbackCopy);
+  } else {
+    fallbackCopy();
   }
 }
 
 function refreshAll() {
   refreshLive();
   if (document.getElementById('panel-workloads').classList.contains('active')) loadWorkloads();
+  if (document.getElementById('panel-network').classList.contains('active')) loadNetworkCenter();
+  if (document.getElementById('panel-setup').classList.contains('active') && getToken()) {
+    loadSafetySettings();
+    pollPairingStatus();
+  }
 }
 
 initPreferences();
@@ -2981,6 +3069,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             if ok:
                 controller.gateway_port_override = self.gateway_manager.bound_port
             else:
+                controller.gateway_port_override = -1
                 LOG.warning("Master Network Guard failed to start on boot: %s", msg)
 
     def process_request(self, request: Any, client_address: Any) -> None:
@@ -3223,7 +3312,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
             elif path == "/api/discover":
-                existing_hosts = {n.host for n in self.server.controller.config.nodes}
+                with self.server.controller.config_lock:
+                    existing_hosts = {n.host for n in self.server.controller.config.nodes}
                 found = discover_lan_nodes(timeout_sec=2.0)
                 for item in found:
                     item["already_configured"] = item["host"] in existing_hosts
@@ -3316,9 +3406,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return None
 
         if path == "/api/exec":
-            command = str(body.get("command", "")).strip()
-            target = str(body.get("target", "auto")).strip() or "auto"
-            workload_hint = str(body.get("workload_hint", body.get("workload", ""))).strip()
+            command = str(body.get("command") or "").strip()
+            target = str(body.get("target") or "auto").strip() or "auto"
+            workload_hint = str(body.get("workload_hint") or body.get("workload") or "").strip()
             if not command:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "empty command"})
                 return
@@ -3335,11 +3425,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"results": [o.to_dict() for o in outcomes]})
 
         elif path == "/api/terminal/exec":
-            command = str(body.get("command", "")).strip()
-            target = str(body.get("target", "auto")).strip() or "auto"
-            cwd = str(body.get("cwd", "")).strip() or None
-            job_id = str(body.get("job_id", "")).strip() or None
-            workload_hint = str(body.get("workload_hint", body.get("workload", ""))).strip()
+            command = str(body.get("command") or "").strip()
+            target = str(body.get("target") or "auto").strip() or "auto"
+            cwd = str(body.get("cwd") or "").strip() or None
+            job_id = str(body.get("job_id") or "").strip() or None
+            workload_hint = str(body.get("workload_hint") or body.get("workload") or "").strip()
             if not command:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "empty command"})
                 return
@@ -3361,24 +3451,24 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"results": results})
 
         elif path == "/api/map":
-            mode = str(body.get("mode", "commands"))
-            target = str(body.get("target", "auto")).strip() or "auto"
-            workload_hint = str(body.get("workload_hint", body.get("workload", ""))).strip()
+            mode = str(body.get("mode") or "commands")
+            target = str(body.get("target") or "auto").strip() or "auto"
+            workload_hint = str(body.get("workload_hint") or body.get("workload") or "").strip()
             timeout = _parse_timeout(body.get("timeout_sec"))
             if timeout is None:
                 return
             jobs: list[JobSpec] = []
             batch_id = uuid.uuid4().hex[:6]
             if mode == "script":
-                script_content = str(body.get("script_content", ""))
-                interpreter = str(body.get("interpreter", "python3"))
+                script_content = str(body.get("script_content") or "")
+                interpreter = str(body.get("interpreter") or "python3").strip() or "python3"
                 args_lines = body.get("args_lines") or []
                 if not script_content.strip() or not isinstance(args_lines, list) or not args_lines:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "provide script_content and non-empty args_lines"})
                     return
                 for idx, line in enumerate(args_lines):
                     try:
-                        parsed_args = shlex.split(str(line))
+                        parsed_args = shlex.split(str("" if line is None else line))
                     except ValueError as exc:
                         self._send_json(
                             HTTPStatus.BAD_REQUEST,
@@ -3403,6 +3493,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "provide non-empty commands list"})
                     return
                 for idx, cmd in enumerate(commands):
+                    if cmd is None:
+                        continue
                     cmd_s = str(cmd).strip()
                     if cmd_s:
                         jobs.append(
@@ -3448,8 +3540,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, res)
 
         elif path == "/api/services/custom":
-            raw_name = str(body.get("name", "")).strip().lower()
-            url = str(body.get("url", "")).strip()
+            raw_name = str(body.get("name") or "").strip().lower()
+            url = str(body.get("url") or "").strip()
             if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,39}", raw_name):
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
@@ -3474,7 +3566,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
 
         elif path == "/api/services/custom/remove":
-            raw_name = str(body.get("name", "")).strip().lower()
+            raw_name = str(body.get("name") or "").strip().lower()
             with ctrl.config_lock:
                 if not raw_name or raw_name not in ctrl.config.custom_services:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": f"custom service '{raw_name}' not found"})
@@ -3485,7 +3577,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"removed": raw_name})
 
         elif path == "/api/services/probe":
-            host = str(body.get("host", "")).strip()
+            host = str(body.get("host") or "").strip()
             try:
                 port = int(body.get("port", 0))
             except (TypeError, ValueError):
@@ -3542,7 +3634,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         ctrl.gateway_port_override = (
                             self.server.gateway_manager.bound_port
                             if self.server.gateway_manager.is_running
-                            else None
+                            else -1
                         )
                     else:
                         ctrl.gateway_port_override = None
@@ -3561,7 +3653,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/gateway/allow-domain":
             try:
-                dom = validate_domain_pattern(str(body.get("domain", "")))
+                dom = validate_domain_pattern(str(body.get("domain") or ""))
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -3577,8 +3669,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"allowed": dom, "allowed_domains": allowed_copy})
 
         elif path == "/api/gateway/quarantine":
-            node_id = str(body.get("node_id", "")).strip()
-            quarantine = bool(body.get("quarantine", True))
+            node_id = str(body.get("node_id") or "").strip()
+            quarantine = bool(True if body.get("quarantine") is None else body.get("quarantine"))
             with ctrl.config_lock:
                 if not node_id or not any(n.id == node_id for n in ctrl.config.nodes):
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
@@ -3610,7 +3702,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
 
         elif path == "/api/network/profile":
-            profile = str(body.get("profile", "")).strip()
+            profile = str(body.get("profile") or "").strip()
             with ctrl.config_lock:
                 prev_gw = GatewayConfig.from_dict(ctrl.config.to_dict().get("gateway"))
                 prev_req_auth = ctrl.config.dashboard_require_auth
@@ -3627,11 +3719,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     ctrl.config.network = prev_net
                     if prev_gw.enabled:
                         self.server.gateway_manager.sync_with_config()
-                    ctrl.gateway_port_override = (
-                        self.server.gateway_manager.bound_port
-                        if self.server.gateway_manager.is_running
-                        else None
-                    )
+                        ctrl.gateway_port_override = (
+                            self.server.gateway_manager.bound_port
+                            if self.server.gateway_manager.is_running
+                            else -1
+                        )
+                    else:
+                        ctrl.gateway_port_override = None
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": msg})
                     return
                 ctrl.gateway_port_override = (
@@ -3647,19 +3741,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/network/hardening":
             with ctrl.config_lock:
-                if "dashboard_require_auth" in body:
+                if "dashboard_require_auth" in body and body["dashboard_require_auth"] is not None:
                     ctrl.config.dashboard_require_auth = bool(body["dashboard_require_auth"])
                 cur_net = ctrl.config.network
                 master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
                 raw_ips = body.get("allowed_master_ips", cur_net.allowed_master_ips)
-                ips = [str(i).strip() for i in raw_ips if str(i).strip()] if isinstance(raw_ips, list) else list(cur_net.allowed_master_ips)
+                ips = (
+                    [str(i).strip() for i in raw_ips if i is not None and str(i).strip()]
+                    if isinstance(raw_ips, list)
+                    else list(cur_net.allowed_master_ips)
+                )
                 if master_node.host and master_node.host not in ips:
                     ips.append(master_node.host)
-                ag_url = str(body.get("adguard_url", cur_net.adguard_url)).strip()
+                raw_ag = body.get("adguard_url", cur_net.adguard_url)
+                ag_url = str("" if raw_ag is None else raw_ag).strip()
                 if ag_url and (any(c.isspace() or ord(c) < 32 for c in ag_url) or not ag_url.startswith(("http://", "https://"))):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https:// (no spaces/control chars)"})
                     return
-                lan_sub = str(body.get("lan_subnet", cur_net.lan_subnet)).strip()
+                raw_sub = body.get("lan_subnet", cur_net.lan_subnet)
+                lan_sub = str("" if raw_sub is None else raw_sub).strip()
                 if lan_sub:
                     try:
                         lan_sub = str(ipaddress.ip_network(lan_sub, strict=False))
@@ -3667,8 +3767,16 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid lan_subnet CIDR '{lan_sub}'"})
                         return
                 ctrl.config.network = NetworkHardeningConfig(
-                    enforce_worker_source_ip=bool(body.get("enforce_worker_source_ip", cur_net.enforce_worker_source_ip)),
-                    require_signed_requests=bool(body.get("require_signed_requests", cur_net.require_signed_requests)),
+                    enforce_worker_source_ip=bool(
+                        cur_net.enforce_worker_source_ip
+                        if body.get("enforce_worker_source_ip") is None
+                        else body.get("enforce_worker_source_ip")
+                    ),
+                    require_signed_requests=bool(
+                        cur_net.require_signed_requests
+                        if body.get("require_signed_requests") is None
+                        else body.get("require_signed_requests")
+                    ),
                     allowed_master_ips=ips[:32],
                     adguard_url=ag_url,
                     lan_subnet=lan_sub,
@@ -3687,7 +3795,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/network/push-config":
             raw_ids = body.get("node_ids")
-            node_ids = [str(x).strip() for x in raw_ids if str(x).strip()] if isinstance(raw_ids, list) else None
+            node_ids = [str(x).strip() for x in raw_ids if x is not None and str(x).strip()] if isinstance(raw_ids, list) else None
             self._send_json(HTTPStatus.OK, ctrl.push_config_to_all(node_ids=node_ids))
 
         elif path == "/api/gateway/check-isolation":
@@ -3695,8 +3803,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"workers": results})
 
         elif path == "/api/jobs/cancel":
-            node_id = str(body.get("node_id", "")).strip()
-            job_id = str(body.get("job_id", "")).strip()
+            node_id = str(body.get("node_id") or "").strip()
+            job_id = str(body.get("job_id") or "").strip()
             if not node_id or not job_id:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing node_id or job_id"})
                 return
@@ -3709,8 +3817,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(status, res)
 
         elif path == "/api/workloads/action":
-            action = str(body.get("action", "")).strip()
-            cidr = str(body.get("cidr", "")).strip()
+            action = str(body.get("action") or "").strip()
+            cidr = str(body.get("cidr") or "").strip()
             if not cidr:
                 with ctrl.config_lock:
                     master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
@@ -3770,7 +3878,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     if ready_workers:
                         cross_env = _build_env(snaps, ctrl.config)
                         outcomes = []
-                        with _cf.ThreadPoolExecutor(max_workers=len(ready_workers)) as pool:
+                        with _cf.ThreadPoolExecutor(max_workers=min(32, len(ready_workers))) as pool:
                             fut_map = {
                                 pool.submit(
                                     ctrl.exec_on_node,
@@ -3822,9 +3930,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/nodes/add":
             try:
-                host = validate_host(str(body.get("host", "")))
-                ssh_user = validate_ssh_user(str(body.get("ssh_user", "")))
-                pool_name = validate_pool_name(str(body.get("pool", "auto")))
+                host = validate_host(str(body.get("host") or ""))
+                ssh_user = validate_ssh_user(str(body.get("ssh_user") or ""))
+                pool_name = validate_pool_name(str(body.get("pool") or "auto"))
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -3881,7 +3989,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
 
         elif path == "/api/nodes/update":
-            node_id = str(body.get("id", "")).strip()
+            node_id = str(body.get("id") or "").strip()
             if not node_id:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing node id"})
                 return
@@ -3902,7 +4010,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     target_node.tier = t_val
                 if "pool" in body:
                     try:
-                        target_node.pool = validate_pool_name(str(body["pool"]))
+                        target_node.pool = validate_pool_name(str(body["pool"] or "auto"))
                     except ValueError as exc:
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
@@ -3925,7 +4033,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid weight"})
                         return
                 if "notes" in body:
-                    target_node.notes = str(body["notes"])[:240]
+                    target_node.notes = str(body["notes"] or "")[:240]
                 if self.server.config_path is not None:
                     save_config(ctrl.config, self.server.config_path)
                 updated_rec = {
@@ -3939,7 +4047,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"node": updated_rec, "pushed": pushed})
 
         elif path == "/api/nodes/remove":
-            node_id = str(body.get("id", "")).strip()
+            node_id = str(body.get("id") or "").strip()
             if not node_id:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing node id"})
                 return
