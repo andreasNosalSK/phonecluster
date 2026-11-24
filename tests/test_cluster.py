@@ -6474,9 +6474,11 @@ class TestPass11HardeningAndBugHunt(unittest.TestCase):
 
         # 3. TUI negative uptime & stdin EOF handling
         self.assertEqual(_format_uptime(-5), "0m")
-        with mock.patch("phonecluster.tui.select.select", return_value=([0], [], [])):
-            with mock.patch("phonecluster.tui.os.read", return_value=b""):
-                self.assertEqual(_read_key(0.01), "EOF")
+        fake_tty = mock.MagicMock(isatty=lambda: True, fileno=lambda: 0)
+        with mock.patch("phonecluster.tui.sys.stdin", fake_tty):
+            with mock.patch("phonecluster.tui.select.select", return_value=([fake_tty], [], [])):
+                with mock.patch("phonecluster.tui.os.read", return_value=b""):
+                    self.assertEqual(_read_key(0.01), "EOF")
 
         # 4. CLI validation: --max-concurrency 0 and huge --timeout fail cleanly with exit 2
         with tempfile.TemporaryDirectory() as tmp:
@@ -7330,10 +7332,12 @@ class TestPass12HardeningAndBugHunt(unittest.TestCase):
 
         # 3. TUI drains full multi-byte CSI sequence (Ctrl+Right = \x1b[1;5C) without leaking 'C'
         seq = iter([b"\x1b", b"[", b"1", b";", b"5", b"C"])
-        with mock.patch("phonecluster.tui.select.select", side_effect=lambda *_a, **_k: ([0], [], [])), mock.patch(
-            "phonecluster.tui.os.read", side_effect=lambda _fd, _n: next(seq)
-        ):
-            self.assertEqual(_read_key(0.05), "ESC")
+        fake_tty = mock.MagicMock(isatty=lambda: True, fileno=lambda: 0)
+        with mock.patch("phonecluster.tui.sys.stdin", fake_tty):
+            with mock.patch("phonecluster.tui.select.select", side_effect=lambda *_a, **_k: ([fake_tty], [], [])):
+                with mock.patch("phonecluster.tui.os.read", side_effect=lambda _fd, _n: next(seq)):
+                    self.assertEqual(_read_key(0.05), "ESC")
+        self.assertIsNone(next(seq, None))
 
         pal = Palette(enabled=False)
         box = _box_lines("A" * 120, ["body"], width=40, pal=pal)
