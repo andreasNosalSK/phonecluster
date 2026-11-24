@@ -21,6 +21,7 @@ from .config import (
     ClusterConfig,
     NodeConfig,
     SafetyConfig,
+    format_host_port,
     load_config,
     resolve_config_path,
     save_config,
@@ -30,6 +31,7 @@ from .config import (
 from .discovery import detect_local_ip, discover_lan_nodes
 from .doctor import run_doctor
 from .master import JobSpec, MasterController
+from .netguard import infer_lan_subnet
 from .telemetry import detect_os_environment, read_memory_info
 
 
@@ -235,7 +237,7 @@ def run_setup_wizard(
     print(f"       pc --config {saved} doctor")
     print("  3. Open the friendly Web Control Center:")
     print(f"       pc --config {saved} dashboard")
-    print(f"       -> http://{master_host}:{cfg.dashboard_port}")
+    print(f"       -> http://{format_host_port(master_host, cfg.dashboard_port)}")
     return 0
 
 
@@ -269,7 +271,12 @@ def run_interactive_menu(
         print("  0) Exit")
         print("-" * 52)
 
-        choice = _prompt("Choose an option", "1", input_fn=input_fn).lower()
+        try:
+            raw_choice = input_fn("Choose an option [1]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            return 0
+        choice = raw_choice or "1"
 
         if choice == "0":
             print("Goodbye!")
@@ -359,7 +366,9 @@ def run_interactive_menu(
             mpi = ctrl.build_mpi_hostfile().strip()
             print(f"OpenMPI   :\n{mpi or '(no healthy nodes)'}")
             if _prompt_yes_no("Start distccd compiler workers on all ready phones now?", default=False, input_fn=input_fn):
-                raw_cidr = _prompt("Allowed LAN subnet CIDR", "192.168.1.0/24", input_fn=input_fn)
+                master_n = next((n for n in cfg.nodes if n.role == "master"), cfg.nodes[0])
+                default_cidr = infer_lan_subnet(master_n.host or detect_local_ip(), cfg.network.lan_subnet)
+                raw_cidr = _prompt("Allowed LAN subnet CIDR", default_cidr, input_fn=input_fn)
                 try:
                     cidr = str(ipaddress.ip_network(raw_cidr, strict=False))
                 except ValueError:

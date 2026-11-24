@@ -49,17 +49,26 @@ if [[ "${SETUP_KEYS}" -eq 1 && ! -f "${HOME}/.ssh/id_ed25519" ]]; then
   ssh-keygen -t ed25519 -N "" -f "${HOME}/.ssh/id_ed25519"
 fi
 
-# Extract node list cleanly via stdlib Python (no jq required)
-NODES_TSV="$(python3 - "${CONFIG_PATH}" <<'PY'
+# Extract node list cleanly via stdlib Python (pipe-delimited so empty ssh_user never collapses under IFS whitespace!)
+NODES_PSV="$(python3 - "${CONFIG_PATH}" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     cfg = json.load(fh)
 for n in cfg["nodes"]:
-    print(f"{n['id']}\t{n['host']}\t{n.get('ssh_port', 8022)}\t{n.get('ssh_user', '')}\t{n.get('role', 'worker')}")
+    fields = [
+        str(n["id"]),
+        str(n["host"]),
+        str(n.get("ssh_port", 8022)),
+        str(n.get("ssh_user") or ""),
+        str(n.get("role") or "worker"),
+    ]
+    if any("|" in f or "\n" in f or "\r" in f for f in fields):
+        raise SystemExit(f"Invalid control/delimiter character in node entry: {n.get('id')}")
+    print("|".join(fields))
 PY
 )"
 
-while IFS=$'\t' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
+while IFS='|' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
   [[ -z "${NODE_ID}" ]] && continue
   if [[ "${NODE_ID}" == "${SKIP_LOCAL}" ]]; then
     echo "--- Skipping local node '${NODE_ID}' (${HOST}) ---"
@@ -141,7 +150,11 @@ PY
   ssh -p "${SSH_PORT}" -- "${TARGET}" bash -s -- "${NODE_ID}" "${REMOTE_DIR}" <<'REMOTE'
 set -euo pipefail
 NODE_ID="$1"
-REMOTE_DIR="${2/#\~/$HOME}"
+case "$2" in
+  '~') REMOTE_DIR="$HOME" ;;
+  '~/'*) REMOTE_DIR="$HOME/${2#'~/'}" ;;
+  *) REMOTE_DIR="$2" ;;
+esac
 LOG_DIR="${REMOTE_DIR}/logs"
 PID_FILE="${LOG_DIR}/worker-${NODE_ID}.pid"
 mkdir -p "${LOG_DIR}"
@@ -183,7 +196,7 @@ if ! kill -0 "${NEW_PID}" 2>/dev/null; then
 fi
 echo "Started worker '${NODE_ID}' (PID ${NEW_PID})"
 REMOTE
-done <<< "${NODES_TSV}"
+done <<< "${NODES_PSV}"
 
 echo
 echo "Sync complete! Verify the whole cluster with:"

@@ -264,8 +264,10 @@ class MetricsHistory:
                     "net_tx_kbps": summary.get("total_net_tx_kbps", 0.0),
                 }
             )
+            current_ids: set[str] = set()
             for n in summary.get("nodes", []):
                 nid = n["id"]
+                current_ids.add(nid)
                 if nid not in self._nodes:
                     self._nodes[nid] = collections.deque(maxlen=self.maxlen)
                 h = n.get("health") or {}
@@ -304,6 +306,9 @@ class MetricsHistory:
                             "active_jobs": 0,
                         }
                     )
+            if current_ids:
+                for stale_id in [k for k in self._nodes if k not in current_ids]:
+                    self._nodes.pop(stale_id, None)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -454,9 +459,10 @@ class MasterController:
         into every job so Tier 1/2/3 workloads seamlessly communicate as one system.
         """
         snapshots = self.poll_health(tags=tags)
-        cross_env = build_cross_tier_env(snapshots, self.config)
+        with self.config_lock:
+            cross_env = build_cross_tier_env(snapshots, self.config)
+            quarantined = set(self.config.gateway.quarantined_nodes)
         snap_by_id = {s.node.id: s for s in snapshots}
-        quarantined = self._quarantined_ids()
 
         if target == "all":
             chosen = [
@@ -717,7 +723,8 @@ class MasterController:
         def _refresh_health() -> None:
             nonlocal snapshots, cross_env, last_poll
             snapshots = self.poll_health(tags=tags)
-            cross_env = build_cross_tier_env(snapshots, self.config)
+            with self.config_lock:
+                cross_env = build_cross_tier_env(snapshots, self.config)
             last_poll = time.monotonic()
             for s in snapshots:
                 # Account for jobs already running on this phone outside this map_jobs() batch
@@ -966,7 +973,8 @@ class MasterController:
             step_env: dict[str, str] = dict(prior_step_env)
             if isinstance(raw_env, dict):
                 for k, v in raw_env.items():
-                    step_env[str(k)] = str(v)
+                    if k is not None:
+                        step_env[str(k)] = "" if v is None else str(v)
             step_env["PHONECLUSTER_PIPELINE_STEP"] = str(idx)
             step_env["PHONECLUSTER_PIPELINE_STEP_NAME"] = name
             if idx > 1:
@@ -1077,13 +1085,13 @@ class MasterController:
         if kind == "ok":
             return JobOutcome(
                 index=spec.index,
-                job_id=str(data.get("job_id", spec.job_id)),
+                job_id=str(data.get("job_id") or spec.job_id),
                 label=spec.label,
                 node_id=node_id,
                 returncode=_safe_int(data.get("returncode", -1), -1),
                 duration_sec=max(0.0, _safe_float(data.get("duration_sec", 0.0), 0.0)),
-                stdout=str(data.get("stdout", "")),
-                stderr=str(data.get("stderr", "")),
+                stdout=str(data.get("stdout") or ""),
+                stderr=str(data.get("stderr") or ""),
                 timed_out=bool(data.get("timed_out", False)),
                 cancelled=bool(data.get("cancelled", False)),
                 attempts=attempts,
@@ -1091,7 +1099,13 @@ class MasterController:
                 node_tier=node_tier,
                 node_pool=node_pool,
             )
-        err_msg = data.get("error") or ", ".join(data.get("reasons", [])) or str(data)
+        raw_reasons = data.get("reasons")
+        reasons_txt = (
+            ", ".join(str(r) for r in raw_reasons if r is not None)
+            if isinstance(raw_reasons, list)
+            else ""
+        )
+        err_msg = data.get("error") or reasons_txt or str(data)
         return JobOutcome(
             index=spec.index,
             job_id=spec.job_id,
@@ -1262,8 +1276,21 @@ class MasterController:
         )
         avg_latency_ms = round(sum(latencies) / len(latencies), 1) if latencies else 0.0
 
+        with self.config_lock:
+            cluster_name = self.config.cluster_name
+            services_reg = build_service_registry(snapshots, self.config)
+            s_cfg = self.config.safety
+            safety_dict = {
+                "max_temp_c": s_cfg.max_temp_c,
+                "resume_temp_c": s_cfg.resume_temp_c,
+                "min_free_ram_mb": s_cfg.min_free_ram_mb,
+                "battery_low_pct": s_cfg.battery_low_pct,
+                "battery_high_pct": s_cfg.battery_high_pct,
+                "battery_webhook_configured": bool(s_cfg.battery_webhook_url),
+            }
+
         summary = {
-            "cluster_name": self.config.cluster_name,
+            "cluster_name": cluster_name,
             "nodes_total": len(snapshots),
             "nodes_online": online_count,
             "nodes_ready": ready_count,
@@ -1278,15 +1305,8 @@ class MasterController:
             "total_net_rx_kbps": round(total_net_rx, 1),
             "total_net_tx_kbps": round(total_net_tx, 1),
             "pools": summarize_pools(snapshots, quarantined_nodes=quarantined),
-            "services_registry": build_service_registry(snapshots, self.config),
-            "safety": {
-                "max_temp_c": self.config.safety.max_temp_c,
-                "resume_temp_c": self.config.safety.resume_temp_c,
-                "min_free_ram_mb": self.config.safety.min_free_ram_mb,
-                "battery_low_pct": self.config.safety.battery_low_pct,
-                "battery_high_pct": self.config.safety.battery_high_pct,
-                "battery_webhook_configured": bool(self.config.safety.battery_webhook_url),
-            },
+            "services_registry": services_reg,
+            "safety": safety_dict,
             "timestamp": int(time.time()),
             "nodes": node_dicts,
         }
@@ -1299,11 +1319,16 @@ class MasterController:
     ) -> dict[str, Any]:
         """Return live cross-tier service registry, `.env` vars, and DNS hosts block."""
         snaps = snapshots if snapshots is not None else self.poll_health()
+        with self.config_lock:
+            quarantined = set(self.config.gateway.quarantined_nodes)
+            services = build_service_registry(snaps, self.config)
+            env = build_cross_tier_env(snaps, self.config)
+            dns_hosts = build_cluster_dns_hosts(snaps, self.config)
         return {
-            "pools": summarize_pools(snaps, quarantined_nodes=self._quarantined_ids()),
-            "services": build_service_registry(snaps, self.config),
-            "env": build_cross_tier_env(snaps, self.config),
-            "dns_hosts": build_cluster_dns_hosts(snaps, self.config),
+            "pools": summarize_pools(snaps, quarantined_nodes=quarantined),
+            "services": services,
+            "env": env,
+            "dns_hosts": dns_hosts,
         }
 
     @staticmethod
@@ -1461,7 +1486,11 @@ class MasterController:
         try:
             with _DIRECT_OPENER.open(req, timeout=self.config.health_timeout_sec) as resp:
                 data = read_json_object_bounded(resp, _MAX_JOBS_RESP_BYTES)
-                return {"node_id": node.id, "online": True, **data}
+                raw_active = data.get("active")
+                raw_recent = data.get("recent")
+                active = [j for j in raw_active if isinstance(j, dict)] if isinstance(raw_active, list) else []
+                recent = [j for j in raw_recent if isinstance(j, dict)] if isinstance(raw_recent, list) else []
+                return {**data, "node_id": node.id, "online": True, "active": active, "recent": recent}
         except urllib.error.HTTPError as exc:
             try:
                 err = exc.read(4096).decode("utf-8", errors="replace")[:200]
@@ -1532,7 +1561,7 @@ class MasterController:
         try:
             with _DIRECT_OPENER.open(req, timeout=timeout_sec) as resp:
                 data = read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES)
-                return {"node_id": node.id, "ok": True, **data}
+                return {**data, "node_id": node.id, "ok": True}
         except urllib.error.HTTPError as exc:
             try:
                 raw = exc.read(4096).decode("utf-8", errors="replace")[:200]

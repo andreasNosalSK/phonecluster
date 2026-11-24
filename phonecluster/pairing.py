@@ -39,7 +39,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from .auth import build_direct_opener, parse_strict_content_length, read_json_object_bounded
+from .auth import (
+    build_direct_opener,
+    parse_strict_content_length,
+    read_json_object_bounded,
+    safe_json_dumps,
+)
 from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
@@ -271,7 +276,7 @@ class PairingBeaconResponder(threading.Thread):
         LOG.info("Temporary pairing beacon active on UDP %s:%d", self.listen_host, self.bound_port)
         reply_window_start = time.monotonic()
         replies_in_window = 0
-        while not self._stop_event.is_set() and time.time() < self.expires_at:
+        while not self._stop_event.is_set() and time.monotonic() < self.expires_at:
             try:
                 data, addr = self._sock.recvfrom(2048)
             except socket.timeout:
@@ -291,7 +296,7 @@ class PairingBeaconResponder(threading.Thread):
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if isinstance(msg, dict) and msg.get("type") == PAIR_SEARCH_TYPE:
-                rem = max(0, int(self.expires_at - time.time()))
+                rem = max(0, int(self.expires_at - time.monotonic()))
                 if rem <= 0:
                     break
                 reply = {
@@ -413,16 +418,37 @@ class PairingSession:
     paired_nodes: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _validate_ssh_pubkey(pubkey: str) -> str | None:
+    """Strictly validate a single-line OpenSSH public key (blocks authorized_keys newline/option injection)."""
+    raw = str(pubkey or "").strip(" \t")
+    if not raw or len(raw) > 4096:
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        return None
+    parts = raw.split()
+    if len(parts) < 2 or parts[0] not in {"ssh-ed25519", "ssh-rsa"}:
+        return None
+    try:
+        blob = base64.b64decode(parts[1].encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        return None
+    if len(blob) < 16:
+        return None
+    comment = " ".join(parts[2:])[:128] if len(parts) > 2 else ""
+    return f"{parts[0]} {parts[1]} {comment}".strip()
+
+
 def _read_master_ssh_pubkey() -> str:
     """Optionally read Master's public SSH key (~/.ssh/id_ed25519.pub or id_rsa.pub)."""
     for fname in ("id_ed25519.pub", "id_rsa.pub"):
         p = Path.home() / ".ssh" / fname
         if p.exists():
             try:
-                text = p.read_text(encoding="utf-8").strip()
-                if text.startswith(("ssh-ed25519 ", "ssh-rsa ")):
-                    return text
-            except OSError:
+                first_line = p.read_text(encoding="utf-8").splitlines()[0]
+                valid = _validate_ssh_pubkey(first_line)
+                if valid:
+                    return valid
+            except (OSError, IndexError):
                 pass
     return ""
 
@@ -458,7 +484,7 @@ class PairingManager:
     def _cleanup_expired_locked(self) -> None:
         if self._session is not None:
             if (
-                time.time() >= self._session.expires_at
+                time.monotonic() >= self._session.expires_at
                 or self._session.attempts_left <= 0
                 or self._session.remaining_slots <= 0
             ):
@@ -491,7 +517,7 @@ class PairingManager:
             dh_priv=priv,
             dh_pub=pub,
             fingerprint=fingerprint_public_key(pub),
-            expires_at=time.time() + ttl,
+            expires_at=time.monotonic() + ttl,
             attempts_left=5,
             remaining_slots=slots,
         )
@@ -542,7 +568,7 @@ class PairingManager:
                 "session_id": s.session_id,
                 "pin": format_pin(s.pin),
                 "fingerprint": s.fingerprint,
-                "expires_in_sec": max(0, int(s.expires_at - time.time())),
+                "expires_in_sec": max(0, int(s.expires_at - time.monotonic())),
                 "attempts_left": s.attempts_left,
                 "remaining_slots": s.remaining_slots,
                 "pair_port": self.pair_port,
@@ -565,7 +591,7 @@ class PairingManager:
                 "dh_pub": format(s.dh_pub, "x"),
                 "salt": s.salt_hex,
                 "fingerprint": s.fingerprint,
-                "expires_in_sec": max(0, int(s.expires_at - time.time())),
+                "expires_in_sec": max(0, int(s.expires_at - time.monotonic())),
             }
 
     def complete_pairing(
@@ -574,8 +600,8 @@ class PairingManager:
         """Verify DH + PIN proof, mint a unique per-node token, and return encrypted bundle."""
         client_ip = normalize_host(client_ip)
         local_ip = normalize_host(local_ip)
-        peer_pub_hex = str(body.get("dh_pub", "")).strip().lower()
-        client_proof = str(body.get("client_proof", "")).strip().lower()
+        peer_pub_hex = str(body.get("dh_pub") or "").strip().lower()
+        client_proof = str(body.get("client_proof") or "").strip().lower()
         metadata = body.get("metadata")
         if not peer_pub_hex or not client_proof or not isinstance(metadata, dict):
             return HTTPStatus.BAD_REQUEST, {"error": "Missing dh_pub, client_proof, or metadata."}
@@ -595,7 +621,7 @@ class PairingManager:
                 dh_priv = s.dh_priv
                 dh_pub_hex = format(s.dh_pub, "x")
 
-            req_sid = str(body.get("session_id", "")).strip()
+            req_sid = str(body.get("session_id") or "").strip()
             if req_sid != session_id:
                 return HTTPStatus.BAD_REQUEST, {"error": "session_id mismatch (pairing window rotated)."}
 
@@ -751,6 +777,8 @@ class PairingManager:
             }
             self._session.paired_nodes.append(paired_rec)
             self._recent_paired.append(paired_rec)
+            if len(self._recent_paired) > 50:
+                self._recent_paired = self._recent_paired[-50:]
             self._session.remaining_slots -= 1
             if self._session.remaining_slots <= 0:
                 self._stop_beacon_locked()
@@ -808,7 +836,7 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
         LOG.info("pair %s - %s", self.address_string(), format % args)
 
     def _send_json(self, status: int, data: dict[str, Any]) -> None:
-        raw = json.dumps(data).encode("utf-8")
+        raw = safe_json_dumps(data).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
@@ -817,7 +845,10 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except OSError:
+            pass
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.split("?", 1)[0] == "/api/pair/hello":
@@ -889,7 +920,7 @@ def run_cli_pairing_host(
     print(f"  Master IP   : {lan_ip}:{actual_port}")
     print(f"  Fingerprint : {info['fingerprint']}")
     print(f"  6-Digit PIN : >>>  {info['pin']}  <<<")
-    print(f"  Valid for   : {ttl_sec}s  |  Devices allowed: {max_devices}  |  Max wrong PINs: 5")
+    print(f"  Valid for   : {info['expires_in_sec']}s  |  Devices allowed: {info['remaining_slots']}  |  Max wrong PINs: 5")
     print("=" * 60)
     print("\nOn your NEW phone, run:")
     print("  pc join")
@@ -952,9 +983,9 @@ def _http_json(url: str, method: str = "GET", body: dict[str, Any] | None = None
 
 
 def _install_ssh_pubkey(pubkey: str) -> bool:
-    """Safely append Master's SSH public key to ~/.ssh/authorized_keys (deduplicated)."""
-    clean = pubkey.strip()
-    if not clean.startswith(("ssh-ed25519 ", "ssh-rsa ")):
+    """Safely append Master's validated single-line SSH public key to ~/.ssh/authorized_keys."""
+    clean = _validate_ssh_pubkey(pubkey)
+    if not clean:
         return False
     ssh_dir = Path.home() / ".ssh"
     ssh_dir.mkdir(parents=True, exist_ok=True)
@@ -1026,7 +1057,10 @@ def join_cluster_via_pairing(
         else ({1: "compute", 2: "services", 3: "docker"}.get(eff_tier, det_pool))
     )
     actual_ssh_port = ssh_port if ssh_port is not None else (8022 if os_env == "termux" else 22)
-    actual_user = ssh_user or os.environ.get("USER", "")
+    try:
+        actual_user = validate_ssh_user(ssh_user or os.environ.get("USER", ""))
+    except ValueError:
+        actual_user = ""
     mem = read_memory_info()
     metadata = {
         "worker_port": worker_port,
@@ -1075,16 +1109,19 @@ def join_cluster_via_pairing(
     if not worker_token:
         raise RuntimeError("Master pairing bundle missing node_token.")
     assigned_host = validate_host(str(bundle.get("node_host") or detect_local_ip()))
-    raw_net = dict(bundle.get("network") or {})
-    master_ips = list(raw_net.get("allowed_master_ips") or [])
-    for m_ip in (str(bundle.get("master_host") or ""), master_host):
+    raw_net_obj = bundle.get("network")
+    raw_net = dict(raw_net_obj) if isinstance(raw_net_obj, dict) else {}
+    raw_mips = raw_net.get("allowed_master_ips")
+    master_ips = [str(x).strip() for x in raw_mips if x is not None and str(x).strip()] if isinstance(raw_mips, list) else []
+    for m_ip in (normalize_host(str(bundle.get("master_host") or "")), clean_master):
         if m_ip and m_ip not in master_ips:
             master_ips.append(m_ip)
     raw_net["allowed_master_ips"] = master_ips
+    raw_safety_obj = bundle.get("safety")
     worker_cfg = ClusterConfig(
         cluster_name=str(bundle.get("cluster_name") or "phonecluster"),
         auth_token=worker_token,
-        safety=SafetyConfig.from_dict(bundle.get("safety") or {}),
+        safety=SafetyConfig.from_dict(raw_safety_obj if isinstance(raw_safety_obj, dict) else {}),
         network=NetworkHardeningConfig.from_dict(raw_net),
         nodes=[
             NodeConfig(

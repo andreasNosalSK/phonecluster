@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import re
 import secrets
 import socket
@@ -64,15 +65,43 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _sanitize_json_value(obj: Any) -> Any:
+    """Recursively replace non-finite floats (NaN/Infinity) with None for RFC 8259 JSON compliance."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_json_value(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json_value(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_json_value(v) for v in obj]
+    return obj
+
+
+def safe_json_dumps(obj: Any) -> str:
+    """Serialize `obj` as strict RFC 8259 JSON (guarantees zero bare `NaN`/`Infinity` tokens)."""
+    try:
+        return json.dumps(obj, allow_nan=False)
+    except ValueError:
+        return json.dumps(_sanitize_json_value(obj), allow_nan=False)
+
+
 def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
     """Block webhook redirects to non-HTTP(S), link-local/cloud metadata, or cross-origin loopback."""
-    parsed_new = urllib.parse.urlsplit(new_url)
+    try:
+        parsed_new = urllib.parse.urlsplit(new_url)
+        new_port = parsed_new.port or 80
+    except ValueError:
+        return True
     if parsed_new.scheme.lower() not in {"http", "https"} or not parsed_new.hostname:
         return True
     new_host = parsed_new.hostname.strip().strip("[]").lower()
     if "%" in new_host:
         return True
-    orig_host = (urllib.parse.urlsplit(orig_url).hostname or "").strip().strip("[]").lower()
+    try:
+        orig_host = (urllib.parse.urlsplit(orig_url).hostname or "").strip().strip("[]").lower()
+    except ValueError:
+        return True
 
     def _is_loopback_name(h: str) -> bool:
         if h == "localhost":
@@ -89,7 +118,7 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
     if new_host == "localhost" and not orig_is_loopback:
         return True
     try:
-        infos = socket.getaddrinfo(new_host, parsed_new.port or 80, type=socket.SOCK_STREAM)
+        infos = socket.getaddrinfo(new_host, new_port, type=socket.SOCK_STREAM)
     except OSError:
         return True
     for _fam, _st, _pr, _cn, sa in infos:
@@ -331,10 +360,24 @@ class AuthRateLimiter:
             stale = [ip for ip, dq in self._failures.items() if not dq or dq[-1] < cutoff]
             for ip in stale:
                 self._failures.pop(ip, None)
+            if len(self._failures) > 2048:
+                # Hard cap against spoofed/distinct-IP memory floods within one window
+                oldest = sorted(
+                    self._failures.items(),
+                    key=lambda kv: kv[1][-1] if kv[1] else 0.0,
+                )[: len(self._failures) - 1024]
+                for ip, _ in oldest:
+                    self._failures.pop(ip, None)
         if len(self._blocked_until) > 512:
             expired = [ip for ip, until in self._blocked_until.items() if until <= now]
             for ip in expired:
                 self._blocked_until.pop(ip, None)
+            if len(self._blocked_until) > 2048:
+                earliest = sorted(self._blocked_until.items(), key=lambda kv: kv[1])[
+                    : len(self._blocked_until) - 1024
+                ]
+                for ip, _ in earliest:
+                    self._blocked_until.pop(ip, None)
 
     def record_failure(self, client_ip: str) -> bool:
         """Record one failed auth attempt; returns True if the IP is now blocked."""

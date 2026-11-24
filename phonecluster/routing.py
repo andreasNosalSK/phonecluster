@@ -391,11 +391,15 @@ def build_service_registry(
 
     if config.network.adguard_url and not has_auto_adguard:
         ag_url = config.network.adguard_url
-        parsed_ag = urllib.parse.urlparse(ag_url)
-        ag_host = parsed_ag.hostname or ""
         try:
-            ag_port = parsed_ag.port or (443 if parsed_ag.scheme == "https" else 80)
+            parsed_ag = urllib.parse.urlparse(ag_url)
+            ag_host = parsed_ag.hostname or ""
+            try:
+                ag_port = parsed_ag.port or (443 if parsed_ag.scheme == "https" else 80)
+            except ValueError:
+                ag_port = 80
         except ValueError:
+            ag_host = ""
             ag_port = 80
         entries.append(
             {
@@ -413,11 +417,15 @@ def build_service_registry(
         )
 
     for cname, curl in sorted(config.custom_services.items()):
-        parsed = urllib.parse.urlparse(curl)
-        c_host = parsed.hostname or ""
         try:
-            c_port = parsed.port or (443 if parsed.scheme == "https" else (80 if parsed.scheme == "http" else 0))
+            parsed = urllib.parse.urlparse(curl)
+            c_host = parsed.hostname or ""
+            try:
+                c_port = parsed.port or (443 if parsed.scheme == "https" else (80 if parsed.scheme == "http" else 0))
+            except ValueError:
+                c_port = 0
         except ValueError:
+            c_host = ""
             c_port = 0
         entries.append(
             {
@@ -589,7 +597,8 @@ def build_cluster_dns_hosts(
             slug = re.sub(r"[^a-z0-9_-]+", "-", str(item["name"]).lower()).strip("-_")
             if slug and slug not in seen_aliases:
                 seen_aliases.add(slug)
-                lines.append(f"{item_host:<16s} {slug}.{domain}  # custom service ({item['url']})")
+                safe_url = re.sub(r"[\x00-\x1f\x7f]", "", str(item.get("url") or ""))[:160]
+                lines.append(f"{item_host:<16s} {slug}.{domain}  # custom service ({safe_url})")
     return "\n".join(lines) + "\n"
 
 

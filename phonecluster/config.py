@@ -81,8 +81,10 @@ def validate_domain_pattern(pattern: str) -> str:
     if not clean:
         raise ValueError(f"Invalid domain pattern '{pattern}'")
     try:
-        ipaddress.ip_address(clean.strip("[]"))
-        return clean.strip("[]")
+        addr = ipaddress.ip_address(clean.strip("[]"))
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(addr)
     except ValueError:
         pass
     if not _DOMAIN_LABEL_RE.fullmatch(clean):
@@ -259,7 +261,13 @@ class SafetyConfig:
             )
         wb = cfg.battery_webhook_url.strip()
         if wb:
-            p_wb = urllib.parse.urlsplit(wb)
+            try:
+                p_wb = urllib.parse.urlsplit(wb)
+                _ = p_wb.port
+            except ValueError as exc:
+                raise ValueError(
+                    "safety.battery_webhook_url must be empty or a valid http:// / https:// URL"
+                ) from exc
             if (
                 any(c.isspace() or ord(c) < 32 for c in wb)
                 or p_wb.scheme.lower() not in {"http", "https"}
@@ -368,13 +376,23 @@ class NetworkHardeningConfig:
             return cls()
         raw_ips = data.get("allowed_master_ips")
         ips = (
-            [str(ip).strip() for ip in raw_ips if str(ip).strip()][:32]
+            [str(ip).strip() for ip in raw_ips if ip is not None and str(ip).strip()][:32]
             if isinstance(raw_ips, list)
             else []
         )
         ag_url = str(data.get("adguard_url") or "").strip()
-        if ag_url and (any(c.isspace() or ord(c) < 32 for c in ag_url) or not ag_url.startswith(("http://", "https://"))):
-            raise ValueError("network.adguard_url must be empty or a valid http:// / https:// URL")
+        if ag_url:
+            try:
+                p_ag = urllib.parse.urlsplit(ag_url)
+                _ = p_ag.port
+            except ValueError as exc:
+                raise ValueError("network.adguard_url must be empty or a valid http:// / https:// URL") from exc
+            if (
+                any(c.isspace() or ord(c) < 32 for c in ag_url)
+                or p_ag.scheme.lower() not in {"http", "https"}
+                or not p_ag.hostname
+            ):
+                raise ValueError("network.adguard_url must be empty or a valid http:// / https:// URL")
         lan_sub = str(data.get("lan_subnet") or "").strip()
         if lan_sub:
             try:
@@ -430,11 +448,15 @@ class ClusterConfig:
         gateway = GatewayConfig.from_dict(data.get("gateway"))
         network = NetworkHardeningConfig.from_dict(data.get("network"))
         raw_svcs = data.get("custom_services") or {}
-        custom_services = (
-            {str(k): str(v) for k, v in raw_svcs.items() if k is not None and v is not None}
-            if isinstance(raw_svcs, dict)
-            else {}
-        )
+        custom_services: dict[str, str] = {}
+        if isinstance(raw_svcs, dict):
+            for k, v in raw_svcs.items():
+                if k is None or v is None:
+                    continue
+                k_clean = re.sub(r"[\x00-\x1f\x7f]", "", str(k)).strip()
+                v_clean = re.sub(r"[\x00-\x1f\x7f]", "", str(v)).strip()
+                if k_clean and v_clean:
+                    custom_services[k_clean] = v_clean
         default_timeout = int(data.get("default_job_timeout_sec", 600))
         health_timeout = float(data.get("health_timeout_sec", 3.0))
         dash_port = int(data.get("dashboard_port", 8080))

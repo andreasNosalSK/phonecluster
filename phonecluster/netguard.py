@@ -154,7 +154,8 @@ def build_adguard_config_snippets(
     """Generate native AdGuard Home YAML rewrites & old-phone telemetry blocking rules (NO Docker needed!)."""
     registry = build_service_registry(snapshots, config)
     quarantined = set(config.gateway.quarantined_nodes)
-    master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
+    nodes_list = list(config.nodes)
+    master_node = next((n for n in nodes_list if n.role == "master"), nodes_list[0])
 
     rewrite_entries: list[tuple[str, str]] = [("master.cluster", master_node.host)]
     seen_domains: set[str] = {"master.cluster"}
@@ -190,7 +191,7 @@ def build_adguard_config_snippets(
         yaml_lines.append(f"  - domain: {dom}")
         yaml_lines.append(f"    answer: {ip}")
 
-    worker_ips = [n.host for n in config.nodes if n.role != "master" and n.host]
+    worker_ips = [n.host for n in nodes_list if n.role != "master" and n.host]
     client_list = ", ".join(worker_ips) if worker_ips else "192.168.1.202, 192.168.1.203"
     block_rules = "\n".join(
         [
@@ -231,33 +232,39 @@ def build_adguard_config_snippets(
 def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> dict[str, str]:
     """Generate tailored `nftables`, `ufw`, and Home Router WAN-block rules for this exact cluster."""
     subnet = host_info["lan_subnet"]
-    dash_port = int(config.dashboard_port)
+    dash_port = int(config.dashboard_port or 8080)
     gw_port = int(config.gateway.port or 8888)
-    master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
-    workers = [n for n in config.nodes if n.role != "master"]
+    nodes_list = list(config.nodes)
+    master_node = next((n for n in nodes_list if n.role == "master"), nodes_list[0])
+    master_worker_port = int(master_node.worker_port or 8765)
+    workers = [n for n in nodes_list if n.role != "master"]
     ssh_ports: list[int] = []
     if not host_info.get("is_termux"):
         ssh_ports.append(22)
     cfg_ssh = int(master_node.ssh_port or 22)
-    if cfg_ssh not in ssh_ports:
+    if cfg_ssh > 0 and cfg_ssh not in ssh_ports:
         ssh_ports.append(cfg_ssh)
 
     tcp_ports = sorted(
-        set(ssh_ports)
-        | {
-            dash_port,
-            int(master_node.worker_port),
-            gw_port,
-            53,
-            80,
-            1883,
-            3000,
-            3632,
-            8081,
-            8123,
-            8767,
-            50052,
-        }
+        p
+        for p in (
+            set(ssh_ports)
+            | {
+                dash_port,
+                master_worker_port,
+                gw_port,
+                53,
+                80,
+                1883,
+                3000,
+                3632,
+                8081,
+                8123,
+                8767,
+                50052,
+            }
+        )
+        if 1 <= p <= 65535
     )
     tcp_port_list = ", ".join(str(p) for p in tcp_ports)
     is_v6_subnet = ":" in subnet
@@ -305,7 +312,7 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
     ufw_lines.extend(
         [
             f"sudo ufw allow from {subnet} to any port {dash_port} proto tcp comment 'PhoneCluster Web UI'",
-            f"sudo ufw allow from {subnet} to any port {master_node.worker_port} proto tcp comment 'PhoneCluster Master Worker'",
+            f"sudo ufw allow from {subnet} to any port {master_worker_port} proto tcp comment 'PhoneCluster Master Worker'",
             f"sudo ufw allow from {subnet} to any port 8767 proto tcp comment 'PhoneCluster Pairing Window'",
             f"sudo ufw allow from {subnet} to any port 8766 proto udp comment 'PhoneCluster LAN Discovery/Pairing Beacon'",
             f"sudo ufw allow from {subnet} to any port {gw_port} proto tcp comment 'PhoneCluster Network Guard Proxy'",

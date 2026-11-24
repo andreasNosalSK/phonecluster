@@ -176,6 +176,11 @@ elif [[ "${ROLE}" == "worker" && -z "${NODE_ID}" ]]; then
   NODE_ID="${NODE_ID:-node1}"
 fi
 
+if [[ -n "${NODE_ID}" && ! "${NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
+  echo "Error: Invalid node ID '${NODE_ID}' (must start with alphanumeric and contain only A-Za-z0-9._-, max 40 chars)." >&2
+  exit 2
+fi
+
 # 4. Termux boot + SSH setup
 if [[ "${IS_TERMUX}" -eq 1 && "${ROLE}" != "cli-only" && -n "${ROLE}" ]]; then
   echo "[4/4] Setting up Termux SSH + Termux:Boot auto-start for '${NODE_ID}' (${ROLE})..."

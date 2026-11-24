@@ -62,20 +62,43 @@ def _sanitize_log_text(value: str, max_len: int = 200) -> str:
     return _CTRL_CHAR_RE.sub("?", str(value or ""))[:max_len]
 
 
-def _extract_host_header_hostname(host_val: str) -> str:
-    """Extract normalized hostname from an HTTP `Host:` header (IPv4, hostname, or `[IPv6]:port`)."""
+def _parse_host_header(host_val: str) -> tuple[str, int | None] | None:
+    """Strictly parse an HTTP `Host:` header into `(normalized_host, explicit_port_or_None)`."""
     raw = host_val.strip()
-    if not raw:
-        return ""
+    if not raw or any(c.isspace() or c in "@/\\?#;'\"" for c in raw):
+        return None
     if raw.startswith("["):
         end = raw.find("]")
         if end == -1:
-            return ""
-        return raw[1:end].strip().lower().rstrip(".")
-    if raw.count(":") == 1:
-        h_part, _ = raw.rsplit(":", 1)
-        return h_part.strip().lower().rstrip(".")
-    return raw.lower().rstrip(".")
+            return None
+        host_part = raw[1:end].strip()
+        rest = raw[end + 1 :]
+        if not host_part or "[" in host_part or "]" in host_part:
+            return None
+        if not rest:
+            port_val: int | None = None
+        elif rest.startswith(":") and _ASCII_PORT_RE.fullmatch(rest[1:]):
+            port_val = int(rest[1:])
+            if not (1 <= port_val <= 65535):
+                return None
+        else:
+            return None
+        norm = normalize_host(host_part).lower().rstrip(".")
+        return (norm, port_val) if norm else None
+    if raw.count(":") > 1:
+        # Unbracketed IPv6 in Host header is invalid per RFC 9110 §7.2
+        return None
+    if ":" in raw:
+        host_part, p_str = raw.rsplit(":", 1)
+        if not host_part or not _ASCII_PORT_RE.fullmatch(p_str):
+            return None
+        port_val = int(p_str)
+        if not (1 <= port_val <= 65535):
+            return None
+        norm = normalize_host(host_part).lower().rstrip(".")
+        return (norm, port_val) if norm else None
+    norm = normalize_host(raw).lower().rstrip(".")
+    return (norm, None) if norm else None
 
 GATEWAY_PRESETS: dict[str, dict[str, Any]] = {
     "github": {
@@ -181,13 +204,19 @@ def build_worker_proxy_env(
     for n in config.nodes:
         _add_no_proxy(n.host)
     for curl in config.custom_services.values():
-        parsed = urllib.parse.urlparse(curl)
-        if parsed.hostname:
-            _add_no_proxy(parsed.hostname)
+        try:
+            parsed = urllib.parse.urlparse(curl)
+            if parsed.hostname:
+                _add_no_proxy(parsed.hostname)
+        except ValueError:
+            continue
     if config.network.adguard_url:
-        parsed_ag = urllib.parse.urlparse(config.network.adguard_url)
-        if parsed_ag.hostname:
-            _add_no_proxy(parsed_ag.hostname)
+        try:
+            parsed_ag = urllib.parse.urlparse(config.network.adguard_url)
+            if parsed_ag.hostname:
+                _add_no_proxy(parsed_ag.hostname)
+        except ValueError:
+            pass
     no_proxy = ",".join(no_proxy_items)
 
     return {
@@ -537,11 +566,13 @@ def _relay_chunked_request_body(
         if chunk_size < 0 or total_body + chunk_size > MAX_HTTP_BODY_BYTES:
             raise ValueError("payload exceeds limit")
 
-        upstream.sendall(size_line)
-        bytes_forwarded += len(size_line)
+        # Forward canonical hex chunk size without unvalidated extensions (RFC 9112 §7.1.1 smuggling defense)
+        canon_size_line = f"{chunk_size:x}\r\n".encode("ascii")
+        upstream.sendall(canon_size_line)
+        bytes_forwarded += len(canon_size_line)
 
         if chunk_size == 0:
-            # Forward optional trailers until terminating CRLF (with strict line & byte caps)
+            # Forward validated trailers until terminating CRLF (with strict line, byte & header checks)
             trailer_lines = 0
             trailer_bytes = 0
             while not stop_event.is_set():
@@ -554,11 +585,27 @@ def _relay_chunked_request_body(
                 trailer_bytes += len(tr_line)
                 if trailer_lines > MAX_TRAILER_LINES or trailer_bytes > MAX_TRAILER_BYTES:
                     raise ValueError("chunked trailers exceed limit")
-                upstream.sendall(tr_line)
-                bytes_forwarded += len(tr_line)
                 if tr_line == b"\r\n":
+                    upstream.sendall(tr_line)
+                    bytes_forwarded += len(tr_line)
                     saw_final_chunk = True
                     break
+                tr_text = tr_line[:-2].decode("iso-8859-1", errors="replace")
+                if "\r" in tr_text or "\n" in tr_text or ":" not in tr_text:
+                    raise ValueError("malformed chunked trailer line")
+                tr_k, tr_v = tr_text.split(":", 1)
+                if not tr_k or not _HTTP_TOKEN_RE.fullmatch(tr_k):
+                    raise ValueError("invalid chunked trailer name")
+                if any((ord(c) < 32 and c != "\t") or ord(c) == 127 for c in tr_v):
+                    raise ValueError("invalid control character in chunked trailer")
+                # Never forward forbidden framing or proxy-credential headers inside chunked trailers
+                tr_kl = tr_k.lower()
+                if tr_kl.startswith("proxy-") or tr_kl in (
+                    _PROTECTED_END_TO_END_HEADERS | {"connection", "authorization", "cookie", "te"}
+                ):
+                    continue
+                upstream.sendall(tr_line)
+                bytes_forwarded += len(tr_line)
             break
 
         need = chunk_size
@@ -878,16 +925,22 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 return
             forward_path = ""
         else:
-            parsed = urllib.parse.urlsplit(target)
+            if "\\" in target:
+                _send_proxy_error(conn, 400, "Bad Request", "invalid backslash in proxy URL")
+                return
+            try:
+                parsed = urllib.parse.urlsplit(target)
+                dest_port = parsed.port or 80
+            except ValueError:
+                _send_proxy_error(conn, 400, "Bad Request", "malformed proxy target URL")
+                return
             if parsed.scheme.lower() not in {"http"} or not parsed.hostname:
                 _send_proxy_error(conn, 400, "Bad Request", "only HTTP URLs or HTTPS CONNECT supported")
                 return
-            dest_host = parsed.hostname
-            try:
-                dest_port = parsed.port or 80
-            except ValueError:
-                _send_proxy_error(conn, 400, "Bad Request", "invalid URL port")
+            if parsed.username is not None or parsed.password is not None:
+                _send_proxy_error(conn, 400, "Bad Request", "userinfo in proxy target URL is not allowed")
                 return
+            dest_host = parsed.hostname
             if not (1 <= dest_port <= 65535):
                 _send_proxy_error(conn, 400, "Bad Request", "invalid URL port")
                 return
@@ -898,15 +951,20 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 _send_proxy_error(conn, 400, "Bad Request", "invalid request path")
                 return
 
-        # 2b. Validate Host consistency & HTTP request framing BEFORE touching DNS/upstream
+        # 2b. Validate Host consistency (host + explicit port) & HTTP request framing BEFORE touching DNS/upstream
         host_values = [v for k, v in header_pairs if k.lower() == "host"]
         if len(host_values) > 1:
             _send_proxy_error(conn, 400, "Bad Request", "duplicate Host headers rejected")
             return
         if host_values:
-            hdr_host = _extract_host_header_hostname(host_values[0])
-            norm_dest = dest_host.strip().strip("[]").lower().rstrip(".")
-            if not hdr_host or hdr_host != norm_dest:
+            parsed_hdr = _parse_host_header(host_values[0])
+            norm_dest = normalize_host(dest_host).lower().rstrip(".")
+            if (
+                parsed_hdr is None
+                or parsed_hdr[0] != norm_dest
+                or (parsed_hdr[1] is not None and parsed_hdr[1] != dest_port)
+            ):
+                bad_hdr = parsed_hdr[0] if parsed_hdr is not None else "?"
                 self.server.audit_log.record(
                     node_id=node_id,
                     client_ip=client_ip,
@@ -914,9 +972,9 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     host=dest_host,
                     port=dest_port,
                     action="block",
-                    reason=f"Host header mismatch ({hdr_host or '?'} != {norm_dest})",
+                    reason=f"Host header mismatch ({bad_hdr} != {norm_dest}:{dest_port})",
                 )
-                _send_proxy_error(conn, 400, "Bad Request", "Host header does not match target URL")
+                _send_proxy_error(conn, 400, "Bad Request", "Host header does not match target URL/port")
                 return
 
         is_chunked = False

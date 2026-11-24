@@ -5193,6 +5193,346 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
             ):
                 self.assertEqual(cli_main(argv), 2, f"Expected exit 2 for CLI args: {argv}")
 
+    def test_pass9_proxy_host_port_chunk_ext_trailer_url_hardening_and_ip_canonicalization(self) -> None:
+        """Verify proxy Host-port check, malformed URL/userinfo/backslash blocking, chunk-ext & trailer sanitization, IP pattern canonicalization, and rate-limiter memory cap."""
+        import base64
+        import socketserver
+        from phonecluster.auth import AuthRateLimiter, _is_webhook_redirect_target_unsafe
+        from phonecluster.config import validate_domain_pattern
+
+        captured_raw: list[bytes] = []
+
+        class _CaptureHTTPHandler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.settimeout(3.0)
+                buf = bytearray()
+                try:
+                    while True:
+                        chunk = self.request.recv(4096)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        if b"\r\n0\r\n" in buf and buf.endswith(b"\r\n\r\n"):
+                            break
+                        if b"Transfer-Encoding:" not in buf and b"\r\n\r\n" in buf:
+                            break
+                except OSError:
+                    pass
+                captured_raw.append(bytes(buf))
+                try:
+                    self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                except OSError:
+                    pass
+
+        class _ReuseTCP(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        up_srv = _ReuseTCP(("127.0.0.1", 0), _CaptureHTTPHandler)
+        up_port = up_srv.server_address[1]
+        threading.Thread(target=up_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        tok = "pass9-gw-tok-1234567890"
+        w_tok = "pass9-gw-worker-987654321"
+        cfg = ClusterConfig(
+            cluster_name="pass9-gw",
+            auth_token=tok,
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=8766, auth_token=w_tok),
+            ],
+            gateway=GatewayConfig(
+                enabled=True,
+                bind_host="127.0.0.1",
+                port=0,
+                mode="allowlist",
+                allowed_domains=["127.0.0.1"],
+                allowed_ports=[up_port],
+                block_private_ips=False,
+                idle_timeout_sec=10.0,
+            ),
+        )
+        gw_mgr = GatewayManager(cfg)
+        ok, msg = gw_mgr.start()
+        self.assertTrue(ok, msg)
+        gw_port = gw_mgr.bound_port
+        secret = derive_proxy_password(w_tok, "node1")
+        auth_b64 = base64.b64encode(f"node1:{secret}".encode("utf-8")).decode("ascii")
+
+        def _raw_req(payload: bytes) -> bytes:
+            with socket.create_connection(("127.0.0.1", gw_port), timeout=5.0) as s:
+                s.sendall(payload)
+                s.settimeout(3.0)
+                out = bytearray()
+                while True:
+                    try:
+                        c = s.recv(4096)
+                    except OSError:
+                        break
+                    if not c:
+                        break
+                    out.extend(c)
+                return bytes(out)
+
+        try:
+            # 1. Host header port mismatch -> 400
+            r_port = _raw_req(
+                f"GET http://127.0.0.1:{up_port}/ HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:9999\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+            )
+            self.assertIn(b"400 Bad Request", r_port)
+
+            # 2. Malformed IPv6 bracket target URL -> 400 (no uncaught ValueError)
+            r_badv6 = _raw_req(
+                f"GET http://[bad/ HTTP/1.1\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+            )
+            self.assertIn(b"400 Bad Request", r_badv6)
+
+            # 3. Backslash & userinfo URL differentials -> 400
+            r_bslash = _raw_req(
+                f"GET http://127.0.0.1\\@evil.com/ HTTP/1.1\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+            )
+            self.assertIn(b"400 Bad Request", r_bslash)
+
+            r_uinfo = _raw_req(
+                f"GET http://user:pass@127.0.0.1:{up_port}/ HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{up_port}\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+            )
+            self.assertIn(b"400 Bad Request", r_uinfo)
+
+            # 4. Chunk extension stripped & forbidden Proxy-Authorization trailer dropped while valid trailer passes
+            captured_raw.clear()
+            r_chunk = _raw_req(
+                f"POST http://127.0.0.1:{up_port}/chunk HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{up_port}\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                f"Transfer-Encoding: chunked\r\n\r\n"
+                f"5;ext=sneaky\r\nhello\r\n"
+                f"0;last=ext\r\n"
+                f"Proxy-Authorization: Basic leaked\r\n"
+                f"X-Safe-Trailer: yes\r\n\r\n".encode("ascii")
+            )
+            self.assertIn(b"200 OK", r_chunk)
+            self.assertEqual(len(captured_raw), 1)
+            sent_up = captured_raw[0]
+            self.assertIn(b"\r\n5\r\nhello\r\n0\r\n", sent_up)
+            self.assertNotIn(b"ext=sneaky", sent_up)
+            self.assertNotIn(b"Proxy-Authorization", sent_up)
+            self.assertIn(b"X-Safe-Trailer: yes\r\n", sent_up)
+
+            # 5. Malformed chunk trailer (missing colon) -> 400
+            r_badtr = _raw_req(
+                f"POST http://127.0.0.1:{up_port}/badtr HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{up_port}\r\n"
+                f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                f"Transfer-Encoding: chunked\r\n\r\n"
+                f"0\r\nBadTrailerNoColon\r\n\r\n".encode("ascii")
+            )
+            self.assertIn(b"400 Bad Request", r_badtr)
+        finally:
+            gw_mgr.stop()
+            up_srv.shutdown()
+            up_srv.server_close()
+
+        # 6. IP pattern canonicalization, malformed webhook redirect port, and rate-limiter memory cap
+        self.assertEqual(validate_domain_pattern("::ffff:127.0.0.1"), "127.0.0.1")
+        self.assertEqual(validate_domain_pattern("0:0:0:0:0:0:0:1"), "::1")
+        self.assertTrue(_is_webhook_redirect_target_unsafe("https://example.com/hook", "http://evil.com:99999/"))
+        rl = AuthRateLimiter(max_failures=5, window_sec=60.0, block_sec=60.0)
+        for i in range(2500):
+            rl.record_failure(f"10.0.{i // 256}.{i % 256}")
+        self.assertLessEqual(len(rl._failures), 2048)
+
+    def test_pass9_ssh_pubkey_injection_json_nan_poison_sync_empty_ssh_user_and_self_resilience(self) -> None:
+        """Verify SSH pubkey newline injection block, RFC 8259 JSON NaN sanitization, malformed Origin/URL guards, doctor/netguard/TUI/wizard resilience, and 03_sync_cluster empty ssh_user."""
+        import base64
+        import subprocess
+        from unittest import mock
+        from phonecluster.auth import safe_json_dumps
+        from phonecluster.doctor import run_doctor
+        from phonecluster.gateway import build_worker_proxy_env
+        from phonecluster.netguard import build_firewall_guides
+        from phonecluster.pairing import _validate_ssh_pubkey
+        from phonecluster.routing import build_service_registry
+        from phonecluster.telemetry import BatteryInfo, ThermalGate, collect_node_health
+        from phonecluster.tui import render_top_frame
+        from phonecluster.wizard import run_interactive_menu
+
+        # 1. SSH authorized_keys multi-line / command injection rejected; valid key accepted
+        valid_blob = base64.b64encode(b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00 " + b"A" * 32).decode("ascii")
+        good_key = f"ssh-ed25519 {valid_blob} master@node0"
+        self.assertEqual(_validate_ssh_pubkey(good_key), good_key)
+        self.assertIsNone(_validate_ssh_pubkey(good_key + '\ncommand="/bin/evil" ' + good_key))
+        self.assertIsNone(_validate_ssh_pubkey("ssh-ed25519 !!!notbase64!!! user"))
+        self.assertIsNone(_validate_ssh_pubkey("ssh-ed25519 " + valid_blob + "\x1b[31muser"))
+
+        # 2. Strict RFC 8259 JSON serialization eliminates bare NaN / Infinity
+        strict_s = safe_json_dumps({"temp": float("nan"), "vals": [float("inf"), float("-inf"), 36.5]})
+        self.assertNotIn("NaN", strict_s)
+        self.assertNotIn("Infinity", strict_s)
+        def _forbid_const(c: str) -> None:
+            raise AssertionError(f"Non-RFC JSON constant emitted: {c}")
+        parsed = json.loads(strict_s, parse_constant=_forbid_const)
+        self.assertIsNone(parsed["temp"])
+        self.assertEqual(parsed["vals"], [None, None, 36.5])
+
+        # 3. collect_node_health(safety_only=True) does NOT conflate OVER_VOLTAGE with overheated
+        with mock.patch(
+            "phonecluster.telemetry.read_battery_info",
+            return_value=BatteryInfo(percentage=50, temperature_c=33.0, status="CHARGING", health="OVER_VOLTAGE", source="test"),
+        ), mock.patch(
+            "phonecluster.telemetry.read_memory_info",
+            return_value={"total_mb": 4096, "available_mb": 2048, "used_mb": 2048},
+        ):
+            h_safe = collect_node_health("n1", "worker", SafetyConfig(), ThermalGate(), safety_only=True)
+            self.assertFalse(h_safe["overheated"])
+            self.assertTrue(h_safe["battery_hazard"])
+            self.assertFalse(h_safe["ready_for_jobs"])
+
+        # 4. MasterController._to_outcome & service/proxy builders survive poisoned payloads and malformed URLs
+        spec = JobSpec(index=0, job_id="j1", command="echo x")
+        out_null = MasterController._to_outcome(spec, "n1", "ok", {"stdout": None, "stderr": None, "returncode": 0}, 1)
+        self.assertEqual(out_null.stdout, "")
+        self.assertEqual(out_null.stderr, "")
+        out_bad_r = MasterController._to_outcome(spec, "n1", "retryable", {"reasons": "not-a-list"}, 1)
+        self.assertFalse(out_bad_r.ok)
+
+        bad_url_cfg = ClusterConfig(
+            cluster_name="badurl",
+            auth_token="tok-badurl-1234567890",
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=0),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=8766),
+            ],
+            dashboard_port=0,
+            gateway=GatewayConfig(enabled=True, port=8888, inject_proxy_env=True),
+            custom_services={"broken": "http://[bad/"},
+        )
+        self.assertTrue(isinstance(build_service_registry([], bad_url_cfg), list))
+        self.assertIn("HTTP_PROXY", build_worker_proxy_env(bad_url_cfg, bad_url_cfg.nodes[1]))
+
+        # 5. Firewall guides never emit port 0
+        fw = build_firewall_guides(bad_url_cfg, {"lan_subnet": "192.168.1.0/24", "is_termux": False})
+        self.assertNotIn("port 0 ", fw["ufw"])
+        self.assertNotIn("{ 0,", fw["nftables"])
+
+        # 6. Dashboard rejects malformed Origin (403) and malformed webhook/adguard URLs (400), never 500
+        tok = "pass9-dash-tok-123456"
+        d_cfg = ClusterConfig(
+            cluster_name="p9-dash",
+            auth_token=tok,
+            nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765)],
+        )
+        dash = DashboardHTTPServer(("127.0.0.1", 0), MasterController(d_cfg), enable_pairing_beacon=False, pairing_fail_delay_sec=0.0)
+        d_port = dash.server_address[1]
+        dt = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        dt.start()
+        try:
+            def _post(path: str, body: dict[str, Any], extra_hdrs: dict[str, str] | None = None) -> int:
+                hdrs = {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"}
+                if extra_hdrs:
+                    hdrs.update(extra_hdrs)
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}{path}",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers=hdrs,
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        return resp.status
+                except urllib.error.HTTPError as exc:
+                    exc.close()
+                    return exc.code
+
+            self.assertEqual(_post("/api/exec", {"command": "echo hi"}, {"Origin": "http://[bad"}), 403)
+            self.assertEqual(_post("/api/settings/test-webhook", {"battery_webhook_url": "http://[bad/"}), 400)
+            self.assertEqual(_post("/api/network/hardening", {"adguard_url": "http://[bad/"}), 400)
+        finally:
+            dash.shutdown()
+            dash.server_close()
+            dt.join(timeout=2.0)
+
+        # 7. Doctor survives poisoned string battery_pct and flags PMIC OVER_VOLTAGE as fail
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "doc.json"
+            save_config(d_cfg, cfg_p)
+            poison_snap = NodeSnapshot(
+                node=d_cfg.nodes[0],
+                online=True,
+                health={"battery_pct": "bad", "battery_status": "CHARGING", "battery_health": "OVER_VOLTAGE", "overheated": False, "ready_for_jobs": False},
+            )
+            with mock.patch.object(MasterController, "poll_health", return_value=[poison_snap]):
+                rep = run_doctor(cfg_p, check_remote=True)
+            self.assertEqual(rep["overall"], "fail")
+            self.assertTrue(any(c["name"] == "Battery Hardware Health (PMIC)" and c["status"] == "fail" for c in rep["checks"]))
+
+        # 8. TUI strips ANSI/OSC escapes from last_command_banner & interactive menu exits cleanly on EOF
+        frame = render_top_frame(
+            summary={"cluster_name": "c", "nodes": [], "safety": {}},
+            history={"cluster": [], "nodes": {}},
+            all_jobs=[],
+            last_command_banner="\x1b]52;c;ZXZpbA==\x07\x1b[2Jclean_out",
+            use_color=False,
+        )
+        self.assertNotIn("\x1b", frame)
+        self.assertIn("clean_out", frame)
+        def _eof_input(_p: str) -> str:
+            raise EOFError()
+        self.assertEqual(run_interactive_menu(input_fn=_eof_input), 0)
+
+        # 9. Shell script hardening: 03_sync_cluster empty ssh_user IFS preservation + setup_pi_master & 05_workload_helpers guards
+        repo = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            sync_cfg = Path(tmp) / "sync.json"
+            save_config(
+                ClusterConfig(
+                    cluster_name="sync-empty-user",
+                    auth_token="tok-sync-empty-1234567890",
+                    nodes=[
+                        NodeConfig(id="node0", host="192.168.1.201", role="master", ssh_user=""),
+                        NodeConfig(id="node1", host="192.168.1.202", role="worker", ssh_user=""),
+                    ],
+                ),
+                sync_cfg,
+            )
+            # Verify pipe-delimited parsing keeps SSH_USER empty and preserves ROLE="worker"
+            p_ifs = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'NODES_PSV="$(python3 - "$1" <<\'PY\'\n'
+                    'import json, sys\n'
+                    'cfg = json.load(open(sys.argv[1]))\n'
+                    'for n in cfg["nodes"]:\n'
+                    '    print("|".join([str(n["id"]), str(n["host"]), str(n.get("ssh_port", 8022)), str(n.get("ssh_user") or ""), str(n.get("role") or "worker")]))\n'
+                    'PY\n'
+                    ')"\n'
+                    'while IFS="|" read -r ID H P U R; do echo "$ID:$U:$R"; done <<< "$NODES_PSV"',
+                    "_",
+                    str(sync_cfg),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(p_ifs.stdout.strip().splitlines(), ["node0::master", "node1::worker"])
+            self.assertIn("IFS='|' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE", (repo / "scripts" / "03_sync_cluster.sh").read_text(encoding="utf-8"))
+
+        for bad_cmd in (
+            ["bash", str(repo / "scripts" / "setup_pi_master.sh"), "--user", "bad;id"],
+            ["bash", str(repo / "scripts" / "setup_pi_master.sh"), "--lan-subnet", "not-a-cidr"],
+            ["bash", str(repo / "scripts" / "05_workload_helpers.sh"), "distcc-start", "-evil"],
+            ["bash", str(repo / "scripts" / "05_workload_helpers.sh"), "distcc-start", "192.168.1.0/24", "0"],
+            ["bash", str(repo / "scripts" / "05_workload_helpers.sh"), "llama-rpc-start", "/tmp", "99999"],
+        ):
+            proc = subprocess.run(bad_cmd, capture_output=True, text=True, check=False)
+            self.assertEqual(proc.returncode, 2, f"Expected exit 2 for {bad_cmd}, got {proc.returncode}: {proc.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()

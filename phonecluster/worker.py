@@ -34,6 +34,7 @@ from .auth import (
     extract_auth_scheme,
     parse_hmac_auth_header,
     parse_strict_content_length,
+    safe_json_dumps,
     verify_hmac_request,
     verify_token,
 )
@@ -455,13 +456,14 @@ class WorkerState:
         return {"active": active, "recent": recent}
 
     def record_safety_event(self, event: str, message: str, health: dict[str, Any]) -> bool:
-        """Record a battery/thermal safety event respecting cooldown, and fire webhook."""
-        now = time.time()
+        """Record a battery/thermal safety event respecting monotonic cooldown, and fire webhook."""
+        now_mono = time.monotonic()
+        now_wall = time.time()
         with self.lock:
-            last = self._last_alert_ts.get(event, 0.0)
-            if now - last < self.safety.webhook_cooldown_sec:
+            last = self._last_alert_ts.get(event)
+            if last is not None and (now_mono - last) < self.safety.webhook_cooldown_sec:
                 return False
-            self._last_alert_ts[event] = now
+            self._last_alert_ts[event] = now_mono
             webhook_url = self.safety.battery_webhook_url
             payload = {
                 "event": event,
@@ -471,7 +473,7 @@ class WorkerState:
                 "battery_status": health.get("battery_status"),
                 "battery_health": health.get("battery_health"),
                 "temp_c": health.get("temp_c"),
-                "timestamp": int(now),
+                "timestamp": int(now_wall),
             }
             self.recent_alerts.appendleft(payload)
 
@@ -545,7 +547,12 @@ _WEBHOOK_OPENER = build_webhook_opener()
 def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> None:
     """Send a best-effort JSON webhook (e.g., Home Assistant, ntfy, smart plug bridge)."""
     clean_url = str(url or "").strip()
-    parsed_wb = urllib.parse.urlsplit(clean_url)
+    try:
+        parsed_wb = urllib.parse.urlsplit(clean_url)
+        _ = parsed_wb.port
+    except ValueError:
+        LOG.warning("Skipped invalid safety webhook URL (malformed URL)")
+        return
     if (
         not clean_url
         or any(c.isspace() or ord(c) < 32 for c in clean_url)
@@ -555,7 +562,7 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> No
         LOG.warning("Skipped invalid safety webhook URL (must be http:// or https:// with hostname)")
         return
     try:
-        body = json.dumps(payload).encode("utf-8")
+        body = safe_json_dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             clean_url,
             data=body,
@@ -931,7 +938,7 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         LOG.info("%s - %s", self.address_string(), format % args)
 
     def _send_json(self, status: int, body: dict[str, Any]) -> None:
-        raw = json.dumps(body).encode("utf-8")
+        raw = safe_json_dumps(body).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
@@ -940,7 +947,10 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except OSError:
+            pass
 
     def _read_raw_body(self) -> bytes | None:
         length, err_status, err_msg = parse_strict_content_length(self.headers, MAX_REQUEST_BYTES)

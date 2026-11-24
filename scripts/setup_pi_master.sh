@@ -39,9 +39,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ ! "${RUN_USER}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]]; then
+  echo "Error: Invalid --user '${RUN_USER}'." >&2
+  exit 2
+fi
+
+if [[ -n "${LAN_SUBNET}" ]]; then
+  if ! python3 -c 'import ipaddress, sys; ipaddress.ip_network(sys.argv[1], strict=False)' "${LAN_SUBNET}" 2>/dev/null; then
+    echo "Error: Invalid --lan-subnet CIDR '${LAN_SUBNET}' (example: 192.168.1.0/24)." >&2
+    exit 2
+  fi
+fi
+
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run with sudo: sudo bash $0 $*" >&2
   exit 1
+fi
+
+if ! id -u "${RUN_USER}" >/dev/null 2>&1; then
+  echo "Error: System user '${RUN_USER}' does not exist." >&2
+  exit 2
 fi
 
 USER_HOME="$(getent passwd "${RUN_USER}" | cut -d: -f6 || echo "/home/${RUN_USER}")"
@@ -166,6 +183,10 @@ if [[ "${WITH_FIREWALL}" -eq 1 ]]; then
   echo "Applying hardened LAN-only nftables rules (${LAN_SUBNET})..."
   sudo -u "${RUN_USER}" python3 "${REPO_DIR}/phonecluster_cli.py" \
     --config "${CFG_PATH}" net-audit --firewall > /etc/nftables.phonecluster.conf
+  if ! nft -c -f /etc/nftables.phonecluster.conf; then
+    echo "Error: Generated nftables rules failed syntax check; leaving existing /etc/nftables.conf untouched." >&2
+    exit 1
+  fi
   if [[ -f /etc/nftables.conf && ! -f /etc/nftables.conf.pre-phonecluster.bak ]]; then
     cp /etc/nftables.conf /etc/nftables.conf.pre-phonecluster.bak
   fi

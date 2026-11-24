@@ -21,7 +21,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .auth import AuthRateLimiter, build_webhook_opener, parse_strict_content_length, verify_token
+from .auth import (
+    AuthRateLimiter,
+    build_webhook_opener,
+    parse_strict_content_length,
+    safe_json_dumps,
+    verify_token,
+)
 from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
@@ -3123,7 +3129,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except OSError:
+            pass
 
     def _check_same_origin(self) -> bool:
         """Block cross-site browser POSTs (CSRF defense) while keeping non-browser API clients working."""
@@ -3137,7 +3146,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         host_hdr = self.headers.get("Host", "").strip().lower()
         origin = self.headers.get("Origin", "").strip()
         if origin:
-            parsed = urllib.parse.urlparse(origin)
+            try:
+                parsed = urllib.parse.urlparse(origin)
+                _ = parsed.port
+            except ValueError:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "forbidden: malformed Origin header on browser POST"},
+                )
+                return False
             if (
                 parsed.scheme.lower() not in {"http", "https"}
                 or not host_hdr
@@ -3151,7 +3168,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return True
         referer = self.headers.get("Referer", "").strip()
         if referer:
-            parsed_ref = urllib.parse.urlparse(referer)
+            try:
+                parsed_ref = urllib.parse.urlparse(referer)
+                _ = parsed_ref.port
+            except ValueError:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "forbidden: malformed Referer header on browser POST"},
+                )
+                return False
             if (
                 parsed_ref.scheme.lower() not in {"http", "https"}
                 or not host_hdr
@@ -3165,7 +3190,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         return True
 
     def _send_json(self, status: int, data: dict[str, Any]) -> None:
-        self._send(status, "application/json", json.dumps(data).encode("utf-8"))
+        self._send(status, "application/json", safe_json_dumps(data).encode("utf-8"))
 
     def _read_json(self) -> dict[str, Any] | None:
         length, err_status, err_msg = parse_strict_content_length(self.headers, MAX_DASHBOARD_BODY)
@@ -3755,9 +3780,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     ips.append(master_node.host)
                 raw_ag = body.get("adguard_url", cur_net.adguard_url)
                 ag_url = str("" if raw_ag is None else raw_ag).strip()
-                if ag_url and (any(c.isspace() or ord(c) < 32 for c in ag_url) or not ag_url.startswith(("http://", "https://"))):
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https:// (no spaces/control chars)"})
-                    return
+                if ag_url:
+                    try:
+                        p_ag = urllib.parse.urlsplit(ag_url)
+                        _ = p_ag.port
+                    except ValueError:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url is malformed"})
+                        return
+                    if (
+                        any(c.isspace() or ord(c) < 32 for c in ag_url)
+                        or p_ag.scheme.lower() not in {"http", "https"}
+                        or not p_ag.hostname
+                    ):
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https:// with a valid hostname"})
+                        return
                 raw_sub = body.get("lan_subnet", cur_net.lan_subnet)
                 lan_sub = str("" if raw_sub is None else raw_sub).strip()
                 if lan_sub:
@@ -4097,7 +4133,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/settings/test-webhook":
             url = str(body.get("battery_webhook_url") or ctrl.config.safety.battery_webhook_url).strip()
-            p_url = urllib.parse.urlsplit(url)
+            try:
+                p_url = urllib.parse.urlsplit(url)
+                _ = p_url.port
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "enter a valid http:// or https:// webhook URL"})
+                return
             if (
                 not url
                 or any(c.isspace() or ord(c) < 32 for c in url)

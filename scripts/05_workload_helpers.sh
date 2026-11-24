@@ -10,6 +10,14 @@ case "${CMD}" in
   distcc-start)
     ALLOW_CIDR="${1:-192.168.1.0/24}"
     JOBS="${2:-$(nproc 2>/dev/null || echo 4)}"
+    if [[ "${ALLOW_CIDR}" == -* || "${ALLOW_CIDR}" =~ [[:space:]] ]]; then
+      echo "Error: Invalid allow CIDR '${ALLOW_CIDR}'." >&2
+      exit 2
+    fi
+    if [[ ! "${JOBS}" =~ ^[0-9]+$ ]] || (( JOBS < 1 || JOBS > 128 )); then
+      echo "Error: Invalid jobs count '${JOBS}' (expected 1..128)." >&2
+      exit 2
+    fi
     if ! command -v distccd >/dev/null 2>&1; then
       echo "Error: distccd not installed. Run: pkg install distcc (Termux) or apt install distcc (Debian 13)" >&2
       exit 1
@@ -35,6 +43,10 @@ case "${CMD}" in
   llama-rpc-start)
     LLAMA_DIR="${1:-${HOME}/llama.cpp}"
     PORT="${2:-50052}"
+    if [[ ! "${PORT}" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+      echo "Error: Invalid port '${PORT}' (expected 1..65535)." >&2
+      exit 2
+    fi
     BIN=""
     for CAND in "${LLAMA_DIR}/build/bin/rpc-server" "${LLAMA_DIR}/rpc-server" "$(command -v rpc-server 2>/dev/null || true)"; do
       if [[ -n "${CAND}" && -x "${CAND}" ]]; then

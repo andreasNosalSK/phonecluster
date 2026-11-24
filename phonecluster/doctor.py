@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
+import socket
 import stat
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import ClusterConfig, load_config, resolve_config_path
+from .config import ClusterConfig, is_loopback_or_unspecified_host, load_config, normalize_host, resolve_config_path
 from .master import MasterController
 from .telemetry import (
+    _read_listening_tcp_map,
     detect_capabilities,
     detect_os_environment,
     is_local_port_open,
@@ -199,7 +202,23 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
 
             if cfg.gateway.enabled:
                 gw_port = int(cfg.gateway.port or 0)
-                gw_live = True if gw_port <= 0 else is_local_port_open(gw_port)
+                if gw_port <= 0:
+                    gw_live = True
+                else:
+                    lmap = _read_listening_tcp_map()
+                    if lmap is not None and gw_port in lmap:
+                        gw_live = True
+                    else:
+                        bind_h = normalize_host(cfg.gateway.bind_host)
+                        gw_live = False
+                        if bind_h and not is_loopback_or_unspecified_host(bind_h):
+                            try:
+                                with socket.create_connection((bind_h, gw_port), timeout=0.25):
+                                    gw_live = True
+                            except OSError:
+                                gw_live = False
+                        if not gw_live:
+                            gw_live = is_local_port_open(gw_port)
                 if gw_live:
                     checks.append(
                         CheckResult(
@@ -272,18 +291,40 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                 )
             )
 
-        # Battery swelling safety check across online phones
+        # Battery swelling, PMIC hazard, and thermal safety check across online phones
         high_bat_nodes: list[str] = []
+        hazard_bat_nodes: list[str] = []
         hot_nodes: list[str] = []
         for s in online:
-            h = s.health
-            pct = h.get("battery_pct")
-            st = str(h.get("battery_status", "")).upper()
+            h = s.health if isinstance(s.health, dict) else {}
+            pct_raw = h.get("battery_pct")
+            pct_val: float | None = None
+            if pct_raw is not None and not isinstance(pct_raw, bool):
+                try:
+                    pf = float(pct_raw)
+                    if math.isfinite(pf):
+                        pct_val = pf
+                except (TypeError, ValueError):
+                    pct_val = None
+            st = str(h.get("battery_status") or "").upper()
+            b_health = str(h.get("battery_health") or "").upper()
             temp = h.get("temp_c")
-            if pct is not None and pct >= cfg.safety.battery_high_pct and st in {"CHARGING", "FULL"}:
-                high_bat_nodes.append(f"{s.node.id} ({pct}% {st})")
+            if b_health in {"OVERHEAT", "OVER_VOLTAGE", "SAFETY_TIMER_EXPIRE"}:
+                hazard_bat_nodes.append(f"{s.node.id} ({b_health})")
+            if pct_val is not None and pct_val >= cfg.safety.battery_high_pct and st in {"CHARGING", "FULL"}:
+                high_bat_nodes.append(f"{s.node.id} ({int(pct_val)}% {st})")
             if h.get("overheated"):
                 hot_nodes.append(f"{s.node.id} ({temp}C)")
+
+        if hazard_bat_nodes:
+            checks.append(
+                CheckResult(
+                    "Battery Hardware Health (PMIC)",
+                    "fail",
+                    f"Hardware PMIC battery hazard reported on: {', '.join(hazard_bat_nodes)}",
+                    "Disconnect charger power immediately and inspect the phone battery for heat or swelling.",
+                )
+            )
 
         if hot_nodes:
             checks.append(

@@ -472,7 +472,7 @@ def render_top_frame(
 
     # 4. Last Interactive Command Result (if any)
     if last_command_banner:
-        cmd_lines = last_command_banner.splitlines()[:5]
+        cmd_lines = [_clean_term_text(line, max_len=max(80, cols)) for line in last_command_banner.splitlines()[:5]]
         frames.extend(_box_lines("LAST COMMAND OUTPUT", cmd_lines, cols, pal))
 
     # 5. Keybinding Footer Bar
@@ -634,11 +634,12 @@ def run_top_tui(
                     outcomes = controller.run_single(spec, target="auto")
                     parts = []
                     for o in outcomes:
-                        first = (o.stdout.strip() or o.stderr.strip() or o.error or "(no output)").splitlines()[0][:80]
+                        first_raw = (o.stdout.strip() or o.stderr.strip() or o.error or "(no output)").splitlines()[0]
+                        first = _clean_term_text(first_raw, 80)
                         tier_tag = f"T{o.node_tier}:{o.node_pool}" if o.node_tier else "none"
                         status_str = "OK" if o.ok else "FAIL"
                         parts.append(
-                            f"[{o.node_id} · {tier_tag}] {status_str} ({o.duration_sec:.2f}s) — {o.routing_reason}\n  {first}"
+                            f"[{o.node_id} · {tier_tag}] {status_str} ({o.duration_sec:.2f}s) — {_clean_term_text(o.routing_reason, 60)}\n  {first}"
                         )
                     last_banner = "\n".join(parts)
                     last_poll = 0.0
@@ -650,7 +651,8 @@ def run_top_tui(
                     outcomes = controller.run_single(spec, target=target)
                     parts = []
                     for o in outcomes:
-                        first = (o.stdout.strip() or o.stderr.strip() or o.error or "(no output)").splitlines()[0][:80]
+                        first_raw = (o.stdout.strip() or o.stderr.strip() or o.error or "(no output)").splitlines()[0]
+                        first = _clean_term_text(first_raw, 80)
                         tier_tag = f"T{o.node_tier}:{o.node_pool}" if o.node_tier else ""
                         status_str = "OK" if o.ok else "FAIL"
                         parts.append(f"[{o.node_id} {tier_tag}] {status_str} ({o.duration_sec:.2f}s): {first}")
@@ -660,24 +662,36 @@ def run_top_tui(
                 sel_id = nodes[selected_idx]["id"]
                 node_entry = next((n for n in all_jobs if n.get("node_id") == sel_id), None)
                 active = (node_entry or {}).get("active") or []
-                if active:
-                    jid = active[0]["job_id"]
-                    res = controller.cancel_node_job(sel_id, jid)
-                    last_banner = f"Cancel {jid} on {sel_id}: {'OK' if res.get('cancelled') else res.get('error')}"
+                first_act = active[0] if (isinstance(active, list) and active and isinstance(active[0], dict)) else None
+                jid = str(first_act.get("job_id") or "") if first_act else ""
+                if jid:
+                    try:
+                        res = controller.cancel_node_job(sel_id, jid)
+                        last_banner = f"Cancel {_clean_term_text(jid, 32)} on {sel_id}: {'OK' if res.get('cancelled') else _clean_term_text(res.get('error', ''), 80)}"
+                    except KeyError as exc:
+                        last_banner = f"Cancel failed: {exc}"
                     last_poll = 0.0
                 else:
                     last_banner = f"No running job on {sel_id} to cancel."
             elif key in {"s", "S"} and nodes:
-                sel_node = controller.config.get_node(nodes[selected_idx]["id"])
+                try:
+                    sel_node = controller.config.get_node(nodes[selected_idx]["id"])
+                except KeyError as exc:
+                    last_banner = f"SSH failed: {exc}"
+                    continue
                 target_ssh = f"{sel_node.ssh_user}@{sel_node.host}" if sel_node.ssh_user else sel_node.host
                 # Temporarily exit alternate screen for clean interactive SSH session
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                 sys.stdout.write("\033[?25h\033[?1049l")
                 sys.stdout.flush()
-                subprocess.call(["ssh", "-p", str(sel_node.ssh_port), "--", target_ssh])
-                tty.setcbreak(fd)
-                sys.stdout.write("\033[?1049h\033[?25l")
-                sys.stdout.flush()
+                try:
+                    subprocess.call(["ssh", "-p", str(sel_node.ssh_port), "--", target_ssh])
+                except OSError as exc:
+                    last_banner = f"SSH failed: {exc}"
+                finally:
+                    tty.setcbreak(fd)
+                    sys.stdout.write("\033[?1049h\033[?25l")
+                    sys.stdout.flush()
                 last_poll = 0.0
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)

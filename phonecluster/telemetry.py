@@ -65,7 +65,7 @@ class ThermalGate:
     def evaluate(self, temp_c: float | None) -> bool:
         """Update state and return True if the node is currently overheated."""
         with self._lock:
-            if temp_c is None:
+            if temp_c is None or not math.isfinite(temp_c):
                 return self._overheated
             if self._overheated:
                 if temp_c <= self.resume_temp_c:
@@ -148,23 +148,23 @@ def read_battery_via_termux(timeout_sec: float = 4.0) -> BatteryInfo | None:
         try:
             pct_f = float(pct_raw)
             if math.isfinite(pct_f):
-                pct = int(pct_f)
+                pct = max(0, min(100, int(pct_f)))
         except (TypeError, ValueError):
             pct = None
     temp_c: float | None = None
     if temp_raw is not None:
         try:
             tf = float(temp_raw)
-            if math.isfinite(tf):
+            if math.isfinite(tf) and -20.0 <= tf <= 130.0:
                 temp_c = round(tf, 2)
         except (TypeError, ValueError):
             temp_c = None
     return BatteryInfo(
         percentage=pct,
         temperature_c=temp_c,
-        status=str(data.get("status", "UNKNOWN")).upper(),
-        health=str(data.get("health", "UNKNOWN")).upper(),
-        plugged=str(data.get("plugged", "UNKNOWN")).upper(),
+        status=str(data.get("status") or "UNKNOWN").upper(),
+        health=str(data.get("health") or "UNKNOWN").upper(),
+        plugged=str(data.get("plugged") or "UNKNOWN").upper(),
         source="termux-api",
     )
 
@@ -201,7 +201,9 @@ def read_battery_via_sysfs(base_dir: Path = POWER_SUPPLY_DIR) -> BatteryInfo | N
     pct: int | None = None
     if cap_raw is not None:
         try:
-            pct = int(float(cap_raw))
+            pct_f = float(cap_raw)
+            if math.isfinite(pct_f):
+                pct = max(0, min(100, int(pct_f)))
         except ValueError:
             pct = None
 
@@ -304,9 +306,12 @@ def read_load_average() -> tuple[float, float, float]:
         pass
     try:
         parts = Path("/proc/loadavg").read_text(encoding="utf-8").split()
-        return (round(float(parts[0]), 2), round(float(parts[1]), 2), round(float(parts[2]), 2))
+        vals = [float(parts[0]), float(parts[1]), float(parts[2])]
+        if all(math.isfinite(v) for v in vals):
+            return (round(vals[0], 2), round(vals[1], 2), round(vals[2], 2))
     except (OSError, ValueError, IndexError):
-        return (0.0, 0.0, 0.0)
+        pass
+    return (0.0, 0.0, 0.0)
 
 
 def read_uptime_sec(uptime_path: Path = PROC_UPTIME_PATH) -> int | None:
@@ -503,6 +508,10 @@ def read_top_processes(limit: int = 5, timeout_sec: float = 1.5) -> list[dict[st
         try:
             cpu = float(parts[1])
             mem = float(parts[2])
+            if not math.isfinite(cpu):
+                cpu = 0.0
+            if not math.isfinite(mem):
+                mem = 0.0
         except ValueError:
             cpu = 0.0
             mem = 0.0
@@ -741,7 +750,8 @@ def collect_node_health(
             "temp_c": battery.temperature_c,
             "battery_status": battery.status,
             "battery_health": battery.health,
-            "overheated": overheated or battery_hazard,
+            "battery_hazard": battery_hazard,
+            "overheated": overheated,
             "ready_for_jobs": ready_for_jobs,
             "not_ready_reasons": reasons,
             "active_jobs": active_jobs,
@@ -805,6 +815,7 @@ def collect_node_health(
         "temp_c": battery.temperature_c,
         "battery_status": battery.status,
         "battery_health": battery.health,
+        "battery_hazard": battery_hazard,
         "battery_source": battery.source,
         "overheated": overheated,
         "ready_for_jobs": ready_for_jobs,
