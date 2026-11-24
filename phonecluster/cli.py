@@ -98,8 +98,18 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    port = args.port or node.worker_port
-    max_conc = args.max_concurrency or node.max_concurrency
+    port = args.port if args.port else node.worker_port
+    if not (0 <= int(port) <= 65535):
+        print(f"Error: worker port must be 0..65535 (got {port})", file=sys.stderr)
+        return 2
+    max_conc = args.max_concurrency if args.max_concurrency else node.max_concurrency
+    if not (1 <= int(max_conc) <= 32):
+        print(f"Error: --max-concurrency must be 1..32 (got {max_conc})", file=sys.stderr)
+        return 2
+    workdir = Path(args.workdir).expanduser()
+    if not workdir.exists() or not workdir.is_dir():
+        print(f"Error: --workdir does not exist or is not a directory: {workdir}", file=sys.stderr)
+        return 2
     allowed_ips: set[str] = set()
     if cfg.network.enforce_worker_source_ip:
         allowed_ips = {"127.0.0.1", "::1"} | set(cfg.network.allowed_master_ips)
@@ -111,8 +121,8 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         role=node.role,
         auth_token=cfg.token_for_node(node),
         safety=cfg.safety,
-        max_concurrency=max_conc,
-        workdir=Path(args.workdir),
+        max_concurrency=int(max_conc),
+        workdir=workdir,
         allowed_client_ips=allowed_ips,
         require_signed_requests=bool(cfg.network.require_signed_requests),
         config_path=cfg_path,
@@ -172,14 +182,24 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
         elif n["ready_for_jobs"]:
             state_str = f"READY ({h.get('active_jobs', 0)}/{h.get('max_concurrency', '?')})"
         else:
-            reasons = ",".join(h.get("not_ready_reasons", ["paused"]))
+            raw_r = h.get("not_ready_reasons")
+            reasons = ",".join(str(x) for x in raw_r) if isinstance(raw_r, list) and raw_r else "paused"
             state_str = f"PAUSED ({reasons})"
-        cpu_str = f"{h.get('cpu_cores', '?')}c / {h.get('load_1m', 0):.2f}"
+        try:
+            load_v = float(h.get("load_1m", 0) or 0)
+            load_txt = f"{load_v:.2f}" if load_v == load_v else "0.00"
+        except (TypeError, ValueError):
+            load_txt = "0.00"
+        cpu_str = f"{h.get('cpu_cores', '?')}c / {load_txt}"
         ram_str = f"{h.get('mem_available_mb', 0)}/{h.get('mem_total_mb', 0)} MB"
         bat = h.get("battery_pct")
-        bat_str = f"{bat}% {h.get('battery_status', '')[:4]}" if bat is not None else "N/A"
+        bat_str = f"{bat}% {str(h.get('battery_status', ''))[:4]}" if bat is not None else "N/A"
         temp = h.get("temp_c")
-        temp_str = f"{temp:.1f}C" if temp is not None else "N/A"
+        try:
+            temp_f = float(temp) if temp is not None else None
+            temp_str = f"{temp_f:.1f}C" if (temp_f is not None and temp_f == temp_f) else "N/A"
+        except (TypeError, ValueError):
+            temp_str = "N/A"
         raw_svcs = h.get("services") if isinstance(h, dict) else None
         svcs = [k.split("_")[0] for k, v in (raw_svcs.items() if isinstance(raw_svcs, dict) else ()) if v]
         svc_str = ",".join(svcs) if svcs else "-"

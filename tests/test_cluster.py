@@ -4727,6 +4727,228 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
             disc.stop()
             beacon.stop()
 
+    def test_battery_pmic_hazard_gating_worker_workdir_safety_and_config_wizard_validation(self) -> None:
+        """Verify PMIC battery_health hazard pauses jobs & fires alert, worker workdir NUL/type safety, wizard/CLI validation, and UDP ssh_user sanitization."""
+        from unittest import mock
+        from phonecluster.discovery import REPLY_TYPE
+        from phonecluster.telemetry import BatteryInfo, ThermalGate, collect_node_health
+        from phonecluster.wizard import run_setup_wizard
+        from phonecluster.worker import BatteryGuardLoop
+
+        # 1. PMIC battery_health OVERHEAT / OVER_VOLTAGE pauses jobs even when temperature reading is cool
+        for hazard in ("OVERHEAT", "OVER_VOLTAGE"):
+            fake_bat = BatteryInfo(percentage=52, temperature_c=32.0, status="CHARGING", health=hazard, plugged="PLUGGED", source="sysfs:battery")
+            with mock.patch("phonecluster.telemetry.read_battery_info", return_value=fake_bat):
+                h_full = collect_node_health("n0", "worker", SafetyConfig(), ThermalGate(), safety_only=True)
+                self.assertFalse(h_full["ready_for_jobs"], f"Should pause jobs on battery_health={hazard}")
+                self.assertTrue(any("battery_health" in r for r in h_full["not_ready_reasons"]))
+                self.assertEqual(h_full["battery_health"], hazard)
+
+        # 2. BatteryGuardLoop emits 'battery_hazard' alert on OVER_VOLTAGE
+        st_haz = WorkerState(
+            node_id="bat_node",
+            role="worker",
+            auth_token="bat-tok-12345678",
+            safety=SafetyConfig(webhook_cooldown_sec=0),
+            health_provider=lambda: {
+                "node_id": "bat_node",
+                "role": "worker",
+                "battery_pct": 50,
+                "battery_status": "CHARGING",
+                "battery_health": "OVER_VOLTAGE",
+                "temp_c": 34.0,
+                "overheated": False,
+                "ready_for_jobs": False,
+                "not_ready_reasons": ["battery_health (OVER_VOLTAGE)"],
+            },
+        )
+        guard = BatteryGuardLoop(st_haz, threading.Event())
+        guard.check_once()
+        self.assertTrue(any(a["event"] == "battery_hazard" for a in st_haz.recent_alerts))
+
+        # 3. Live worker cleanly returns 400 (never 500) on NUL-byte or non-string workdir
+        tok = "workdir-safe-tok-123456"
+        st_w = WorkerState(
+            node_id="w_dir",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=2,
+            health_provider=lambda: {
+                "node_id": "w_dir",
+                "role": "worker",
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "cpu_cores": 4,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 2048,
+                "tools": {},
+                "services": {},
+            },
+        )
+        srv, _g, ev = create_worker_server("127.0.0.1", 0, st_w)
+        w_port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        try:
+            for bad_wd in ("/tmp\x00evil", 12345):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{w_port}/exec",
+                    data=json.dumps({"command": "echo hi", "workdir": bad_wd}).encode("utf-8"),
+                    headers=build_auth_headers(tok),
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as exc_ctx:
+                    urllib.request.urlopen(req, timeout=3.0)
+                try:
+                    self.assertEqual(exc_ctx.exception.code, 400)
+                finally:
+                    exc_ctx.exception.close()
+        finally:
+            ev.set()
+            srv.shutdown()
+            srv.server_close()
+
+        # 4. create_default_config & wizard reject/sanitize invalid host, ssh_user, ssh_port, NaN temp, file:// webhook
+        with self.assertRaises(ValueError):
+            create_default_config(master_host="-oProxyCommand=id")
+        with self.assertRaises(ValueError):
+            create_default_config(master_host="127.0.0.1", ssh_user="-oProxyCommand=id")
+        with self.assertRaises(ValueError):
+            create_default_config(master_host="127.0.0.1", ssh_port=99999)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wiz_cfg = Path(tmp) / "wiz.json"
+            answers = iter([
+                "safe-cluster",          # cluster_name
+                "127.0.0.1",             # master_host
+                "-oEvilUser",            # invalid ssh_user -> sanitized to ""
+                "8022",                  # ssh_port
+                "n",                     # skip LAN scan
+                "bad host!, 192.168.1.9",  # one bad, one valid worker IP
+                "NaN",                   # NaN temp -> falls back to 40.0
+                "file:///etc/passwd",    # bad webhook -> ignored cleanly
+            ])
+            rc = run_setup_wizard(wiz_cfg, input_fn=lambda _p: next(answers))
+            self.assertEqual(rc, 0)
+            loaded = load_config(wiz_cfg)
+            self.assertEqual(loaded.nodes[0].ssh_user, "")
+            self.assertEqual([n.host for n in loaded.nodes], ["127.0.0.1", "192.168.1.9"])
+            self.assertEqual(loaded.safety.max_temp_c, 40.0)
+            self.assertEqual(loaded.safety.battery_webhook_url, "")
+
+            # CLI worker validation rejects bad port, concurrency, and missing workdir
+            self.assertEqual(cli_main(["--config", str(wiz_cfg), "worker", "--node-id", "node0", "--port", "99999"]), 2)
+            self.assertEqual(cli_main(["--config", str(wiz_cfg), "worker", "--node-id", "node0", "--max-concurrency", "99"]), 2)
+            self.assertEqual(cli_main(["--config", str(wiz_cfg), "worker", "--node-id", "node0", "--workdir", str(Path(tmp) / "missing")]), 2)
+
+        # 5. UDP discovery strips malicious '-oProxyCommand=id' ssh_user
+        udp_s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_s.bind(("127.0.0.1", 0))
+        u_port = udp_s.getsockname()[1]
+        udp_s.settimeout(0.2)
+        stop_u = threading.Event()
+
+        def _bad_ssh_udp() -> None:
+            while not stop_u.is_set():
+                try:
+                    _raw, addr = udp_s.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                pkt = {"type": REPLY_TYPE, "node_id": "n1", "worker_port": 8765, "ssh_port": 8022, "ssh_user": "-oProxyCommand=id"}
+                udp_s.sendto(json.dumps(pkt).encode("utf-8"), addr)
+
+        tu = threading.Thread(target=_bad_ssh_udp, daemon=True)
+        tu.start()
+        try:
+            res = discover_lan_nodes(timeout_sec=0.35, discovery_port=u_port, targets=["127.0.0.1"])
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0]["ssh_user"], "")
+        finally:
+            stop_u.set()
+            udp_s.close()
+            tu.join(timeout=2.0)
+
+    def test_tui_status_ansi_escape_sanitization_poisoned_health_and_script_safety_guards(self) -> None:
+        """Verify pc top & pc status strip worker ANSI/OSC escapes, survive poisoned fields, and shell scripts reject dangerous flags."""
+        import subprocess
+        from phonecluster.tui import render_top_frame
+
+        poison_summary = {
+            "cluster_name": "test-safe",
+            "nodes_total": 1,
+            "nodes_online": 1,
+            "nodes_ready": 0,
+            "total_cores": 4,
+            "cluster_cpu_pct": 12.0,
+            "cluster_ram_pct": 40.0,
+            "mem_total_mb": 4096,
+            "mem_available_mb": 2048,
+            "max_temp_c": 35.0,
+            "avg_latency_ms": 2.0,
+            "total_active_jobs": 1,
+            "total_net_rx_kbps": 1.0,
+            "total_net_tx_kbps": 2.0,
+            "safety": {"max_temp_c": 40.0, "battery_high_pct": 60},
+            "nodes": [
+                {
+                    "id": "node1",
+                    "host": "127.0.0.1",
+                    "role": "worker",
+                    "tier": 1,
+                    "pool": "compute",
+                    "online": True,
+                    "quarantined": False,
+                    "ready_for_jobs": False,
+                    "latency_ms": "bad",
+                    "health": {
+                        "os_env": "\x1b]52;c;ZXZpbA==\x07termux",
+                        "not_ready_reasons": ["\x1b[2Joverheated"],
+                        "cpu_pct": "bad",
+                        "per_core_pct": ["bad", 50.0],
+                        "mem_total_mb": "bad",
+                        "mem_available_mb": None,
+                        "temp_c": "NaN",
+                        "battery_pct": "bad",
+                        "battery_status": "\x1b[31mCHAR",
+                        "net_rx_kbps": "bad",
+                        "net_tx_kbps": "bad",
+                        "services": ["not-a-dict"],
+                        "active_job_list": [{"job_id": "\x1b[2Jj1", "running_sec": "nan", "command": "\x1b]0;pwn\x07echo"}],
+                        "top_processes": [{"pid": "bad", "cpu_pct": "nan", "mem_pct": "bad", "name": "\x1b]52;c;x\x07proc"}],
+                    },
+                }
+            ],
+        }
+        poison_jobs = [
+            {
+                "node_id": "node1",
+                "active": [{"job_id": "\x1b[2Ja1", "running_sec": "bad", "command": "\x1b[31mcmd"}],
+                "recent": [{"job_id": "r1", "returncode": "bad", "duration_sec": "nan", "command": "\x1b]0;hi\x07ok"}],
+            }
+        ]
+        for mode in ("tasks", "procs"):
+            frame = render_top_frame(
+                summary=poison_summary,
+                history={"cluster": [], "nodes": {}},
+                all_jobs=poison_jobs,
+                view_mode=mode,
+                use_color=False,
+            )
+            self.assertNotIn("\x1b", frame, f"Unstripped ESC sequence leaked in TUI ({mode} mode)!")
+
+        # Shell script safety guards reject dangerous node-ids, root chroot dir, and non-HTTP rootfs URLs
+        repo = Path(__file__).resolve().parent.parent
+        for cmd in (
+            ["bash", str(repo / "scripts" / "02_termux_node_setup.sh"), "--node-id", "bad;id"],
+            ["bash", str(repo / "scripts" / "04_debian13_chroot_setup.sh"), "--dir", "/"],
+            ["bash", str(repo / "scripts" / "04_debian13_chroot_setup.sh"), "--rootfs-url", "file:///etc/passwd"],
+            ["bash", str(repo / "install.sh"), "--node-id", "../evil"],
+        ):
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            self.assertEqual(proc.returncode, 2, f"Expected exit 2 for {cmd}, got {proc.returncode}: {proc.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()

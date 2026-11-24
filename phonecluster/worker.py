@@ -462,20 +462,22 @@ class WorkerState:
             if now - last < self.safety.webhook_cooldown_sec:
                 return False
             self._last_alert_ts[event] = now
+            webhook_url = self.safety.battery_webhook_url
             payload = {
                 "event": event,
                 "node_id": self.node_id,
                 "message": message,
                 "battery_pct": health.get("battery_pct"),
                 "battery_status": health.get("battery_status"),
+                "battery_health": health.get("battery_health"),
                 "temp_c": health.get("temp_c"),
                 "timestamp": int(now),
             }
             self.recent_alerts.appendleft(payload)
 
         LOG.warning("[%s] %s: %s", self.node_id, event, message)
-        if self.safety.battery_webhook_url:
-            _post_webhook(self.safety.battery_webhook_url, payload)
+        if webhook_url:
+            _post_webhook(webhook_url, payload)
         return True
 
 
@@ -669,8 +671,18 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
         return HTTPStatus.BAD_REQUEST, {"error": "'env' must be a JSON object"}
 
     req_workdir = payload.get("workdir")
-    cwd = Path(req_workdir).expanduser() if req_workdir else state.workdir
-    if not cwd.exists() or not cwd.is_dir():
+    if req_workdir is not None and req_workdir != "":
+        if not isinstance(req_workdir, str) or "\x00" in req_workdir:
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid workdir path"}
+        try:
+            cwd = Path(req_workdir).expanduser()
+            exists_dir = cwd.exists() and cwd.is_dir()
+        except (OSError, ValueError) as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": f"invalid workdir path: {exc}"}
+    else:
+        cwd = state.workdir
+        exists_dir = cwd.exists() and cwd.is_dir()
+    if not exists_dir:
         return HTTPStatus.BAD_REQUEST, {"error": f"workdir does not exist: {cwd}"}
 
     preview = (
@@ -818,7 +830,15 @@ class BatteryGuardLoop(threading.Thread):
         safety = self.state.safety
         pct = health.get("battery_pct")
         status = str(health.get("battery_status", "UNKNOWN")).upper()
+        bat_health = str(health.get("battery_health", "UNKNOWN")).upper()
         temp_c = health.get("temp_c")
+
+        if bat_health in {"OVERHEAT", "OVER_VOLTAGE", "SAFETY_TIMER_EXPIRE"}:
+            self.state.record_safety_event(
+                "battery_hazard",
+                f"Hardware PMIC reported battery health '{bat_health}' (temp={temp_c}C, pct={pct}%); pausing jobs & cut charger power immediately!",
+                health,
+            )
 
         if health.get("overheated"):
             self.state.record_safety_event(

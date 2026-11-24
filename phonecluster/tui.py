@@ -7,6 +7,7 @@ keyboard control (works on Android Termux, Debian 13, and desktop SSH terminals)
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import select
@@ -28,6 +29,34 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 SPARK_CHARS = " ▁▂▃▄▅▆▇█"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_TERM_ESCAPE_RE = re.compile(r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-9;?]*[ -/]*[@-~]|[@-Z\\-_])")
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _clean_term_text(val: Any, max_len: int = 120) -> str:
+    """Strip terminal ANSI/OSC escape sequences and C0 control chars from untrusted worker text."""
+    s = _TERM_ESCAPE_RE.sub("", str(val if val is not None else ""))
+    return _CTRL_CHARS_RE.sub("", s)[:max_len]
+
+
+def _safe_num(val: Any, default: float = 0.0) -> float:
+    try:
+        if isinstance(val, bool):
+            return default
+        f = float(val)
+        return f if math.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    try:
+        if isinstance(val, bool):
+            return default
+        f = float(val)
+        return int(f) if math.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
 
 
 class Palette:
@@ -282,7 +311,7 @@ def render_top_frame(
         nid_styled = pal.sel_bg(f"{n['id']:<6s}") if is_sel else pal.bold(f"{n['id']:<6s}")
 
         if not n.get("online"):
-            err = str(n.get("error", "unreachable"))[:42]
+            err = _clean_term_text(n.get("error", "unreachable"), 42)
             device_lines.append(
                 f"{pointer} {nid_styled} [{role_badge} {t_badge}] {n['host']:<15s}  {pal.bad('✕ OFFLINE')}  {pal.dim(err)}"
             )
@@ -291,26 +320,33 @@ def render_top_frame(
         if n.get("quarantined"):
             st_badge = pal.bad("✕ QUARANTINED")
         elif n.get("ready_for_jobs"):
-            st_badge = pal.ok(f"✓ READY {h.get('active_jobs', 0)}/{h.get('max_concurrency', n.get('max_concurrency', 2))}")
+            st_badge = pal.ok(
+                f"✓ READY {_safe_int(h.get('active_jobs', 0), 0)}/{max(1, _safe_int(h.get('max_concurrency', n.get('max_concurrency', 2)), 2))}"
+            )
         else:
-            reasons = ",".join(h.get("not_ready_reasons", ["paused"]))
+            raw_reasons = h.get("not_ready_reasons")
+            reasons_list = raw_reasons if isinstance(raw_reasons, list) and raw_reasons else ["paused"]
+            reasons = ",".join(_clean_term_text(r, 32) for r in reasons_list)
             st_badge = pal.warn(f"⚠ {reasons[:26]}")
 
-        up_s = _format_uptime(h.get("uptime_sec"))
-        os_s = str(h.get("os_env", "linux"))[:10]
-        lat_txt = f"{n.get('latency_ms', 0)}ms"
+        up_raw = h.get("uptime_sec")
+        up_s = _format_uptime(_safe_int(up_raw, 0) if up_raw is not None else None)
+        os_s = _clean_term_text(h.get("os_env", "linux"), 10)
+        lat_txt = f"{_safe_num(n.get('latency_ms', 0), 0.0):.1f}ms"
         device_lines.append(
             f"{pointer} {nid_styled} [{role_badge} {t_badge}] {n['host']:<15s} {pal.dim(f'{os_s:<10s}')} "
             f"up {up_s:<6s} {st_badge}  {pal.dim(lat_txt)}"
         )
 
         # CPU + sparkline + per-core bars + RAM
-        n_cpu = float(h.get("cpu_pct") if h.get("cpu_pct") is not None else 0.0)
-        n_hist = [float(p.get("cpu_pct", 0.0)) for p in node_hist_map.get(n["id"], [])]
+        n_cpu = min(100.0, max(0.0, _safe_num(h.get("cpu_pct"), 0.0)))
+        n_hist = [_safe_num(p.get("cpu_pct", 0.0), 0.0) for p in node_hist_map.get(n["id"], []) if isinstance(p, dict)]
         n_spark = pal.cyan(make_sparkline(n_hist, width=10, max_val=100.0))
-        cores_vis = make_core_bars(h.get("per_core_pct") or [], pal)
-        mem_tot = h.get("mem_total_mb") or 0
-        mem_avail = h.get("mem_available_mb") or 0
+        raw_pc = h.get("per_core_pct")
+        per_core_clean = [_safe_num(x, 0.0) for x in raw_pc] if isinstance(raw_pc, list) else []
+        cores_vis = make_core_bars(per_core_clean, pal)
+        mem_tot = max(0, _safe_int(h.get("mem_total_mb", 0), 0))
+        mem_avail = max(0, _safe_int(h.get("mem_available_mb", 0), 0))
         mem_used = max(0, mem_tot - mem_avail)
         mem_pct = (mem_used / mem_tot) * 100.0 if mem_tot else 0.0
         device_lines.append(
@@ -319,32 +355,45 @@ def render_top_frame(
         )
 
         # Temp + Battery + Net + Services
-        temp_v = h.get("temp_c")
+        temp_raw = h.get("temp_c")
+        temp_v = _safe_num(temp_raw, -999.0) if temp_raw is not None else None
+        if temp_v is not None and temp_v <= -500.0:
+            temp_v = None
         t_bar = make_bar((temp_v / 50.0) * 100.0, 8, pal, warn_at=(max_temp_limit - 3) * 2, bad_at=max_temp_limit * 2) if temp_v is not None else pal.dim("────────")
         t_txt = f"{temp_v:4.1f}°C" if temp_v is not None else "  N/A "
 
-        bat_v = h.get("battery_pct")
-        bat_st = str(h.get("battery_status", ""))[:4]
+        bat_raw = h.get("battery_pct")
+        bat_v = _safe_int(bat_raw, -1) if bat_raw is not None else None
+        if bat_v is not None and bat_v < 0:
+            bat_v = None
+        bat_st = _clean_term_text(h.get("battery_status", ""), 4)
         if bat_v is not None:
             b_warn = bat_v >= bat_high and bat_st in {"CHAR", "FULL"}
             bat_txt = pal.warn(f"{bat_v:3d}% {bat_st}") if b_warn else f"{bat_v:3d}% {bat_st}"
         else:
             bat_txt = pal.dim("N/A")
 
-        rx_v = h.get("net_rx_kbps")
-        tx_v = h.get("net_tx_kbps")
-        net_txt = f"↓{rx_v:.0f} ↑{tx_v:.0f}KB/s" if rx_v is not None and tx_v is not None else ""
+        rx_raw = h.get("net_rx_kbps")
+        tx_raw = h.get("net_tx_kbps")
+        rx_v = _safe_num(rx_raw, -1.0) if rx_raw is not None else -1.0
+        tx_v = _safe_num(tx_raw, -1.0) if tx_raw is not None else -1.0
+        net_txt = f"↓{rx_v:.0f} ↑{tx_v:.0f}KB/s" if rx_v >= 0.0 and tx_v >= 0.0 else ""
         raw_svcs = h.get("services") if isinstance(h, dict) else None
-        svcs = ",".join(k.split("_")[0] for k, v in (raw_svcs.items() if isinstance(raw_svcs, dict) else ()) if v)
+        svcs = ",".join(_clean_term_text(k.split("_")[0], 20) for k, v in (raw_svcs.items() if isinstance(raw_svcs, dict) else ()) if v)
         device_lines.append(
             f"    TMP {t_txt} {t_bar}  BAT {bat_txt}  "
             f"{pal.cyan(net_txt)}  {pal.dim(svcs)}"
         )
 
         # Show inline running task or top processes briefly
-        active_list = h.get("active_job_list") or []
+        raw_active = h.get("active_job_list")
+        active_list = [j for j in raw_active if isinstance(j, dict)] if isinstance(raw_active, list) else []
         if active_list:
-            running_txt = " · ".join(f"[{j['job_id']} {j['running_sec']}s] {j['command'][:28]}" for j in active_list[:2])
+            running_txt = " · ".join(
+                f"[{_clean_term_text(j.get('job_id', '?'), 20)} {_safe_num(j.get('running_sec', 0), 0.0):.1f}s] "
+                f"{_clean_term_text(j.get('command', ''), 28)}"
+                for j in active_list[:2]
+            )
             device_lines.append(f"    {pal.accent('RUN')} {running_txt}")
 
         if idx < len(nodes) - 1:
@@ -372,12 +421,17 @@ def render_top_frame(
             if not n.get("online"):
                 continue
             nid_col = pal.bold(f"{n['id']:<6s}")
-            for p in (n.get("health") or {}).get("top_processes") or []:
+            raw_procs = (n.get("health") or {}).get("top_processes")
+            for p in (raw_procs if isinstance(raw_procs, list) else []):
+                if not isinstance(p, dict):
+                    continue
+                p_cpu = _safe_num(p.get("cpu_pct", 0.0), 0.0)
+                p_mem = _safe_num(p.get("mem_pct", 0.0), 0.0)
                 line = (
-                    f"{nid_col}  PID {p['pid']:<6d}  "
-                    f"CPU {p['cpu_pct']:5.1f}%  MEM {p['mem_pct']:4.1f}%  {p['name']}"
+                    f"{nid_col}  PID {_safe_int(p.get('pid', 0), 0):<6d}  "
+                    f"CPU {p_cpu:5.1f}%  MEM {p_mem:4.1f}%  {_clean_term_text(p.get('name', '?'), 32)}"
                 )
-                proc_rows.append((float(p.get("cpu_pct", 0.0)), line))
+                proc_rows.append((p_cpu, line))
         proc_rows.sort(key=lambda r: r[0], reverse=True)
         bottom_lines = [r[1] for r in proc_rows[:7]] or [pal.dim("No process info reported by workers.")]
     else:
@@ -385,25 +439,30 @@ def render_top_frame(
         active_rows: list[str] = []
         recent_rows: list[str] = []
         for node_jobs in all_jobs:
-            nid = node_jobs.get("node_id", "?")
-            for j in node_jobs.get("active", []):
+            nid = _clean_term_text(node_jobs.get("node_id", "?"), 20)
+            for j in (node_jobs.get("active") if isinstance(node_jobs.get("active"), list) else []):
+                if not isinstance(j, dict):
+                    continue
                 active_rows.append(
-                    f"{pal.warn('● RUN ')} {pal.bold(f'{nid:<6s}')} {j['job_id']:<14s} "
-                    f"{j['running_sec']:5.1f}s  {j['command'][:44]}"
+                    f"{pal.warn('● RUN ')} {pal.bold(f'{nid:<6s}')} {_clean_term_text(j.get('job_id', '?'), 14):<14s} "
+                    f"{_safe_num(j.get('running_sec', 0), 0.0):5.1f}s  {_clean_term_text(j.get('command', ''), 44)}"
                 )
-            for j in node_jobs.get("recent", [])[:3]:
+            for j in (node_jobs.get("recent") if isinstance(node_jobs.get("recent"), list) else [])[:3]:
+                if not isinstance(j, dict):
+                    continue
+                rc_val = _safe_int(j.get("returncode", -1), -1)
                 st = (
                     pal.warn("CANCEL")
                     if j.get("cancelled")
                     else (
                         pal.bad("TIMOUT")
                         if j.get("timed_out")
-                        else (pal.ok("✓ OK  ") if j.get("returncode") == 0 else pal.bad(f"✕ {j.get('returncode'):<4d}"))
+                        else (pal.ok("✓ OK  ") if rc_val == 0 else pal.bad(f"✕ {rc_val:<4d}"))
                     )
                 )
                 recent_rows.append(
-                    f"{st} {pal.dim(f'{nid:<6s}')} {j['job_id']:<14s} "
-                    f"{j.get('duration_sec', 0):5.2f}s  {str(j.get('command', ''))[:44]}"
+                    f"{st} {pal.dim(f'{nid:<6s}')} {_clean_term_text(j.get('job_id', '?'), 14):<14s} "
+                    f"{_safe_num(j.get('duration_sec', 0), 0.0):5.2f}s  {_clean_term_text(j.get('command', ''), 44)}"
                 )
         bottom_lines = (active_rows + recent_rows)[:7] or [
             pal.dim("Idle — press [r] to run on selected phone or [a] to broadcast to all.")

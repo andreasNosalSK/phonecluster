@@ -1679,7 +1679,8 @@ function renderNodesGrid(live) {
             + '</div>';
         }
 
-        const svcs = Object.entries(h.services || {}).filter(([, v]) => v).map(([k]) => k.split('_')[0]);
+        const svcsObj = (h.services && typeof h.services === 'object' && !Array.isArray(h.services)) ? h.services : {};
+        const svcs = Object.entries(svcsObj).filter(([, v]) => v).map(([k]) => k.split('_')[0]);
         const netChip = (h.net_rx_kbps != null && h.net_tx_kbps != null)
           ? '<span class="pill neutral mono">↓' + esc(h.net_rx_kbps) + ' ↑' + esc(h.net_tx_kbps) + ' KB/s</span>' : '';
         bodyHtml += '<div class="chips">'
@@ -2331,7 +2332,10 @@ async function loadWorkloads() {
     let svcHtml = '';
     if (d.home_assistant_urls && d.home_assistant_urls.length) {
       svcHtml += '<p><strong>✓ Home Assistant detected:</strong> '
-        + d.home_assistant_urls.map(u => '<a href="' + esc(u) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(u) + '</a>').join(', ')
+        + d.home_assistant_urls.map(u => /^https?:\/\//i.test(String(u || ''))
+            ? '<a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">' + esc(u) + '</a>'
+            : '<span class="mono">' + esc(u) + '</span>'
+          ).join(', ')
         + '</p>';
     } else {
       svcHtml += '<p><strong>Home Assistant:</strong> Not detected on port 8123. Best deployed on Tier 2 (Rooted Debian 13 chroot) or Tier 3 (Docker).</p>';
@@ -2373,8 +2377,8 @@ async function loadWorkloads() {
       } else {
         meshBox.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Service</th><th>Phone</th><th>Tier / Pool</th><th>Endpoint</th><th>Status</th><th>Action</th></tr></thead><tbody>'
           + svcs.map((s, idx) => {
-              const link = String(s.url || '').startsWith('http')
-                ? '<a href="' + esc(s.url) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(s.url) + '</a>'
+              const link = /^https?:\/\//i.test(String(s.url || ''))
+                ? '<a href="' + esc(s.url) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">' + esc(s.url) + '</a>'
                 : '<span class="mono">' + esc(s.url) + '</span>';
               const tp = s.tier ? tierPillHtml(s.tier, s.pool) : '<span class="pill neutral">custom</span>';
               let actions = '';
@@ -2397,7 +2401,8 @@ async function loadWorkloads() {
     const envObj = mesh.env || {};
     const envEl = document.getElementById('mesh-env-code');
     if (envEl) {
-      const lines = Object.entries(envObj).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => 'export ' + k + '="' + v + '"');
+      const shQuote = v => "'" + String(v ?? '').replace(/'/g, "'\\''") + "'";
+      const lines = Object.entries(envObj).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => 'export ' + k + '=' + shQuote(v));
       envEl.textContent = lines.join('\n') || '# No cluster env variables yet.';
     }
     const hostsEl = document.getElementById('mesh-hosts-code');
@@ -2713,8 +2718,10 @@ async function loadNetworkAudit() {
     // AdGuard & Pi hub
     const agBox = document.getElementById('net-adguard-status');
     if (d.adguard_url) {
-      agBox.innerHTML = '<span class="pill ok">✓ Active</span> AdGuard Home reachable on <strong>' + esc(d.adguard_node) + '</strong>: '
-        + '<a href="' + esc(d.adguard_url) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(d.adguard_url) + '</a>';
+      const agLink = /^https?:\/\//i.test(String(d.adguard_url || ''))
+        ? '<a href="' + esc(d.adguard_url) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">' + esc(d.adguard_url) + '</a>'
+        : '<span class="mono">' + esc(d.adguard_url) + '</span>';
+      agBox.innerHTML = '<span class="pill ok">✓ Active</span> AdGuard Home reachable on <strong>' + esc(d.adguard_node) + '</strong>: ' + agLink;
     } else if (hi.is_termux) {
       agBox.innerHTML = '<span class="pill warn">Unrooted Termux Master</span> Port 53 requires root — run native AdGuard Home on a <strong>Raspberry Pi Zero 2 W</strong> Master or a <strong>Tier 2 Debian 13</strong> phone (no Docker needed!).';
     } else {
@@ -2738,7 +2745,7 @@ async function loadNetworkAudit() {
     const cIcons = { ok: '✓ OK', warn: '⚠ WARN', info: 'ℹ TIP' };
     const cCls = { ok: 'ok', warn: 'warn', info: 'neutral' };
     cBox.innerHTML = (d.checks || []).map(c =>
-      '<div class="check-item"><span class="pill ' + (cCls[c.status] || 'neutral') + '">' + (cIcons[c.status] || c.status) + '</span> '
+      '<div class="check-item"><span class="pill ' + (cCls[c.status] || 'neutral') + '">' + (cIcons[c.status] || esc(c.status)) + '</span> '
       + '<strong>' + esc(c.name) + '</strong>: ' + esc(c.detail)
       + (c.fix ? '<div class="hint">' + esc(c.fix) + '</div>' : '')
       + '</div>'

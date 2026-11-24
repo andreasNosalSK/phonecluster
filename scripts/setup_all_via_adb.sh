@@ -35,12 +35,13 @@ TMP_TSV="$(mktemp)"
 trap 'rm -f "${TMP_TSV}"' EXIT
 
 for SER in "${SERIALS[@]}"; do
-  MODEL="$(adb -s "${SER}" shell getprop ro.product.model | tr -d '\r')"
-  DEVICE="$(adb -s "${SER}" shell getprop ro.product.device | tr -d '\r')"
-  VER="$(adb -s "${SER}" shell getprop ro.build.version.release | tr -d '\r')"
-  MEM_KB="$(adb -s "${SER}" shell "awk '/MemTotal/{print \$2}' /proc/meminfo" | tr -d '\r')"
-  MEM_MB="$(( ${MEM_KB:-0} / 1024 ))"
-  WIFI_IP="$(adb -s "${SER}" shell "ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print \$2}' | cut -d/ -f1 | head -n1" | tr -d '\r' || true)"
+  MODEL="$(adb -s "${SER}" shell getprop ro.product.model | tr -d '\r\n\t')"
+  DEVICE="$(adb -s "${SER}" shell getprop ro.product.device | tr -d '\r\n\t')"
+  VER="$(adb -s "${SER}" shell getprop ro.build.version.release | tr -d '\r\n\t')"
+  MEM_KB="$(adb -s "${SER}" shell "awk '/MemTotal/{print \$2}' /proc/meminfo" | tr -d '\r\n\t ' || true)"
+  [[ "${MEM_KB}" =~ ^[0-9]+$ ]] || MEM_KB=0
+  MEM_MB="$(( MEM_KB / 1024 ))"
+  WIFI_IP="$(adb -s "${SER}" shell "ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print \$2}' | cut -d/ -f1 | head -n1" | tr -d '\r\n\t ' || true)"
 
   echo ">>> Device ${SER}: ${MODEL} (${DEVICE}) | Android ${VER} | ${MEM_MB} MB RAM | Wi-Fi IP: ${WIFI_IP:-NOT CONNECTED}"
 
@@ -49,7 +50,7 @@ for SER in "${SERIALS[@]}"; do
     shopt -s nullglob
     for APK in "${APKS_DIR}"/*.apk; do
       echo "    Installing $(basename "${APK}")..."
-      adb -s "${SER}" install -r "${APK}" >/dev/null || echo "    Warning: Failed to install ${APK}"
+      adb -s "${SER}" install -r -- "${APK}" >/dev/null || echo "    Warning: Failed to install ${APK}"
     done
     shopt -u nullglob
   fi
@@ -97,7 +98,7 @@ done
 
 # Generate config/cluster.json automatically using detected Wi-Fi IPs ranked by Master score
 python3 - "${TMP_TSV}" "${CONFIG_OUT}" <<'PY'
-import json, os, secrets, sys
+import json, os, secrets, sys, tempfile
 from pathlib import Path
 
 rows = []
@@ -150,11 +151,23 @@ cfg = {
 
 out = Path(sys.argv[2])
 out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=str(out.parent))
+tmp_path = Path(tmp_name)
 try:
-    os.chmod(out, 0o600)
-except OSError:
-    pass
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        pass
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(cfg, indent=2) + "\n")
+        fh.flush()
+    os.replace(tmp_path, out)
+except Exception:
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    raise
 
 print("=== Auto-Generated Cluster Plan ===")
 for n in nodes:

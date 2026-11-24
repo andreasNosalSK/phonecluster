@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
+import math
 import os
 import secrets
 import shlex
@@ -22,6 +24,8 @@ from .config import (
     load_config,
     resolve_config_path,
     save_config,
+    validate_host,
+    validate_ssh_user,
 )
 from .discovery import detect_local_ip, discover_lan_nodes
 from .doctor import run_doctor
@@ -79,8 +83,18 @@ def run_setup_wizard(
             return 0
 
     cluster_name = _prompt("1. Name your cluster", "phone-cluster", input_fn=input_fn)
-    master_host = _prompt("2. Static LAN IP of your Master phone (node0)", local_ip, input_fn=input_fn)
-    ssh_user = _prompt("3. Default SSH username on phones (from `whoami`)", user, input_fn=input_fn)
+    raw_master = _prompt("2. Static LAN IP of your Master phone (node0)", local_ip, input_fn=input_fn)
+    try:
+        master_host = validate_host(raw_master)
+    except ValueError:
+        print(f"  (Invalid master host '{raw_master}', falling back to detected IP {local_ip})")
+        master_host = validate_host(local_ip)
+    raw_user = _prompt("3. Default SSH username on phones (from `whoami`)", user, input_fn=input_fn)
+    try:
+        ssh_user = validate_ssh_user(raw_user)
+    except ValueError:
+        print(f"  (Invalid SSH username '{raw_user}', leaving blank)")
+        ssh_user = ""
     ssh_port_str = _prompt("4. Default SSH port (8022 for Termux, 22 for Debian)", str(default_ssh_port), input_fn=input_fn)
     ssh_port = int(ssh_port_str) if ssh_port_str.isdigit() and 1 <= int(ssh_port_str) <= 65535 else DEFAULT_SSH_PORT
 
@@ -113,15 +127,23 @@ def run_setup_wizard(
                 )
             if _prompt_yes_no("Add all discovered phones as Workers?", default=True, input_fn=input_fn):
                 for item in discovered:
+                    try:
+                        disc_host = validate_host(str(item["host"]))
+                    except ValueError:
+                        continue
+                    try:
+                        disc_user = validate_ssh_user(str(item.get("ssh_user") or "")) or ssh_user
+                    except ValueError:
+                        disc_user = ssh_user
                     nid = f"node{len(nodes)}"
                     nodes.append(
                         NodeConfig(
                             id=nid,
-                            host=item["host"],
+                            host=disc_host,
                             role="worker",
                             worker_port=item["worker_port"],
                             ssh_port=item["ssh_port"],
-                            ssh_user=item["ssh_user"] or ssh_user,
+                            ssh_user=disc_user,
                             max_concurrency=2,
                             weight=1.0,
                             tags=["worker"],
@@ -139,8 +161,15 @@ def run_setup_wizard(
     )
     existing_hosts = {n.host for n in nodes}
     for raw_ip in extra_ips.split(","):
-        ip = raw_ip.strip()
-        if ip and ip not in existing_hosts:
+        cand = raw_ip.strip()
+        if not cand:
+            continue
+        try:
+            ip = validate_host(cand)
+        except ValueError:
+            print(f"  Skipping invalid worker host/IP '{cand}'.")
+            continue
+        if ip not in existing_hosts:
             nid = f"node{len(nodes)}"
             nodes.append(
                 NodeConfig(
@@ -161,7 +190,10 @@ def run_setup_wizard(
     print("\n6. Thermal & 24/7 Battery Safety Guard:")
     raw_temp = _prompt("Pause jobs on a phone if temperature reaches (°C)", "40.0", input_fn=input_fn)
     try:
-        max_temp = max(25.0, min(85.0, float(raw_temp.rstrip("cC° "))))
+        parsed_t = float(raw_temp.rstrip("cC° "))
+        if not math.isfinite(parsed_t):
+            raise ValueError("non-finite")
+        max_temp = max(25.0, min(85.0, parsed_t))
     except ValueError:
         max_temp = 40.0
     resume_temp = round(max(20.0, max_temp - 3.0), 1)
@@ -170,16 +202,23 @@ def run_setup_wizard(
         "",
         input_fn=input_fn,
     )
+    try:
+        safety_cfg = SafetyConfig.from_dict(
+            {
+                "max_temp_c": max_temp,
+                "resume_temp_c": resume_temp,
+                "battery_webhook_url": webhook,
+            }
+        )
+    except ValueError as exc:
+        print(f"  (Invalid webhook URL ignored: {exc})")
+        safety_cfg = SafetyConfig(max_temp_c=max_temp, resume_temp_c=resume_temp, battery_webhook_url="")
 
     cfg = ClusterConfig(
         cluster_name=cluster_name,
         auth_token=secrets.token_urlsafe(32),
         nodes=nodes,
-        safety=SafetyConfig(
-            max_temp_c=max_temp,
-            resume_temp_c=resume_temp,
-            battery_webhook_url=webhook,
-        ),
+        safety=safety_cfg,
     )
     saved = save_config(cfg, out_path)
 
@@ -320,7 +359,12 @@ def run_interactive_menu(
             mpi = ctrl.build_mpi_hostfile().strip()
             print(f"OpenMPI   :\n{mpi or '(no healthy nodes)'}")
             if _prompt_yes_no("Start distccd compiler workers on all ready phones now?", default=False, input_fn=input_fn):
-                cidr = _prompt("Allowed LAN subnet CIDR", "192.168.1.0/24", input_fn=input_fn)
+                raw_cidr = _prompt("Allowed LAN subnet CIDR", "192.168.1.0/24", input_fn=input_fn)
+                try:
+                    cidr = str(ipaddress.ip_network(raw_cidr, strict=False))
+                except ValueError:
+                    print(f"Invalid CIDR subnet '{raw_cidr}' — cancelled.")
+                    continue
                 helper_sh = Path(__file__).resolve().parent.parent / "scripts" / "05_workload_helpers.sh"
                 if helper_sh.exists():
                     spec = JobSpec(

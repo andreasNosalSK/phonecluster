@@ -51,14 +51,28 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --master) ROLE="master"; shift ;;
     --worker) ROLE="worker"; shift ;;
-    --node-id) NODE_ID="$2"; shift 2 ;;
+    --node-id)
+      [[ $# -ge 2 ]] || { echo "Error: --node-id requires a value" >&2; usage; exit 2; }
+      NODE_ID="$2"; shift 2 ;;
     --with-compute) WITH_COMPUTE=1; shift ;;
-    --dir) INSTALL_DIR="$2"; shift 2 ;;
+    --dir)
+      [[ $# -ge 2 ]] || { echo "Error: --dir requires a path" >&2; usage; exit 2; }
+      INSTALL_DIR="$2"; shift 2 ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ -n "${NODE_ID}" && ! "${NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
+  echo "Error: Invalid --node-id '${NODE_ID}' (must start with alphanumeric and contain only A-Za-z0-9._-, max 40 chars)." >&2
+  exit 2
+fi
+
+if [[ "${INSTALL_DIR}" == *$'\n'* || "${INSTALL_DIR}" == *'"'* || "${INSTALL_DIR}" == *'$'* || "${INSTALL_DIR}" == *'`'* ]]; then
+  echo "Error: Unsupported special characters in --dir '${INSTALL_DIR}'." >&2
+  exit 2
+fi
 
 IS_TERMUX=0
 if [[ "${PREFIX:-}" == *"com.termux"* ]] || [[ -n "${TERMUX_VERSION:-}" ]]; then

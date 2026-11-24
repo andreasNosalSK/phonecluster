@@ -704,6 +704,7 @@ def collect_node_health(
     battery = read_battery_info()
     mem = read_memory_info()
     overheated = thermal_gate.evaluate(battery.temperature_c)
+    battery_hazard = battery.health.upper() in {"OVERHEAT", "OVER_VOLTAGE", "SAFETY_TIMER_EXPIRE"}
     low_ram = (
         mem["total_mb"] > 0 and mem["available_mb"] < safety.min_free_ram_mb
     )
@@ -713,6 +714,8 @@ def collect_node_health(
         reasons.append(
             f"overheated ({battery.temperature_c}C >= {safety.max_temp_c}C)"
         )
+    if battery_hazard:
+        reasons.append(f"battery_health ({battery.health.upper()})")
     if low_ram:
         reasons.append(
             f"low_ram ({mem['available_mb']}MB < {safety.min_free_ram_mb}MB)"
@@ -720,7 +723,12 @@ def collect_node_health(
     if active_jobs >= max_concurrency:
         reasons.append(f"busy ({active_jobs}/{max_concurrency})")
 
-    ready_for_jobs = (not overheated) and (not low_ram) and (active_jobs < max_concurrency)
+    ready_for_jobs = (
+        (not overheated)
+        and (not battery_hazard)
+        and (not low_ram)
+        and (active_jobs < max_concurrency)
+    )
 
     if safety_only:
         return {
@@ -732,7 +740,8 @@ def collect_node_health(
             "battery_pct": battery.percentage,
             "temp_c": battery.temperature_c,
             "battery_status": battery.status,
-            "overheated": overheated,
+            "battery_health": battery.health,
+            "overheated": overheated or battery_hazard,
             "ready_for_jobs": ready_for_jobs,
             "not_ready_reasons": reasons,
             "active_jobs": active_jobs,

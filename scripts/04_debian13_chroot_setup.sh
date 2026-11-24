@@ -32,12 +32,26 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check-only) CHECK_ONLY=1; shift ;;
-    --dir) CHROOT_DIR="$2"; shift 2 ;;
-    --rootfs-url) ROOTFS_URL="$2"; shift 2 ;;
+    --dir)
+      [[ $# -ge 2 ]] || { echo "Error: --dir requires a path" >&2; usage; exit 2; }
+      CHROOT_DIR="$2"; shift 2 ;;
+    --rootfs-url)
+      [[ $# -ge 2 ]] || { echo "Error: --rootfs-url requires an https:// URL" >&2; usage; exit 2; }
+      ROOTFS_URL="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ -z "${CHROOT_DIR}" || "${CHROOT_DIR}" == "/" || "${CHROOT_DIR}" != /* || "${CHROOT_DIR}" == *$'\n'* || "${CHROOT_DIR}" == *'"'* || "${CHROOT_DIR}" == *'$'* || "${CHROOT_DIR}" == *'`'* ]]; then
+  echo "Error: Invalid --dir '${CHROOT_DIR}' (must be a safe absolute path and not '/')." >&2
+  exit 2
+fi
+
+if [[ -n "${ROOTFS_URL}" && ! "${ROOTFS_URL}" =~ ^https?:// ]]; then
+  echo "Error: --rootfs-url must start with https:// or http://" >&2
+  exit 2
+fi
 
 echo "=== Debian 13 (Trixie) ARM64 Chroot Pre-Flight Check ==="
 echo "Kernel  : $(uname -a)"
@@ -87,10 +101,13 @@ if [[ ! -d "${CHROOT_DIR}/etc" ]]; then
     ROOTFS_URL="${BASE_URL}${LATEST_DIR}rootfs.tar.xz"
   fi
   echo "Downloading ${ROOTFS_URL}..."
-  curl -fSL "${ROOTFS_URL}" -o /data/local/linux/debian13-rootfs.tar.xz
+  TMP_TAR="/data/local/linux/debian13-rootfs.tar.xz.tmp.$$"
+  trap 'rm -f "${TMP_TAR}"' EXIT
+  curl -fsSL -- "${ROOTFS_URL}" -o "${TMP_TAR}"
   echo "Extracting Debian 13 rootfs into ${CHROOT_DIR}..."
-  tar -xJf /data/local/linux/debian13-rootfs.tar.xz -C "${CHROOT_DIR}"
-  rm -f /data/local/linux/debian13-rootfs.tar.xz
+  tar --numeric-owner -xJf "${TMP_TAR}" -C "${CHROOT_DIR}"
+  rm -f "${TMP_TAR}"
+  trap - EXIT
 fi
 
 # Basic DNS & Android group compatibility inside Debian chroot

@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .config import validate_ssh_user
 from .telemetry import detect_os_environment, read_memory_info
 
 LOG = logging.getLogger("phonecluster.discovery")
@@ -289,6 +290,11 @@ def discover_lan_nodes(
                 key = (host_ip, worker_port)
                 if key not in found and len(found) < _MAX_DISCOVERED_NODES:
                     role_raw = _CTRL_RE.sub("", str(msg.get("role", "worker"))).strip().lower()
+                    raw_ssh_u = _CTRL_RE.sub("", str(msg.get("ssh_user", ""))).strip()[:64]
+                    try:
+                        safe_ssh_u = validate_ssh_user(raw_ssh_u)
+                    except ValueError:
+                        safe_ssh_u = ""
                     found[key] = {
                         "host": host_ip,
                         "node_id": _CTRL_RE.sub("", str(msg.get("node_id", ""))).strip()[:40],
@@ -296,7 +302,7 @@ def discover_lan_nodes(
                         "hostname": _CTRL_RE.sub("", str(msg.get("hostname", ""))).strip()[:64],
                         "worker_port": worker_port,
                         "ssh_port": ssh_port,
-                        "ssh_user": _CTRL_RE.sub("", str(msg.get("ssh_user", ""))).strip()[:64],
+                        "ssh_user": safe_ssh_u,
                         "os_env": _CTRL_RE.sub("", str(msg.get("os_env", "unknown"))).strip()[:32] or "unknown",
                         "cpu_cores": cpu_cores,
                         "mem_total_mb": mem_total_mb,

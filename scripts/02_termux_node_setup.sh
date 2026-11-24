@@ -23,10 +23,14 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --node-id) NODE_ID="$2"; shift 2 ;;
+    --node-id)
+      [[ $# -ge 2 ]] || { echo "Error: --node-id requires a value" >&2; usage; exit 2; }
+      NODE_ID="$2"; shift 2 ;;
     --master) IS_MASTER=1; shift ;;
     --with-compute) WITH_COMPUTE=1; shift ;;
-    --repo-dir) REPO_DIR="$2"; shift 2 ;;
+    --repo-dir)
+      [[ $# -ge 2 ]] || { echo "Error: --repo-dir requires a directory path" >&2; usage; exit 2; }
+      REPO_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
   esac
@@ -35,6 +39,16 @@ done
 if [[ -z "${NODE_ID}" ]]; then
   echo "Error: --node-id is required (e.g. --node-id node0)." >&2
   usage
+  exit 2
+fi
+
+if [[ ! "${NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
+  echo "Error: Invalid --node-id '${NODE_ID}' (must start with alphanumeric and contain only A-Za-z0-9._-, max 40 chars)." >&2
+  exit 2
+fi
+
+if [[ "${REPO_DIR}" == *$'\n'* || "${REPO_DIR}" == *'"'* || "${REPO_DIR}" == *'$'* || "${REPO_DIR}" == *'`'* ]]; then
+  echo "Error: Unsupported special characters in --repo-dir '${REPO_DIR}'." >&2
   exit 2
 fi
 
@@ -81,7 +95,7 @@ if [ -f "\${REPO_DIR}/phonecluster_cli.py" ] && [ -f "\${REPO_DIR}/config/cluste
   nohup python3 "\${REPO_DIR}/phonecluster_cli.py" \\
     --config "\${REPO_DIR}/config/cluster.json" \\
     worker --node-id "\${NODE_ID}" \\
-    >> "\${LOG_DIR}/worker-\${NODE_ID}.log" 2>&1 &
+    >> "\${LOG_DIR}/worker-\${NODE_ID}.log" 2>&1 < /dev/null &
   echo \$! > "\${LOG_DIR}/worker-\${NODE_ID}.pid"
 EOF
 
@@ -91,7 +105,7 @@ if [[ "${IS_MASTER}" -eq 1 ]]; then
   nohup python3 "${REPO_DIR}/phonecluster_cli.py" \
     --config "${REPO_DIR}/config/cluster.json" \
     dashboard \
-    >> "${LOG_DIR}/dashboard.log" 2>&1 &
+    >> "${LOG_DIR}/dashboard.log" 2>&1 < /dev/null &
   echo $! > "${LOG_DIR}/dashboard.pid"
 EOF
 fi
@@ -99,7 +113,7 @@ fi
 cat >> "${BOOT_SCRIPT}" <<'EOF'
 fi
 EOF
-chmod +x "${BOOT_SCRIPT}"
+chmod 700 "${BOOT_SCRIPT}"
 
 echo "[4/4] Enabling Termux wake lock and verifying battery API..."
 termux-wake-lock || true

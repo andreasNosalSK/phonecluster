@@ -19,7 +19,9 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -s) SERIAL_ARGS=(-s "$2"); shift 2 ;;
+    -s)
+      [[ $# -ge 2 ]] || { echo "Error: -s requires an ADB device serial" >&2; usage; exit 2; }
+      SERIAL_ARGS=(-s "$2"); shift 2 ;;
     --audit-only) APPLY_FIX=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;

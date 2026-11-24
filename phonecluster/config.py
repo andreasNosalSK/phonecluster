@@ -497,18 +497,24 @@ def create_default_config(
     ssh_user: str = "",
     ssh_port: int = DEFAULT_SSH_PORT,
 ) -> ClusterConfig:
-    """Generate a ready-to-edit default cluster config with a fresh secret token."""
-    workers = worker_hosts if worker_hosts is not None else [
+    """Generate a validated default cluster config with a fresh secret token."""
+    clean_master = validate_host(master_host)
+    clean_user = validate_ssh_user(ssh_user)
+    clean_ssh_port = int(ssh_port)
+    if not (1 <= clean_ssh_port <= 65535):
+        raise ValueError(f"ssh_port must be between 1 and 65535 (got {ssh_port})")
+    raw_workers = worker_hosts if worker_hosts is not None else [
         "192.168.1.202",
         "192.168.1.203",
     ]
+    workers = [validate_host(w) for w in raw_workers if str(w).strip()]
     nodes: list[NodeConfig] = [
         NodeConfig(
             id="node0",
-            host=master_host,
+            host=clean_master,
             role="master",
-            ssh_port=ssh_port,
-            ssh_user=ssh_user,
+            ssh_port=clean_ssh_port,
+            ssh_user=clean_user,
             max_concurrency=2,
             weight=1.2,
             tags=["master", "ufs", "5g"],
@@ -521,8 +527,8 @@ def create_default_config(
                 id=f"node{idx}",
                 host=host,
                 role="worker",
-                ssh_port=ssh_port,
-                ssh_user=ssh_user,
+                ssh_port=clean_ssh_port,
+                ssh_user=clean_user,
                 max_concurrency=2,
                 weight=1.0,
                 tags=["worker"],
@@ -530,7 +536,7 @@ def create_default_config(
             )
         )
     return ClusterConfig(
-        cluster_name=cluster_name,
+        cluster_name=str(cluster_name or "phonecluster").strip() or "phonecluster",
         auth_token=secrets.token_urlsafe(32),
         nodes=nodes,
         safety=SafetyConfig(),
