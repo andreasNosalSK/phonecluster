@@ -10,8 +10,39 @@
 #   6. Generates a ready-to-use config/cluster.json with all discovered Wi-Fi IPs!
 set -euo pipefail
 
-CONFIG_OUT="${1:-config/cluster.json}"
+CONFIG_OUT="config/cluster.json"
 APKS_DIR="apks"
+FORCE_OVERWRITE=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/setup_all_via_adb.sh [--force] [config-output-path]
+
+Options:
+  -f, --force   Overwrite existing cluster config file if present
+  -h, --help    Show this help
+EOF
+}
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--force) FORCE_OVERWRITE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; while [[ $# -gt 0 ]]; do POSITIONAL+=("$1"); shift; done ;;
+    -*) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+if [[ "${#POSITIONAL[@]}" -ge 1 ]]; then
+  CONFIG_OUT="${POSITIONAL[0]}"
+fi
+
+if [[ -f "${CONFIG_OUT}" && "${FORCE_OVERWRITE}" -eq 0 ]]; then
+  echo "Error: Config already exists at '${CONFIG_OUT}' (refusing to overwrite existing cluster tokens)." >&2
+  echo "Pass --force to overwrite or specify a different output path." >&2
+  exit 1
+fi
 
 if ! command -v adb >/dev/null 2>&1; then
   echo "Error: 'adb' not found. Install android-tools / platform-tools on your PC first." >&2
@@ -58,10 +89,11 @@ for SER in "${SERIALS[@]}"; do
     shopt -u nullglob
   fi
 
-  # Check Termux apps
+  # Check Termux apps (inspect stdout instead of exit code — Android 7-9 ADB protocol v1 always returns 0!)
   MISSING_APPS=()
   for PKG in com.termux com.termux.boot com.termux.api; do
-    if ! adb -s "${SER}" shell pm path "${PKG}" >/dev/null 2>&1; then
+    PKG_PATH="$(adb -s "${SER}" shell pm path "${PKG}" 2>/dev/null | tr -d '\r\n' || true)"
+    if [[ -z "${PKG_PATH}" ]]; then
       MISSING_APPS+=("${PKG}")
     else
       # Best-effort Doze whitelist (works on most unrooted Android builds)

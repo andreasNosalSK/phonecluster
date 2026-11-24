@@ -4,7 +4,7 @@
   "dashboard_port": 8080,
   "dashboard_require_auth": false,
   "health_timeout_sec": 3.0,
-  "default_job_timeout_sec": 600.0,
+  "default_job_timeout_sec": 600,
   "custom_services": {},
   "safety": {
     "max_temp_c": 40.0,

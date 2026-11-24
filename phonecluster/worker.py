@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import selectors
 import shlex
 import signal
 import socket
@@ -44,14 +45,22 @@ from .auth import (
 from .config import (
     NetworkHardeningConfig,
     SafetyConfig,
+    format_host_port,
     load_config,
     normalize_host,
     save_config,
 )
 from .discovery import DISCOVERY_PORT, DiscoveryResponder
-from .telemetry import CpuSampler, NetSampler, ThermalGate, collect_node_health
+from .telemetry import (
+    CpuSampler,
+    NetSampler,
+    ThermalGate,
+    collect_node_health,
+    is_battery_health_hazardous,
+)
 
 LOG = logging.getLogger("phonecluster.worker")
+_CTRL_LOG_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 MAX_OUTPUT_BYTES = 512 * 1024  # 512 KiB per stream to protect 4 GB phones from OOM
 MAX_REQUEST_BYTES = 2 * 1024 * 1024  # 2 MiB max JSON payload (allows inline scripts)
@@ -66,6 +75,8 @@ class ActiveJob:
     started_at: float
     process: subprocess.Popen[bytes] | None = None
     cancelled: bool = False
+    reaped: bool = False
+    proc_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -82,6 +93,7 @@ class WorkerState:
     allowed_client_ips: set[str] = field(default_factory=set)
     require_signed_requests: bool = False
     config_path: Path | None = None
+    allowed_hosts: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).resolve()
@@ -94,6 +106,8 @@ class WorkerState:
         self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
         self.replay_cache = ReplayCache(ttl_sec=150.0, max_entries=4096)
         self.lock = threading.Lock()
+        self._config_update_lock = threading.Lock()
+        self._shutting_down = False
         self.active_jobs: dict[str, ActiveJob] = {}
         self.recent_jobs: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
         self.recent_alerts: collections.deque[dict[str, Any]] = collections.deque(maxlen=25)
@@ -220,6 +234,14 @@ class WorkerState:
     ) -> tuple[bool, dict[str, Any]]:
         """Atomically check capacity & thermal safety, then reserve a job slot."""
         with self.lock:
+            if self._shutting_down:
+                return (
+                    False,
+                    {
+                        "error": "node_shutting_down",
+                        "reasons": [f"worker '{self.node_id}' is shutting down"],
+                    },
+                )
             if job_id in self.active_jobs:
                 return (
                     False,
@@ -246,23 +268,22 @@ class WorkerState:
 
         if not force:
             try:
-                # Evaluate thermal/RAM safety outside the lock (fast path skips `ps`/port probes/CPU sampler!)
+                # Evaluate thermal/RAM safety outside the lock (excluding our own newly-reserved slot!)
                 if self.health_provider is not None:
-                    health = self.get_health()
+                    health = dict(self.health_provider())
                 else:
                     with self.lock:
-                        cur_active = len(self.active_jobs)
+                        other_active = max(0, len(self.active_jobs) - 1)
                     health = collect_node_health(
                         node_id=self.node_id,
                         role=self.role,
                         safety=self.safety,
                         thermal_gate=self.thermal_gate,
-                        active_jobs=cur_active,
+                        active_jobs=other_active,
                         max_concurrency=self.max_concurrency,
                         workdir=self.workdir,
                         safety_only=True,
                     )
-                # Exclude our own newly reserved slot when checking busy state
                 raw_reasons = health.get("not_ready_reasons")
                 reasons_list = [str(r) for r in raw_reasons if r is not None] if isinstance(raw_reasons, list) else []
                 non_busy_reasons = [r for r in reasons_list if not r.startswith("busy")]
@@ -271,9 +292,7 @@ class WorkerState:
                         non_busy_reasons.append("overheated")
                     if health.get("battery_hazard"):
                         non_busy_reasons.append("battery_hazard")
-                    if not non_busy_reasons and health.get("ready_for_jobs") is False and not any(
-                        r.startswith("busy") for r in reasons_list
-                    ):
+                    if not non_busy_reasons and health.get("ready_for_jobs") is False:
                         non_busy_reasons.append("node not ready")
             except Exception:
                 with self.lock:
@@ -292,15 +311,22 @@ class WorkerState:
                 )
         return True, {}
 
-    def attach_process(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
+    def get_active_job(self, job_id: str) -> ActiveJob | None:
+        with self.lock:
+            return self.active_jobs.get(job_id)
+
+    def attach_process(self, job_id: str, proc: subprocess.Popen[bytes]) -> ActiveJob | None:
         already_cancelled = False
         with self.lock:
             job = self.active_jobs.get(job_id)
             if job is not None:
                 job.process = proc
-                already_cancelled = job.cancelled
-        if already_cancelled and proc.poll() is None:
-            _terminate_process_group(proc)
+                already_cancelled = job.cancelled or self._shutting_down
+                if self._shutting_down:
+                    job.cancelled = True
+        if already_cancelled and job is not None:
+            _terminate_process_group(proc, job=job)
+        return job
 
     def finish_job(self, job_id: str, record: dict[str, Any]) -> None:
         with self.lock:
@@ -314,21 +340,53 @@ class WorkerState:
                 return False
             job.cancelled = True
             proc = job.process
-        if proc is not None and proc.poll() is None:
-            _terminate_process_group(proc)
+        if proc is not None:
+            _terminate_process_group(proc, job=job)
         return True
 
     def cancel_all_jobs(self) -> int:
         """Terminate all running child process groups cleanly (called on worker shutdown)."""
-        procs: list[subprocess.Popen[bytes]] = []
+        targets: list[tuple[ActiveJob, subprocess.Popen[bytes]]] = []
         with self.lock:
+            self._shutting_down = True
             for job in self.active_jobs.values():
                 job.cancelled = True
-                if job.process is not None and job.process.poll() is None:
-                    procs.append(job.process)
-        for proc in procs:
-            _terminate_process_group(proc)
-        return len(procs)
+                if job.process is not None and not job.reaped and job.process.poll() is None:
+                    targets.append((job, job.process))
+        if not targets:
+            return 0
+        # Send SIGTERM to every active process group first, then escalate concurrently with one shared deadline
+        for job, proc in targets:
+            with job.proc_lock:
+                if not job.reaped and proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except OSError:
+                        try:
+                            proc.terminate()
+                        except OSError:
+                            pass
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            alive = False
+            for job, proc in targets:
+                with job.proc_lock:
+                    if not job.reaped and proc.poll() is None:
+                        alive = True
+            if not alive:
+                break
+            time.sleep(0.05)
+        for job, proc in targets:
+            with job.proc_lock:
+                if not job.reaped:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+        return len(targets)
 
     def apply_live_config(
         self, payload: dict[str, Any], requester_ip: str = ""
@@ -339,6 +397,12 @@ class WorkerState:
         always includes the authenticated Master's current source IP + loopback so Master
         cannot lock itself out. Persists atomically to `self.config_path` when available.
         """
+        with self._config_update_lock:
+            return self._apply_live_config_serialized(payload, requester_ip=requester_ip)
+
+    def _apply_live_config_serialized(
+        self, payload: dict[str, Any], requester_ip: str = ""
+    ) -> tuple[int, dict[str, Any]]:
         target_id = str(payload.get("target_node_id") or "").strip()
         if target_id and target_id != self.node_id:
             return HTTPStatus.CONFLICT, {
@@ -351,16 +415,20 @@ class WorkerState:
             if not isinstance(raw_s, dict):
                 return HTTPStatus.BAD_REQUEST, {"error": "'safety' must be a JSON object"}
             try:
-                cur_s = self.safety
+                with self.lock:
+                    cur_s = self.safety
+                def _sv(k: str, fallback: Any) -> Any:
+                    v = raw_s.get(k)
+                    return fallback if v is None else v
                 merged_s = {
-                    "max_temp_c": raw_s.get("max_temp_c", cur_s.max_temp_c),
-                    "resume_temp_c": raw_s.get("resume_temp_c", cur_s.resume_temp_c),
-                    "min_free_ram_mb": raw_s.get("min_free_ram_mb", cur_s.min_free_ram_mb),
-                    "battery_low_pct": raw_s.get("battery_low_pct", cur_s.battery_low_pct),
-                    "battery_high_pct": raw_s.get("battery_high_pct", cur_s.battery_high_pct),
-                    "battery_poll_sec": raw_s.get("battery_poll_sec", cur_s.battery_poll_sec),
-                    "webhook_cooldown_sec": raw_s.get("webhook_cooldown_sec", cur_s.webhook_cooldown_sec),
-                    "battery_webhook_url": raw_s.get("battery_webhook_url", cur_s.battery_webhook_url),
+                    "max_temp_c": _sv("max_temp_c", cur_s.max_temp_c),
+                    "resume_temp_c": _sv("resume_temp_c", cur_s.resume_temp_c),
+                    "min_free_ram_mb": _sv("min_free_ram_mb", cur_s.min_free_ram_mb),
+                    "battery_low_pct": _sv("battery_low_pct", cur_s.battery_low_pct),
+                    "battery_high_pct": _sv("battery_high_pct", cur_s.battery_high_pct),
+                    "battery_poll_sec": _sv("battery_poll_sec", cur_s.battery_poll_sec),
+                    "webhook_cooldown_sec": _sv("webhook_cooldown_sec", cur_s.webhook_cooldown_sec),
+                    "battery_webhook_url": _sv("battery_webhook_url", cur_s.battery_webhook_url),
                 }
                 new_safety = SafetyConfig.from_dict(merged_s)
             except (ValueError, TypeError, OverflowError) as exc:
@@ -383,10 +451,12 @@ class WorkerState:
 
         new_net_cfg: NetworkHardeningConfig | None = None
         new_allowed_ips: set[str] | None = None
+        explicit_allowed_ips = False
         if "network" in payload:
             raw_n = payload.get("network")
             if not isinstance(raw_n, dict):
                 return HTTPStatus.BAD_REQUEST, {"error": "'network' must be a JSON object"}
+            explicit_allowed_ips = "allowed_master_ips" in raw_n and raw_n.get("allowed_master_ips") is not None
             with self.lock:
                 cur_enforce = bool(self.allowed_client_ips)
                 cur_signed = bool(self.require_signed_requests)
@@ -431,7 +501,6 @@ class WorkerState:
             # Resolve hostnames OUTSIDE `self.lock` so slow mDNS never stalls worker /health or /exec
             compiled_clients = self._build_allowed_clients(new_allowed_ips)
 
-        persisted = False
         with self.lock:
             if new_safety is not None:
                 self.safety = new_safety
@@ -443,33 +512,40 @@ class WorkerState:
                 self._allowed_exact_ips, self._allowed_networks = compiled_clients
             if new_net_cfg is not None:
                 self.require_signed_requests = bool(new_net_cfg.require_signed_requests)
+            cfg_path = self.config_path
+            cur_mc = self.max_concurrency
+            cur_temp = self.safety.max_temp_c
+            cur_ip_lock = bool(self.allowed_client_ips)
+            cur_signed_only = bool(self.require_signed_requests)
 
-            if self.config_path is not None and self.config_path.exists():
-                try:
-                    disk_cfg = load_config(self.config_path)
-                    if new_safety is not None:
-                        disk_cfg.safety = new_safety
-                    if new_max_conc is not None:
-                        for n in disk_cfg.nodes:
-                            if n.id == self.node_id:
-                                n.max_concurrency = new_max_conc
-                    if new_net_cfg is not None:
-                        disk_cfg.network.enforce_worker_source_ip = new_net_cfg.enforce_worker_source_ip
-                        disk_cfg.network.require_signed_requests = new_net_cfg.require_signed_requests
-                        if new_net_cfg.allowed_master_ips:
-                            disk_cfg.network.allowed_master_ips = list(new_net_cfg.allowed_master_ips)
-                    save_config(disk_cfg, self.config_path)
-                    persisted = True
-                except Exception as exc:
-                    LOG.warning("Live config applied in memory but disk save failed: %s", exc)
+        # Persist OUTSIDE `self.lock` (serialized by `_config_update_lock`) so eMMC fsync never stalls /health or /exec
+        persisted = False
+        if cfg_path is not None and cfg_path.exists():
+            try:
+                disk_cfg = load_config(cfg_path)
+                if new_safety is not None:
+                    disk_cfg.safety = new_safety
+                if new_max_conc is not None:
+                    for n in disk_cfg.nodes:
+                        if n.id == self.node_id:
+                            n.max_concurrency = new_max_conc
+                if new_net_cfg is not None:
+                    disk_cfg.network.enforce_worker_source_ip = new_net_cfg.enforce_worker_source_ip
+                    disk_cfg.network.require_signed_requests = new_net_cfg.require_signed_requests
+                    if explicit_allowed_ips or new_net_cfg.enforce_worker_source_ip or new_net_cfg.allowed_master_ips:
+                        disk_cfg.network.allowed_master_ips = list(new_net_cfg.allowed_master_ips)
+                save_config(disk_cfg, cfg_path)
+                persisted = True
+            except Exception as exc:
+                LOG.warning("Live config applied in memory but disk save failed: %s", exc)
 
         LOG.info(
             "[%s] Applied live Master config push (max_conc=%d, max_temp=%.1fC, ip_lock=%s, signed_only=%s, persisted=%s)",
             self.node_id,
-            self.max_concurrency,
-            self.safety.max_temp_c,
-            bool(self.allowed_client_ips),
-            bool(self.require_signed_requests),
+            cur_mc,
+            cur_temp,
+            cur_ip_lock,
+            cur_signed_only,
             persisted,
         )
         return HTTPStatus.OK, {
@@ -529,33 +605,57 @@ class WorkerState:
         return True
 
 
-def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
-    """Safely terminate a subprocess and ALL of its children (including SIGTERM-ignoring grandchildren)."""
+def _terminate_process_group(
+    proc: subprocess.Popen[bytes], job: ActiveJob | None = None
+) -> None:
+    """Safely terminate a subprocess and ALL of its children without racing against PID reap/reuse."""
+    lock = job.proc_lock if job is not None else threading.Lock()
     pgid: int | None = None
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except OSError:
-        try:
-            proc.terminate()
-        except OSError:
+    with lock:
+        if (job is not None and job.reaped) or proc.poll() is not None:
+            if job is not None and proc.returncode is not None:
+                job.reaped = True
             return
-    try:
-        proc.wait(timeout=3.0)
-    except subprocess.TimeoutExpired:
-        if pgid is not None:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except OSError:
-                pass
+        # `start_new_session=True` guarantees pgid == proc.pid while alive
+        pgid = proc.pid
         try:
-            proc.kill()
+            os.killpg(pgid, signal.SIGTERM)
         except OSError:
-            pass
-        try:
-            proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            pass
+            try:
+                proc.terminate()
+            except OSError:
+                return
+
+    deadline_term = time.monotonic() + 3.0
+    exited = False
+    while time.monotonic() < deadline_term:
+        with lock:
+            if (job is not None and job.reaped) or proc.poll() is not None:
+                if job is not None and proc.returncode is not None:
+                    job.reaped = True
+                exited = True
+                break
+        time.sleep(0.05)
+
+    if not exited:
+        with lock:
+            if not (job is not None and job.reaped) and proc.poll() is None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        deadline_kill = time.monotonic() + 1.0
+        while time.monotonic() < deadline_kill:
+            with lock:
+                if (job is not None and job.reaped) or proc.poll() is not None:
+                    if job is not None and proc.returncode is not None:
+                        job.reaped = True
+                    break
+            time.sleep(0.05)
         return
 
     # Even if the session leader exited promptly on SIGTERM, stubborn grandchildren
@@ -567,12 +667,6 @@ def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
         while True:
             try:
                 os.killpg(pgid, 0)
-            except ProcessLookupError:
-                still_alive = False
-                break
-            except PermissionError:
-                still_alive = False
-                break
             except OSError:
                 still_alive = False
                 break
@@ -642,63 +736,106 @@ def _run_process_bounded(
     proc: subprocess.Popen[bytes],
     timeout_sec: float,
     max_bytes: int = MAX_OUTPUT_BYTES,
+    job: ActiveJob | None = None,
 ) -> tuple[int, str, str, bool]:
-    """Wait for `proc` while draining stdout/stderr with a hard RAM cap (OOM protection for phones)."""
+    """Wait for `proc` while draining stdout/stderr via `selectors` with hard RAM cap and zero thread/FD leaks."""
     out_buf = bytearray()
     err_buf = bytearray()
     overflow = [0, 0]
-    buf_lock = threading.Lock()
-    finished_collecting = threading.Event()
+    sel = selectors.DefaultSelector()
+    streams: list[tuple[Any, bytearray, int]] = []
+    for idx, (stream, target) in enumerate(((proc.stdout, out_buf), (proc.stderr, err_buf))):
+        if stream is not None:
+            try:
+                os.set_blocking(stream.fileno(), False)
+                sel.register(stream, selectors.EVENT_READ, (target, idx))
+                streams.append((stream, target, idx))
+            except (OSError, ValueError):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
-    def _drain(stream: Any, target: bytearray, idx: int) -> None:
-        if stream is None:
+    def _drain_ready(wait_sec: float) -> None:
+        if not sel.get_map():
             return
         try:
-            while True:
-                chunk = stream.read(32768)
-                if not chunk:
-                    break
-                if finished_collecting.is_set():
-                    continue
-                with buf_lock:
-                    rem = max_bytes - len(target)
-                    if rem > 0:
-                        target.extend(chunk[:rem])
-                        if len(chunk) > rem:
-                            overflow[idx] += len(chunk) - rem
-                    else:
-                        overflow[idx] += len(chunk)
-        except OSError:
-            pass
-        finally:
+            events = sel.select(timeout=max(0.0, wait_sec))
+        except (OSError, ValueError):
+            return
+        for key, _mask in events:
+            stream = key.fileobj
+            target, idx = key.data
             try:
-                stream.close()
+                fd = stream.fileno()
+                chunk = os.read(fd, 32768)
+            except BlockingIOError:
+                continue
             except OSError:
-                pass
+                chunk = b""
+            if not chunk:
+                try:
+                    sel.unregister(stream)
+                except (KeyError, ValueError):
+                    pass
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+                continue
+            rem = max_bytes - len(target)
+            if rem > 0:
+                target.extend(chunk[:rem])
+                if len(chunk) > rem:
+                    overflow[idx] += len(chunk) - rem
+            else:
+                overflow[idx] += len(chunk)
 
-    t_out = threading.Thread(target=_drain, args=(proc.stdout, out_buf, 0), daemon=True)
-    t_err = threading.Thread(target=_drain, args=(proc.stderr, err_buf, 1), daemon=True)
-    t_out.start()
-    t_err.start()
-
+    deadline = time.monotonic() + max(0.05, float(timeout_sec))
     timed_out = False
+    returncode = -1
+    lock = job.proc_lock if job is not None else threading.Lock()
     try:
-        proc.wait(timeout=timeout_sec)
-        returncode = int(proc.returncode if proc.returncode is not None else -1)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _terminate_process_group(proc)
-        returncode = -9
+        while True:
+            with lock:
+                rc = proc.poll()
+                if rc is not None and job is not None:
+                    job.reaped = True
+            if rc is not None:
+                returncode = int(rc)
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                timed_out = True
+                _terminate_process_group(proc, job=job)
+                returncode = -9
+                break
+            step = min(0.1, max(0.01, deadline - now))
+            if sel.get_map():
+                _drain_ready(step)
+            else:
+                time.sleep(step)
 
-    t_out.join(timeout=2.0)
-    t_err.join(timeout=2.0)
-    finished_collecting.set()
-    with buf_lock:
-        out_bytes = bytes(out_buf)
-        err_bytes = bytes(err_buf)
-        ov_out, ov_err = overflow[0], overflow[1]
-    stdout_text = _decode_capped(out_bytes, limit=max_bytes, overflow_bytes=ov_out)
-    stderr_text = _decode_capped(err_bytes, limit=max_bytes, overflow_bytes=ov_err)
+        # Brief post-exit drain so trailing buffered output is captured without stalling on leaked grandchild FDs
+        drain_end = time.monotonic() + 0.15
+        while sel.get_map() and time.monotonic() < drain_end:
+            _drain_ready(min(0.03, max(0.0, drain_end - time.monotonic())))
+    finally:
+        for key in list(sel.get_map().values()):
+            try:
+                sel.unregister(key.fileobj)
+            except (KeyError, ValueError):
+                pass
+        sel.close()
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    stdout_text = _decode_capped(bytes(out_buf), limit=max_bytes, overflow_bytes=overflow[0])
+    stderr_text = _decode_capped(bytes(err_buf), limit=max_bytes, overflow_bytes=overflow[1])
     if timed_out:
         stderr_text = stderr_text + f"\n[Job timed out after {timeout_sec}s]"
     return returncode, stdout_text, stderr_text, timed_out
@@ -778,7 +915,8 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
         if not isinstance(req_workdir, str) or "\x00" in req_workdir:
             return HTTPStatus.BAD_REQUEST, {"error": "invalid workdir path"}
         try:
-            cwd = Path(req_workdir).expanduser()
+            raw_p = Path(req_workdir).expanduser()
+            cwd = (raw_p if raw_p.is_absolute() else (state.workdir / raw_p)).resolve()
             exists_dir = cwd.exists() and cwd.is_dir()
         except (OSError, ValueError, RuntimeError) as exc:
             return HTTPStatus.BAD_REQUEST, {"error": f"invalid workdir path: {exc}"}
@@ -805,6 +943,8 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
 
     started = time.monotonic()
     temp_script_path: Path | None = None
+    proc: subprocess.Popen[bytes] | None = None
+    active_job: ActiveJob | None = state.get_active_job(job_id)
     timed_out = False
     returncode = -1
     stdout_text = ""
@@ -819,7 +959,7 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
         env["PHONECLUSTER_NODE_ID"] = state.node_id
         env["PHONECLUSTER_JOB_ID"] = job_id
 
-        if state.is_cancelled(job_id):
+        if state.is_cancelled(job_id) or state._shutting_down:
             returncode = -15
         elif script_content:
             script_name = Path(str(payload.get("script_name") or "job.py").replace("\x00", "")).name
@@ -838,10 +978,13 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
                 fd, tmp_name = tempfile.mkstemp(
                     prefix=f"pc_{safe_job_prefix}_", suffix=suffix
                 )
-            temp_script_path = Path(tmp_name)
+            temp_script_path = Path(tmp_name).resolve()
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(str(script_content))
-            os.chmod(temp_script_path, 0o700)
+            try:
+                os.chmod(temp_script_path, 0o700)
+            except OSError:
+                pass  # Android /sdcard FUSE/exFAT rejects chmod even though interpreter doesn't need +x
 
             cmd_list = interp_parts + [str(temp_script_path)] + args
             proc = subprocess.Popen(
@@ -853,9 +996,9 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
-            state.attach_process(job_id, proc)
+            active_job = state.attach_process(job_id, proc)
             returncode, stdout_text, stderr_text, timed_out = _run_process_bounded(
-                proc, timeout_sec=timeout_sec, max_bytes=MAX_OUTPUT_BYTES
+                proc, timeout_sec=timeout_sec, max_bytes=MAX_OUTPUT_BYTES, job=active_job
             )
         else:
             proc = subprocess.Popen(
@@ -868,14 +1011,23 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
-            state.attach_process(job_id, proc)
+            active_job = state.attach_process(job_id, proc)
             returncode, stdout_text, stderr_text, timed_out = _run_process_bounded(
-                proc, timeout_sec=timeout_sec, max_bytes=MAX_OUTPUT_BYTES
+                proc, timeout_sec=timeout_sec, max_bytes=MAX_OUTPUT_BYTES, job=active_job
             )
     except (OSError, ValueError) as exc:
         stderr_text = f"Execution error: {exc}"
         returncode = 127
     finally:
+        if proc is not None:
+            if proc.poll() is None:
+                _terminate_process_group(proc, job=active_job)
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
         if temp_script_path is not None:
             try:
                 temp_script_path.unlink(missing_ok=True)
@@ -930,11 +1082,11 @@ class BatteryGuardLoop(threading.Thread):
             )
         safety = self.state.safety
         pct = health.get("battery_pct")
-        status = str(health.get("battery_status", "UNKNOWN")).upper()
-        bat_health = str(health.get("battery_health", "UNKNOWN")).upper()
+        status = str(health.get("battery_status", "UNKNOWN")).strip().upper().replace(" ", "_")
+        bat_health = str(health.get("battery_health", "UNKNOWN")).strip().upper().replace(" ", "_")
         temp_c = health.get("temp_c")
 
-        if bat_health in {"OVERHEAT", "OVER_VOLTAGE", "SAFETY_TIMER_EXPIRE"}:
+        if is_battery_health_hazardous(bat_health):
             self.state.record_safety_event(
                 "battery_hazard",
                 f"Hardware PMIC reported battery health '{bat_health}' (temp={temp_c}C, pct={pct}%); pausing jobs & cut charger power immediately!",
@@ -991,9 +1143,10 @@ class WorkerHTTPServer(ThreadingHTTPServer):
     ) -> None:
         self.state = state
         self._conn_sem = threading.BoundedSemaphore(64)
-        if ":" in str(server_address[0]):
+        clean_host = normalize_host(str(server_address[0])) or "0.0.0.0"
+        if ":" in clean_host:
             self.address_family = socket.AF_INET6
-        super().__init__(server_address, WorkerRequestHandler)
+        super().__init__((clean_host, server_address[1]), WorkerRequestHandler)
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._conn_sem.acquire(blocking=False):
@@ -1022,7 +1175,8 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         return "PhoneCluster"
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        LOG.info("%s - %s", self.address_string(), format % args)
+        msg = _CTRL_LOG_RE.sub("?", format % args)
+        LOG.info("%s - %s", self.address_string(), msg)
 
     def _send_json(self, status: int, body: dict[str, Any]) -> None:
         raw = safe_json_dumps(body).encode("utf-8")
@@ -1058,7 +1212,7 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
 
     def _authenticate(self, method: str, path: str, read_body: bool) -> tuple[bool, bytes]:
         # Workers are strictly machine-to-machine (Master -> Worker); reject browser CSRF & DNS-rebinding calls.
-        if not is_allowed_http_host(self.headers):
+        if not is_allowed_http_host(self.headers, extra_allowed_hosts=self.server.state.allowed_hosts):
             self._send_json(
                 HTTPStatus.FORBIDDEN,
                 {"error": "forbidden: invalid or untrusted Host header (DNS rebinding guard)"},
@@ -1139,7 +1293,7 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
     def _parse_json_body(self, raw: bytes) -> dict[str, Any] | None:
         try:
             parsed = json.loads((raw or b"{}").decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return None
         if not isinstance(parsed, dict):
@@ -1233,12 +1387,24 @@ def serve_worker(
         else:
             responder = None
 
-    def _handle_sigterm(signum: int, _frame: Any) -> None:
-        LOG.info("Received signal %s; shutting down worker '%s'...", signum, state.node_id)
-        stop_event.set()
-        if responder is not None:
-            responder.stop()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+    sigterm_event = threading.Event()
+    shutdown_watcher_stop = threading.Event()
+
+    def _sigterm_watcher() -> None:
+        while not shutdown_watcher_stop.is_set():
+            if sigterm_event.wait(timeout=0.25):
+                LOG.info("Received SIGTERM; shutting down worker '%s'...", state.node_id)
+                stop_event.set()
+                if responder is not None:
+                    responder.stop()
+                server.shutdown()
+                return
+
+    watcher_t = threading.Thread(target=_sigterm_watcher, name="worker-sigterm", daemon=True)
+    watcher_t.start()
+
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        sigterm_event.set()
 
     try:
         signal.signal(signal.SIGTERM, _handle_sigterm)
@@ -1246,11 +1412,10 @@ def serve_worker(
         pass  # Not on main thread
 
     LOG.info(
-        "PhoneCluster worker '%s' (%s) listening on http://%s:%d (max_concurrency=%d, max_temp=%.1fC)",
+        "PhoneCluster worker '%s' (%s) listening on http://%s (max_concurrency=%d, max_temp=%.1fC)",
         state.node_id,
         state.role,
-        bind_host,
-        server.server_address[1],
+        format_host_port(normalize_host(bind_host) or "0.0.0.0", server.server_address[1]),
         state.max_concurrency,
         state.safety.max_temp_c,
     )
@@ -1259,6 +1424,7 @@ def serve_worker(
     except KeyboardInterrupt:
         pass
     finally:
+        shutdown_watcher_stop.set()
         stop_event.set()
         if responder is not None:
             responder.stop()

@@ -263,6 +263,8 @@ class PairingBeaconResponder(threading.Thread):
         lh = normalize_host(self.listen_host)
         if lh and ":" not in lh and lh.startswith("127."):
             bind_addr = lh
+        elif lh and (lh.lower().rstrip(".") == "localhost" or lh == "::1"):
+            bind_addr = "127.0.0.1"
         else:
             bind_addr = "0.0.0.0"
         try:
@@ -300,6 +302,8 @@ class PairingBeaconResponder(threading.Thread):
                 except socket.timeout:
                     continue
                 except OSError:
+                    break
+                if self._stop_event.is_set():
                     break
                 if not addr or addr[1] <= 0:
                     continue
@@ -429,7 +433,7 @@ def discover_pairing_masters(
                 expires_raw = _parse_udp_int(msg.get("expires_in_sec", 0))
                 if pair_port is None or expires_raw is None or not (1 <= pair_port <= 65535):
                     continue
-                expires_in_sec = max(0, expires_raw)
+                expires_in_sec = max(0, min(86400, expires_raw))
                 host_ip = str(addr[0])
                 key_pair = (host_ip, pair_port)
                 if key_pair not in found and len(found) < 64 and per_ip_count.get(host_ip, 0) < 4:
@@ -535,6 +539,7 @@ class PairingManager:
         self.config_lock = config_lock or threading.RLock()
         self._lock = threading.Lock()
         self._attempt_lock = threading.Lock()  # Strictly serializes PIN attempts against parallel brute-force
+        self._dh_rate_limiter = AuthRateLimiter(max_failures=15, window_sec=60.0, block_sec=60.0)
         self._session: PairingSession | None = None
         self._beacon: PairingBeaconResponder | None = None
         self._recent_paired: list[dict[str, Any]] = []
@@ -581,21 +586,27 @@ class PairingManager:
         )
 
         with self._lock:
+            old_beacon = self._beacon
             self._stop_beacon_locked()
             self._session = session
-            if self.enable_beacon:
-                beacon = PairingBeaconResponder(
-                    cluster_name=self.config.cluster_name,
-                    pair_port=self.pair_port,
-                    session_id=session.session_id,
-                    fingerprint=session.fingerprint,
-                    expires_at=session.expires_at,
-                    listen_host=self.listen_host,
-                    discovery_port=self.discovery_port,
-                )
-                if beacon.bind():
-                    beacon.start()
-                    self._beacon = beacon
+        # Wait briefly outside `_lock` for any prior UDP beacon thread to close its socket (avoids EADDRINUSE without SO_REUSEPORT)
+        if old_beacon is not None and old_beacon.is_alive():
+            old_beacon.join(timeout=0.6)
+        if self.enable_beacon:
+            with self._lock:
+                if self._session is session:
+                    beacon = PairingBeaconResponder(
+                        cluster_name=self.config.cluster_name,
+                        pair_port=self.pair_port,
+                        session_id=session.session_id,
+                        fingerprint=session.fingerprint,
+                        expires_at=session.expires_at,
+                        listen_host=self.listen_host,
+                        discovery_port=self.discovery_port,
+                    )
+                    if beacon.bind():
+                        beacon.start()
+                        self._beacon = beacon
 
         return self.admin_status()
 
@@ -658,12 +669,20 @@ class PairingManager:
         """Verify DH + PIN proof, mint a unique per-node token, and return encrypted bundle."""
         client_ip = normalize_host(client_ip)
         local_ip = normalize_host(local_ip)
+        blocked, retry_after = self._dh_rate_limiter.is_blocked(client_ip)
+        if blocked:
+            return HTTPStatus.TOO_MANY_REQUESTS, {
+                "error": f"Too many failed pairing requests; retry in {retry_after}s",
+                "retry_after_sec": retry_after,
+            }
         peer_pub_hex = str(body.get("dh_pub") or "").strip().lower()
         client_proof = str(body.get("client_proof") or "").strip().lower()
         metadata = body.get("metadata")
         if not peer_pub_hex or not client_proof or not isinstance(metadata, dict):
+            self._dh_rate_limiter.record_failure(client_ip)
             return HTTPStatus.BAD_REQUEST, {"error": "Missing dh_pub, client_proof, or metadata."}
         if len(peer_pub_hex) > 600 or len(client_proof) > 128:
+            self._dh_rate_limiter.record_failure(client_ip)
             return HTTPStatus.BAD_REQUEST, {"error": "Oversized dh_pub or client_proof."}
 
         # Snapshot immutable session DH parameters and compute shared secret OUTSIDE `_attempt_lock`
@@ -681,17 +700,20 @@ class PairingManager:
 
         req_sid = str(body.get("session_id") or "").strip()
         if req_sid != session_id:
+            self._dh_rate_limiter.record_failure(client_ip)
             return HTTPStatus.BAD_REQUEST, {"error": "session_id mismatch (pairing window rotated)."}
 
         try:
             meta_canonical = json.dumps(metadata, sort_keys=True, separators=(",", ":"), allow_nan=False)
         except ValueError as exc:
+            self._dh_rate_limiter.record_failure(client_ip)
             return HTTPStatus.BAD_REQUEST, {"error": f"Invalid pairing metadata JSON values: {exc}"}
 
         try:
             peer_pub = int(peer_pub_hex, 16)
             shared_secret = compute_shared_secret(dh_priv, peer_pub)
         except ValueError as exc:
+            self._dh_rate_limiter.record_failure(client_ip)
             return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
 
         # Strictly serialize PIN attempts so parallel sockets can NEVER exceed 5 guesses!
@@ -737,8 +759,8 @@ class PairingManager:
             return HTTPStatus.BAD_REQUEST, {"error": "Invalid numeric pairing metadata."}
         assert worker_port is not None and ssh_port is not None and cores_raw is not None
         assert mem_raw is not None and mc_raw is not None and raw_tier is not None
-        cores = max(1, cores_raw)
-        mem_mb = max(0, mem_raw)
+        cores = max(1, min(1024, cores_raw))
+        mem_mb = max(0, min(16 * 1024 * 1024, mem_raw))
         max_conc = max(1, min(32, mc_raw))
         if not (0 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
             return HTTPStatus.BAD_REQUEST, {"error": "worker_port must be 0..65535 and ssh_port must be 1..65535."}
@@ -813,7 +835,7 @@ class PairingManager:
             if self.config_path is not None:
                 try:
                     save_config(self.config, self.config_path)
-                except OSError as exc:
+                except Exception as exc:
                     if existing is not None and prev_snapshot is not None:
                         (
                             existing.host,
@@ -916,6 +938,9 @@ class StandalonePairingServer(ThreadingHTTPServer):
     def __init__(self, addr: tuple[str, int], manager: PairingManager) -> None:
         self.manager = manager
         self._conn_sem = threading.BoundedSemaphore(32)
+        self._active_lock = threading.Lock()
+        self._active_cond = threading.Condition(self._active_lock)
+        self._active_requests = 0
         self.rate_limiter = AuthRateLimiter(max_failures=15, window_sec=60.0, block_sec=60.0)
         bind_host = normalize_host(str(addr[0])) or "0.0.0.0"
         if ":" in bind_host:
@@ -926,9 +951,15 @@ class StandalonePairingServer(ThreadingHTTPServer):
         if not self._conn_sem.acquire(blocking=False):
             self.shutdown_request(request)
             return
+        with self._active_cond:
+            self._active_requests += 1
         try:
             super().process_request(request, client_address)
         except Exception:
+            with self._active_cond:
+                self._active_requests -= 1
+                if self._active_requests <= 0:
+                    self._active_cond.notify_all()
             self._conn_sem.release()
             raise
 
@@ -936,7 +967,21 @@ class StandalonePairingServer(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
+            with self._active_cond:
+                self._active_requests -= 1
+                if self._active_requests <= 0:
+                    self._active_cond.notify_all()
             self._conn_sem.release()
+
+    def wait_active_requests(self, timeout: float = 5.0) -> None:
+        """Wait for any in-flight pairing HTTP responses to flush before process exit."""
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        with self._active_cond:
+            while self._active_requests > 0:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                self._active_cond.wait(timeout=rem)
 
 
 class StandalonePairingHandler(BaseHTTPRequestHandler):
@@ -947,7 +992,12 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
         return "PhoneCluster"
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        LOG.info("pair %s - %s", self.address_string(), format % args)
+        msg = re.sub(r"[\x00-\x1f\x7f]", "?", format % args)
+        LOG.info("pair %s - %s", self.address_string(), msg)
+
+    def _allowed_hosts(self) -> set[str]:
+        with self.server.manager.config_lock:
+            return {n.host for n in self.server.manager.config.nodes if n.host}
 
     def _send_json(self, status: int, data: dict[str, Any]) -> None:
         raw = safe_json_dumps(data).encode("utf-8")
@@ -965,7 +1015,7 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self) -> None:  # noqa: N802
-        if not is_allowed_http_host(self.headers):
+        if not is_allowed_http_host(self.headers, extra_allowed_hosts=self._allowed_hosts()):
             self._send_json(
                 HTTPStatus.FORBIDDEN,
                 {"error": "forbidden: invalid or untrusted Host header (DNS rebinding guard)"},
@@ -978,7 +1028,7 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if not is_allowed_http_host(self.headers):
+        if not is_allowed_http_host(self.headers, extra_allowed_hosts=self._allowed_hosts()):
             self._send_json(
                 HTTPStatus.FORBIDDEN,
                 {"error": "forbidden: invalid or untrusted Host header (DNS rebinding guard)"},
@@ -1007,7 +1057,19 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
             return
         try:
             if length > 0:
-                raw_bytes = self.rfile.read(length)
+                # Enforce a strict 10s total body-read deadline to block Slowloris slot exhaustion
+                deadline = time.monotonic() + 10.0
+                chunks = bytearray()
+                while len(chunks) < length:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        raise TimeoutError("request body read timed out")
+                    self.connection.settimeout(rem)
+                    piece = self.rfile.read1(min(4096, length - len(chunks))) if hasattr(self.rfile, "read1") else self.rfile.read(length - len(chunks))
+                    if not piece:
+                        break
+                    chunks.extend(piece)
+                raw_bytes = bytes(chunks)
                 if len(raw_bytes) != length:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "truncated request body"})
                     return
@@ -1020,7 +1082,7 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
                 body = {}
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be an object")
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, OSError) as exc:
             self.server.rate_limiter.record_failure(norm_ip)
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return
@@ -1089,6 +1151,7 @@ def run_cli_pairing_host(
     finally:
         manager.close_session()
         server.shutdown()
+        server.wait_active_requests(timeout=5.0)
         server.server_close()
 
     if seen_count > 0:
@@ -1169,6 +1232,7 @@ def join_cluster_via_pairing(
     trust_ssh_key: bool = False,
     tier: int = 0,
     pool: str = "auto",
+    expected_fingerprint: str = "",
 ) -> dict[str, Any]:
     """Perform authenticated DH pairing with Master and save a scoped worker config."""
     clean_master = normalize_host(master_host)
@@ -1190,6 +1254,17 @@ def join_cluster_via_pairing(
     ):
         raise RuntimeError("Malformed pairing hello from Master (invalid session_id, dh_pub, or salt).")
     pub_a = int(pub_a_hex, 16)
+    actual_fp = fingerprint_public_key(pub_a)
+    hello_fp = str(hello.get("fingerprint") or "").strip().upper()
+    if hello_fp and not hmac.compare_digest(hello_fp, actual_fp):
+        raise RuntimeError(
+            f"Master hello fingerprint mismatch ({hello_fp} != {actual_fp}) — possible spoofed Master!"
+        )
+    exp_fp = str(expected_fingerprint or "").strip().upper()
+    if exp_fp and not hmac.compare_digest(exp_fp, actual_fp):
+        raise RuntimeError(
+            f"Master DH key fingerprint mismatch (expected {exp_fp}, got {actual_fp}) — aborting before sending PIN proof!"
+        )
 
     priv_b, pub_b = generate_dh_keypair()
     pub_b_hex = format(pub_b, "x")
@@ -1280,7 +1355,7 @@ def join_cluster_via_pairing(
                 worker_port=worker_port,
                 ssh_port=actual_ssh_port,
                 ssh_user=actual_user,
-                max_concurrency=max_concurrency,
+                max_concurrency=max(1, min(32, int(bundle.get("max_concurrency", max_concurrency) or max_concurrency))),
                 tier=eff_tier,
                 pool=eff_pool,
                 tags=["worker", "paired"],

@@ -44,7 +44,7 @@ if [[ ! "${RUN_USER}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]]; then
   exit 2
 fi
 
-if [[ "${REPO_DIR}" == *$'\n'* || "${REPO_DIR}" == *'"'* || "${REPO_DIR}" == *'$'* || "${REPO_DIR}" == *'`'* || "${REPO_DIR}" == *'\'* ]]; then
+if [[ "${REPO_DIR}" == *$'\n'* || "${REPO_DIR}" == *'"'* || "${REPO_DIR}" == *'$'* || "${REPO_DIR}" == *'`'* || "${REPO_DIR}" == *'\'* || "${REPO_DIR}" == *'%'* || "${REPO_DIR}" == *'}'* ]]; then
   echo "Error: Unsupported special characters in repo directory '${REPO_DIR}'." >&2
   exit 2
 fi
@@ -110,10 +110,28 @@ EOF
 chmod 0755 /usr/local/bin/phonecluster
 ln -sf /usr/local/bin/phonecluster /usr/local/bin/pc
 
+run_as_user() {
+  if [[ "${RUN_USER}" == "root" ]]; then
+    "$@"
+  elif command -v runuser >/dev/null 2>&1; then
+    runuser -u "${RUN_USER}" -- "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -u "${RUN_USER}" -- "$@"
+  else
+    su -s /bin/sh "${RUN_USER}" -c 'exec "$@"' _ "$@"
+  fi
+}
+
+# Re-validate --lan-subnet now that python3 is guaranteed installed (before passing it to CLI!)
+if ! python3 -c 'import ipaddress, sys; ipaddress.ip_network(sys.argv[1], strict=False)' "${LAN_SUBNET}" 2>/dev/null; then
+  echo "Error: Invalid --lan-subnet CIDR '${LAN_SUBNET}' (example: 192.168.1.0/24)." >&2
+  exit 2
+fi
+
 # 3. Ensure cluster.json exists (owned by RUN_USER, 0600, with Linux SSH port 22!)
 CFG_PATH="${REPO_DIR}/config/cluster.json"
 if [[ ! -f "${CFG_PATH}" ]]; then
-  sudo -u "${RUN_USER}" python3 "${REPO_DIR}/phonecluster_cli.py" init-config \
+  run_as_user python3 "${REPO_DIR}/phonecluster_cli.py" init-config \
     --name "pi-phonecluster" \
     --master-host "${MASTER_IP}" \
     --workers "" \
@@ -123,18 +141,12 @@ if [[ ! -f "${CFG_PATH}" ]]; then
 fi
 
 # Persist chosen LAN subnet so firewall & distcc guides match this exact network
-sudo -u "${RUN_USER}" python3 "${REPO_DIR}/phonecluster_cli.py" \
+run_as_user python3 "${REPO_DIR}/phonecluster_cli.py" \
   --config "${CFG_PATH}" net-audit --lan-subnet "${LAN_SUBNET}" --json >/dev/null
 
 if [[ "${ENABLE_GATEWAY}" -eq 1 ]]; then
-  sudo -u "${RUN_USER}" python3 "${REPO_DIR}/phonecluster_cli.py" \
+  run_as_user python3 "${REPO_DIR}/phonecluster_cli.py" \
     --config "${CFG_PATH}" gateway --enable --mode allowlist
-fi
-
-# Re-validate --lan-subnet now that python3 is guaranteed installed
-if ! python3 -c 'import ipaddress, sys; ipaddress.ip_network(sys.argv[1], strict=False)' "${LAN_SUBNET}" 2>/dev/null; then
-  echo "Error: Invalid --lan-subnet CIDR '${LAN_SUBNET}' (example: 192.168.1.0/24)." >&2
-  exit 2
 fi
 
 # Detect Master node ID from cluster.json (supports pre-existing custom Master node IDs)
@@ -194,7 +206,7 @@ if [[ "${WITH_ADGUARD}" -eq 1 ]]; then
     echo "[OK] Native AdGuard Home already installed at /opt/AdGuardHome/AdGuardHome"
   else
     echo "Installing native AdGuard Home (no Docker)..."
-    curl -s -S -L https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh | sh -s -- -v
+    curl -fsSL https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh | sh -s -- -v
   fi
   echo "[OK] Open AdGuard Home setup wizard at: http://${MASTER_IP}:3000"
   echo "     Then paste DNS rewrites from: pc net-audit --adguard"
@@ -203,7 +215,7 @@ fi
 # 6. Optional: Hardened LAN-only nftables firewall (persisted to /etc/nftables.conf so rules survive reboot)
 if [[ "${WITH_FIREWALL}" -eq 1 ]]; then
   echo "Applying hardened LAN-only nftables rules (${LAN_SUBNET})..."
-  sudo -u "${RUN_USER}" python3 "${REPO_DIR}/phonecluster_cli.py" \
+  run_as_user python3 "${REPO_DIR}/phonecluster_cli.py" \
     --config "${CFG_PATH}" net-audit --firewall > /etc/nftables.phonecluster.conf
   if ! nft -c -f /etc/nftables.phonecluster.conf; then
     echo "Error: Generated nftables rules failed syntax check; leaving existing /etc/nftables.conf untouched." >&2

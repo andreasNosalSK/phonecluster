@@ -25,11 +25,13 @@ from .config import (
     DEFAULT_SSH_PORT,
     create_default_config,
     format_host_for_url,
+    format_host_port,
     generate_auth_token,
     load_config,
     normalize_host,
     resolve_config_path,
     save_config,
+    validate_host,
     validate_pool_name,
 )
 from .dashboard import serve_dashboard
@@ -128,6 +130,7 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         allowed_client_ips=allowed_ips,
         require_signed_requests=bool(cfg.network.require_signed_requests),
         config_path=cfg_path,
+        allowed_hosts={n.host for n in cfg.nodes if n.host},
     )
     serve_worker(
         args.bind,
@@ -361,7 +364,7 @@ def _cmd_map(args: argparse.Namespace) -> int:
         if args.args_file:
             try:
                 arg_lines = _load_lines(args.args_file)
-            except OSError as exc:
+            except (OSError, UnicodeDecodeError) as exc:
                 print(f"Could not read --args-file '{args.args_file}': {exc}", file=sys.stderr)
                 return 2
             for idx, line in enumerate(arg_lines):
@@ -406,7 +409,7 @@ def _cmd_map(args: argparse.Namespace) -> int:
     elif args.jobs_file:
         try:
             cmd_lines = _load_lines(args.jobs_file)
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             print(f"Could not read --jobs-file '{args.jobs_file}': {exc}", file=sys.stderr)
             return 2
         for idx, cmd in enumerate(cmd_lines):
@@ -534,10 +537,25 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
     cfg_path = resolve_config_path(args.config)
     cfg = load_config(cfg_path)
 
+    if args.enable and args.disable:
+        print("Error: --enable and --disable cannot be used together", file=sys.stderr)
+        return 2
+    if args.disable and args.serve:
+        print("Error: --disable and --serve cannot be used together", file=sys.stderr)
+        return 2
     if args.port is not None and not (0 <= int(args.port) <= 65535):
         print(f"Error: --port must be between 0 and 65535 (got {args.port})", file=sys.stderr)
         return 2
-    if args.enable or args.disable or args.mode or args.port is not None:
+    if args.bind:
+        try:
+            args.bind = validate_host(args.bind)
+        except ValueError as exc:
+            print(f"Error: invalid --bind host: {exc}", file=sys.stderr)
+            return 2
+
+    # Persist config updates when explicit policy-mutation flags are given (without clobbering --status / --check-isolation)
+    mutated = False
+    if args.enable or args.disable or args.mode:
         if args.enable:
             cfg.gateway.enabled = True
         if args.disable:
@@ -546,14 +564,15 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
             cfg.gateway.mode = args.mode
         if args.port is not None:
             cfg.gateway.port = int(args.port)
+        if args.bind:
+            cfg.gateway.bind_host = args.bind
         save_config(cfg, cfg_path)
+        mutated = True
         state_txt = "ENABLED" if cfg.gateway.enabled else "DISABLED"
         print(
             f"Saved Network Guard config ({state_txt}, mode={cfg.gateway.mode}, "
             f"port={cfg.gateway.port}) -> {cfg_path}"
         )
-        if not args.serve:
-            return 0
 
     if args.check_isolation:
         ctrl = MasterController(cfg)
@@ -583,10 +602,13 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
         else:
             print(f"Network Guard : {'ENABLED' if gw.enabled else 'DISABLED (OFF by default)'}")
             print(f"Policy Mode   : {gw.mode}")
-            print(f"Proxy Listen  : {gw.bind_host}:{gw.port}")
+            print(f"Proxy Listen  : {format_host_port(gw.bind_host, gw.port)}")
             print(f"SSRF Guard    : {'ON' if gw.block_private_ips else 'OFF'}")
             print(f"Auto Proxy Env: {'ON' if gw.inject_proxy_env else 'OFF'}")
             print(f"Allowlist ({len(gw.allowed_domains)}): {', '.join(gw.allowed_domains[:8])}" + (" ..." if len(gw.allowed_domains) > 8 else ""))
+        return 0
+
+    if mutated and not args.serve:
         return 0
 
     # Standalone foreground proxy mode (great for Master phone or Raspberry Pi Zero 2 W!)
@@ -610,7 +632,7 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
     except ValueError:
         pass
 
-    print(f"PhoneCluster Master Network Guard listening on {cfg.gateway.bind_host}:{mgr.bound_port}")
+    print(f"PhoneCluster Master Network Guard listening on {format_host_port(cfg.gateway.bind_host, mgr.bound_port)}")
     print(f"Policy mode: {cfg.gateway.mode} | SSRF guard: {'ON' if cfg.gateway.block_private_ips else 'OFF'} | Allowlist: {len(cfg.gateway.allowed_domains)} domains")
     print("Press Ctrl+C to stop.")
     try:
@@ -772,7 +794,12 @@ def _cmd_join(args: argparse.Namespace) -> int:
         else:
             # Hostname, IPv4 without port, or bare IPv6 literal (multiple ':')
             master_host = normalize_host(raw_m.rstrip("/"))
-        if not master_host or not (1 <= pair_port <= 65535):
+        try:
+            master_host = validate_host(master_host)
+        except ValueError as exc:
+            print(f"Error: invalid --master address '{raw_m}': {exc}", file=sys.stderr)
+            return 2
+        if not (1 <= pair_port <= 65535):
             print(f"Error: invalid --master address '{raw_m}' (expected host[:port] with port 1..65535)", file=sys.stderr)
             return 2
     else:
@@ -844,6 +871,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
             trust_ssh_key=trust_ssh,
             tier=args.tier,
             pool=validated_pool,
+            expected_fingerprint=fingerprint,
         )
     except (RuntimeError, ValueError) as exc:
         print(f"Pairing failed: {exc}", file=sys.stderr)
@@ -858,16 +886,20 @@ def _cmd_join(args: argparse.Namespace) -> int:
     if res["ssh_key_trusted"]:
         print("  Master SSH Key   : Added to ~/.ssh/authorized_keys")
 
-    # Configure Termux:Boot automatically if running inside Termux
+    # Configure Termux:Boot automatically if running inside Termux (using --boot-only so air-gapped phones work offline!)
     if "com.termux" in os.environ.get("PREFIX", ""):
         setup_sh = REPO_ROOT / "scripts" / "02_termux_node_setup.sh"
         if setup_sh.exists():
             print("  Updating Termux:Boot startup script for your new node ID...")
-            subprocess.call(["bash", str(setup_sh), "--node-id", res["node_id"], "--repo-dir", str(REPO_ROOT)])
+            subprocess.call(["bash", str(setup_sh), "--boot-only", "--node-id", res["node_id"], "--repo-dir", str(REPO_ROOT)])
 
     if not args.no_start:
         log_dir = REPO_ROOT / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log_dir = Path.home() / ".local" / "state" / "phonecluster" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"worker-{res['node_id']}.log"
         pid_file = log_dir / f"worker-{res['node_id']}.pid"
         # Stop any previously running local worker PID (verify /proc cmdline to prevent killing unrelated PIDs after reboot!)
@@ -898,11 +930,12 @@ def _cmd_join(args: argparse.Namespace) -> int:
                     old_pid_file.unlink(missing_ok=True)
                 except OSError:
                     pass
+        cli_entry = REPO_ROOT / "phonecluster_cli.py"
+        cli_cmd = [sys.executable, str(cli_entry)] if cli_entry.is_file() else [sys.executable, "-m", "phonecluster.cli"]
         with log_file.open("a", encoding="utf-8") as lf:
             proc = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(REPO_ROOT / "phonecluster_cli.py"),
+                cli_cmd
+                + [
                     "--config",
                     str(cfg_path),
                     "worker",
@@ -1062,6 +1095,14 @@ def _cmd_copy(args: argparse.Namespace) -> int:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
 
+    if not nodes:
+        print(f"Error: no nodes matched target '{args.target}' in cluster config.", file=sys.stderr)
+        return 1
+
+    src_arg = str(src)
+    if ":" in src_arg and not src.is_absolute() and not src_arg.startswith(("./", "../")):
+        src_arg = f"./{src_arg}"
+
     rc_all = 0
     for node in nodes:
         host_scp = format_host_for_url(node.host)
@@ -1069,7 +1110,7 @@ def _cmd_copy(args: argparse.Namespace) -> int:
         scp_cmd = ["scp", "-P", str(node.ssh_port)]
         if src.is_dir():
             scp_cmd.append("-r")
-        scp_cmd.extend(["--", str(src), f"{target}:{args.dest}"])
+        scp_cmd.extend(["--", src_arg, f"{target}:{args.dest}"])
         print(f"Copying {src} -> {node.id} ({target}:{args.dest})...")
         rc = subprocess.call(scp_cmd)
         if rc != 0:
@@ -1224,11 +1265,13 @@ def _cmd_update(args: argparse.Namespace) -> int:
         return rc
     if args.sync:
         cfg_path = resolve_config_path(args.config).resolve()
-        if cfg_path.exists():
-            return subprocess.call(
-                ["bash", str(REPO_ROOT / "scripts" / "03_sync_cluster.sh"), "--config", str(cfg_path)],
-                cwd=str(REPO_ROOT),
-            )
+        if not cfg_path.exists():
+            print(f"Warning: --sync skipped because config file does not exist: {cfg_path}", file=sys.stderr)
+            return 1
+        return subprocess.call(
+            ["bash", str(REPO_ROOT / "scripts" / "03_sync_cluster.sh"), "--config", str(cfg_path)],
+            cwd=str(REPO_ROOT),
+        )
     return 0
 
 
@@ -1569,12 +1612,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         return int(args.func(args))
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     except ValueError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
+    except OSError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

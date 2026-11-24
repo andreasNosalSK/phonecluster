@@ -12,6 +12,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -176,7 +177,8 @@ def make_core_bars(per_core: list[float], pal: Palette) -> str:
 
 def _box_lines(title: str, body_lines: list[str], width: int, pal: Palette) -> list[str]:
     inner_w = max(20, width - 2)
-    title_str = f" {title} " if title else ""
+    clean_t = _clean_term_text(title, max(1, inner_w - 4)) if title else ""
+    title_str = f" {clean_t} " if clean_t else ""
     t_vis = _visible_len(title_str)
     right_dashes = max(1, inner_w - t_vis - 1)
     top = pal.border("╭─") + pal.accent(title_str) + pal.border("─" * right_dashes + "╮")
@@ -222,8 +224,10 @@ def render_top_frame(
     cpu_series = [float(p.get("cpu_pct", 0.0)) for p in cluster_hist]
     cpu_pct = float(summary.get("cluster_cpu_pct", 0.0))
     ram_pct = float(summary.get("cluster_ram_pct", 0.0))
-    mem_used_gb = (summary.get("mem_total_mb", 0) - summary.get("mem_available_mb", 0)) / 1024.0
-    mem_tot_gb = summary.get("mem_total_mb", 0) / 1024.0
+    mem_tot_mb = max(0, int(summary.get("mem_total_mb", 0) or 0))
+    mem_avail_mb = max(0, int(summary.get("mem_available_mb", 0) or 0))
+    mem_used_gb = max(0, mem_tot_mb - mem_avail_mb) / 1024.0
+    mem_tot_gb = mem_tot_mb / 1024.0
     max_temp = summary.get("max_temp_c")
     safety = summary.get("safety", {})
     max_temp_limit = float(safety.get("max_temp_c", 40.0))
@@ -246,7 +250,7 @@ def render_top_frame(
     mem_bar_w = 12 if cols < 100 else 16
 
     top_row = (
-        f"{pal.purple(summary.get('cluster_name', 'phonecluster'))}  "
+        f"{pal.purple(_clean_term_text(summary.get('cluster_name', 'phonecluster'), 36))}  "
         f"{live_tag}  "
         f"Ready: {pal.ok(str(summary.get('nodes_ready', 0)))}/{summary.get('nodes_total', 0)}  "
         f"Tasks: {pal.accent(str(summary.get('total_active_jobs', 0)))}  "
@@ -506,14 +510,41 @@ def _read_key(timeout_sec: float) -> str | None:
         return "EOF"
     ch = raw.decode("utf-8", errors="ignore")
     if ch == "\x1b":
-        # Check for arrow key sequence like ESC [ A / B
+        # Drain complete CSI (`ESC [ ... <0x40-0x7E>`) or SS3 (`ESC O <byte>`) sequences
+        # so multi-byte keys like Ctrl+Right (`\x1b[1;5C`) NEVER leak `C` (cancel job) into stdin!
         r2, _, _ = select.select([sys.stdin], [], [], 0.03)
-        if r2:
-            seq = os.read(sys.stdin.fileno(), 2).decode("utf-8", errors="ignore")
+        if not r2:
+            return "ESC"
+        b2 = os.read(sys.stdin.fileno(), 1)
+        if not b2:
+            return "ESC"
+        if b2 == b"[":
+            seq_bytes = bytearray(b2)
+            for _ in range(16):
+                rn, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if not rn:
+                    break
+                bn = os.read(sys.stdin.fileno(), 1)
+                if not bn:
+                    break
+                seq_bytes.extend(bn)
+                if 0x40 <= bn[0] <= 0x7E:
+                    break
+            seq = seq_bytes.decode("utf-8", errors="ignore")
             if seq == "[A":
                 return "UP"
             if seq == "[B":
                 return "DOWN"
+            return "ESC"
+        if b2 == b"O":
+            rn, _, _ = select.select([sys.stdin], [], [], 0.02)
+            if rn:
+                bn = os.read(sys.stdin.fileno(), 1)
+                if bn == b"A":
+                    return "UP"
+                if bn == b"B":
+                    return "DOWN"
+            return "ESC"
         return "ESC"
     return ch
 
@@ -569,12 +600,27 @@ def run_top_tui(
     all_jobs = controller.get_all_jobs()
     last_poll = time.monotonic()
 
+    stop_requested = False
+    prev_handlers: dict[int, Any] = {}
+
+    def _on_stop_signal(_signum: int, _frame: Any) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    for sig_name in ("SIGTERM", "SIGHUP"):
+        sig_num = getattr(signal, sig_name, None)
+        if sig_num is not None:
+            try:
+                prev_handlers[sig_num] = signal.signal(sig_num, _on_stop_signal)
+            except ValueError:
+                pass  # Not on main thread
+
     try:
         tty.setcbreak(fd)
         sys.stdout.write("\033[?1049h\033[?25l")
         sys.stdout.flush()
 
-        while True:
+        while not stop_requested:
             now = time.monotonic()
             if not paused and (now - last_poll >= speed):
                 summary = controller.cluster_summary()
@@ -700,6 +746,11 @@ def run_top_tui(
     except KeyboardInterrupt:
         pass
     finally:
+        for sig_num, old_h in prev_handlers.items():
+            try:
+                signal.signal(sig_num, old_h)
+            except ValueError:
+                pass
         try:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         except (OSError, termios.error):

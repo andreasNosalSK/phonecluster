@@ -5686,10 +5686,12 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
         self.assertIn("Invalid tier target", reason)
 
         with tempfile.TemporaryDirectory() as tmp:
+            from phonecluster.telemetry import detect_os_environment
             wiz_cfg = Path(tmp) / "wiz_u.json"
             answers = iter(["u-cluster", "127.0.0.1", "", "\u00b2", "n", "", "40", ""])
             self.assertEqual(run_setup_wizard(wiz_cfg, input_fn=lambda _p: next(answers)), 0)
-            self.assertEqual(load_config(wiz_cfg).nodes[0].ssh_port, DEFAULT_SSH_PORT)
+            expected_ssh_port = DEFAULT_SSH_PORT if detect_os_environment() == "termux" else 22
+            self.assertEqual(load_config(wiz_cfg).nodes[0].ssh_port, expected_ssh_port)
 
             # 2. _install_ssh_pubkey creates authorized_keys with atomic 0600 mode
             fake_home = Path(tmp) / "home"
@@ -6516,6 +6518,884 @@ class TestPass11HardeningAndBugHunt(unittest.TestCase):
         adb_sh = (repo / "scripts" / "setup_all_via_adb.sh").read_text(encoding="utf-8")
         self.assertNotIn("mapfile ", adb_sh)
         self.assertNotIn("install -r --", adb_sh)
+
+
+class TestPass12HardeningAndBugHunt(unittest.TestCase):
+    """Pass 12 regression tests covering security hardening, stability, and edge-case fixes."""
+
+    def test_config_auth_deep_json_webhook_ssrf_and_rate_limiter_ipv6_norm(self) -> None:
+        import io
+        from unittest import mock
+        from phonecluster.auth import (
+            AuthRateLimiter,
+            _connect_validated_webhook_socket,
+            _is_webhook_redirect_target_unsafe,
+            _sanitize_json_value,
+            is_webhook_target_unsafe,
+            read_json_object_bounded,
+            safe_json_dumps,
+        )
+        from phonecluster.config import NetworkHardeningConfig
+
+        # 1. auth_token rejects whitespace, control chars, and non-ASCII
+        for bad_tok in ("tok\r\nX-Evil: 1", "tok with space", "tok\x00nul", "tök€n"):
+            with self.assertRaises(ValueError):
+                ClusterConfig.from_dict({
+                    "cluster_name": "c",
+                    "auth_token": bad_tok,
+                    "nodes": [{"id": "node0", "host": "127.0.0.1"}],
+                })
+            with self.assertRaises(ValueError):
+                NodeConfig.from_dict({"id": "node1", "host": "10.0.0.2", "auth_token": bad_tok})
+
+        # 2. allowed_master_ips validates IP / CIDR / safe host; rejects malformed CIDRs & control chars
+        net_ok = NetworkHardeningConfig.from_dict({
+            "allowed_master_ips": ["192.168.1.10", "10.0.0.0/24", "fd00::/64", "master.local"]
+        })
+        self.assertEqual(net_ok.allowed_master_ips, ["192.168.1.10", "10.0.0.0/24", "fd00::/64", "master.local"])
+        for bad_ip in ("192.168.1.0/99", "not a host!", "10.0.0.1\nX: 1", "10.0.0.1/"):
+            with self.assertRaises(ValueError):
+                NetworkHardeningConfig.from_dict({"allowed_master_ips": [bad_ip]})
+
+        # 3. NodeConfig max_concurrency capped to 1..32; SafetyConfig enforces 10..100 C bounds
+        with self.assertRaises(ValueError):
+            NodeConfig.from_dict({"id": "node1", "host": "10.0.0.2", "max_concurrency": 64})
+        with self.assertRaises(ValueError):
+            NodeConfig.from_dict({"id": "node1", "host": "10.0.0.2", "max_concurrency": 0})
+        with self.assertRaises(ValueError):
+            SafetyConfig.from_dict({"max_temp_c": 0.0, "resume_temp_c": 0.0})
+        with self.assertRaises(ValueError):
+            SafetyConfig.from_dict({"max_temp_c": 40.0, "resume_temp_c": 5.0})
+
+        # 4. Iterative _sanitize_json_value & RecursionError-safe read_json_object_bounded
+        deep: Any = [float("nan")]
+        for _ in range(2000):
+            deep = [deep]
+        sanitized = _sanitize_json_value(deep)
+        cur = sanitized
+        for _ in range(2000):
+            cur = cur[0]
+        self.assertEqual(cur, [None])
+        self.assertEqual(safe_json_dumps({"x": float("inf"), "y": float("nan")}), '{"x": null, "y": null}')
+
+        deep_json = b'{"a":1}'
+        with mock.patch("phonecluster.auth.json.loads", side_effect=RecursionError("too deep")):
+            with self.assertRaises(ValueError):
+                read_json_object_bounded(io.BytesIO(deep_json), max_bytes=1024)
+        nan_obj = read_json_object_bounded(io.BytesIO(b'{"v": NaN, "w": Infinity}'), max_bytes=1024)
+        self.assertEqual(nan_obj, {"v": None, "w": None})
+
+        # 5. Webhook SSRF hardening: trailing dot, 0/8, 6to4, site-local, NAT64, SIIT, redirects, single-resolve connect
+        for unsafe_url in (
+            "http://169.254.169.254./latest/meta-data/",
+            "http://0.0.0.1/hook",
+            "http://[2002:a9fe:a9fe::1]/hook",
+            "http://[fec0::1]/hook",
+            "http://[64:ff9b::169.254.169.254]/hook",
+            "http://[::ffff:0:169.254.169.254]/hook",
+        ):
+            self.assertTrue(is_webhook_target_unsafe(unsafe_url), f"Expected unsafe: {unsafe_url}")
+        self.assertFalse(is_webhook_target_unsafe("http://192.168.1.50:8123/api/webhook/batt"))
+
+        # Public -> LAN redirect blocked; LAN -> loopback redirect blocked
+        self.assertTrue(
+            _is_webhook_redirect_target_unsafe("https://93.184.216.34/hook", "http://192.168.1.201:8080/api/exec")
+        )
+        self.assertTrue(
+            _is_webhook_redirect_target_unsafe("http://192.168.1.50:8123/hook", "http://127.0.0.1:8080/api/exec")
+        )
+        self.assertFalse(
+            _is_webhook_redirect_target_unsafe("http://192.168.1.50:8123/old", "http://192.168.1.50:8123/new")
+        )
+
+        # Single-resolve webhook connect refuses disallowed IP without opening a socket
+        with mock.patch(
+            "phonecluster.auth.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 80))],
+        ), mock.patch("phonecluster.auth.socket.socket") as mock_sock:
+            with self.assertRaises(OSError):
+                _connect_validated_webhook_socket("rebind.example.test", 80, 2.0)
+            mock_sock.assert_not_called()
+
+        # 6. AuthRateLimiter normalizes IPv4-mapped IPv6 addresses identically to IPv4
+        rl = AuthRateLimiter(max_failures=2, window_sec=60.0, block_sec=60.0)
+        rl.record_failure("::ffff:192.168.1.50")
+        rl.record_failure("192.168.1.50")
+        self.assertTrue(rl.is_blocked("192.168.1.50")[0])
+        self.assertTrue(rl.is_blocked("::ffff:192.168.1.50")[0])
+        rl.record_success("192.168.1.50")
+        self.assertFalse(rl.is_blocked("::ffff:192.168.1.50")[0])
+
+    def test_telemetry_routing_worker_bg_process_slot_gate_and_master_safety(self) -> None:
+        import io
+        import urllib.error
+        import urllib.request
+        from unittest import mock
+        from phonecluster.master import MetricsHistory, NodeSnapshot
+        from phonecluster.routing import build_cross_tier_env
+        from phonecluster.telemetry import (
+            BatteryInfo,
+            _normalize_sysfs_temp,
+            is_battery_health_hazardous,
+            read_battery_via_sysfs,
+            read_top_processes,
+        )
+        from phonecluster.worker import (
+            BatteryGuardLoop,
+            WorkerHTTPServer,
+            WorkerState,
+            _execute_job_payload,
+            _run_process_bounded,
+        )
+
+        # 1. Sysfs space-separated battery hazard normalization + decideg/millideg cool-room temps
+        self.assertTrue(is_battery_health_hazardous("Over voltage"))
+        self.assertTrue(is_battery_health_hazardous("Safety timer expire"))
+        self.assertTrue(is_battery_health_hazardous("Overheat"))
+        self.assertFalse(is_battery_health_hazardous("Good"))
+        self.assertEqual(_normalize_sysfs_temp("125", unit="decideg"), 12.5)
+        self.assertEqual(_normalize_sysfs_temp("800", unit="millideg"), 0.8)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ps = Path(tmp) / "battery"
+            ps.mkdir()
+            (ps / "type").write_text("Battery\n", encoding="utf-8")
+            (ps / "capacity").write_text("60\n", encoding="utf-8")
+            (ps / "temp").write_text("125\n", encoding="utf-8")
+            (ps / "status").write_text("Not charging\n", encoding="utf-8")
+            (ps / "health").write_text("Over voltage\n", encoding="utf-8")
+            bat = read_battery_via_sysfs(Path(tmp))
+            self.assertIsNotNone(bat)
+            assert bat is not None
+            self.assertEqual(bat.temperature_c, 12.5)
+            self.assertEqual(bat.status, "NOT_CHARGING")
+            self.assertEqual(bat.health, "OVER_VOLTAGE")
+
+        # 2. read_top_processes decodes non-UTF-8 bytes safely without raising UnicodeDecodeError
+        with mock.patch("phonecluster.telemetry.subprocess.check_output", return_value=b"PID %CPU %MEM COMMAND\n123 1.0 0.5 bad\xffname\n"):
+            procs = read_top_processes(limit=3)
+            self.assertEqual(len(procs), 1)
+            self.assertEqual(procs[0]["pid"], 123)
+
+        # 3. WorkerState.try_reserve_slot with health_provider gates thermal hazard even on last slot (max_concurrency=1)
+        st_hot = WorkerState(
+            node_id="n-hot",
+            role="worker",
+            auth_token="tok1234567890",
+            safety=SafetyConfig(),
+            max_concurrency=1,
+            health_provider=lambda: {"ready_for_jobs": False, "not_ready_reasons": ["overheated (48C)"]},
+        )
+        ok_hot, reason_hot = st_hot.try_reserve_slot("j1", "echo hi")
+        self.assertFalse(ok_hot)
+        self.assertEqual(reason_hot.get("error"), "node_not_ready")
+
+        st_ok = WorkerState(
+            node_id="n-ok",
+            role="worker",
+            auth_token="tok1234567890",
+            safety=SafetyConfig(),
+            max_concurrency=1,
+            health_provider=lambda: {"ready_for_jobs": True, "not_ready_reasons": []},
+        )
+        ok_good, _ = st_ok.try_reserve_slot("j1", "echo hi")
+        self.assertTrue(ok_good)
+        st_ok.finish_job("j1", {"job_id": "j1", "returncode": 0})
+
+        # 4. _run_process_bounded returns promptly when a job spawns a detached background process holding stdout
+        import signal
+        import subprocess
+        proc_bg = subprocess.Popen(
+            ["sh", "-c", "(sleep 20) & echo bg_done"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            t0 = time.monotonic()
+            rc_bg, out_bg, _err_bg, to_bg = _run_process_bounded(proc_bg, timeout_sec=5.0, max_bytes=4096)
+            elapsed_bg = time.monotonic() - t0
+            self.assertEqual(rc_bg, 0)
+            self.assertFalse(to_bg)
+            self.assertIn("bg_done", out_bg)
+            self.assertLess(elapsed_bg, 2.5)
+        finally:
+            try:
+                os.killpg(proc_bg.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            if proc_bg.stdout:
+                proc_bg.stdout.close()
+            if proc_bg.stderr:
+                proc_bg.stderr.close()
+
+        # 5. Relative workdir anchored to state.workdir + os.chmod EPERM on script_content ignored
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sub = base / "subjob"
+            sub.mkdir()
+            st_wd = WorkerState(
+                node_id="n-wd",
+                role="worker",
+                auth_token="tok1234567890",
+                safety=SafetyConfig(),
+                max_concurrency=2,
+                workdir=base,
+                health_provider=lambda: {"ready_for_jobs": True, "not_ready_reasons": []},
+            )
+            with mock.patch("phonecluster.worker.os.chmod", side_effect=PermissionError("FUSE EPERM")):
+                rc_wd, res_wd = _execute_job_payload(
+                    st_wd,
+                    {
+                        "job_id": "j-wd",
+                        "workdir": "subjob",
+                        "script_name": "hello.py",
+                        "script_content": "import os; print(os.path.basename(os.getcwd()))\n",
+                        "timeout_sec": 5.0,
+                    },
+                )
+            self.assertEqual(rc_wd, 200)
+            self.assertEqual(res_wd["returncode"], 0)
+            self.assertEqual(res_wd["stdout"].strip(), "subjob")
+
+        # 6. BatteryGuardLoop triggers battery_hazard on space-separated Linux sysfs "Over voltage"
+        st_guard = WorkerState(
+            node_id="n-guard",
+            role="worker",
+            auth_token="tok-guard-123456",
+            safety=SafetyConfig(battery_webhook_url=""),
+            max_concurrency=1,
+            health_provider=lambda: {
+                "battery_pct": 55,
+                "max_temp_c": 33.0,
+                "battery_status": "CHARGING",
+                "battery_health": "Over voltage",
+                "battery_plugged": "PLUGGED",
+            },
+        )
+        guard = BatteryGuardLoop(st_guard, threading.Event())
+        with mock.patch.object(st_guard, "record_safety_event", wraps=st_guard.record_safety_event) as spy_ev:
+            guard.check_once()
+        self.assertTrue(any(c.args[0] == "battery_hazard" for c in spy_ev.call_args_list))
+
+        # 7. WorkerState.allowed_hosts allows configured multi-label Host header
+        st_host = WorkerState(
+            node_id="n-host",
+            role="worker",
+            auth_token="tok-host-secret-123",
+            safety=SafetyConfig(),
+            max_concurrency=1,
+            allowed_hosts={"node1.home.lan"},
+        )
+        wsrv = WorkerHTTPServer(("127.0.0.1", 0), st_host)
+        wport = wsrv.server_address[1]
+        wt = threading.Thread(target=wsrv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        wt.start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{wport}/health",
+                headers={**build_auth_headers("tok-host-secret-123"), "Host": f"node1.home.lan:{wport}"},
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                self.assertEqual(resp.status, 200)
+        finally:
+            wsrv.shutdown()
+            wsrv.server_close()
+            wt.join(timeout=2.0)
+
+        # 8. Routing build_cross_tier_env uses Master LAN IP for remote distcc and skips malformed custom llama_rpc/distcc
+        cfg_rt = ClusterConfig(
+            cluster_name="rt-test",
+            auth_token="rt-tok-1234567890",
+            nodes=[
+                NodeConfig(id="node0", host="192.168.1.10", role="master"),
+                NodeConfig(id="node1", host="192.168.1.55", role="worker"),
+            ],
+            custom_services={"llama_rpc": "http://:0", "distcc": "http://:0"},
+        )
+        snaps_rt = [
+            NodeSnapshot(
+                node=cfg_rt.nodes[0],
+                online=True,
+                health={"ready_for_jobs": True, "services": {"distccd_3632": True}, "cpu_cores": 4},
+            ),
+            NodeSnapshot(
+                node=cfg_rt.nodes[1],
+                online=True,
+                health={"ready_for_jobs": True, "services": {"distccd_3632": True}, "cpu_cores": 8},
+            ),
+        ]
+        env_rt = build_cross_tier_env(snaps_rt, cfg_rt)
+        self.assertEqual(env_rt["PHONECLUSTER_MASTER_HOST"], "192.168.1.10")
+        self.assertIn("192.168.1.10/2,lzo", env_rt.get("PHONECLUSTER_DISTCC_HOSTS", ""))
+        self.assertIn("192.168.1.55/8,lzo", env_rt.get("PHONECLUSTER_DISTCC_HOSTS", ""))
+        self.assertNotIn("localhost", env_rt.get("PHONECLUSTER_DISTCC_HOSTS", ""))
+        self.assertNotIn("PHONECLUSTER_LLAMA_RPC", env_rt)
+
+        # 9. MasterController blocks worker error JSON status spoofing, validates WAN probe, pipeline types, & MetricsHistory prune
+        cfg_m = ClusterConfig(
+            cluster_name="m-test",
+            auth_token="m-tok-1234567890",
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master"),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=59995),
+            ],
+        )
+        ctrl = MasterController(cfg_m)
+        spoof_err = urllib.error.HTTPError(
+            url="http://127.0.0.1:59995/cancel",
+            code=500,
+            msg="Internal Server Error",
+            hdrs={},  # type: ignore[arg-type]
+            fp=io.BytesIO(b'{"cancelled": true, "ok": true, "http_status": 200}'),
+        )
+        with mock.patch("phonecluster.master._DIRECT_OPENER.open", side_effect=spoof_err):
+            c_res = ctrl.cancel_node_job("node1", "job-x")
+        self.assertFalse(c_res["cancelled"])
+        self.assertEqual(c_res["http_status"], 500)
+
+        with self.assertRaises(ValueError):
+            ctrl.check_workers_wan_isolation(probe_host="bad host!")
+        with self.assertRaises(ValueError):
+            ctrl.check_workers_wan_isolation(probe_port=99999)
+        with self.assertRaises(ValueError):
+            ctrl.check_workers_wan_isolation(timeout_sec=float("nan"))
+
+        pipe_res = ctrl.run_pipeline([{"name": "bad", "command": 12345}])
+        self.assertFalse(pipe_res["ok"])
+        self.assertIn("must be a string", pipe_res["results"][0]["error"])
+
+        mh = MetricsHistory(maxlen=10)
+        mh.record({"timestamp": 1.0, "nodes": [{"id": "node1", "online": True, "health": {"cpu_pct": 10.0, "battery_pct": 999}}]})
+        self.assertIn("node1", mh.snapshot()["nodes"])
+        self.assertIsNone(mh.snapshot()["nodes"]["node1"][0]["battery_pct"])
+        mh.record({"timestamp": 2.0, "nodes": []})
+        self.assertNotIn("node1", mh.snapshot()["nodes"])
+
+    def test_gateway_non_ascii_host_ipv6_sitelocal_upstream_smuggling_and_chunked_audit(self) -> None:
+        from unittest import mock
+        from phonecluster.config import GatewayConfig
+        from phonecluster.gateway import (
+            GatewayManager,
+            _parse_host_header,
+            derive_proxy_password,
+            evaluate_policy,
+            resolve_and_validate_target,
+        )
+
+        # 1. Non-ASCII soft-hyphen host rejected across Host header, policy, and DNS validation
+        self.assertIsNone(_parse_host_header("gi\xadst.github.com"))
+        gw_cfg = GatewayConfig(
+            enabled=True,
+            mode="allowlist",
+            allowed_domains=["*.github.com"],
+            blocked_domains=["93.184.216.34"],
+        )
+        allowed_sh, _ = evaluate_policy("gi\xadst.github.com", 443, gw_cfg)
+        self.assertFalse(allowed_sh)
+        cands_sh, _ = resolve_and_validate_target("gi\xadst.github.com", 443)
+        self.assertIsNone(cands_sh)
+
+        # 2. IPv6 site-local fec0::1 blocked by SSRF guard
+        cands_sl, _ = resolve_and_validate_target("fec0::1", 80)
+        self.assertIsNone(cands_sl)
+
+        # 3. Live Gateway proxy: upstream 0-byte EOF -> 502, bare-LF -> 502, TE+CL drops CL, bad chunked POST audited
+        responses: list[bytes] = [
+            b"",  # Case A: immediate 0-byte EOF
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\nX-Injected: 1\r\n\r\nok",  # Case B: bare-LF header splitting
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",  # Case C: TE+CL
+        ]
+        up_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        up_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        up_sock.bind(("127.0.0.1", 0))
+        up_port = up_sock.getsockname()[1]
+        up_sock.listen(8)
+        up_stop = threading.Event()
+
+        def _up_loop() -> None:
+            up_sock.settimeout(0.2)
+            while not up_stop.is_set():
+                try:
+                    c, _ = up_sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                with c:
+                    c.settimeout(1.0)
+                    try:
+                        c.recv(4096)
+                    except OSError:
+                        pass
+                    if responses:
+                        payload = responses.pop(0)
+                        if payload:
+                            c.sendall(payload)
+
+        up_thread = threading.Thread(target=_up_loop, daemon=True)
+        up_thread.start()
+
+        import base64
+        p_secret = derive_proxy_password("gw-p12-tok-12345", "node0")
+        p_auth = base64.b64encode(f"node0:{p_secret}".encode("utf-8")).decode("ascii")
+        cfg = ClusterConfig(
+            cluster_name="gw-p12",
+            auth_token="gw-p12-tok-12345",
+            nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master")],
+            gateway=GatewayConfig(
+                enabled=True,
+                mode="allowlist",
+                bind_host="127.0.0.1",
+                port=0,
+                allowed_domains=["upstream.example", "nat64blocked.example"],
+                blocked_domains=["93.184.216.34"],
+                allowed_ports=[80, 443, up_port],
+            ),
+        )
+        proxy = GatewayManager(cfg)
+        audit = proxy.audit_log
+        ok_start, msg_start = proxy.start()
+        self.assertTrue(ok_start, msg_start)
+        p_port = proxy.bound_port
+        try:
+            def _send_proxy(raw: bytes) -> bytes:
+                # Inject Proxy-Authorization header before end of headers
+                head, sep, rest = raw.partition(b"\r\n\r\n")
+                authed = head + f"\r\nProxy-Authorization: Basic {p_auth}".encode("ascii") + sep + rest
+                with socket.create_connection(("127.0.0.1", p_port), timeout=3.0) as s:
+                    s.settimeout(3.0)
+                    s.sendall(authed)
+                    chunks: list[bytes] = []
+                    while True:
+                        b = s.recv(4096)
+                        if not b:
+                            break
+                        chunks.append(b)
+                    return b"".join(chunks)
+
+            # Case 0: NAT64-wrapped blocked_domains IPv4 (64:ff9b::93.184.216.34) blocked post-DNS with 403
+            with mock.patch(
+                "phonecluster.gateway.resolve_and_validate_target",
+                return_value=([(socket.AF_INET6, ("64:ff9b::5db8:d822", 80, 0, 0))], "ok"),
+            ):
+                r_nat64 = _send_proxy(
+                    b"GET http://nat64blocked.example/ HTTP/1.1\r\nHost: nat64blocked.example\r\nConnection: close\r\n\r\n"
+                )
+                self.assertTrue(r_nat64.startswith(b"HTTP/1.1 403"), f"Expected 403 on NAT64 blocked IP, got {r_nat64!r}")
+
+            with mock.patch(
+                "phonecluster.gateway.resolve_and_validate_target",
+                return_value=([(socket.AF_INET, ("127.0.0.1", up_port))], "ok"),
+            ):
+                # Case A: 0-byte upstream EOF -> 502 Bad Gateway
+                r_eof = _send_proxy(f"GET http://upstream.example:{up_port}/eof HTTP/1.1\r\nHost: upstream.example:{up_port}\r\nConnection: close\r\n\r\n".encode("ascii"))
+                self.assertTrue(r_eof.startswith(b"HTTP/1.1 502"), f"Expected 502 on EOF, got {r_eof!r}")
+
+                # Case B: bare-LF upstream header injection -> 502 Bad Gateway
+                r_lf = _send_proxy(f"GET http://upstream.example:{up_port}/lf HTTP/1.1\r\nHost: upstream.example:{up_port}\r\nConnection: close\r\n\r\n".encode("ascii"))
+                self.assertTrue(r_lf.startswith(b"HTTP/1.1 502"), f"Expected 502 on bare LF, got {r_lf!r}")
+
+                # Case C: Transfer-Encoding: gzip + Content-Length: 5 -> Content-Length stripped per RFC 9112 §6.3
+                r_tecl = _send_proxy(f"GET http://upstream.example:{up_port}/tecl HTTP/1.1\r\nHost: upstream.example:{up_port}\r\nConnection: close\r\n\r\n".encode("ascii"))
+                head_c = r_tecl.split(b"\r\n\r\n", 1)[0]
+                self.assertTrue(head_c.startswith(b"HTTP/1.1 200"))
+                self.assertNotIn(b"content-length", head_c.lower())
+                self.assertIn(b"transfer-encoding: gzip", head_c.lower())
+
+                # Case D: Malformed chunked POST body returns 400 AND logs to audit_log
+                before_cnt = len(audit.snapshot(100)["events"])
+                r_badchk = _send_proxy(
+                    f"POST http://upstream.example:{up_port}/chk HTTP/1.1\r\n"
+                    f"Host: upstream.example:{up_port}\r\n"
+                    f"Transfer-Encoding: chunked\r\n\r\n"
+                    f"ZZZZ\r\n".encode("ascii")
+                )
+                self.assertTrue(r_badchk.startswith(b"HTTP/1.1 400"), f"Expected 400, got {r_badchk!r}")
+                after_events = audit.snapshot(100)["events"]
+                self.assertGreater(len(after_events), before_cnt)
+        finally:
+            proxy.stop()
+            up_stop.set()
+            up_sock.close()
+            up_thread.join(timeout=2.0)
+
+    def test_pairing_fingerprint_mitm_rate_limit_loopback_udp_netguard_and_doctor(self) -> None:
+        from unittest import mock
+        from phonecluster.discovery import DiscoveryResponder
+        from phonecluster.doctor import run_doctor
+        from phonecluster.master import NodeSnapshot
+        from phonecluster.netguard import (
+            audit_cluster_network,
+            build_adguard_config_snippets,
+            build_firewall_guides,
+        )
+        from phonecluster.pairing import (
+            PairingBeaconResponder,
+            PairingManager,
+            StandalonePairingServer,
+            join_cluster_via_pairing,
+        )
+
+        # 1. Pairing: expected_fingerprint mismatch aborts BEFORE sending POST /api/pair/complete
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "pair_cfg.json"
+            cfg = ClusterConfig(
+                cluster_name="p12-pair",
+                auth_token="p12-master-secret-token-1234",
+                nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master")],
+            )
+            save_config(cfg, cfg_p)
+            mgr = PairingManager(
+                config=cfg,
+                config_path=cfg_p,
+                pair_port=0,
+                listen_host="127.0.0.1",
+                fail_delay_sec=0.0,
+                enable_beacon=False,
+            )
+            srv = StandalonePairingServer(("127.0.0.1", 0), mgr)
+            try:
+                mgr.pair_port = srv.server_address[1]
+                sess = mgr.open_session(ttl_sec=60, max_devices=2)
+                t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+                t.start()
+                try:
+                    with mock.patch.object(mgr, "complete_pairing", wraps=mgr.complete_pairing) as spy_complete:
+                        with self.assertRaises(RuntimeError) as ctx:
+                            join_cluster_via_pairing(
+                                master_host="127.0.0.1",
+                                pair_port=srv.server_address[1],
+                                pin=sess["pin"],
+                                config_out=Path(tmp) / "w.json",
+                                expected_fingerprint="deadbeef",
+                            )
+                        self.assertIn("fingerprint mismatch", str(ctx.exception).lower())
+                        spy_complete.assert_not_called()
+
+                    # 2. PairingManager.complete_pairing rate-limits bad-DH floods from same IP with 429
+                    saw_429 = False
+                    for _ in range(20):
+                        code, _ = mgr.complete_pairing(
+                            "10.0.0.99",
+                            {"session_id": sess["session_id"], "pub_b": "1", "client_proof": "00" * 32},
+                        )
+                        if code == 429:
+                            saw_429 = True
+                            break
+                    self.assertTrue(saw_429, "Expected 429 rate-limit on bad-DH flood")
+
+                    # 3. StandalonePairingServer.wait_active_requests waits cleanly
+                    srv.wait_active_requests(0.5)
+                finally:
+                    mgr.close_session()
+                    srv.shutdown()
+                    t.join(timeout=2.0)
+            finally:
+                srv.server_close()
+
+        # 4. PairingBeaconResponder & DiscoveryResponder bind 127.0.0.1 (never 0.0.0.0) for localhost / ::1
+        for host_in in ("localhost", "::1"):
+            pb = PairingBeaconResponder(
+                cluster_name="t",
+                pair_port=8767,
+                session_id="s1",
+                fingerprint="abcd1234",
+                expires_at=time.time() + 60.0,
+                listen_host=host_in,
+                discovery_port=0,
+            )
+            self.assertTrue(pb.bind())
+            try:
+                assert pb._sock is not None
+                self.assertEqual(pb._sock.getsockname()[0], "127.0.0.1")
+            finally:
+                pb.stop()
+
+            dr = DiscoveryResponder(
+                node_id="node0",
+                role="master",
+                worker_port=8765,
+                ssh_port=8022,
+                listen_host=host_in,
+                discovery_port=0,
+            )
+            self.assertTrue(dr.bind())
+            try:
+                assert dr._sock is not None
+                self.assertEqual(dr._sock.getsockname()[0], "127.0.0.1")
+            finally:
+                dr.stop()
+
+        # 5. Doctor: scoped worker config -> OK; duplicate worker tokens -> WARN; OverflowError / space health / unsynced temp
+        with tempfile.TemporaryDirectory() as tmp:
+            w_cfg = Path(tmp) / "worker_scoped.json"
+            save_config(
+                ClusterConfig(
+                    cluster_name="scoped",
+                    auth_token="strong-worker-token-1234567890",
+                    nodes=[NodeConfig(id="node1", host="192.168.1.201", role="worker", auth_token="strong-worker-token-1234567890")],
+                ),
+                w_cfg,
+            )
+            rep_scoped = run_doctor(w_cfg, check_remote=False)
+            tok_chk = next(c for c in rep_scoped["checks"] if c["name"] == "Per-Node Token Isolation")
+            self.assertEqual(tok_chk["status"], "ok")
+
+            dup_cfg = Path(tmp) / "dup_tok.json"
+            dup_cfg_obj = ClusterConfig(
+                cluster_name="dup",
+                auth_token="master-tok-unique-1234567890",
+                nodes=[
+                    NodeConfig(id="node0", host="192.168.1.10", role="master"),
+                    NodeConfig(id="node1", host="192.168.1.21", role="worker", auth_token="shared-worker-tok-123456"),
+                    NodeConfig(id="node2", host="192.168.1.22", role="worker", auth_token="shared-worker-tok-123456"),
+                ],
+            )
+            save_config(dup_cfg_obj, dup_cfg)
+            fake_health = {
+                "temp_c": 45.0,
+                "overheated": False,  # unsynced flag even though >= safety.max_temp_c (40.0)
+                "battery_pct": 10**400,  # would raise OverflowError on float()
+                "battery_health": "Over voltage",
+                "battery_status": "CHARGING",
+                "ready_for_jobs": True,
+            }
+            fake_snaps = [NodeSnapshot(node=dup_cfg_obj.nodes[0], online=True, health=fake_health)]
+            with mock.patch("phonecluster.doctor.MasterController.poll_health", return_value=fake_snaps):
+                rep_dup = run_doctor(dup_cfg, check_remote=True)
+            tok_dup = next(c for c in rep_dup["checks"] if c["name"] == "Per-Node Token Isolation")
+            self.assertEqual(tok_dup["status"], "warn")
+            self.assertIn("duplicate", tok_dup["detail"].lower())
+            bat_chk = next(c for c in rep_dup["checks"] if c["name"] == "Battery Hardware Health (PMIC)")
+            self.assertEqual(bat_chk["status"], "fail")
+            therm_chk = next(c for c in rep_dup["checks"] if c["name"] == "Thermal Safety")
+            self.assertEqual(therm_chk["status"], "warn")
+
+        # 6. Netguard: IPv6 YAML quoting, loopback_only skipped, UFW service ports, non-destructive nftables, empty allowlist warn
+        ng_cfg = ClusterConfig(
+            cluster_name="ng-p12",
+            auth_token="master-tok-unique-1234567890",
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master"),
+                NodeConfig(id="node1", host="fd00::21", role="worker", auth_token="dup-tok-1234567890"),
+                NodeConfig(id="node2", host="fd00::22", role="worker", auth_token="dup-tok-1234567890"),
+            ],
+        )
+        ng_cfg.network.enforce_worker_source_ip = True
+        ng_cfg.network.allowed_master_ips = []
+        snaps_ng = [
+            NodeSnapshot(node=ng_cfg.nodes[0], online=True, health={}),
+            NodeSnapshot(
+                node=ng_cfg.nodes[1],
+                online=True,
+                health={
+                    "ready_for_jobs": True,
+                    "services": {"llama_api_8081": True},
+                    "listening_ports": [{"port": 8081, "exposed": False}],
+                },
+            ),
+            NodeSnapshot(node=ng_cfg.nodes[2], online=False, health={}),
+        ]
+        host_info = {"lan_ip": "192.168.1.10", "lan_subnet": "192.168.1.0/24", "is_termux": False}
+        ag = build_adguard_config_snippets(snaps_ng, ng_cfg, host_info)
+        self.assertIn('answer: "fd00::21"', ag["rewrites_yaml"])
+        self.assertIn('answer: "192.168.1.10"', ag["rewrites_yaml"])
+        self.assertNotIn("ai.cluster", ag["rewrites_yaml"])  # loopback_only service excluded
+
+        fw = build_firewall_guides(ng_cfg, host_info)
+        nft_code = "\n".join(ln for ln in fw["nftables"].splitlines() if not ln.lstrip().startswith("#"))
+        self.assertNotIn("flush ruleset", nft_code)
+        self.assertNotIn("chain forward", nft_code)
+        self.assertIn("table inet phonecluster_master", nft_code)
+        for port_s in (
+            "port 1883 proto tcp",
+            "port 3632 proto tcp",
+            "port 8081 proto tcp",
+            "port 8123 proto tcp",
+            "port 50052 proto tcp",
+            "tailscale0",
+        ):
+            self.assertIn(port_s, fw["ufw"])
+
+        ctrl_ng = MasterController(ng_cfg)
+        offline_snaps_ng = [
+            NodeSnapshot(node=ng_cfg.nodes[0], online=True, health={}),
+            NodeSnapshot(node=ng_cfg.nodes[1], online=False, health={}),
+            NodeSnapshot(node=ng_cfg.nodes[2], online=False, health={}),
+        ]
+        with mock.patch.object(ctrl_ng, "poll_health", return_value=offline_snaps_ng):
+            audit_ng = audit_cluster_network(ctrl_ng)
+        tok_ng = next(c for c in audit_ng["checks"] if c["name"] == "Per-Worker Token Isolation")
+        self.assertEqual(tok_ng["status"], "warn")
+        self.assertIn("duplicate", tok_ng["detail"].lower())
+        ip_ng = next(c for c in audit_ng["checks"] if c["name"] == "Worker Master-IP Firewall Allowlist")
+        self.assertEqual(ip_ng["status"], "warn")
+
+    def test_dashboard_rollback_validation_tui_csi_cli_flags_and_shell_scripts(self) -> None:
+        import subprocess
+        import urllib.error
+        import urllib.request
+        from unittest import mock
+        from phonecluster.cli import main as cli_main
+        from phonecluster.dashboard import DASHBOARD_HTML, DashboardHTTPServer
+        from phonecluster.tui import Palette, _box_lines, _read_key, _visible_len
+
+        # 1. Dashboard atomic config rollback on save_config failure + hardening & settings validation
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "dash_p12.json"
+            tok = "dash-p12-secret-token-12345"
+            cfg = ClusterConfig(
+                cluster_name="dash-p12",
+                auth_token=tok,
+                nodes=[
+                    NodeConfig(id="node0", host="192.168.1.10", role="master", worker_port=59994),
+                    NodeConfig(id="node1", host="192.168.1.20", role="worker", worker_port=59993),
+                ],
+            )
+            save_config(cfg, cfg_path)
+            ctrl = MasterController(cfg)
+            dash = DashboardHTTPServer(("127.0.0.1", 0), ctrl, config_path=cfg_path, enable_pairing_beacon=False)
+            d_port = dash.server_address[1]
+            dt = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            dt.start()
+
+            def _post(path: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}{path}",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=build_auth_headers(tok),
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        return resp.status, json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as exc:
+                    try:
+                        return exc.code, json.loads(exc.read().decode("utf-8"))
+                    finally:
+                        exc.close()
+
+            try:
+                # Disk-full rollback on /api/settings, /api/nodes/add, /api/network/hardening
+                orig_temp = cfg.safety.max_temp_c
+                orig_nodes = len(cfg.nodes)
+                with mock.patch("phonecluster.dashboard.save_config", side_effect=OSError("disk full")):
+                    st_s, body_s = _post("/api/settings", {"max_temp_c": 45.0})
+                    self.assertEqual(st_s, 500)
+                    self.assertIn("Failed to persist cluster config", body_s.get("error", ""))
+                    self.assertEqual(cfg.safety.max_temp_c, orig_temp)
+
+                    st_n, _ = _post("/api/nodes/add", {"id": "node9", "host": "192.168.1.99"})
+                    self.assertEqual(st_n, 500)
+                    self.assertEqual(len(cfg.nodes), orig_nodes)
+
+                    st_h, _ = _post("/api/network/hardening", {"dashboard_require_auth": True})
+                    self.assertEqual(st_h, 500)
+                    self.assertFalse(cfg.dashboard_require_auth)
+
+                # /api/network/hardening preserves master_node.host even with 32 other IPs & rejects invalid CIDR
+                st_bad_cidr, _ = _post("/api/network/hardening", {"allowed_master_ips": ["999.999.999.999/33"]})
+                self.assertEqual(st_bad_cidr, 400)
+                many_ips = [f"10.0.0.{i}" for i in range(1, 33)]
+                with mock.patch.object(ctrl, "push_config_to_all", return_value={"ok_count": 0, "results": []}):
+                    st_many, _ = _post("/api/network/hardening", {"allowed_master_ips": many_ips})
+                self.assertEqual(st_many, 200)
+                self.assertLessEqual(len(cfg.network.allowed_master_ips), 32)
+                self.assertIn("192.168.1.10", cfg.network.allowed_master_ips)
+
+                # /api/settings blocks metadata webhook & 0 C temp, preserves current values on JSON null
+                st_meta, _ = _post("/api/settings", {"battery_webhook_url": "http://169.254.169.254/meta"})
+                self.assertEqual(st_meta, 400)
+                st_zero, _ = _post("/api/settings", {"max_temp_c": 0, "resume_temp_c": 0})
+                self.assertEqual(st_zero, 400)
+                with mock.patch.object(ctrl, "push_config_to_all", return_value={"ok_count": 0, "results": []}):
+                    st_null, _ = _post("/api/settings", {"max_temp_c": None, "resume_temp_c": None})
+                self.assertEqual(st_null, 200)
+                self.assertEqual(cfg.safety.max_temp_c, orig_temp)
+
+                # /api/services/custom rejects empty-host and out-of-range-port URLs
+                for bad_svc in ("http://", "http://127.0.0.1:99999", "ftp://127.0.0.1:21"):
+                    st_svc, _ = _post("/api/services/custom", {"name": "badsvc", "url": bad_svc})
+                    self.assertEqual(st_svc, 400)
+            finally:
+                dash.shutdown()
+                dash.server_close()
+                dt.join(timeout=2.0)
+
+        # 2. Dashboard JS hardening markers
+        self.assertIn("typeof j === 'object'", DASHBOARD_HTML)
+        self.assertIn("lastPairedKey", DASHBOARD_HTML)
+        self.assertIn("if (pairPollTimer)", DASHBOARD_HTML)
+
+        # 3. TUI drains full multi-byte CSI sequence (Ctrl+Right = \x1b[1;5C) without leaking 'C'
+        seq = iter([b"\x1b", b"[", b"1", b";", b"5", b"C"])
+        with mock.patch("phonecluster.tui.select.select", side_effect=lambda *_a, **_k: ([0], [], [])), mock.patch(
+            "phonecluster.tui.os.read", side_effect=lambda _fd, _n: next(seq)
+        ):
+            self.assertEqual(_read_key(0.05), "ESC")
+
+        pal = Palette(enabled=False)
+        box = _box_lines("A" * 120, ["body"], width=40, pal=pal)
+        for line in box:
+            self.assertLessEqual(_visible_len(line), 40)
+
+        # 4. CLI validates conflicting gateway flags and malformed join --master host
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_cli = Path(tmp) / "cli_p12.json"
+            save_config(
+                ClusterConfig(
+                    cluster_name="cli-p12",
+                    auth_token="cli-p12-tok-123456",
+                    nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master")],
+                ),
+                cfg_cli,
+            )
+            self.assertEqual(cli_main(["--config", str(cfg_cli), "gateway", "--enable", "--disable"]), 2)
+            self.assertEqual(cli_main(["--config", str(cfg_cli), "join", "--master", "[::1]junk", "--pin", "123456"]), 2)
+
+        # 5. Shell scripts & CI matrix checks
+        repo = Path(__file__).resolve().parent.parent
+        chroot_sh = (repo / "scripts" / "04_debian13_chroot_setup.sh").read_text(encoding="utf-8")
+        idx_bind = chroot_sh.index(r'mount -o bind /dev "\${CHROOT}/dev"')
+        idx_shm = chroot_sh.index(r'mkdir -p "\${CHROOT}/dev/pts" "\${CHROOT}/dev/shm"')
+        self.assertGreater(idx_shm, idx_bind)
+
+        sync_sh = (repo / "scripts" / "03_sync_cluster.sh").read_text(encoding="utf-8")
+        self.assertIn("${RDIR#??}", sync_sh)
+        self.assertIn("SCOPED_CFG", sync_sh)
+        self.assertIn(r'[ ! -s \"\$TMP\" ]', sync_sh)
+        self.assertIn("load_config", sync_sh)
+
+        install_sh = (repo / "install.sh").read_text(encoding="utf-8")
+        self.assertLess(
+            install_sh.index('git -C "${INSTALL_DIR}" pull --ff-only'),
+            install_sh.index('elif [[ ! -f "${INSTALL_DIR}/phonecluster_cli.py" ]]; then'),
+        )
+
+        termux_sh = (repo / "scripts" / "02_termux_node_setup.sh").read_text(encoding="utf-8")
+        self.assertIn("--boot-only", termux_sh)
+        self.assertIn("DEBIAN_FRONTEND=noninteractive", termux_sh)
+
+        adb_prep_sh = (repo / "scripts" / "01_adb_prep.sh").read_text(encoding="utf-8")
+        self.assertIn('${SERIAL_ARGS[@]+"${SERIAL_ARGS[@]}"}', adb_prep_sh)
+
+        pi_sh = (repo / "scripts" / "setup_pi_master.sh").read_text(encoding="utf-8")
+        self.assertIn("run_as_user()", pi_sh)
+        self.assertIn("curl -fsSL", pi_sh)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p_adb_help = subprocess.run(
+                ["bash", str(repo / "scripts" / "setup_all_via_adb.sh"), "--help"],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(p_adb_help.returncode, 0)
+            self.assertFalse((Path(tmp) / "--help").exists())
+
+        ci_yml = (repo / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn('"3.9"', ci_yml)
 
 
 if __name__ == "__main__":

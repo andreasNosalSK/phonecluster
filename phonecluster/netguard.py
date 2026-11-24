@@ -6,9 +6,12 @@ Debian 13 ARM64 chroot, unrooted Android Termux, and generic Linux hosts.
 
 from __future__ import annotations
 
+import collections
 import ipaddress
+import json
 import platform
 import shutil
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -117,11 +120,11 @@ def detect_controller_host_info(config: ClusterConfig) -> dict[str, Any]:
     lmap = _read_listening_tcp_map()
     if lmap is not None:
         adguard_local_3000 = adguard_bin and (3000 in lmap)
-        adguard_local_53 = 53 in lmap
+        adguard_local_53 = adguard_bin and (53 in lmap)
         adguard_local_80 = adguard_bin and (80 in lmap)
     else:
         adguard_local_3000 = adguard_bin and is_local_port_open(3000)
-        adguard_local_53 = is_local_port_open(53)
+        adguard_local_53 = adguard_bin and is_local_port_open(53)
         adguard_local_80 = adguard_bin and is_local_port_open(80)
 
     if is_pi:
@@ -177,20 +180,22 @@ def build_adguard_config_snippets(
     quarantined = set(config.gateway.quarantined_nodes)
     nodes_list = list(config.nodes)
     master_node = next((n for n in nodes_list if n.role == "master"), nodes_list[0])
-    master_answer = (
-        host_info.get("lan_ip") or master_node.host
-        if is_loopback_or_unspecified_host(master_node.host)
-        else master_node.host
-    )
+    master_answer = _effective_master_lan_host(master_node.host, str(host_info.get("lan_ip") or ""))
     rewrite_entries: list[tuple[str, str]] = [("master.cluster", master_answer)]
     seen_domains: set[str] = {"master.cluster"}
     for snap in snapshots:
         if snap.node.id in quarantined:
             continue
         dom = f"{snap.node.id}.cluster"
-        if dom not in seen_domains and snap.node.host:
+        raw_h = str(snap.node.host or "").strip()
+        if is_loopback_or_unspecified_host(raw_h):
+            if snap.node.role == "master" and not is_loopback_or_unspecified_host(master_answer):
+                raw_h = master_answer
+            else:
+                continue
+        if dom not in seen_domains and raw_h:
             seen_domains.add(dom)
-            rewrite_entries.append((dom, snap.node.host))
+            rewrite_entries.append((dom, raw_h))
 
     alias_map = {
         "mqtt": "mqtt.cluster",
@@ -202,10 +207,18 @@ def build_adguard_config_snippets(
         "postgres": "db.cluster",
     }
     for item in registry:
+        if item.get("loopback_only"):
+            continue
         dom = alias_map.get(item["name"])
-        if dom and item.get("host") and dom not in seen_domains:
+        raw_ih = str(item.get("host") or "").strip()
+        if is_loopback_or_unspecified_host(raw_ih):
+            if item.get("node_id") == master_node.id and not is_loopback_or_unspecified_host(master_answer):
+                raw_ih = master_answer
+            else:
+                continue
+        if dom and raw_ih and dom not in seen_domains:
             seen_domains.add(dom)
-            rewrite_entries.append((dom, item["host"]))
+            rewrite_entries.append((dom, raw_ih))
 
     yaml_lines = [
         "# Paste under `dns:` -> `rewrites:` in /opt/AdGuardHome/AdGuardHome.yaml",
@@ -213,8 +226,9 @@ def build_adguard_config_snippets(
         "rewrites:",
     ]
     for dom, ip in rewrite_entries:
-        yaml_lines.append(f"  - domain: {dom}")
-        yaml_lines.append(f"    answer: {ip}")
+        # Quote YAML scalars safely so IPv6 addresses (e.g. "fd00::1") remain valid YAML
+        yaml_lines.append(f"  - domain: {json.dumps(dom)}")
+        yaml_lines.append(f"    answer: {json.dumps(ip)}")
 
     worker_ips = [n.host for n in nodes_list if n.role != "master" and n.host]
     client_list = ", ".join(worker_ips) if worker_ips else "192.168.1.202, 192.168.1.203"
@@ -292,33 +306,46 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
         if 1 <= p <= 65535
     )
     tcp_port_list = ", ".join(str(p) for p in tcp_ports)
+    ssh_port_list = ", ".join(str(p) for p in ssh_ports)
     is_v6_subnet = ":" in subnet
     addr_match = f"ip6 saddr {subnet}" if is_v6_subnet else f"ip saddr {subnet}"
+    extra_family_lines: list[str] = []
+    if is_v6_subnet:
+        v4_lan = infer_lan_subnet(str(host_info.get("lan_ip") or ""))
+        if v4_lan and ":" not in v4_lan:
+            extra_family_lines.append(f"    # Also allow IPv4 LAN ({v4_lan}) for IPv4 SSH, workers, and UDP discovery")
+            extra_family_lines.append(f"    ip saddr {v4_lan} tcp dport {{ {tcp_port_list} }} accept")
+            extra_family_lines.append(f"    ip saddr {v4_lan} udp dport {{ 53, 8766 }} accept")
+    else:
+        extra_family_lines.append("    # Keep link-local IPv6 SSH reachable (prevents mDNS/.local SSH lockout)")
+        extra_family_lines.append(f"    ip6 saddr fe80::/10 tcp dport {{ {ssh_port_list} }} accept")
 
-    nft_rules = "\n".join(
+    nft_lines = [
+        "#!/usr/sbin/nft -f",
+        "# Hardened PhoneCluster Master Firewall (Raspberry Pi / Debian 13)",
+        f"# Allows LAN ({subnet}) + Tailscale/WireGuard ONLY; drops unsolicited WAN traffic.",
+        "# NOTE: Scoped to its own table (no `flush ruleset` / forward drop) so Docker/NAT chains stay intact.",
+        "table inet phonecluster_master",
+        "delete table inet phonecluster_master",
+        "",
+        "table inet phonecluster_master {",
+        "  chain input {",
+        "    type filter hook input priority 0; policy drop;",
+        "    iif lo accept",
+        "    ct state established,related accept",
+        "    ip protocol icmp accept",
+        "    ip6 nexthdr ipv6-icmp accept",
+        "",
+        "    # Allow Tailscale / WireGuard overlay if used",
+        '    iifname { "tailscale0", "wg0" } accept',
+        "",
+        f"    # Allow LAN ({subnet}) access to SSH, Dashboard, Worker, Pairing, Network Guard, AdGuard & Shared Services",
+        f"    {addr_match} tcp dport {{ {tcp_port_list} }} accept",
+        f"    {addr_match} udp dport {{ 53, 8766 }} accept",
+    ]
+    nft_lines.extend(extra_family_lines)
+    nft_lines.extend(
         [
-            "#!/usr/sbin/nft -f",
-            "# Hardened PhoneCluster Master Firewall (Raspberry Pi / Debian 13)",
-            f"# Allows LAN ({subnet}) + Tailscale ONLY; drops all unsolicited WAN traffic.",
-            "flush ruleset",
-            "",
-            "table inet phonecluster_master {",
-            "  chain input {",
-            "    type filter hook input priority 0; policy drop;",
-            "    iif lo accept",
-            "    ct state established,related accept",
-            "    ip protocol icmp accept",
-            "    ip6 nexthdr ipv6-icmp accept",
-            "",
-            "    # Allow Tailscale / WireGuard overlay if used",
-            '    iifname { "tailscale0", "wg0" } accept',
-            "",
-            f"    # Allow LAN ({subnet}) access to SSH, Dashboard, Worker, Pairing, Network Guard, AdGuard & Shared Services",
-            f"    {addr_match} tcp dport {{ {tcp_port_list} }} accept",
-            f"    {addr_match} udp dport {{ 53, 8766 }} accept",
-            "  }",
-            "  chain forward {",
-            "    type filter hook forward priority 0; policy drop;",
             "  }",
             "  chain output {",
             "    type filter hook output priority 0; policy accept;",
@@ -326,11 +353,15 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
             "}",
         ]
     )
+    nft_rules = "\n".join(nft_lines)
 
     ufw_lines = [
         f"# Quick UFW Hardening for Raspberry Pi / Debian 13 Master (LAN: {subnet})",
         "sudo ufw default deny incoming",
         "sudo ufw default allow outgoing",
+        "# Keep Tailscale / WireGuard overlay interfaces reachable so VPN SSH sessions never lock out",
+        "sudo ufw allow in on tailscale0 comment 'Tailscale overlay'",
+        "sudo ufw allow in on wg0 comment 'WireGuard overlay'",
     ]
     for sp in ssh_ports:
         ufw_lines.append(f"sudo ufw allow from {subnet} to any port {sp} proto tcp comment 'PhoneCluster SSH'")
@@ -344,14 +375,20 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
             f"sudo ufw allow from {subnet} to any port 53 comment 'Native AdGuard Home DNS'",
             f"sudo ufw allow from {subnet} to any port 80 proto tcp comment 'AdGuard Home Web UI'",
             f"sudo ufw allow from {subnet} to any port 3000 proto tcp comment 'AdGuard Home Setup UI'",
+            f"sudo ufw allow from {subnet} to any port 1883 proto tcp comment 'Cluster MQTT Broker'",
+            f"sudo ufw allow from {subnet} to any port 3632 proto tcp comment 'Cluster distcc'",
+            f"sudo ufw allow from {subnet} to any port 8081 proto tcp comment 'Cluster llama.cpp API'",
+            f"sudo ufw allow from {subnet} to any port 8123 proto tcp comment 'Cluster Home Assistant'",
+            f"sudo ufw allow from {subnet} to any port 50052 proto tcp comment 'Cluster llama.cpp RPC'",
             "sudo ufw enable && sudo ufw status verbose",
         ]
     )
     ufw_cmds = "\n".join(ufw_lines)
 
+    eff_master_host = _effective_master_lan_host(master_node.host, str(host_info.get("lan_ip") or ""))
     router_lines = [
         "# Home Router Firewall / Parental Control Checklist (Air-Gap Old Worker Phones)",
-        f"1. KEEP WAN ALLOWED for Master ({master_node.id}): {master_node.host}",
+        f"1. KEEP WAN ALLOWED for Master ({master_node.id}): {eff_master_host}",
         "2. BLOCK OUTBOUND & INBOUND WAN (keep LAN open!) for these worker phones:",
     ]
     if workers:
@@ -361,7 +398,7 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
         router_lines.append("   - (No worker phones added yet — pair them in Tab 6 first!)")
     router_lines.extend(
         [
-            f"3. Set your router's LAN DNS server to your AdGuard Home IP (e.g. {master_node.host}) if running AdGuard natively.",
+            f"3. Set your router's LAN DNS server to your AdGuard Home IP (e.g. {eff_master_host}) if running AdGuard natively.",
             f"4. Turn ON Master Network Guard (port {gw_port}) in Tab 5 so approved worker jobs reach allowlisted sites via Master.",
             "5. Click 'Verify Router WAN Block on Workers' in Tab 5 to confirm direct WAN is blocked!",
         ]
@@ -381,7 +418,7 @@ def apply_security_profile(config: ClusterConfig, profile: str) -> dict[str, Any
         raise ValueError("profile must be 'standard', 'airgap_workers', or 'lockdown'")
     master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
     m_host = normalize_host(master_node.host)
-    if m_host and m_host not in config.network.allowed_master_ips:
+    if m_host and not is_loopback_or_unspecified_host(m_host) and m_host not in config.network.allowed_master_ips:
         config.network.allowed_master_ips.append(m_host)
     if is_loopback_or_unspecified_host(m_host):
         lan_ip = normalize_host(detect_local_ip())
@@ -461,7 +498,10 @@ def audit_cluster_network(
 
     # 1. Per-node token isolation (20 pts)
     workers = [n for n in config.nodes if n.role != "master"]
-    if not workers or all(n.auth_token and n.auth_token != config.auth_token for n in workers):
+    tok_counts = collections.Counter(n.auth_token for n in workers if n.auth_token)
+    shared_master = [n.id for n in workers if not n.auth_token or n.auth_token == config.auth_token]
+    dup_workers = [n.id for n in workers if n.auth_token and n.auth_token != config.auth_token and tok_counts[n.auth_token] > 1]
+    if not workers or (not shared_master and not dup_workers):
         score += 20
         checks.append({
             "name": "Per-Worker Token Isolation",
@@ -470,12 +510,16 @@ def audit_cluster_network(
             "fix": "",
         })
     else:
-        shared = [n.id for n in workers if not n.auth_token or n.auth_token == config.auth_token]
+        parts: list[str] = []
+        if shared_master:
+            parts.append(f"sharing Master token: {', '.join(shared_master)}")
+        if dup_workers:
+            parts.append(f"sharing duplicate worker token: {', '.join(dup_workers)}")
         checks.append({
             "name": "Per-Worker Token Isolation",
             "status": "warn",
-            "detail": f"Worker(s) sharing Master token: {', '.join(shared)}",
-            "fix": "Re-pair via Tab 6 (`pc pair` + `pc join`) so each phone gets an isolated token.",
+            "detail": f"Worker(s) {'; '.join(parts)}",
+            "fix": "Re-pair via Tab 6 (`pc pair` + `pc join`) so each phone gets an isolated unique token.",
         })
 
     # 2. Dashboard Read-Auth Lockdown (15 pts)
@@ -504,19 +548,44 @@ def audit_cluster_network(
             if not bool((s.health if isinstance(s.health, dict) else {}).get("source_ip_allowlist_active", False))
         ]
         if unsynced:
-            score += 7
+            score += 7 if config.network.allowed_master_ips else 5
+            empty_note = " (`allowed_master_ips` is also empty)" if not config.network.allowed_master_ips else ""
             checks.append({
                 "name": "Worker Master-IP Firewall Allowlist",
                 "status": "warn",
-                "detail": f"Enabled in Master config, but not yet active on online worker(s): {', '.join(unsynced)}",
+                "detail": f"Enabled in Master config, but not yet active on online worker(s): {', '.join(unsynced)}{empty_note}",
                 "fix": "Click 'Push Live Policy to All Workers' below (or run `pc push-config`) to activate immediately without SSH.",
+            })
+        elif online_workers:
+            score += 15
+            checks.append({
+                "name": "Worker Master-IP Firewall Allowlist",
+                "status": "ok",
+                "detail": "Active — online workers reject HTTP :8765 connections from any IP except your Master.",
+                "fix": "",
+            })
+        elif not config.network.allowed_master_ips:
+            score += 5
+            checks.append({
+                "name": "Worker Master-IP Firewall Allowlist",
+                "status": "warn",
+                "detail": "Enabled in config, but `allowed_master_ips` is empty.",
+                "fix": "Add your Master LAN IP in Tab 5 and push live policy to workers.",
+            })
+        elif workers:
+            score += 7
+            checks.append({
+                "name": "Worker Master-IP Firewall Allowlist",
+                "status": "info",
+                "detail": "Enabled in Master config — awaiting online workers to verify live enforcement.",
+                "fix": "Bring worker phones online and click 'Push Live Policy to All Workers'.",
             })
         else:
             score += 15
             checks.append({
                 "name": "Worker Master-IP Firewall Allowlist",
                 "status": "ok",
-                "detail": "Active — online workers reject HTTP :8765 connections from any IP except your Master.",
+                "detail": "Configured — new workers will enforce Master-IP allowlist upon pairing/sync.",
                 "fix": "",
             })
     else:
@@ -536,7 +605,19 @@ def audit_cluster_network(
         gw_p = int(gw.port or 0)
         if gw_p > 0:
             lmap_gw = _read_listening_tcp_map()
-            gw_running = (gw_p in lmap_gw) if lmap_gw is not None else is_local_port_open(gw_p)
+            if lmap_gw is not None:
+                gw_running = gw_p in lmap_gw
+            else:
+                bind_h = normalize_host(gw.bind_host)
+                gw_running = False
+                if bind_h and not is_loopback_or_unspecified_host(bind_h):
+                    try:
+                        with socket.create_connection((bind_h, gw_p), timeout=0.25):
+                            gw_running = True
+                    except OSError:
+                        gw_running = False
+                if not gw_running:
+                    gw_running = is_local_port_open(gw_p)
         else:
             gw_running = False
     else:
@@ -614,6 +695,8 @@ def audit_cluster_network(
         config.dashboard_port,
         config.gateway.port,
     }
+    if gateway_manager is not None and gateway_manager.is_running and gateway_manager.bound_port > 0:
+        allowed_ports.add(gateway_manager.bound_port)
     for n in config.nodes:
         allowed_ports.add(n.worker_port)
         allowed_ports.add(n.ssh_port)

@@ -42,6 +42,7 @@ from .config import (
     is_loopback_or_unspecified_host,
     normalize_host,
     save_config,
+    validate_allowed_master_entry,
     validate_domain_pattern,
     validate_host,
     validate_node_id,
@@ -1305,12 +1306,23 @@ async function verifyAndSaveToken() {
     showToast('Could not reach Master to verify token: ' + e, 'bad');
   }
 }
-function clearToken() {
+function clearToken(silent) {
   sessionStorage.removeItem('pc_token');
   localStorage.removeItem('pc_token');
+  if (pairPollTimer) { clearInterval(pairPollTimer); pairPollTimer = null; }
+  const pairBox = document.getElementById('pair-active-box');
+  if (pairBox) pairBox.style.display = 'none';
+  const btnClose = document.getElementById('btn-pair-close');
+  if (btnClose) btnClose.style.display = 'none';
+  const pinEl = document.getElementById('pair-pin');
+  if (pinEl) pinEl.textContent = '------';
+  const wbEl = document.getElementById('set-webhook');
+  if (wbEl) wbEl.value = '';
   updateAuthBadge();
-  refreshAll();
-  showToast('Controls locked (Read-Only Mode).', 'neutral');
+  if (!silent) {
+    refreshAll();
+    showToast('Controls locked (Read-Only Mode).', 'neutral');
+  }
 }
 
 function scheduleRefresh() {
@@ -1503,7 +1515,16 @@ async function refreshLive() {
   try {
     const r = await apiFetch('/api/live');
     if (r.status === 401) {
+      if (getToken()) {
+        clearToken(true);
+        const pill = document.getElementById('auth-pill');
+        if (pill) { pill.textContent = '✕ Token Rejected'; pill.className = 'pill bad'; }
+      }
       document.getElementById('last-updated').textContent = 'Dashboard locked — paste auth_token above and click Unlock.';
+      const grid = document.getElementById('nodes-grid');
+      if (grid) grid.innerHTML = '<div class="card"><p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p></div>';
+      const tasks = document.getElementById('tasks-board-wrap');
+      if (tasks) tasks.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
       return;
     }
     if (!r.ok) {
@@ -1563,30 +1584,42 @@ async function refreshLive() {
     document.getElementById('k-ping').textContent = (d.avg_latency_ms ?? 0) + ' ms';
     document.getElementById('k-nodes-sub').textContent = d.nodes_online + ' online · ' + d.nodes_ready + ' ready';
 
-    // Update Terminal Target Dropdown dynamically (Smart Auto-Route + Tiers + Pools + Nodes)
+    // Update Terminal Target Dropdown dynamically only when options change and select is not open/focused
     const termSel = document.getElementById('term-target');
     const prevTerm = termSel.value;
-    let termOpts = '<option value="auto">⚡ Auto-Route by Workload (Smart Tier)</option>'
-      + '<option value="tier:1">Tier 1 · Termux Compute &amp; AI</option>'
-      + '<option value="tier:2">Tier 2 · Debian 13 Services</option>'
-      + '<option value="tier:3">Tier 3 · Docker &amp; Containers</option>'
-      + '<option value="best">Best Coolest Phone (Any Tier)</option>'
-      + '<option value="all">ALL READY PHONES (Broadcast)</option>';
+    const dynPools = [];
     const seenPools = new Set(['compute', 'services', 'docker']);
     for (const p of (d.pools || [])) {
       if (p.pool && !seenPools.has(p.pool)) {
         seenPools.add(p.pool);
-        termOpts += '<option value="pool:' + esc(p.pool) + '">Pool: ' + esc(p.pool) + '</option>';
+        dynPools.push(p.pool);
       }
     }
-    termSel.innerHTML = termOpts;
-    for (const n of d.nodes) {
-      const opt = document.createElement('option');
-      opt.value = n.id;
-      opt.textContent = n.id + ' (' + n.role + ' · T' + (n.tier || 1) + ':' + (n.pool || 'compute') + ' · ' + n.host + ')';
-      termSel.appendChild(opt);
+    const termSig = JSON.stringify([dynPools, (d.nodes || []).map(n => [n.id, n.role, n.tier || 1, n.pool || 'compute', n.host])]);
+    if (termSel.dataset.sig !== termSig && document.activeElement !== termSel) {
+      let termOpts = '<option value="auto">⚡ Auto-Route by Workload (Smart Tier)</option>'
+        + '<option value="tier:1">Tier 1 · Termux Compute &amp; AI</option>'
+        + '<option value="tier:2">Tier 2 · Debian 13 Services</option>'
+        + '<option value="tier:3">Tier 3 · Docker &amp; Containers</option>'
+        + '<option value="best">Best Coolest Phone (Any Tier)</option>'
+        + '<option value="all">ALL READY PHONES (Broadcast)</option>';
+      for (const pname of dynPools) {
+        termOpts += '<option value="pool:' + esc(pname) + '">Pool: ' + esc(pname) + '</option>';
+      }
+      termSel.innerHTML = termOpts;
+      for (const n of (d.nodes || [])) {
+        const opt = document.createElement('option');
+        opt.value = n.id;
+        opt.textContent = n.id + ' (' + n.role + ' · T' + (n.tier || 1) + ':' + (n.pool || 'compute') + ' · ' + n.host + ')';
+        termSel.appendChild(opt);
+      }
+      termSel.dataset.sig = termSig;
+      if (Array.from(termSel.options).some(o => o.value === prevTerm)) {
+        termSel.value = prevTerm;
+      } else {
+        onTermTargetChange();
+      }
     }
-    if (Array.from(termSel.options).some(o => o.value === prevTerm)) termSel.value = prevTerm;
 
     renderPoolStrip(d);
     renderNodesGrid(live);
@@ -1700,7 +1733,7 @@ function renderNodesGrid(live) {
         bodyHtml += metricBar('Battery', bat != null ? bat + '% · ' + (h.battery_status || '?') : 'N/A', bat ?? 0, batTone);
 
         // Inline running tasks badge
-        const activeJobs = Array.isArray(h.active_job_list) ? h.active_job_list : [];
+        const activeJobs = Array.isArray(h.active_job_list) ? h.active_job_list.filter(j => j && typeof j === 'object') : [];
         if (activeJobs.length) {
           bodyHtml += '<div class="chips">' + activeJobs.map(j =>
             '<span class="pill accent mono">▶ ' + esc(String(j.command ?? '').slice(0, 26)) + ' (' + esc(j.running_sec) + 's)</span>'
@@ -2532,7 +2565,28 @@ async function workloadAction(action) {
 }
 
 let pairPollTimer = null;
-let knownPairedCount = null;
+let lastPairedKey = null;
+
+function _pairedEntryKey(recents) {
+  if (!Array.isArray(recents) || !recents.length) return '';
+  const latest = recents[recents.length - 1];
+  if (!latest || typeof latest !== 'object') return '';
+  return String(latest.id || '') + '|' + String(latest.host || '') + '|' + String(latest.paired_at || recents.length);
+}
+
+function _checkNewlyPaired(recents) {
+  const key = _pairedEntryKey(recents);
+  if (lastPairedKey === null) {
+    lastPairedKey = key;
+    return;
+  }
+  if (key && key !== lastPairedKey) {
+    const latest = recents[recents.length - 1];
+    lastPairedKey = key;
+    showToast('✓ Securely paired ' + latest.id + ' (' + latest.host + ') with its own unique token!', 'ok');
+    refreshLive();
+  }
+}
 
 function renderPairingState(st) {
   const box = document.getElementById('pair-active-box');
@@ -2555,22 +2609,14 @@ function renderPairingState(st) {
     pairPollTimer = setInterval(pollPairingStatus, 1500);
   }
 
-  const recents = st.recent_paired || [];
-  if (knownPairedCount === null) {
-    knownPairedCount = recents.length;
-  } else if (recents.length > knownPairedCount) {
-    const latest = recents[recents.length - 1];
-    knownPairedCount = recents.length;
-    showToast('✓ Securely paired ' + latest.id + ' (' + latest.host + ') with its own unique token!', 'ok');
-    refreshLive();
-  }
+  _checkNewlyPaired(st.recent_paired || []);
 }
 
 async function openPairingWindow() {
   const max_devices = Number(document.getElementById('pair-slots').value || 1);
   const data = await authPost('/api/pair/open', { ttl_sec: 120, max_devices });
   if (data.error) { showToast('Could not open pairing: ' + data.error, 'bad'); return; }
-  knownPairedCount = (data.recent_paired || []).length;
+  lastPairedKey = _pairedEntryKey(data.recent_paired || []);
   renderPairingState(data);
   showToast('Pairing window open for 2 minutes! Run `pc join` on your new phone.', 'ok');
 }
@@ -2588,15 +2634,7 @@ async function pollPairingStatus() {
     const r = await apiFetch('/api/pair/status');
     if (!r.ok) return;
     const st = await r.json();
-    const recents = st.recent_paired || [];
-    if (knownPairedCount === null) {
-      knownPairedCount = recents.length;
-    } else if (recents.length > knownPairedCount) {
-      const latest = recents[recents.length - 1];
-      knownPairedCount = recents.length;
-      showToast('✓ Securely paired ' + latest.id + ' (' + latest.host + ') with its own unique token!', 'ok');
-      refreshLive();
-    }
+    _checkNewlyPaired(st.recent_paired || []);
     renderPairingState(st);
   } catch (e) {}
 }
@@ -2679,11 +2717,19 @@ async function loadSafetySettings() {
 }
 
 async function saveSafetySettings() {
+  const rawMaxT = document.getElementById('set-max-temp').value.trim();
+  const rawResT = document.getElementById('set-res-temp').value.trim();
+  const rawLowB = document.getElementById('set-bat-low').value.trim();
+  const rawHighB = document.getElementById('set-bat-high').value.trim();
+  if (!rawMaxT || !rawResT || !rawLowB || !rawHighB) {
+    showToast('Please fill in all temperature and battery threshold fields.', 'warn');
+    return;
+  }
   const payload = {
-    max_temp_c: Number(document.getElementById('set-max-temp').value),
-    resume_temp_c: Number(document.getElementById('set-res-temp').value),
-    battery_low_pct: Number(document.getElementById('set-bat-low').value),
-    battery_high_pct: Number(document.getElementById('set-bat-high').value),
+    max_temp_c: Number(rawMaxT),
+    resume_temp_c: Number(rawResT),
+    battery_low_pct: Number(rawLowB),
+    battery_high_pct: Number(rawHighB),
     battery_webhook_url: document.getElementById('set-webhook').value.trim(),
   };
   const data = await authPost('/api/settings', payload);
@@ -3143,7 +3189,27 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         return "PhoneCluster"
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        LOG.info("dashboard %s - %s", self.address_string(), format % args)
+        msg = re.sub(r"[\x00-\x1f\x7f]", "?", format % args)
+        LOG.info("dashboard %s - %s", self.address_string(), msg)
+
+    def _save_config_or_rollback(self, rollback_fn: Any) -> bool:
+        """Persist `controller.config` atomically; roll back in-memory state and return HTTP 500 JSON on failure."""
+        if self.server.config_path is None:
+            return True
+        try:
+            save_config(self.server.controller.config, self.server.config_path)
+            return True
+        except Exception as exc:
+            try:
+                rollback_fn()
+            except Exception as rb_exc:
+                LOG.error("Rollback after failed config save also failed: %s", rb_exc)
+            LOG.error("Failed to save cluster config: %s", exc)
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": f"Failed to persist cluster config: {exc}"},
+            )
+            return False
 
     def _send(self, status: int, content_type: str, raw: bytes) -> None:
         self.send_response(int(status))
@@ -3247,7 +3313,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be an object")
             return body
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, OSError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return None
 
@@ -3678,17 +3744,38 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     {"error": "service name must be 1-40 chars (letters, digits, '_' or '-')"},
                 )
                 return
-            allowed_schemes = ("http://", "https://", "mqtt://", "tcp://", "redis://", "postgresql://", "ssh://")
-            if not url or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url) or not url.startswith(allowed_schemes):
+            allowed_schemes = {"http", "https", "mqtt", "tcp", "redis", "postgresql", "ssh"}
+            url_ok = False
+            if url and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url):
+                try:
+                    p_svc = urllib.parse.urlsplit(url)
+                    svc_port = p_svc.port
+                    url_ok = (
+                        p_svc.scheme.lower() in allowed_schemes
+                        and bool(p_svc.hostname)
+                        and (svc_port is None or 1 <= svc_port <= 65535)
+                    )
+                except ValueError:
+                    url_ok = False
+            if not url_ok:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
-                    {"error": "url must start with http://, https://, mqtt://, tcp://, redis://, postgresql://, or ssh:// (no spaces/control chars)"},
+                    {"error": "url must be a valid http://, https://, mqtt://, tcp://, redis://, postgresql://, or ssh:// URL with a hostname and valid port"},
                 )
                 return
             with ctrl.config_lock:
+                prev_existed = raw_name in ctrl.config.custom_services
+                prev_val = ctrl.config.custom_services.get(raw_name)
                 ctrl.config.custom_services[raw_name] = url
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+
+                def _rb_svc_add() -> None:
+                    if prev_existed and prev_val is not None:
+                        ctrl.config.custom_services[raw_name] = prev_val
+                    else:
+                        ctrl.config.custom_services.pop(raw_name, None)
+
+                if not self._save_config_or_rollback(_rb_svc_add):
+                    return
                 custom_copy = dict(ctrl.config.custom_services)
             self._send_json(
                 HTTPStatus.OK,
@@ -3710,9 +3797,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if not matched_key:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": f"custom service '{raw_name}' not found"})
                     return
-                ctrl.config.custom_services.pop(matched_key, None)
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+                removed_val = ctrl.config.custom_services.pop(matched_key, None)
+
+                def _rb_svc_rm() -> None:
+                    if matched_key is not None and removed_val is not None:
+                        ctrl.config.custom_services[matched_key] = removed_val
+
+                if not self._save_config_or_rollback(_rb_svc_rm):
+                    return
             self._send_json(HTTPStatus.OK, {"removed": matched_key})
 
         elif path == "/api/services/probe":
@@ -3784,11 +3876,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         ctrl.gateway_port_override = None
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": msg})
                     return
+                prev_port_override = ctrl.gateway_port_override
                 ctrl.gateway_port_override = (
                     self.server.gateway_manager.bound_port if updated_gw.enabled else None
                 )
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+
+                def _rb_gw_settings() -> None:
+                    ctrl.config.gateway = prev_gw
+                    self.server.gateway_manager.sync_with_config()
+                    ctrl.gateway_port_override = prev_port_override
+
+                if not self._save_config_or_rollback(_rb_gw_settings):
+                    return
             self._send_json(HTTPStatus.OK, self.server.gateway_manager.status())
 
         elif path == "/api/gateway/logs/clear":
@@ -3802,13 +3901,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             with ctrl.config_lock:
+                prev_allowed = list(ctrl.config.gateway.allowed_domains)
+                prev_blocked = list(ctrl.config.gateway.blocked_domains)
                 if dom not in ctrl.config.gateway.allowed_domains:
                     ctrl.config.gateway.allowed_domains.append(dom)
                 ctrl.config.gateway.blocked_domains = [
                     d for d in ctrl.config.gateway.blocked_domains if d != dom
                 ]
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+
+                def _rb_allow_dom() -> None:
+                    ctrl.config.gateway.allowed_domains = prev_allowed
+                    ctrl.config.gateway.blocked_domains = prev_blocked
+
+                if not self._save_config_or_rollback(_rb_allow_dom):
+                    return
                 allowed_copy = list(ctrl.config.gateway.allowed_domains)
             self._send_json(HTTPStatus.OK, {"allowed": dom, "allowed_domains": allowed_copy})
 
@@ -3823,14 +3929,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if target_n.role == "master":
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot quarantine the master node"})
                     return
-                q_set = set(ctrl.config.gateway.quarantined_nodes)
+                prev_q = list(ctrl.config.gateway.quarantined_nodes)
+                q_set = set(prev_q)
                 if quarantine:
                     q_set.add(node_id)
                 else:
                     q_set.discard(node_id)
                 ctrl.config.gateway.quarantined_nodes = sorted(q_set)
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+
+                def _rb_quarantine() -> None:
+                    ctrl.config.gateway.quarantined_nodes = prev_q
+
+                if not self._save_config_or_rollback(_rb_quarantine):
+                    return
                 q_copy = list(ctrl.config.gateway.quarantined_nodes)
             closed_tunnels = (
                 self.server.gateway_manager.disconnect_node(node_id) if quarantine else 0
@@ -3851,6 +3962,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 prev_gw = GatewayConfig.from_dict(ctrl.config.to_dict().get("gateway"))
                 prev_req_auth = ctrl.config.dashboard_require_auth
                 prev_net = NetworkHardeningConfig.from_dict(ctrl.config.to_dict().get("network"))
+                prev_port_override = ctrl.gateway_port_override
                 try:
                     res = apply_security_profile(ctrl.config, profile)
                 except ValueError as exc:
@@ -3875,8 +3987,16 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 ctrl.gateway_port_override = (
                     self.server.gateway_manager.bound_port if ctrl.config.gateway.enabled else None
                 )
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+
+                def _rb_profile() -> None:
+                    ctrl.config.gateway = prev_gw
+                    ctrl.config.dashboard_require_auth = prev_req_auth
+                    ctrl.config.network = prev_net
+                    self.server.gateway_manager.sync_with_config()
+                    ctrl.gateway_port_override = prev_port_override
+
+                if not self._save_config_or_rollback(_rb_profile):
+                    return
             pushed = ctrl.push_config_to_all()
             self._send_json(
                 HTTPStatus.OK,
@@ -3893,13 +4013,42 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 cur_net = ctrl.config.network
                 master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
                 raw_ips = body.get("allowed_master_ips", cur_net.allowed_master_ips)
-                ips = (
-                    [str(i).strip() for i in raw_ips if i is not None and str(i).strip()]
-                    if isinstance(raw_ips, list)
-                    else list(cur_net.allowed_master_ips)
-                )
-                if master_node.host and master_node.host not in ips:
-                    ips.append(master_node.host)
+                ips: list[str] = []
+                if isinstance(raw_ips, list):
+                    seen_ips: set[str] = set()
+                    for item in raw_ips:
+                        if item is None:
+                            continue
+                        if not isinstance(item, str):
+                            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "allowed_master_ips entries must be strings"})
+                            return
+                        s_item = item.strip()
+                        if not s_item:
+                            continue
+                        try:
+                            validated_ip = validate_allowed_master_entry(s_item)
+                        except ValueError as exc:
+                            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                            return
+                        if validated_ip not in seen_ips:
+                            seen_ips.add(validated_ip)
+                            ips.append(validated_ip)
+                elif raw_ips is not None:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "allowed_master_ips must be a list"})
+                    return
+                else:
+                    ips = list(cur_net.allowed_master_ips)
+                # Ensure Master's own IP is ALWAYS preserved within the 32-entry cap (prevents self-lockout!)
+                m_host = normalize_host(master_node.host)
+                if m_host and not is_loopback_or_unspecified_host(m_host):
+                    if m_host in ips:
+                        ips = ips[:32]
+                        if m_host not in ips:
+                            ips = ips[:31] + [m_host]
+                    else:
+                        ips = ips[:31] + [m_host]
+                else:
+                    ips = ips[:32]
                 raw_ag = body.get("adguard_url", cur_net.adguard_url)
                 ag_url = str("" if raw_ag is None else raw_ag).strip()
                 if ag_url:
@@ -3925,7 +4074,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     except ValueError:
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid lan_subnet CIDR '{lan_sub}'"})
                         return
-                # Apply mutations only after ALL inputs validated cleanly
+                # Apply mutations only after ALL inputs validated cleanly, with rollback on disk save failure
+                prev_req_auth = ctrl.config.dashboard_require_auth
+                prev_net_obj = ctrl.config.network
                 ctrl.config.dashboard_require_auth = new_req_auth
                 ctrl.config.network = NetworkHardeningConfig(
                     enforce_worker_source_ip=bool(
@@ -3938,12 +4089,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         if body.get("require_signed_requests") is None
                         else body.get("require_signed_requests")
                     ),
-                    allowed_master_ips=ips[:32],
+                    allowed_master_ips=ips,
                     adguard_url=ag_url,
                     lan_subnet=lan_sub,
                 )
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+
+                def _rb_hardening() -> None:
+                    ctrl.config.dashboard_require_auth = prev_req_auth
+                    ctrl.config.network = prev_net_obj
+
+                if not self._save_config_or_rollback(_rb_hardening):
+                    return
                 resp_hardening = {
                     "saved": True,
                     "dashboard_require_auth": ctrl.config.dashboard_require_auth,
@@ -4154,8 +4310,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     notes="Added via Web Control Center",
                 )
                 ctrl.config.nodes.append(new_node)
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+                if not self._save_config_or_rollback(lambda: ctrl.config.nodes.pop()):
+                    return
             self._send_json(
                 HTTPStatus.OK,
                 {"node": {"id": new_node.id, "host": new_node.host, "tier": new_node.tier, "pool": new_node.pool}},
@@ -4217,6 +4373,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if target_node is None:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
                     return
+                prev_node_fields = (
+                    target_node.tier,
+                    target_node.pool,
+                    target_node.max_concurrency,
+                    target_node.weight,
+                    target_node.notes,
+                )
                 if new_tier is not None:
                     target_node.tier = new_tier
                 if new_pool is not None:
@@ -4227,8 +4390,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     target_node.weight = new_weight
                 if new_notes is not None:
                     target_node.notes = new_notes
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+
+                def _rb_node_upd() -> None:
+                    (
+                        target_node.tier,
+                        target_node.pool,
+                        target_node.max_concurrency,
+                        target_node.weight,
+                        target_node.notes,
+                    ) = prev_node_fields
+
+                if not self._save_config_or_rollback(_rb_node_upd):
+                    return
                 updated_rec = {
                     "id": target_node.id,
                     "tier": target_node.tier,
@@ -4255,39 +4428,60 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if len(ctrl.config.nodes) <= 1:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot remove the last remaining node in cluster"})
                     return
+                prev_nodes = list(ctrl.config.nodes)
+                prev_q_nodes = list(ctrl.config.gateway.quarantined_nodes)
                 ctrl.config.nodes = [n for n in ctrl.config.nodes if n.id != node_id]
                 if node_id in ctrl.config.gateway.quarantined_nodes:
                     ctrl.config.gateway.quarantined_nodes = [
                         q for q in ctrl.config.gateway.quarantined_nodes if q != node_id
                     ]
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+
+                def _rb_node_rm() -> None:
+                    ctrl.config.nodes = prev_nodes
+                    ctrl.config.gateway.quarantined_nodes = prev_q_nodes
+
+                if not self._save_config_or_rollback(_rb_node_rm):
+                    return
             self.server.gateway_manager.disconnect_node(node_id)
             self._send_json(HTTPStatus.OK, {"removed": node_id})
 
         elif path == "/api/settings":
             with ctrl.config_lock:
+                cur_s = ctrl.config.safety
+
+                def _set_val(k: str, fallback: Any) -> Any:
+                    v = body.get(k)
+                    return fallback if v is None else v
+
                 try:
                     updated = SafetyConfig.from_dict(
                         {
-                            "max_temp_c": body.get("max_temp_c", ctrl.config.safety.max_temp_c),
-                            "resume_temp_c": body.get("resume_temp_c", ctrl.config.safety.resume_temp_c),
-                            "min_free_ram_mb": body.get("min_free_ram_mb", ctrl.config.safety.min_free_ram_mb),
-                            "battery_low_pct": body.get("battery_low_pct", ctrl.config.safety.battery_low_pct),
-                            "battery_high_pct": body.get("battery_high_pct", ctrl.config.safety.battery_high_pct),
-                            "battery_poll_sec": ctrl.config.safety.battery_poll_sec,
-                            "webhook_cooldown_sec": ctrl.config.safety.webhook_cooldown_sec,
-                            "battery_webhook_url": body.get(
-                                "battery_webhook_url", ctrl.config.safety.battery_webhook_url
-                            ),
+                            "max_temp_c": _set_val("max_temp_c", cur_s.max_temp_c),
+                            "resume_temp_c": _set_val("resume_temp_c", cur_s.resume_temp_c),
+                            "min_free_ram_mb": _set_val("min_free_ram_mb", cur_s.min_free_ram_mb),
+                            "battery_low_pct": _set_val("battery_low_pct", cur_s.battery_low_pct),
+                            "battery_high_pct": _set_val("battery_high_pct", cur_s.battery_high_pct),
+                            "battery_poll_sec": cur_s.battery_poll_sec,
+                            "webhook_cooldown_sec": cur_s.webhook_cooldown_sec,
+                            "battery_webhook_url": _set_val("battery_webhook_url", cur_s.battery_webhook_url),
                         }
                     )
                 except (ValueError, TypeError, OverflowError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
+                if updated.battery_webhook_url and is_webhook_target_unsafe(updated.battery_webhook_url):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "webhook URL blocked by SSRF guard (link-local, cloud metadata, unspecified, or multicast targets are disallowed)"},
+                    )
+                    return
                 ctrl.config.safety = updated
-                if self.server.config_path is not None:
-                    save_config(ctrl.config, self.server.config_path)
+
+                def _rb_safety() -> None:
+                    ctrl.config.safety = cur_s
+
+                if not self._save_config_or_rollback(_rb_safety):
+                    return
             pushed = ctrl.push_config_to_all()
             self._send_json(HTTPStatus.OK, {"saved": True, "pushed": pushed})
 
@@ -4370,10 +4564,21 @@ def serve_dashboard(
     stop_event = threading.Event()
     _start_background_sampler(controller, stop_event, interval_sec=4.0)
 
-    def _handle_sigterm(signum: int, _frame: Any) -> None:
-        LOG.info("Received signal %s; shutting down Master Dashboard...", signum)
-        stop_event.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+    sigterm_event = threading.Event()
+    watcher_stop = threading.Event()
+
+    def _sigterm_watcher() -> None:
+        while not watcher_stop.is_set():
+            if sigterm_event.wait(timeout=0.25):
+                LOG.info("Received SIGTERM; shutting down Master Dashboard...")
+                stop_event.set()
+                server.shutdown()
+                return
+
+    threading.Thread(target=_sigterm_watcher, name="dashboard-sigterm", daemon=True).start()
+
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        sigterm_event.set()
 
     try:
         signal.signal(signal.SIGTERM, _handle_sigterm)
@@ -4396,5 +4601,6 @@ def serve_dashboard(
     except KeyboardInterrupt:
         pass
     finally:
+        watcher_stop.set()
         stop_event.set()
         server.server_close()

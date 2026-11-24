@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .auth import is_webhook_target_unsafe
 from .config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SSH_PORT,
@@ -71,7 +72,7 @@ def run_setup_wizard(
     os_env = detect_os_environment()
     mem = read_memory_info()
     user = os.environ.get("USER", "")
-    default_ssh_port = 8022 if os_env == "termux" else 22
+    default_ssh_port = DEFAULT_SSH_PORT if os_env == "termux" else 22
 
     print("=" * 60)
     print("  PhoneCluster Guided Setup Wizard")
@@ -102,7 +103,7 @@ def run_setup_wizard(
     ssh_port = (
         int(ssh_port_str)
         if ssh_port_str.isascii() and ssh_port_str.isdigit() and 1 <= int(ssh_port_str) <= 65535
-        else DEFAULT_SSH_PORT
+        else default_ssh_port
     )
 
     nodes: list[NodeConfig] = [
@@ -216,6 +217,8 @@ def run_setup_wizard(
                 "battery_webhook_url": webhook,
             }
         )
+        if safety_cfg.battery_webhook_url and is_webhook_target_unsafe(safety_cfg.battery_webhook_url):
+            raise ValueError("webhook target IP/host is not allowed")
     except ValueError as exc:
         print(f"  (Invalid webhook URL ignored: {exc})")
         safety_cfg = SafetyConfig(max_temp_c=max_temp, resume_temp_c=resume_temp, battery_webhook_url="")
@@ -285,20 +288,21 @@ def run_interactive_menu(
         if choice == "0":
             print("Goodbye!")
             return 0
-        elif choice == "9":
-            run_setup_wizard(cfg_path, input_fn=input_fn)
-            continue
-        elif choice == "6":
-            report = run_doctor(cfg_path)
-            _print_doctor_report(report)
-            continue
-
-        if not cfg_path.exists():
-            print(f"\nNo config found at '{cfg_path}'. Let's run the Setup Wizard first!")
-            run_setup_wizard(cfg_path, input_fn=input_fn)
-            continue
 
         try:
+            if choice == "9":
+                run_setup_wizard(cfg_path, input_fn=input_fn)
+                continue
+            elif choice == "6":
+                report = run_doctor(cfg_path)
+                _print_doctor_report(report)
+                continue
+
+            if not cfg_path.exists():
+                print(f"\nNo config found at '{cfg_path}'. Let's run the Setup Wizard first!")
+                run_setup_wizard(cfg_path, input_fn=input_fn)
+                continue
+
             if choice == "5":
                 cfg = load_config(cfg_path)
                 run_cli_pairing_host(cfg, cfg_path, port=DEFAULT_PAIR_PORT, ttl_sec=120, max_devices=1)
@@ -323,13 +327,14 @@ def run_interactive_menu(
                     if o.error:
                         print(f"ERROR: {o.error}", file=sys.stderr)
             elif choice == "4":
+                cli_entry = Path(__file__).resolve().parent.parent / "phonecluster_cli.py"
+                cli_cmd = [sys.executable, str(cli_entry)] if cli_entry.is_file() else [sys.executable, "-m", "phonecluster.cli"]
                 script = _prompt("Local script path (e.g. examples/sample_job.py, or blank to use a commands file)", "", input_fn=input_fn)
                 if script:
                     args_file = _prompt("Arguments file (one arg list per line)", "examples/sample_args.txt", input_fn=input_fn)
                     subprocess.run(
-                        [
-                            sys.executable,
-                            str(Path(__file__).resolve().parent.parent / "phonecluster_cli.py"),
+                        cli_cmd
+                        + [
                             "--config",
                             str(cfg_path),
                             "map",
@@ -344,9 +349,8 @@ def run_interactive_menu(
                     jobs_file = _prompt("Jobs file path (one shell command per line)", "", input_fn=input_fn)
                     if jobs_file:
                         subprocess.run(
-                            [
-                                sys.executable,
-                                str(Path(__file__).resolve().parent.parent / "phonecluster_cli.py"),
+                            cli_cmd
+                            + [
                                 "--config",
                                 str(cfg_path),
                                 "map",

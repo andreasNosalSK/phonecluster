@@ -7,6 +7,7 @@ set -euo pipefail
 NODE_ID=""
 IS_MASTER=0
 WITH_COMPUTE=0
+BOOT_ONLY=0
 REPO_DIR="${HOME}/phonecluster"
 
 usage() {
@@ -17,6 +18,7 @@ Options:
   --node-id <id>   Node ID from config/cluster.json (required, e.g. node0)
   --master         Also auto-start the Master Web Dashboard on boot
   --with-compute   Install optional compiler/HPC tools (clang, cmake, distcc, openmpi, htop)
+  --boot-only      Only regenerate ~/.termux/boot/00-start-cluster.sh (skip pkg/passwd; works offline!)
   --repo-dir <dir> Path where PhoneCluster lives on this phone (default: ~/phonecluster)
 EOF
 }
@@ -28,6 +30,7 @@ while [[ $# -gt 0 ]]; do
       NODE_ID="$2"; shift 2 ;;
     --master) IS_MASTER=1; shift ;;
     --with-compute) WITH_COMPUTE=1; shift ;;
+    --boot-only) BOOT_ONLY=1; shift ;;
     --repo-dir)
       [[ $# -ge 2 ]] || { echo "Error: --repo-dir requires a directory path" >&2; usage; exit 2; }
       REPO_DIR="$2"; shift 2 ;;
@@ -47,7 +50,15 @@ if [[ ! "${NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
   exit 2
 fi
 
-if [[ "${REPO_DIR}" == *$'\n'* || "${REPO_DIR}" == *'"'* || "${REPO_DIR}" == *'$'* || "${REPO_DIR}" == *'`'* || "${REPO_DIR}" == *'\'* ]]; then
+# Canonicalize relative or ~/ repo paths to absolute paths so Termux:Boot works from any cwd
+case "${REPO_DIR}" in
+  '~') REPO_DIR="${HOME}" ;;
+  '~/'*) REPO_DIR="${HOME}/${REPO_DIR#??}" ;;
+  /*) ;;
+  *) REPO_DIR="${PWD}/${REPO_DIR#./}" ;;
+esac
+
+if [[ "${REPO_DIR}" == *$'\n'* || "${REPO_DIR}" == *'"'* || "${REPO_DIR}" == *'$'* || "${REPO_DIR}" == *'`'* || "${REPO_DIR}" == *'\'* || "${REPO_DIR}" == *'}'* ]]; then
   echo "Error: Unsupported special characters in --repo-dir '${REPO_DIR}'." >&2
   exit 2
 fi
@@ -56,28 +67,31 @@ if [[ "${PREFIX:-}" != *"com.termux"* ]]; then
   echo "Warning: This script is intended for Termux on Android (PREFIX does not look like Termux)." >&2
 fi
 
-echo "[1/4] Updating Termux packages and installing core cluster dependencies..."
-pkg update -y
-pkg upgrade -y
-pkg install -y openssh termux-api python jq tmux git
+if [[ "${BOOT_ONLY}" -eq 0 ]]; then
+  echo "[1/4] Updating Termux packages and installing core cluster dependencies..."
+  export DEBIAN_FRONTEND=noninteractive
+  pkg update -y
+  pkg upgrade -y -o Dpkg::Options::="--force-confold"
+  pkg install -y openssh termux-api python jq tmux git
 
-if [[ "${WITH_COMPUTE}" -eq 1 ]]; then
-  echo "[1b/4] Installing native ARM64 compute & compiler toolchain..."
-  pkg install -y clang cmake make distcc openmpi htop
-fi
-
-echo "[2/4] Ensuring SSH daemon (port 8022) is ready..."
-mkdir -p "${HOME}/.ssh"
-chmod 700 "${HOME}/.ssh"
-if [[ ! -s "${HOME}/.ssh/authorized_keys" ]]; then
-  if (exec < /dev/tty) 2>/dev/null; then
-    echo "Set an SSH password for initial login from your Master phone / PC:"
-    passwd < /dev/tty || echo "Warning: passwd did not complete — run 'passwd' manually or pair via 'pc join'." >&2
-  else
-    echo "Note: Non-interactive shell — run 'passwd' manually in Termux if you need SSH password login." >&2
+  if [[ "${WITH_COMPUTE}" -eq 1 ]]; then
+    echo "[1b/4] Installing native ARM64 compute & compiler toolchain..."
+    pkg install -y clang cmake make distcc openmpi htop
   fi
+
+  echo "[2/4] Ensuring SSH daemon (port 8022) is ready..."
+  mkdir -p "${HOME}/.ssh"
+  chmod 700 "${HOME}/.ssh"
+  if [[ ! -s "${HOME}/.ssh/authorized_keys" ]]; then
+    if (exec < /dev/tty) 2>/dev/null; then
+      echo "Set an SSH password for initial login from your Master phone / PC:"
+      passwd < /dev/tty || echo "Warning: passwd did not complete — run 'passwd' manually or pair via 'pc join'." >&2
+    else
+      echo "Note: Non-interactive shell — run 'passwd' manually in Termux if you need SSH password login." >&2
+    fi
+  fi
+  pgrep -x sshd >/dev/null 2>&1 || sshd
 fi
-pgrep -x sshd >/dev/null 2>&1 || sshd
 
 echo "[3/4] Creating ~/.termux/boot/00-start-cluster.sh for automatic startup on reboot..."
 mkdir -p "${HOME}/.termux/boot" "${REPO_DIR}/logs"

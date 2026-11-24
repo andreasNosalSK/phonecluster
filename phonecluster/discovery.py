@@ -79,12 +79,12 @@ def _detect_ipv4_via_sys_net() -> str | None:
 
 def detect_local_ip() -> str:
     """Best-effort detection of this device's LAN IPv4 address (works even on air-gapped LANs)."""
-    for probe_ip in ("192.0.2.1", "192.168.0.1", "10.255.255.255", "172.16.0.1"):
+    for probe_ip in ("192.0.2.1", "192.168.0.1", "10.0.0.1", "172.16.0.1"):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.connect((probe_ip, 80))
             ip = sock.getsockname()[0]
-            if ip and not ip.startswith(("127.", "169.254.")):
+            if ip and not ip.startswith(("127.", "169.254.", "0.")):
                 return ip
         except OSError:
             pass
@@ -174,6 +174,8 @@ class DiscoveryResponder(threading.Thread):
         lh = normalize_host(self.listen_host)
         if lh and ":" not in lh and lh.startswith("127."):
             bind_addr = lh
+        elif lh and (lh.lower().rstrip(".") == "localhost" or lh == "::1"):
+            bind_addr = "127.0.0.1"
         else:
             bind_addr = "0.0.0.0"
         try:
@@ -215,6 +217,8 @@ class DiscoveryResponder(threading.Thread):
                 except socket.timeout:
                     continue
                 except OSError:
+                    break
+                if self._stop_event.is_set():
                     break
                 if not addr or addr[1] <= 0:
                     continue
@@ -337,7 +341,7 @@ def discover_lan_nodes(
                 if not (1 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
                     continue
                 cpu_cores = max(1, min(1024, raw_cores))
-                mem_total_mb = max(0, raw_mem)
+                mem_total_mb = max(0, min(16 * 1024 * 1024, raw_mem))
                 host_ip = str(addr[0])
                 key_pair = (host_ip, worker_port)
                 if key_pair not in found and len(found) < _MAX_DISCOVERED_NODES and per_ip_count.get(host_ip, 0) < 8:

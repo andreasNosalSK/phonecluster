@@ -197,6 +197,34 @@ DEFAULT_GATEWAY_ALLOWED_DOMAINS: list[str] = [
 ]
 
 
+def _validate_auth_token(raw: str, field_name: str, allow_empty: bool = False) -> str:
+    """Validate an auth token contains only printable ASCII without whitespace/CRLF."""
+    tok = raw.strip()
+    if not tok:
+        if allow_empty:
+            return ""
+        raise ValueError(
+            "Configuration must define a non-empty 'auth_token'. "
+            "Run `phonecluster init-config` to generate one."
+        )
+    if any(c.isspace() or ord(c) < 32 or ord(c) >= 127 for c in tok):
+        raise ValueError(f"{field_name} must contain only printable ASCII characters without whitespace")
+    return tok
+
+
+def validate_allowed_master_entry(raw: str) -> str:
+    """Validate an entry in `network.allowed_master_ips` (IP, CIDR, or safe hostname)."""
+    entry = str(raw or "").strip()
+    if not entry or any(c.isspace() or ord(c) < 32 or ord(c) >= 127 for c in entry):
+        raise ValueError(f"Invalid allowed_master_ips entry {raw!r}")
+    if "/" in entry:
+        try:
+            return str(ipaddress.ip_network(entry, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"Invalid allowed_master_ips CIDR {raw!r}") from exc
+    return validate_host(entry)
+
+
 @dataclass
 class NodeConfig:
     """Configuration for a single phone or Linux node in the cluster."""
@@ -242,8 +270,8 @@ class NodeConfig:
         if not (1 <= ssh_port <= 65535):
             raise ValueError(f"ssh_port must be 1..65535 for node '{node_id}'")
         max_conc = _parse_int_field(data.get("max_concurrency"), 2, f"max_concurrency for '{node_id}'")
-        if max_conc < 1:
-            raise ValueError(f"max_concurrency must be >= 1 for node '{node_id}'")
+        if not (1 <= max_conc <= 32):
+            raise ValueError(f"max_concurrency must be between 1 and 32 for node '{node_id}'")
         weight = _parse_float_field(data.get("weight"), 1.0, f"weight for '{node_id}'")
         if weight <= 0:
             raise ValueError(f"weight must be a finite number > 0 for node '{node_id}'")
@@ -263,6 +291,7 @@ class NodeConfig:
         raw_tok = data.get("auth_token")
         if raw_tok is not None and not isinstance(raw_tok, str):
             raise ValueError(f"auth_token for node '{node_id}' must be a string")
+        node_tok = _validate_auth_token(raw_tok or "", f"auth_token for node '{node_id}'", allow_empty=True)
         return cls(
             id=node_id,
             host=host,
@@ -276,7 +305,7 @@ class NodeConfig:
             pool=pool,
             tags=tags,
             notes=str(data.get("notes") or ""),
-            auth_token=(raw_tok or "").strip(),
+            auth_token=node_tok,
         )
 
 
@@ -308,8 +337,10 @@ class SafetyConfig:
             webhook_cooldown_sec=_parse_int_field(data.get("webhook_cooldown_sec"), 900, "safety.webhook_cooldown_sec"),
             battery_webhook_url=(raw_wb or ""),
         )
-        if cfg.resume_temp_c > cfg.max_temp_c:
-            raise ValueError("safety.resume_temp_c must be <= safety.max_temp_c")
+        if not (10.0 <= cfg.resume_temp_c <= cfg.max_temp_c <= 100.0):
+            raise ValueError(
+                "safety temperature thresholds must satisfy 10.0 <= resume_temp_c <= max_temp_c <= 100.0"
+            )
         if cfg.min_free_ram_mb < 0 or cfg.battery_poll_sec < 1 or cfg.webhook_cooldown_sec < 0:
             raise ValueError("safety min_free_ram_mb/webhook_cooldown_sec must be >= 0 and battery_poll_sec >= 1")
         if not (0 <= cfg.battery_low_pct < cfg.battery_high_pct <= 100):
@@ -455,11 +486,23 @@ class NetworkHardeningConfig:
         if not isinstance(data, dict):
             return cls()
         raw_ips = data.get("allowed_master_ips")
-        ips = (
-            [str(ip).strip() for ip in raw_ips if isinstance(ip, str) and ip.strip()][:32]
-            if isinstance(raw_ips, list)
-            else []
-        )
+        ips: list[str] = []
+        if isinstance(raw_ips, list):
+            seen_ips: set[str] = set()
+            for ip in raw_ips:
+                if ip is None:
+                    continue
+                if not isinstance(ip, str):
+                    raise ValueError("network.allowed_master_ips entries must be strings")
+                cleaned = ip.strip()
+                if not cleaned:
+                    continue
+                validated = validate_allowed_master_entry(cleaned)
+                if validated not in seen_ips:
+                    seen_ips.add(validated)
+                    ips.append(validated)
+                if len(ips) >= 32:
+                    break
         raw_ag = data.get("adguard_url")
         if raw_ag is not None and not isinstance(raw_ag, str):
             raise ValueError("network.adguard_url must be a string")
@@ -525,12 +568,9 @@ class ClusterConfig:
                 raise ValueError(f"Duplicate node id '{node.id}' in configuration.")
             seen_ids.add(node.id)
         raw_token = data.get("auth_token")
-        token = raw_token.strip() if isinstance(raw_token, str) else ""
-        if not token:
-            raise ValueError(
-                "Configuration must define a non-empty 'auth_token'. "
-                "Run `phonecluster init-config` to generate one."
-            )
+        if raw_token is not None and not isinstance(raw_token, str):
+            raise ValueError("Configuration 'auth_token' must be a string.")
+        token = _validate_auth_token(raw_token or "", "auth_token", allow_empty=False)
         raw_safety = data.get("safety")
         safety = SafetyConfig.from_dict(raw_safety if isinstance(raw_safety, dict) else {})
         gateway = GatewayConfig.from_dict(data.get("gateway"))

@@ -93,12 +93,25 @@ if [[ "${DIR_EXPLICIT}" -eq 0 && -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/phonecl
   INSTALL_DIR="${SCRIPT_DIR}"
 fi
 
-if [[ "${INSTALL_DIR}" == *$'\n'* || "${INSTALL_DIR}" == *'"'* || "${INSTALL_DIR}" == *'$'* || "${INSTALL_DIR}" == *'`'* || "${INSTALL_DIR}" == *'\'* ]]; then
+# Canonicalize relative or ~/ install paths to absolute paths so global `pc` wrapper works from any cwd
+case "${INSTALL_DIR}" in
+  '~') INSTALL_DIR="${HOME}" ;;
+  '~/'*) INSTALL_DIR="${HOME}/${INSTALL_DIR#??}" ;;
+  /*) ;;
+  *) INSTALL_DIR="${PWD}/${INSTALL_DIR#./}" ;;
+esac
+
+if [[ "${INSTALL_DIR}" == *$'\n'* || "${INSTALL_DIR}" == *'"'* || "${INSTALL_DIR}" == *'$'* || "${INSTALL_DIR}" == *'`'* || "${INSTALL_DIR}" == *'\'* || "${INSTALL_DIR}" == *'}'* ]]; then
   echo "Error: Unsupported special characters in install directory '${INSTALL_DIR}'." >&2
   exit 2
 fi
 
-if [[ ! -f "${INSTALL_DIR}/phonecluster_cli.py" ]]; then
+if [[ -d "${INSTALL_DIR}/.git" ]]; then
+  if command -v git >/dev/null 2>&1; then
+    echo "Existing installation found at ${INSTALL_DIR} — updating..."
+    git -C "${INSTALL_DIR}" pull --ff-only || echo "Warning: git pull skipped (local changes or offline?)."
+  fi
+elif [[ ! -f "${INSTALL_DIR}/phonecluster_cli.py" ]]; then
   if ! command -v git >/dev/null 2>&1; then
     if [[ "${IS_TERMUX}" -eq 1 ]]; then
       echo "Installing git in Termux..."
@@ -108,13 +121,8 @@ if [[ ! -f "${INSTALL_DIR}/phonecluster_cli.py" ]]; then
       exit 1
     fi
   fi
-  if [[ -d "${INSTALL_DIR}/.git" ]]; then
-    echo "Existing installation found at ${INSTALL_DIR} — updating..."
-    git -C "${INSTALL_DIR}" pull --ff-only || echo "Warning: git pull skipped (local changes?)."
-  else
-    echo "Cloning PhoneCluster into ${INSTALL_DIR}..."
-    git clone "${REPO_URL}" "${INSTALL_DIR}"
-  fi
+  echo "Cloning PhoneCluster into ${INSTALL_DIR}..."
+  git clone "${REPO_URL}" "${INSTALL_DIR}"
 fi
 
 echo "Install path : ${INSTALL_DIR}"

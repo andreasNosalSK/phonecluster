@@ -117,15 +117,16 @@ printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > "${CHROOT_DIR}/etc/resolv.co
 grep -q "^aid_inet:" "${CHROOT_DIR}/etc/group" || echo "aid_inet:x:3003:root" >> "${CHROOT_DIR}/etc/group"
 grep -q "^aid_net_raw:" "${CHROOT_DIR}/etc/group" || echo "aid_net_raw:x:3004:root" >> "${CHROOT_DIR}/etc/group"
 
-# Create mount + enter helper scripts
+# Create mount + enter helper scripts (create dev/pts & dev/shm AFTER bind-mounting /dev since Android /dev lacks /dev/shm!)
 cat > /data/local/linux/mount_debian13.sh <<EOF
 #!/system/bin/sh
 set -e
 CHROOT="${CHROOT_DIR}"
-mkdir -p "\${CHROOT}/dev/pts" "\${CHROOT}/dev/shm" "\${CHROOT}/proc" "\${CHROOT}/sys"
+mkdir -p "\${CHROOT}/proc" "\${CHROOT}/sys" "\${CHROOT}/dev"
 mountpoint -q "\${CHROOT}/proc"    || mount -t proc proc "\${CHROOT}/proc"
 mountpoint -q "\${CHROOT}/sys"     || mount -t sysfs sysfs "\${CHROOT}/sys"
 mountpoint -q "\${CHROOT}/dev"     || mount -o bind /dev "\${CHROOT}/dev"
+mkdir -p "\${CHROOT}/dev/pts" "\${CHROOT}/dev/shm"
 mountpoint -q "\${CHROOT}/dev/pts" || mount -t devpts devpts "\${CHROOT}/dev/pts"
 mountpoint -q "\${CHROOT}/dev/shm" || mount -t tmpfs -o size=256M tmpfs "\${CHROOT}/dev/shm"
 EOF

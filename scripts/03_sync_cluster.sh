@@ -49,21 +49,23 @@ if [[ "${SETUP_KEYS}" -eq 1 && ! -f "${HOME}/.ssh/id_ed25519" ]]; then
   ssh-keygen -t ed25519 -N "" -f "${HOME}/.ssh/id_ed25519"
 fi
 
-# Extract node list cleanly via stdlib Python (pipe-delimited so empty ssh_user never collapses under IFS whitespace!)
-NODES_PSV="$(python3 - "${CONFIG_PATH}" <<'PY'
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    cfg = json.load(fh)
-for n in cfg["nodes"]:
+# Extract & strictly validate node list via phonecluster.config (blocks SSH option injection & normalizes role casing)
+NODES_PSV="$(python3 - "${CONFIG_PATH}" "${REPO_ROOT}" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[2])
+from phonecluster.config import load_config
+
+cfg = load_config(sys.argv[1])
+for n in cfg.nodes:
     fields = [
-        str(n["id"]),
-        str(n["host"]),
-        str(n.get("ssh_port", 8022)),
-        str(n.get("ssh_user") or ""),
-        str(n.get("role") or "worker"),
+        n.id,
+        n.host,
+        str(n.ssh_port),
+        n.ssh_user,
+        n.role,
     ]
     if any("|" in f or "\n" in f or "\r" in f for f in fields):
-        raise SystemExit(f"Invalid control/delimiter character in node entry: {n.get('id')}")
+        raise SystemExit(f"Invalid control/delimiter character in node entry: {n.id}")
     print("|".join(fields))
 PY
 )"
@@ -88,28 +90,26 @@ while IFS='|' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE <&3; do
   SQ_RDIR="$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "${REMOTE_DIR}")"
   SQ_NID="$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "${NODE_ID}")"
 
-  # Stream project code via tar over SSH (without shipping Master's full cluster.json to workers)
+  # Stream project code via tar over SSH (uses POSIX-portable ${RDIR#??} inside '~/'* case arm for dash/ash/mksh/Bash!)
   tar -C "${REPO_ROOT}" -cf - \
     phonecluster \
     phonecluster_cli.py \
     scripts \
     examples \
     | ssh -p "${SSH_PORT}" -- "${TARGET}" \
-      "set -eu; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#'~/'}\" ;; esac; mkdir -p \"\$RDIR/config\" \"\$RDIR/logs\"; tar -xf - -C \"\$RDIR\""
+      "set -eu; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#??}\" ;; esac; mkdir -p \"\$RDIR/config\" \"\$RDIR/logs\"; tar -xf - -C \"\$RDIR\""
 
-  # Push least-privilege scoped config atomically (0600, workers ONLY receive their own node token)
-  python3 - "${CONFIG_PATH}" "${NODE_ID}" "${ROLE}" <<'PY' \
-    | ssh -p "${SSH_PORT}" -- "${TARGET}" \
-      "set -eu; umask 077; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#'~/'}\" ;; esac; TMP=\"\$RDIR/config/.cluster.json.tmp.\$\$\"; cat > \"\$TMP\"; chmod 600 \"\$TMP\"; mv -f \"\$TMP\" \"\$RDIR/config/cluster.json\""
+  # Build scoped config locally FIRST so a Python failure NEVER truncates remote config/cluster.json to 0 bytes
+  SCOPED_CFG="$(python3 - "${CONFIG_PATH}" "${NODE_ID}" "${ROLE}" <<'PY'
 import json, socket, sys
-cfg_path, node_id, role = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg_path, node_id, role = sys.argv[1], sys.argv[2], sys.argv[3].strip().lower()
 with open(cfg_path, "r", encoding="utf-8") as fh:
     cfg = json.load(fh)
 if role == "master":
     out = cfg
 else:
     node = next(n for n in cfg["nodes"] if n["id"] == node_id)
-    master = next((n for n in cfg["nodes"] if n.get("role") == "master"), cfg["nodes"][0])
+    master = next((n for n in cfg["nodes"] if str(n.get("role") or "").strip().lower() == "master"), cfg["nodes"][0])
     tok = node.get("auth_token") or cfg["auth_token"]
     scoped_node = dict(node)
     scoped_node["auth_token"] = tok
@@ -146,6 +146,14 @@ else:
     }
 print(json.dumps(out, indent=2))
 PY
+)"
+  if [[ -z "${SCOPED_CFG}" ]]; then
+    echo "Error: Failed to build scoped config for '${NODE_ID}'." >&2
+    exit 1
+  fi
+  printf '%s\n' "${SCOPED_CFG}" \
+    | ssh -p "${SSH_PORT}" -- "${TARGET}" \
+      "set -eu; umask 077; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#??}\" ;; esac; TMP=\"\$RDIR/config/.cluster.json.tmp.\$\$\"; cat > \"\$TMP\"; if [ ! -s \"\$TMP\" ]; then rm -f \"\$TMP\"; exit 1; fi; chmod 600 \"\$TMP\"; mv -f \"\$TMP\" \"\$RDIR/config/cluster.json\""
 
   # Restart worker daemon cleanly on remote node (arguments pre-quoted via shlex.quote so spaces/metachars stay literal)
   ssh -p "${SSH_PORT}" -- "${TARGET}" "bash -s -- ${SQ_NID} ${SQ_RDIR}" <<'REMOTE'
@@ -153,7 +161,7 @@ set -euo pipefail
 NODE_ID="$1"
 case "$2" in
   '~') REMOTE_DIR="$HOME" ;;
-  '~/'*) REMOTE_DIR="$HOME/${2#'~/'}" ;;
+  '~/'*) REMOTE_DIR="$HOME/${2#??}" ;;
   *) REMOTE_DIR="$2" ;;
 esac
 LOG_DIR="${REMOTE_DIR}/logs"

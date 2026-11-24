@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import math
@@ -30,6 +31,9 @@ _MULTI_LABEL_HOST_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
 )
 _NAT64_WELL_KNOWN_NET = ipaddress.IPv6Network("64:ff9b::/96")
+_SIIT_TRANSLATED_NET = ipaddress.IPv6Network("::ffff:0:0:0/96")
+_IPV4_THIS_NET = ipaddress.IPv4Network("0.0.0.0/8")
+_IPV4_CGNAT_NET = ipaddress.IPv4Network("100.64.0.0/10")
 _LOCAL_HOST_SUFFIXES = (
     ".local",
     ".lan",
@@ -184,16 +188,44 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _sanitize_json_value(obj: Any) -> Any:
-    """Recursively replace non-finite floats (NaN/Infinity) with None for RFC 8259 JSON compliance."""
+    """Iteratively replace non-finite floats (NaN/Infinity) with None for RFC 8259 JSON compliance."""
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
-    if isinstance(obj, dict):
-        return {k: _sanitize_json_value(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize_json_value(v) for v in obj]
-    if isinstance(obj, tuple):
-        return [_sanitize_json_value(v) for v in obj]
-    return obj
+    if not isinstance(obj, (dict, list, tuple)):
+        return obj
+    root: Any = {} if isinstance(obj, dict) else []
+    stack: list[tuple[Any, Any]] = [(obj, root)]
+    while stack:
+        src, dst = stack.pop()
+        if isinstance(src, dict):
+            for k, v in src.items():
+                if isinstance(v, float):
+                    dst[k] = v if math.isfinite(v) else None
+                elif isinstance(v, dict):
+                    child_d: dict[Any, Any] = {}
+                    dst[k] = child_d
+                    stack.append((v, child_d))
+                elif isinstance(v, (list, tuple)):
+                    child_l: list[Any] = []
+                    dst[k] = child_l
+                    stack.append((v, child_l))
+                else:
+                    dst[k] = v
+        else:
+            for v in src:
+                if isinstance(v, float):
+                    dst.append(v if math.isfinite(v) else None)
+                elif isinstance(v, dict):
+                    child_d = {}
+                    dst.append(child_d)
+                    stack.append((v, child_d))
+                elif isinstance(v, (list, tuple)):
+                    child_l = []
+                    dst.append(child_l)
+                    stack.append((v, child_l))
+                else:
+                    dst.append(v)
+    return root
 
 
 def safe_json_dumps(obj: Any) -> str:
@@ -204,19 +236,55 @@ def safe_json_dumps(obj: Any) -> str:
         return json.dumps(_sanitize_json_value(obj), allow_nan=False)
 
 
+def _embedded_ipv4s(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
+    """Return any embedded IPv4 addresses carried inside mapped/NAT64/SIIT/6to4/Teredo IPv6 addresses."""
+    out: list[ipaddress.IPv4Address] = []
+    if isinstance(addr, ipaddress.IPv4Address):
+        return [addr]
+    if addr.ipv4_mapped is not None:
+        out.append(addr.ipv4_mapped)
+    if addr.sixtofour is not None:
+        out.append(addr.sixtofour)
+    if addr.teredo is not None:
+        out.extend(addr.teredo)
+    if addr in _NAT64_WELL_KNOWN_NET or addr in _SIIT_TRANSLATED_NET:
+        out.append(ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF))
+    return out
+
+
 def _is_webhook_ip_disallowed(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Return True if an IP (or mapped/NAT64-embedded IPv4) is link-local/metadata, unspecified, or multicast."""
+    """Return True if an IP (or mapped/NAT64/SIIT/6to4/Teredo IPv4) is link-local/metadata, 0/8, site-local, or multicast."""
     if isinstance(addr, ipaddress.IPv6Address):
-        if addr.ipv4_mapped is not None:
-            return _is_webhook_ip_disallowed(addr.ipv4_mapped)
-        if addr in _NAT64_WELL_KNOWN_NET:
-            embedded_v4 = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
-            return _is_webhook_ip_disallowed(embedded_v4)
+        if getattr(addr, "is_site_local", False):
+            return True
+        for v4 in _embedded_ipv4s(addr):
+            if _is_webhook_ip_disallowed(v4):
+                return True
+    elif addr in _IPV4_THIS_NET:
+        return True
     return bool(addr.is_link_local or addr.is_unspecified or addr.is_multicast)
 
 
+def _is_non_public_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True if `addr` (or embedded IPv4) is loopback, private LAN, CGNAT, link-local, or non-global."""
+    if _is_webhook_ip_disallowed(addr):
+        return True
+    if isinstance(addr, ipaddress.IPv6Address):
+        for v4 in _embedded_ipv4s(addr):
+            if _is_non_public_ip(v4):
+                return True
+        return bool(addr.is_loopback or addr.is_private or addr.is_reserved or not addr.is_global)
+    return bool(
+        addr.is_loopback
+        or addr.is_private
+        or addr.is_reserved
+        or addr in _IPV4_CGNAT_NET
+        or not addr.is_global
+    )
+
+
 def is_webhook_target_unsafe(url: str) -> bool:
-    """Block direct webhook SSRF to non-HTTP(S), link-local/cloud metadata (169.254/16, fe80::/10), unspecified, or multicast IPs.
+    """Block direct webhook SSRF to non-HTTP(S), link-local/cloud metadata (169.254/16, fe80::/10), 0/8, unspecified, or multicast IPs.
 
     Legitimate local LAN/loopback Home Assistant / Node-RED webhooks (192.168.x.x, 127.0.0.1)
     and public services (e.g. ntfy.sh) remain allowed.
@@ -237,9 +305,12 @@ def is_webhook_target_unsafe(url: str) -> bool:
     host = parsed.hostname.strip().strip("[]").lower()
     if not host or "%" in host:
         return True
-    # Check IP literal directly first (works even offline / without DNS)
+    # Check IP literal directly first (strip trailing dot to catch e.g. 169.254.169.254.)
+    host_nodot = host.rstrip(".")
+    if not host_nodot:
+        return True
     try:
-        lit = ipaddress.ip_address(host)
+        lit = ipaddress.ip_address(host_nodot)
         return _is_webhook_ip_disallowed(lit)
     except ValueError:
         pass
@@ -262,7 +333,7 @@ def is_webhook_target_unsafe(url: str) -> bool:
 
 
 def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
-    """Block webhook redirects to non-HTTP(S), link-local/cloud metadata, or cross-origin loopback."""
+    """Block webhook redirects to non-HTTP(S), link-local/metadata, public->private/LAN, or remote->loopback SSRF."""
     try:
         parsed_new = urllib.parse.urlsplit(new_url)
         raw_new_port = parsed_new.port
@@ -274,36 +345,63 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
     if parsed_new.scheme.lower() not in {"http", "https"} or not parsed_new.hostname:
         return True
     new_host = parsed_new.hostname.strip().strip("[]").lower()
-    if "%" in new_host:
+    if not new_host or "%" in new_host:
         return True
     try:
-        orig_host = (urllib.parse.urlsplit(orig_url).hostname or "").strip().strip("[]").lower()
+        parsed_orig = urllib.parse.urlsplit(orig_url)
+        orig_host = (parsed_orig.hostname or "").strip().strip("[]").lower()
+        orig_port = parsed_orig.port or (443 if parsed_orig.scheme.lower() == "https" else 80)
     except ValueError:
         return True
 
-    def _unwrap_v4(a: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    def _is_loopback_addr(a: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         if isinstance(a, ipaddress.IPv6Address):
-            if a.ipv4_mapped is not None:
-                return a.ipv4_mapped
-            if a in _NAT64_WELL_KNOWN_NET:
-                return ipaddress.IPv4Address(int(a) & 0xFFFFFFFF)
-        return a
+            for v4 in _embedded_ipv4s(a):
+                if v4.is_loopback or v4.is_unspecified or v4 in _IPV4_THIS_NET:
+                    return True
+        return bool(a.is_loopback or a.is_unspecified or (isinstance(a, ipaddress.IPv4Address) and a in _IPV4_THIS_NET))
 
-    def _is_loopback_name(h: str) -> bool:
-        if h.rstrip(".") == "localhost":
-            return True
+    def _classify_origin(h: str, p: int) -> tuple[bool, bool]:
+        """Return `(orig_is_loopback, orig_is_private_or_local)`."""
+        nodot = h.rstrip(".")
+        if nodot == "localhost":
+            return True, True
         try:
-            a = _unwrap_v4(ipaddress.ip_address(h))
-            return bool(a.is_loopback or a.is_unspecified)
+            a = ipaddress.ip_address(nodot)
+            return _is_loopback_addr(a), _is_non_public_ip(a)
         except ValueError:
-            return False
+            pass
+        if nodot.endswith(_LOCAL_HOST_SUFFIXES) or "." not in nodot:
+            return False, True
+        try:
+            orig_infos = socket.getaddrinfo(h, p, type=socket.SOCK_STREAM)
+            orig_addrs = [ipaddress.ip_address(str(sa[0])) for *_r, sa in orig_infos if "%" not in str(sa[0])]
+            if orig_addrs and all(_is_non_public_ip(a) for a in orig_addrs):
+                return all(_is_loopback_addr(a) for a in orig_addrs), True
+        except (OSError, ValueError):
+            pass
+        return False, False
 
-    orig_is_loopback = _is_loopback_name(orig_host)
+    orig_is_loopback, orig_is_private = _classify_origin(orig_host, orig_port)
     if new_host.rstrip(".") == "localhost" and not orig_is_loopback:
         return True
+    new_nodot = new_host.rstrip(".")
+    try:
+        lit_new = ipaddress.ip_address(new_nodot)
+        if _is_webhook_ip_disallowed(lit_new):
+            return True
+        if _is_loopback_addr(lit_new) and not orig_is_loopback:
+            return True
+        if _is_non_public_ip(lit_new) and not orig_is_private:
+            return True
+        return False
+    except ValueError:
+        pass
     try:
         infos = socket.getaddrinfo(new_host, new_port, type=socket.SOCK_STREAM)
     except OSError:
+        return True
+    if not infos:
         return True
     for _fam, _st, _pr, _cn, sa in infos:
         ip_raw = str(sa[0])
@@ -315,15 +413,104 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
             return True
         if _is_webhook_ip_disallowed(addr):
             return True
-        addr = _unwrap_v4(addr)
-        # Block remote webhooks redirecting into local Master/Worker loopback services
-        if addr.is_loopback and not orig_is_loopback:
+        if _is_loopback_addr(addr) and not orig_is_loopback:
+            return True
+        if _is_non_public_ip(addr) and not orig_is_private:
             return True
     return False
 
 
+def _connect_validated_webhook_socket(
+    host: str, port: int, timeout: Any, source_address: Any = None
+) -> socket.socket:
+    """Resolve DNS ONCE, validate every IP against webhook SSRF rules, and connect directly (blocks DNS-rebinding TOCTOU)."""
+    clean_host = str(host or "").strip().strip("[]").lower()
+    if not clean_host or "%" in clean_host or not (1 <= int(port) <= 65535):
+        raise OSError(f"Refused unsafe webhook target {host!r}:{port}")
+    try:
+        infos = socket.getaddrinfo(clean_host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise OSError(f"Webhook DNS resolution failed for {clean_host!r}: {exc}") from exc
+    if not infos:
+        raise OSError(f"No addresses resolved for webhook target {clean_host!r}")
+    for _fam, _st, _pr, _cn, sa in infos:
+        ip_raw = str(sa[0])
+        if "%" in ip_raw:
+            raise OSError(f"Refused webhook IP with zone identifier: {ip_raw}")
+        try:
+            addr = ipaddress.ip_address(ip_raw)
+        except ValueError as exc:
+            raise OSError(f"Invalid resolved webhook IP {ip_raw!r}") from exc
+        if _is_webhook_ip_disallowed(addr):
+            raise OSError(f"Blocked unsafe webhook destination IP {ip_raw}")
+    last_exc: OSError | None = None
+    for fam, socktype, proto, _cn, sa in infos:
+        s: socket.socket | None = None
+        try:
+            s = socket.socket(fam, socktype, proto)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:  # type: ignore[attr-defined]
+                s.settimeout(timeout)
+            if source_address:
+                s.bind(source_address)
+            s.connect(sa)
+            return s
+        except OSError as exc:
+            last_exc = exc
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+    raise last_exc or OSError(f"Unable to connect to webhook target {clean_host}:{port}")
+
+
+class _SafeWebhookHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection subclass that connects only to DNS-validated, SSRF-safe IPs (single-resolve)."""
+
+    def connect(self) -> None:
+        self.sock = _connect_validated_webhook_socket(
+            self.host, self.port, self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _SafeWebhookHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection subclass that connects only to DNS-validated IPs while preserving TLS SNI."""
+
+    def connect(self) -> None:
+        raw_sock = _connect_validated_webhook_socket(
+            self.host, self.port, self.timeout, self.source_address
+        )
+        try:
+            if self._tunnel_host:
+                self.sock = raw_sock
+                self._tunnel()
+                server_hostname = self._tunnel_host
+            else:
+                server_hostname = self.host.strip("[]")
+            self.sock = self._context.wrap_socket(raw_sock, server_hostname=server_hostname)
+        except BaseException:
+            try:
+                raw_sock.close()
+            except OSError:
+                pass
+            self.sock = None
+            raise
+
+
+class _SafeWebhookHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: Any) -> Any:
+        return self.do_open(_SafeWebhookHTTPConnection, req)
+
+
+class _SafeWebhookHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: Any) -> Any:
+        return self.do_open(_SafeWebhookHTTPSConnection, req, context=self._context)
+
+
 class _HttpOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Allow safe HTTP(S) redirects for webhooks while blocking file://, metadata, and remote->loopback SSRF."""
+    """Allow safe HTTP(S) redirects for webhooks while blocking file://, metadata, public->LAN, and remote->loopback SSRF."""
 
     max_redirections = 5
 
@@ -339,8 +526,12 @@ def build_direct_opener() -> urllib.request.OpenerDirector:
 
 
 def build_webhook_opener() -> urllib.request.OpenerDirector:
-    """Return an opener for user webhooks that blocks non-HTTP(S) redirect schemes."""
-    return urllib.request.build_opener(_HttpOnlyRedirectHandler())
+    """Return an opener for user webhooks with single-resolve SSRF blocking and strict redirect guards."""
+    return urllib.request.build_opener(
+        _SafeWebhookHTTPHandler(),
+        _SafeWebhookHTTPSHandler(),
+        _HttpOnlyRedirectHandler(),
+    )
 
 
 def read_json_object_bounded(resp: Any, max_bytes: int) -> dict[str, Any]:
@@ -348,7 +539,10 @@ def read_json_object_bounded(resp: Any, max_bytes: int) -> dict[str, Any]:
     raw = resp.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ValueError(f"response exceeds {max_bytes} byte safety limit")
-    parsed = json.loads(raw.decode("utf-8"))
+    try:
+        parsed = json.loads(raw.decode("utf-8"), parse_constant=lambda _c: None)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting depth exceeded") from exc
     if not isinstance(parsed, dict):
         raise ValueError(f"expected JSON object, got {type(parsed).__name__}")
     return parsed
@@ -524,15 +718,29 @@ class AuthRateLimiter:
         self._failures: dict[str, collections.deque[float]] = {}
         self._blocked_until: dict[str, float] = {}
 
+    @staticmethod
+    def _norm_ip(client_ip: str) -> str:
+        raw = str(client_ip or "").strip().strip("[]")
+        if "%" in raw:
+            raw = raw.split("%", 1)[0]
+        try:
+            a = ipaddress.ip_address(raw)
+            if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped is not None:
+                return str(a.ipv4_mapped)
+            return str(a)
+        except ValueError:
+            return raw.lower()
+
     def is_blocked(self, client_ip: str) -> tuple[bool, int]:
         """Return `(blocked, retry_after_sec)` for `client_ip`."""
+        key = self._norm_ip(client_ip)
         now = time.monotonic()
         with self._lock:
-            until = self._blocked_until.get(client_ip, 0.0)
+            until = self._blocked_until.get(key, 0.0)
             if until > now:
                 return True, max(1, int(until - now))
             if until:
-                self._blocked_until.pop(client_ip, None)
+                self._blocked_until.pop(key, None)
         return False, 0
 
     def _prune_locked(self, now: float) -> None:
@@ -563,22 +771,24 @@ class AuthRateLimiter:
 
     def record_failure(self, client_ip: str) -> bool:
         """Record one failed auth attempt; returns True if the IP is now blocked."""
+        key = self._norm_ip(client_ip)
         now = time.monotonic()
         cutoff = now - self.window_sec
         with self._lock:
             self._prune_locked(now)
-            dq = self._failures.setdefault(client_ip, collections.deque())
+            dq = self._failures.setdefault(key, collections.deque())
             while dq and dq[0] < cutoff:
                 dq.popleft()
             dq.append(now)
             if len(dq) >= self.max_failures:
-                self._blocked_until[client_ip] = now + self.block_sec
+                self._blocked_until[key] = now + self.block_sec
                 dq.clear()
                 return True
         return False
 
     def record_success(self, client_ip: str) -> None:
         """Clear prior failures for `client_ip` after a valid authenticated request."""
+        key = self._norm_ip(client_ip)
         with self._lock:
-            self._failures.pop(client_ip, None)
-            self._blocked_until.pop(client_ip, None)
+            self._failures.pop(key, None)
+            self._blocked_until.pop(key, None)

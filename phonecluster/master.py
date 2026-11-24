@@ -32,6 +32,7 @@ from .config import (
     format_host_port,
     is_loopback_or_unspecified_host,
     normalize_host,
+    validate_host,
 )
 from .discovery import detect_local_ip
 from .gateway import build_worker_proxy_env
@@ -303,6 +304,12 @@ class MetricsHistory:
                         cpu_val = min(100.0, round((load_val / cores) * 100.0, 1))
                     temp_raw = h.get("temp_c")
                     temp_clean = _safe_float(temp_raw, -999.0) if temp_raw is not None else None
+                    bat_raw = h.get("battery_pct")
+                    bat_clean: int | None = None
+                    if bat_raw is not None:
+                        bi = _safe_int(bat_raw, -1)
+                        if 0 <= bi <= 100:
+                            bat_clean = bi
                     self._nodes[nid].append(
                         {
                             "ts": ts,
@@ -310,7 +317,7 @@ class MetricsHistory:
                             "cpu_pct": min(100.0, max(0.0, cpu_val)),
                             "ram_pct": ram_pct,
                             "temp_c": temp_clean if temp_clean is not None and temp_clean > -500.0 else None,
-                            "battery_pct": h.get("battery_pct"),
+                            "battery_pct": bat_clean,
                             "active_jobs": max(0, _safe_int(h.get("active_jobs", 0), 0)),
                         }
                     )
@@ -326,9 +333,8 @@ class MetricsHistory:
                             "active_jobs": 0,
                         }
                     )
-            if current_ids:
-                for stale_id in [k for k in self._nodes if k not in current_ids]:
-                    self._nodes.pop(stale_id, None)
+            for stale_id in [k for k in self._nodes if k not in current_ids]:
+                self._nodes.pop(stale_id, None)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -442,11 +448,11 @@ class MasterController:
             try:
                 parsed_err = json.loads(raw_err)
                 err_data = parsed_err if isinstance(parsed_err, dict) else {"error": raw_err[:300]}
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 err_data = {"error": raw_err[:300]}
             if exc.code in {HTTPStatus.SERVICE_UNAVAILABLE, HTTPStatus.TOO_MANY_REQUESTS}:
                 return "retryable", err_data
-            return "error", {"http_status": exc.code, **err_data}
+            return "error", {**err_data, "http_status": exc.code}
         except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
             return "retryable", {"error": str(exc)}
 
@@ -478,9 +484,15 @@ class MasterController:
         Automatically injects live cross-tier `PHONECLUSTER_*` service-discovery variables
         into every job so Tier 1/2/3 workloads seamlessly communicate as one system.
         """
-        snapshots = self.poll_health(tags=tags)
+        # Poll all nodes for complete cross-tier service discovery, then filter eligible targets by `tags`
+        all_snapshots = self.poll_health()
+        if tags:
+            want_tags = set(tags)
+            snapshots = [s for s in all_snapshots if want_tags.issubset(set(s.node.tags))]
+        else:
+            snapshots = all_snapshots
         with self.config_lock:
-            cross_env = build_cross_tier_env(snapshots, self.config)
+            cross_env = build_cross_tier_env(all_snapshots, self.config)
             quarantined = set(self.config.gateway.quarantined_nodes)
         snap_by_id = {s.node.id: s for s in snapshots}
 
@@ -562,6 +574,22 @@ class MasterController:
                 key=lambda s: score_node(s, max_temp_c=self.config.safety.max_temp_c),
                 reverse=True,
             )
+            # For non-strict auto-routing, append ready spillover nodes behind preferred-pool candidates for 503 failover
+            if target == "auto" and route is not None and not route.strict:
+                seen_cand_ids = {c.node.id for c in candidates}
+                spillover = [
+                    s
+                    for s in snapshots
+                    if s.node.id not in seen_cand_ids
+                    and s.online
+                    and (s.ready_for_jobs or spec.force)
+                    and s.node.id not in quarantined
+                ]
+                spillover.sort(
+                    key=lambda s: score_node(s, max_temp_c=self.config.safety.max_temp_c),
+                    reverse=True,
+                )
+                candidates.extend(spillover)
             # Fail over automatically across remaining ranked candidates on transient 503/disconnect
             last_snap = candidates[0]
             last_kind = "retryable"
@@ -609,6 +637,19 @@ class MasterController:
                     duration_sec=0.0,
                     error=f"Unknown node id '{target}'. Check cluster.json or `pc status`.",
                     routing_reason=f"Node '{target}' not found in cluster config",
+                )
+            ]
+        if tags and not set(tags).issubset(set(node.tags)):
+            return [
+                JobOutcome(
+                    index=spec.index,
+                    job_id=spec.job_id,
+                    label=spec.label,
+                    node_id=node.id,
+                    returncode=-1,
+                    duration_sec=0.0,
+                    error=f"Node '{node.id}' does not match required tags {tags}.",
+                    routing_reason=f"Node '{node.id}' excluded by --tags filter",
                 )
             ]
         if node.id in quarantined and not spec.force:
@@ -703,10 +744,16 @@ class MasterController:
         if target not in {"auto", "best", "all"} and not target.startswith(("tier:", "pool:")):
             with self.config_lock:
                 known_ids = {n.id for n in self.config.nodes}
+            eligible_ids = {n.id for n in self._filter_nodes(tags)}
             if target not in known_ids:
                 msg = f"Unknown node id '{target}'. Check cluster.json or `pc status`."
                 for slot_idx, job in enumerate(jobs):
                     _record_immediate_fail(slot_idx, job, target, msg, f"Node '{target}' not found in cluster config")
+                return [outcomes_by_slot[i] for i in range(total_jobs)]
+            if target not in eligible_ids:
+                msg = f"Node '{target}' does not match required tags {tags}."
+                for slot_idx, job in enumerate(jobs):
+                    _record_immediate_fail(slot_idx, job, target, msg, f"Node '{target}' excluded by --tags filter")
                 return [outcomes_by_slot[i] for i in range(total_jobs)]
             q_now = self._quarantined_ids()
             for slot_idx, job in enumerate(jobs):
@@ -742,9 +789,14 @@ class MasterController:
 
         def _refresh_health() -> None:
             nonlocal snapshots, cross_env, last_poll
-            snapshots = self.poll_health(tags=tags)
+            all_snaps = self.poll_health()
+            if tags:
+                want_tags = set(tags)
+                snapshots = [s for s in all_snaps if want_tags.issubset(set(s.node.tags))]
+            else:
+                snapshots = all_snaps
             with self.config_lock:
-                cross_env = build_cross_tier_env(snapshots, self.config)
+                cross_env = build_cross_tier_env(all_snaps, self.config)
             last_poll = time.monotonic()
             for s in snapshots:
                 # Account for jobs already running on this phone outside this map_jobs() batch
@@ -950,11 +1002,42 @@ class MasterController:
                 if stop_on_error:
                     break
                 continue
-            name = str(raw_step.get("name") or f"Step {idx}").strip()
-            command = str(raw_step.get("command") or "").strip()
-            target = str(raw_step.get("target") or "auto").strip() or "auto"
-            workload_hint = str(raw_step.get("workload") or raw_step.get("workload_hint") or "").strip()
+            bad_str_field: str | None = None
+            for fname in ("name", "command", "target", "workload", "workload_hint", "workdir"):
+                fv = raw_step.get(fname)
+                if fv is not None and not isinstance(fv, str):
+                    bad_str_field = fname
+                    break
             continue_on_err = bool(raw_step.get("continue_on_error", False))
+            if bad_str_field is not None:
+                all_ok = False
+                failed_steps += 1
+                results.append(
+                    {
+                        "step_index": idx,
+                        "name": f"Step {idx}",
+                        "target": "auto",
+                        "workload": "",
+                        "ok": False,
+                        "node_id": "none",
+                        "node_tier": 0,
+                        "node_pool": "",
+                        "routing_reason": f"Invalid step field '{bad_str_field}'",
+                        "returncode": -1,
+                        "duration_sec": 0.0,
+                        "stdout": "",
+                        "stderr": "",
+                        "error": f"Pipeline step '{bad_str_field}' must be a string.",
+                    }
+                )
+                prev_stdout, prev_node, prev_tier, prev_pool, prev_rc = "", "none", 0, "", -1
+                if stop_on_error and not continue_on_err:
+                    break
+                continue
+            name = (raw_step.get("name") or f"Step {idx}").strip() or f"Step {idx}"
+            command = (raw_step.get("command") or "").strip()
+            target = (raw_step.get("target") or "auto").strip() or "auto"
+            workload_hint = (raw_step.get("workload") or raw_step.get("workload_hint") or "").strip()
 
             raw_timeout = raw_step.get("timeout_sec")
             if raw_timeout in (None, ""):
@@ -1105,6 +1188,15 @@ class MasterController:
             prev_rc = int(rec.get("returncode", primary.returncode))
             prior_step_env[f"PHONECLUSTER_STEP_{idx}_STDOUT"] = clean_out[:16384]
             prior_step_env[f"PHONECLUSTER_STEP_{idx}_NODE"] = primary.node_id
+            # Cap cumulative prior_step_env to 64 KiB so multi-step pipelines never hit ARG_MAX (E2BIG) or HTTP 413
+            while sum(len(k) + len(v) for k, v in prior_step_env.items()) > 65536:
+                oldest_out = next(
+                    (k for k in prior_step_env if k.endswith("_STDOUT") and k != f"PHONECLUSTER_STEP_{idx}_STDOUT"),
+                    None,
+                )
+                if oldest_out is None:
+                    break
+                prior_step_env.pop(oldest_out, None)
 
             if not step_ok:
                 all_ok = False
@@ -1195,7 +1287,7 @@ class MasterController:
             if running and self._is_remote_port_loopback_only(snap, 3632):
                 continue
             cores = max(1, _safe_int(snap.health.get("cpu_cores", 4), 4))
-            if snap.node.role == "master" or snap.node.host in {"127.0.0.1", "localhost"}:
+            if snap.node.role == "master" or is_loopback_or_unspecified_host(snap.node.host):
                 slots = max(1, cores - 2)
                 entries.append(f"localhost/{slots}")
             else:
@@ -1431,6 +1523,17 @@ class MasterController:
         Runs a raw TCP probe directly from each online worker (bypassing any proxy).
         If the direct connection fails/times out, that worker is air-gapped from WAN.
         """
+        clean_probe_host = validate_host(str(probe_host or ""))
+        if isinstance(probe_port, bool):
+            raise ValueError("probe_port must be an integer, not boolean")
+        probe_port_i = int(probe_port)
+        if not (1 <= probe_port_i <= 65535):
+            raise ValueError(f"probe_port must be between 1 and 65535 (got {probe_port_i})")
+        if isinstance(timeout_sec, bool):
+            raise ValueError("timeout_sec must be a finite number, not boolean")
+        timeout_f = float(timeout_sec)
+        if not math.isfinite(timeout_f) or not (0.1 <= timeout_f <= 30.0):
+            raise ValueError("timeout_sec must be a finite number between 0.1 and 30.0")
         with self.config_lock:
             workers = [n for n in self.config.nodes if n.role != "master"]
         if not workers:
@@ -1438,7 +1541,7 @@ class MasterController:
         probe_code = (
             "import socket, sys\n"
             f"try:\n"
-            f"    s = socket.create_connection(({probe_host!r}, {int(probe_port)}), timeout={float(timeout_sec)})\n"
+            f"    s = socket.create_connection(({clean_probe_host!r}, {probe_port_i}), timeout={timeout_f})\n"
             "    s.close()\n"
             "    print('DIRECT_WAN_OPEN')\n"
             "except OSError as e:\n"
@@ -1452,7 +1555,7 @@ class MasterController:
                 script_content=probe_code,
                 script_name="wan_check.py",
                 interpreter="python3",
-                timeout_sec=float(timeout_sec) + 4.0,
+                timeout_sec=timeout_f + 4.0,
                 force=True,
             )
             kind, data = self.exec_on_node(node, spec)
@@ -1593,33 +1696,40 @@ class MasterController:
                 self.config.nodes[0] if self.config.nodes else None,
             )
             allowed_ips = list(net.allowed_master_ips)
+            need_lan_ip = False
             if master_node is not None and master_node.host:
                 m_host = normalize_host(master_node.host)
                 if m_host and m_host not in allowed_ips:
                     allowed_ips.append(m_host)
                 if is_loopback_or_unspecified_host(m_host) and not is_loopback_or_unspecified_host(node.host):
-                    lan_ip = normalize_host(detect_local_ip())
-                    if lan_ip and not is_loopback_or_unspecified_host(lan_ip) and lan_ip not in allowed_ips:
-                        allowed_ips.append(lan_ip)
-            payload = {
-                "target_node_id": node.id,
-                "max_concurrency": node.max_concurrency,
-                "safety": {
-                    "max_temp_c": s.max_temp_c,
-                    "resume_temp_c": s.resume_temp_c,
-                    "min_free_ram_mb": s.min_free_ram_mb,
-                    "battery_low_pct": s.battery_low_pct,
-                    "battery_high_pct": s.battery_high_pct,
-                    "battery_poll_sec": s.battery_poll_sec,
-                    "webhook_cooldown_sec": s.webhook_cooldown_sec,
-                    "battery_webhook_url": s.battery_webhook_url,
-                },
-                "network": {
-                    "enforce_worker_source_ip": net.enforce_worker_source_ip,
-                    "require_signed_requests": net.require_signed_requests,
-                    "allowed_master_ips": allowed_ips,
-                },
+                    need_lan_ip = True
+            safety_dict = {
+                "max_temp_c": s.max_temp_c,
+                "resume_temp_c": s.resume_temp_c,
+                "min_free_ram_mb": s.min_free_ram_mb,
+                "battery_low_pct": s.battery_low_pct,
+                "battery_high_pct": s.battery_high_pct,
+                "battery_poll_sec": s.battery_poll_sec,
+                "webhook_cooldown_sec": s.webhook_cooldown_sec,
+                "battery_webhook_url": s.battery_webhook_url,
             }
+            enforce_ip = net.enforce_worker_source_ip
+            req_signed = net.require_signed_requests
+        if need_lan_ip:
+            # Resolve local LAN IP OUTSIDE `config_lock` so slow air-gapped DNS never stalls Master
+            lan_ip = normalize_host(detect_local_ip())
+            if lan_ip and not is_loopback_or_unspecified_host(lan_ip) and lan_ip not in allowed_ips:
+                allowed_ips.append(lan_ip)
+        payload = {
+            "target_node_id": node.id,
+            "max_concurrency": node.max_concurrency,
+            "safety": safety_dict,
+            "network": {
+                "enforce_worker_source_ip": enforce_ip,
+                "require_signed_requests": req_signed,
+                "allowed_master_ips": allowed_ips,
+            },
+        }
         url = f"{node.base_url}/config"
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -1676,8 +1786,8 @@ class MasterController:
             try:
                 parsed = json.loads(raw)
                 data = parsed if isinstance(parsed, dict) else {"error": raw[:200]}
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 data = {"error": raw[:200]}
-            return {"cancelled": False, "http_status": exc.code, **data}
+            return {**data, "cancelled": False, "http_status": exc.code}
         except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
             return {"cancelled": False, "error": str(exc)}

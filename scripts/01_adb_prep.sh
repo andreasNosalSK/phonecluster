@@ -33,20 +33,26 @@ if ! command -v adb >/dev/null 2>&1; then
   exit 1
 fi
 
-adb "${SERIAL_ARGS[@]}" get-state >/dev/null
+run_adb() {
+  adb ${SERIAL_ARGS[@]+"${SERIAL_ARGS[@]}"} "$@"
+}
 
-DEVICE="$(adb "${SERIAL_ARGS[@]}" shell getprop ro.product.device | tr -d '\r')"
-MODEL="$(adb "${SERIAL_ARGS[@]}" shell getprop ro.product.model | tr -d '\r')"
-ANDROID_VER="$(adb "${SERIAL_ARGS[@]}" shell getprop ro.build.version.release | tr -d '\r')"
-SDK_INT="$(adb "${SERIAL_ARGS[@]}" shell getprop ro.build.version.sdk | tr -d '\r')"
-MIUI_VER="$(adb "${SERIAL_ARGS[@]}" shell getprop ro.miui.ui.version.name | tr -d '\r' || true)"
-MEM_INFO="$(adb "${SERIAL_ARGS[@]}" shell "head -n 3 /proc/meminfo" | tr -d '\r')"
+run_adb get-state >/dev/null
+
+DEVICE="$(run_adb shell getprop ro.product.device | tr -d '\r')"
+MODEL="$(run_adb shell getprop ro.product.model | tr -d '\r')"
+ANDROID_VER="$(run_adb shell getprop ro.build.version.release | tr -d '\r')"
+SDK_INT="$(run_adb shell getprop ro.build.version.sdk | tr -d '\r')"
+MIUI_VER="$(run_adb shell getprop ro.miui.ui.version.name | tr -d '\r' || true)"
+MEM_INFO="$(run_adb shell "head -n 3 /proc/meminfo" | tr -d '\r')"
 
 echo "=== Android Phone Hardware Audit ==="
 echo "Model          : ${MODEL}"
 echo "Codename       : ${DEVICE}"
 echo "Android / SDK  : ${ANDROID_VER} (API ${SDK_INT})"
-[[ -n "${MIUI_VER}" ]] && echo "MIUI Version   : ${MIUI_VER}"
+if [[ -n "${MIUI_VER}" ]]; then
+  echo "MIUI Version   : ${MIUI_VER}"
+fi
 echo "--- Memory ---"
 echo "${MEM_INFO}"
 echo "===================================="
@@ -68,14 +74,20 @@ if (( MAJOR_VER <= 11 )); then
 elif (( MAJOR_VER == 12 )); then
   echo "Applying Android 12 Phantom Process Killer fix..."
   # set_sync_disabled_for_tests persistent MUST run first so Play Services does not revert it
-  adb "${SERIAL_ARGS[@]}" shell "/system/bin/device_config set_sync_disabled_for_tests persistent"
-  adb "${SERIAL_ARGS[@]}" shell "/system/bin/device_config put activity_manager max_phantom_processes 2147483647"
-  echo "Done. Reboot the phone and verify with:"
-  echo "  adb shell \"/system/bin/device_config get activity_manager max_phantom_processes\""
+  if run_adb shell "/system/bin/device_config set_sync_disabled_for_tests persistent" \
+    && run_adb shell "/system/bin/device_config put activity_manager max_phantom_processes 2147483647"; then
+    echo "Done. Reboot the phone and verify with:"
+    echo "  adb shell \"/system/bin/device_config get activity_manager max_phantom_processes\""
+  else
+    echo "Warning: Could not apply Android 12 Phantom Process Killer fix (on MIUI, enable 'USB debugging (Security settings)')." >&2
+  fi
 elif (( MAJOR_VER == 13 )); then
   echo "Applying Android 13 Phantom Process Killer fix..."
-  adb "${SERIAL_ARGS[@]}" shell "settings put global settings_enable_monitor_phantom_procs false"
-  echo "Done. Reboot the phone for the setting to take effect."
+  if run_adb shell "settings put global settings_enable_monitor_phantom_procs false"; then
+    echo "Done. Reboot the phone for the setting to take effect."
+  else
+    echo "Warning: Could not apply Android 13 Phantom Process Killer fix (on MIUI, enable 'USB debugging (Security settings)')." >&2
+  fi
 else
   echo "Android ${ANDROID_VER} (14+): Open Settings -> Developer Options -> enable 'Disable child process restrictions', then reboot."
 fi

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import math
 import os
 import shutil
@@ -18,6 +19,7 @@ from .telemetry import (
     _read_listening_tcp_map,
     detect_capabilities,
     detect_os_environment,
+    is_battery_health_hazardous,
     is_local_port_open,
     read_battery_via_termux,
 )
@@ -200,27 +202,54 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                         f"Loaded '{cfg.cluster_name}' with {len(cfg.nodes)} node(s) from {resolved_cfg}",
                     )
                 )
+            has_master = any(n.role == "master" for n in cfg.nodes)
             worker_nodes = [n for n in cfg.nodes if n.role != "master"]
             if worker_nodes:
-                isolated = [n for n in worker_nodes if n.auth_token and n.auth_token != cfg.auth_token]
-                if len(isolated) == len(worker_nodes):
+                if not has_master:
                     checks.append(
                         CheckResult(
                             "Per-Node Token Isolation",
                             "ok",
-                            f"All {len(worker_nodes)} worker(s) use unique least-privilege tokens",
+                            "Scoped worker config (isolated per-node token; no Master admin token stored)",
                         )
                     )
                 else:
-                    shared_ids = [n.id for n in worker_nodes if not n.auth_token or n.auth_token == cfg.auth_token]
-                    checks.append(
-                        CheckResult(
-                            "Per-Node Token Isolation",
-                            "warn",
-                            f"Worker(s) sharing master token: {', '.join(shared_ids)}",
-                            "Re-pair workers with `pc pair` + `pc join` so each phone gets its own isolated token.",
+                    tok_counts = collections.Counter(n.auth_token for n in worker_nodes if n.auth_token)
+                    shared_master = [n.id for n in worker_nodes if not n.auth_token or n.auth_token == cfg.auth_token]
+                    dup_workers = [
+                        n.id
+                        for n in worker_nodes
+                        if n.auth_token and n.auth_token != cfg.auth_token and tok_counts[n.auth_token] > 1
+                    ]
+                    weak_workers = [
+                        n.id
+                        for n in worker_nodes
+                        if n.auth_token and ("REPLACE_ME" in n.auth_token or len(n.auth_token) < 16)
+                    ]
+                    if not shared_master and not dup_workers and not weak_workers:
+                        checks.append(
+                            CheckResult(
+                                "Per-Node Token Isolation",
+                                "ok",
+                                f"All {len(worker_nodes)} worker(s) use unique least-privilege tokens",
+                            )
                         )
-                    )
+                    else:
+                        issues: list[str] = []
+                        if shared_master:
+                            issues.append(f"sharing master token: {', '.join(shared_master)}")
+                        if dup_workers:
+                            issues.append(f"sharing duplicate worker token: {', '.join(dup_workers)}")
+                        if weak_workers:
+                            issues.append(f"weak/placeholder token: {', '.join(weak_workers)}")
+                        checks.append(
+                            CheckResult(
+                                "Per-Node Token Isolation",
+                                "warn",
+                                f"Worker(s) {'; '.join(issues)}",
+                                "Re-pair workers with `pc pair` + `pc join` so each phone gets its own strong unique token.",
+                            )
+                        )
             try:
                 mode = stat.S_IMODE(os.stat(resolved_cfg).st_mode)
                 if mode & 0o077:
@@ -248,8 +277,8 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                     )
                 else:
                     lmap = _read_listening_tcp_map()
-                    if lmap is not None and gw_port in lmap:
-                        gw_live = True
+                    if lmap is not None:
+                        gw_live = gw_port in lmap
                     else:
                         bind_h = normalize_host(cfg.gateway.bind_host)
                         gw_live = False
@@ -346,17 +375,25 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                     pf = float(pct_raw)
                     if math.isfinite(pf):
                         pct_val = pf
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     pct_val = None
-            st = str(h.get("battery_status") or "").upper()
-            b_health = str(h.get("battery_health") or "").upper()
-            temp = h.get("temp_c")
-            if b_health in {"OVERHEAT", "OVER_VOLTAGE", "SAFETY_TIMER_EXPIRE"}:
+            st = str(h.get("battery_status") or "").strip().upper().replace(" ", "_")
+            b_health = str(h.get("battery_health") or "").strip().upper().replace(" ", "_")
+            temp_raw = h.get("temp_c")
+            temp_val: float | None = None
+            if temp_raw is not None and not isinstance(temp_raw, bool):
+                try:
+                    tf = float(temp_raw)
+                    if math.isfinite(tf):
+                        temp_val = tf
+                except (TypeError, ValueError, OverflowError):
+                    temp_val = None
+            if is_battery_health_hazardous(b_health):
                 hazard_bat_nodes.append(f"{s.node.id} ({b_health})")
             if pct_val is not None and pct_val >= cfg.safety.battery_high_pct and st in {"CHARGING", "FULL"}:
                 high_bat_nodes.append(f"{s.node.id} ({int(pct_val)}% {st})")
-            if h.get("overheated"):
-                hot_nodes.append(f"{s.node.id} ({temp}C)")
+            if h.get("overheated") or (temp_val is not None and temp_val >= cfg.safety.max_temp_c):
+                hot_nodes.append(f"{s.node.id} ({temp_val if temp_val is not None else temp_raw}C)")
 
         if hazard_bat_nodes:
             checks.append(

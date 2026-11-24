@@ -499,7 +499,7 @@ def build_cross_tier_env(
         rpc_eps = [
             format_host_port(e["host"], int(e["port"]))
             for e in by_name["llama_rpc"]
-            if e.get("ready") and not e.get("loopback_only")
+            if e.get("ready") and not e.get("loopback_only") and e.get("host") and int(e.get("port") or 0) > 0
         ]
         if rpc_eps:
             env["PHONECLUSTER_LLAMA_RPC"] = ",".join(rpc_eps)
@@ -508,11 +508,16 @@ def build_cross_tier_env(
         for e in by_name["distcc"]:
             if not e.get("ready") or e.get("loopback_only"):
                 continue
+            host_e = str(e.get("host") or "").strip()
+            if not host_e:
+                continue
             cores = max(1, int(e.get("cpu_cores", 4)))
-            if e.get("role") == "master" or e.get("host") in {"127.0.0.1", "localhost"}:
+            if is_loopback_or_unspecified_host(host_e):
                 distcc_entries.append(f"localhost/{max(1, cores - 2)}")
+            elif e.get("role") == "master":
+                distcc_entries.append(f"{format_host_for_url(host_e)}/{max(1, cores - 2)},lzo")
             else:
-                distcc_entries.append(f"{format_host_for_url(e['host'])}/{cores},lzo")
+                distcc_entries.append(f"{format_host_for_url(host_e)}/{cores},lzo")
         if distcc_entries:
             env["PHONECLUSTER_DISTCC_HOSTS"] = " ".join(distcc_entries)
     if "redis" in by_name:

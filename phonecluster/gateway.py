@@ -63,10 +63,19 @@ def _sanitize_log_text(value: str, max_len: int = 200) -> str:
     return _CTRL_CHAR_RE.sub("?", str(value or ""))[:max_len]
 
 
+_RESP_HEX_RE = re.compile(rb"^[0-9A-Fa-f]{1,32}$")
+_MAX_RESP_CHUNK_BYTES = 128 * 1024 * 1024
+
+
+def _is_safe_ascii_host(value: str) -> bool:
+    """Return True iff `value` is non-empty printable ASCII (defeats ISO-8859-1 / IDNA blocklist bypasses)."""
+    return bool(value) and value.isascii() and not any(ord(c) <= 0x20 or ord(c) >= 0x7F for c in value)
+
+
 def _parse_host_header(host_val: str) -> tuple[str, int | None] | None:
     """Strictly parse an HTTP `Host:` header into `(normalized_host, explicit_port_or_None)`."""
     raw = host_val.strip()
-    if not raw or any(c.isspace() or c in "@/\\?#;'\"" for c in raw):
+    if not _is_safe_ascii_host(raw) or any(c.isspace() or c in "@/\\?#;'\"" for c in raw):
         return None
     if raw.startswith("["):
         end = raw.find("]")
@@ -249,8 +258,10 @@ def domain_matches(host: str, pattern: str) -> bool:
 
 def evaluate_policy(host: str, port: int, gw: GatewayConfig) -> tuple[bool, str]:
     """Evaluate Network Guard port/domain/mode policy for `(host, port)`."""
+    if not _is_safe_ascii_host(str(host or "").strip()):
+        return False, "invalid non-ASCII or control characters in destination host"
     clean_host = normalize_host(host).lower().rstrip(".")
-    if not clean_host:
+    if not clean_host or not _is_safe_ascii_host(clean_host):
         return False, "empty destination host"
     if port not in gw.allowed_ports:
         return False, f"port {port} blocked (allowed: {','.join(str(p) for p in gw.allowed_ports)})"
@@ -292,6 +303,7 @@ def _is_disallowed_addr(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> 
         or addr.is_private
         or addr.is_loopback
         or addr.is_link_local
+        or getattr(addr, "is_site_local", False)
         or addr.is_multicast
         or addr.is_unspecified
         or addr.is_reserved
@@ -299,7 +311,7 @@ def _is_disallowed_addr(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> 
 
 
 def _is_disallowed_ip(ip_str: str) -> bool:
-    """Block all non-public/internal IPs including LAN, loopback, link-local, Tailscale/CGNAT, NAT64, 6to4, Teredo, and scoped IPv6."""
+    """Block all non-public/internal IPs including LAN, loopback, link-local, site-local, Tailscale/CGNAT, NAT64, 6to4, Teredo, and scoped IPv6."""
     raw = str(ip_str or "").strip()
     if not raw or "%" in raw:
         return True
@@ -315,6 +327,8 @@ def resolve_and_validate_target(
 ) -> tuple[list[tuple[int, tuple[Any, ...]]] | None, str]:
     """Resolve `host:port` once, enforce SSRF guard on ALL IPs, and return validated endpoints."""
     clean_host = host.strip().strip("[]")
+    if not _is_safe_ascii_host(clean_host):
+        return None, "invalid non-ASCII destination host"
     try:
         infos = socket.getaddrinfo(clean_host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -614,41 +628,50 @@ def _relay_http_response(
             buf.extend(chunk)
         return True
 
-    # Read response head(s), forwarding any 1xx interim responses before the final response head
+    # Read response head(s), forwarding any sanitized 1xx interim responses before the final response head
     interim_count = 0
     while True:
         if not _fill_until(b"\r\n\r\n", max_buf=65536):
-            if not buf:
-                return bytes_in, response_started
-            # Non-standard upstream EOF without CRLFCRLF: fail cleanly if nothing started
-            raise OSError("truncated upstream HTTP response headers")
+            # Always raise on EOF before headers so `_handle_once` returns 502 Bad Gateway
+            raise OSError("unexpected EOF before upstream HTTP response headers")
         sep = buf.find(b"\r\n\r\n")
         head_bytes = bytes(buf[:sep])
         del buf[: sep + 4]
 
         lines = head_bytes.decode("iso-8859-1", errors="replace").split("\r\n")
         status_line = lines[0]
+        if "\r" in status_line or "\n" in status_line or any(ord(c) < 32 and c != "\t" or ord(c) == 127 for c in status_line):
+            raise OSError("invalid control character in upstream HTTP status line")
         sparts = status_line.split(" ", 2)
         if len(sparts) < 2 or not sparts[0].upper().startswith("HTTP/") or len(sparts[1]) != 3 or not sparts[1].isascii() or not sparts[1].isdigit():
             raise OSError("malformed upstream HTTP status line")
         status_code = int(sparts[1])
+
+        resp_pairs: list[tuple[str, str]] = []
+        for hline in lines[1:]:
+            if not hline:
+                continue
+            if "\r" in hline or "\n" in hline or ":" not in hline:
+                raise OSError("malformed upstream HTTP response header")
+            rk, rv = hline.split(":", 1)
+            if not rk or not _HTTP_TOKEN_RE.fullmatch(rk):
+                raise OSError("invalid upstream HTTP response header name")
+            if any((ord(c) < 32 and c != "\t") or ord(c) == 127 for c in rv):
+                raise OSError("invalid control character in upstream HTTP response header")
+            resp_pairs.append((rk, rv.strip()))
+
         if 100 <= status_code < 200 and status_code != 101:
             interim_count += 1
             if interim_count > 8:
                 raise OSError("too many interim 1xx upstream responses")
             if req_version == "HTTP/1.1":
-                interim = head_bytes + b"\r\n\r\n"
+                clean_interim_hdrs = [f"{k}: {v}" for k, v in resp_pairs if not k.lower().startswith("proxy-")]
+                interim_txt = status_line + ("\r\n" + "\r\n".join(clean_interim_hdrs) if clean_interim_hdrs else "") + "\r\n\r\n"
+                interim = interim_txt.encode("iso-8859-1", errors="replace")
                 conn.sendall(interim)
                 bytes_in += len(interim)
                 response_started = True
             continue
-
-        resp_pairs: list[tuple[str, str]] = []
-        for hline in lines[1:]:
-            if not hline or ":" not in hline:
-                continue
-            rk, rv = hline.split(":", 1)
-            resp_pairs.append((rk.strip(), rv.strip()))
 
         conn_tokens = {
             tok.strip().lower()
@@ -662,29 +685,39 @@ def _relay_http_response(
             | conn_tokens
         ) - {"content-length", "transfer-encoding"}
 
-        is_chunked = False
+        has_transfer_encoding = False
+        te_tokens: list[str] = []
         content_len: int | None = None
         for k, v in resp_pairs:
             kl = k.lower()
-            if kl == "transfer-encoding" and "chunked" in v.lower():
-                is_chunked = True
+            if kl == "transfer-encoding":
+                has_transfer_encoding = True
+                for tok in v.split(","):
+                    t = tok.strip().lower()
+                    if t:
+                        te_tokens.append(t)
             elif kl == "content-length":
-                cl_parts = [p.strip() for p in v.split(",") if p.strip()]
-                if not cl_parts or not all(_ASCII_UINT_RE.fullmatch(p) for p in cl_parts):
+                raw_parts = v.split(",")
+                if not raw_parts or any(not _ASCII_UINT_RE.fullmatch(p.strip()) for p in raw_parts):
                     raise OSError("invalid upstream Content-Length")
-                for p in cl_parts:
-                    val = int(p)
+                for p in raw_parts:
+                    val = int(p.strip())
                     if content_len is not None and content_len != val:
                         raise OSError("conflicting upstream Content-Length")
                     content_len = val
 
-        # RFC 9112 §6.3: if both Transfer-Encoding and Content-Length appear, drop Content-Length
+        # RFC 9112 §6.3: chunked framing applies iff final Transfer-Encoding coding is "chunked";
+        # whenever ANY Transfer-Encoding is present, Content-Length MUST be dropped and ignored.
+        is_chunked = bool(te_tokens) and te_tokens[-1] == "chunked"
+        if has_transfer_encoding:
+            content_len = None
+
         out_hdrs = [
             f"{k}: {v}"
             for k, v in resp_pairs
             if not k.lower().startswith("proxy-")
             and k.lower() not in hop_headers
-            and not (is_chunked and k.lower() == "content-length")
+            and not (has_transfer_encoding and k.lower() == "content-length")
         ]
         out_hdrs.append("Connection: close")
         clean_head = (status_line + "\r\n" + "\r\n".join(out_hdrs) + "\r\n\r\n").encode(
@@ -700,39 +733,64 @@ def _relay_http_response(
         return bytes_in, response_started
 
     if is_chunked:
+        saw_final_resp_chunk = False
         while not stop_event.is_set():
             _check_abort()
             if not _fill_until(b"\r\n", max_buf=16384):
-                break
+                raise OSError("truncated upstream chunked response size line")
             line_end = buf.find(b"\r\n")
             size_line = bytes(buf[: line_end + 2])
             del buf[: line_end + 2]
-            conn.sendall(size_line)
-            bytes_in += len(size_line)
-            size_tok = size_line[:-2].split(b";", 1)[0].strip()
-            if not _ASCII_HEX_RE.fullmatch(size_tok):
-                break
+            size_tok = size_line[:-2].split(b";", 1)[0].rstrip(b" \t")
+            if not _RESP_HEX_RE.fullmatch(size_tok):
+                raise OSError("malformed upstream chunk size")
             chunk_sz = int(size_tok, 16)
+            if chunk_sz < 0 or chunk_sz > _MAX_RESP_CHUNK_BYTES:
+                raise OSError("upstream chunk size exceeds safety limit")
+            # Emit canonical hex chunk size ONLY after validation (strips unvalidated extensions)
+            canon_line = f"{chunk_sz:x}\r\n".encode("ascii")
+            conn.sendall(canon_line)
+            bytes_in += len(canon_line)
             if chunk_sz == 0:
+                tr_lines = 0
+                tr_bytes = 0
                 while not stop_event.is_set():
                     _check_abort()
                     if not _fill_until(b"\r\n", max_buf=16384):
-                        break
+                        raise OSError("truncated upstream chunked trailers")
                     tr_end = buf.find(b"\r\n")
                     tr_line = bytes(buf[: tr_end + 2])
                     del buf[: tr_end + 2]
+                    tr_lines += 1
+                    tr_bytes += len(tr_line)
+                    if tr_lines > MAX_TRAILER_LINES or tr_bytes > MAX_TRAILER_BYTES:
+                        raise OSError("upstream chunked trailers exceed limit")
+                    if tr_line == b"\r\n":
+                        conn.sendall(tr_line)
+                        bytes_in += len(tr_line)
+                        saw_final_resp_chunk = True
+                        break
+                    tr_text = tr_line[:-2].decode("iso-8859-1", errors="replace")
+                    if "\r" in tr_text or "\n" in tr_text or ":" not in tr_text:
+                        raise OSError("malformed upstream chunked trailer")
+                    tr_k, tr_v = tr_text.split(":", 1)
+                    if not tr_k or not _HTTP_TOKEN_RE.fullmatch(tr_k):
+                        raise OSError("invalid upstream chunked trailer name")
+                    if any((ord(c) < 32 and c != "\t") or ord(c) == 127 for c in tr_v):
+                        raise OSError("invalid control char in upstream chunked trailer")
+                    tr_kl = tr_k.lower()
+                    if tr_kl.startswith("proxy-") or tr_kl in {"content-length", "transfer-encoding", "connection", "keep-alive"}:
+                        continue
                     conn.sendall(tr_line)
                     bytes_in += len(tr_line)
-                    if tr_line == b"\r\n":
-                        break
                 break
-            need = chunk_sz + 2  # payload + CRLF
+            need = chunk_sz
             while need > 0 and not stop_event.is_set():
                 _check_abort()
                 if not buf:
                     more = _recv_more(min(RELAY_CHUNK_BYTES, need))
                     if not more:
-                        return bytes_in, response_started
+                        raise OSError("unexpected EOF in upstream chunked body")
                     buf.extend(more)
                 take = min(len(buf), need)
                 piece = bytes(buf[:take])
@@ -740,6 +798,22 @@ def _relay_http_response(
                 conn.sendall(piece)
                 bytes_in += take
                 need -= take
+            # Verify exact 2-byte CRLF after chunk payload
+            while len(buf) < 2 and not stop_event.is_set():
+                _check_abort()
+                more = _recv_more(2 - len(buf))
+                if not more:
+                    raise OSError("unexpected EOF before upstream chunk CRLF")
+                buf.extend(more)
+            if stop_event.is_set():
+                raise OSError("gateway shutting down")
+            if bytes(buf[:2]) != b"\r\n":
+                raise OSError("malformed upstream chunk terminator")
+            del buf[:2]
+            conn.sendall(b"\r\n")
+            bytes_in += 2
+        if not saw_final_resp_chunk:
+            raise OSError("incomplete upstream chunked response")
         return bytes_in, response_started
 
     if content_len is not None:
@@ -782,6 +856,7 @@ def _relay_chunked_request_body(
     idle_timeout: float,
     stop_event: threading.Event,
     abort_check: Any | None = None,
+    sent_counter: list[int] | None = None,
 ) -> int:
     """Stream an HTTP/1.1 `Transfer-Encoding: chunked` request body safely to upstream."""
     buf = bytearray(initial)
@@ -791,6 +866,12 @@ def _relay_chunked_request_body(
     saw_final_chunk = False
     conn.settimeout(idle_timeout)
     upstream.settimeout(idle_timeout)
+
+    def _add_sent(n: int) -> None:
+        nonlocal bytes_forwarded
+        bytes_forwarded += n
+        if sent_counter is not None:
+            sent_counter[0] += n
 
     def _check_abort() -> None:
         if abort_check is not None and abort_check():
@@ -828,7 +909,7 @@ def _relay_chunked_request_body(
         # Forward canonical hex chunk size without unvalidated extensions (RFC 9112 §7.1.1 smuggling defense)
         canon_size_line = f"{chunk_size:x}\r\n".encode("ascii")
         upstream.sendall(canon_size_line)
-        bytes_forwarded += len(canon_size_line)
+        _add_sent(len(canon_size_line))
 
         if chunk_size == 0:
             # Forward validated trailers until terminating CRLF (with strict line, byte & header checks)
@@ -846,7 +927,7 @@ def _relay_chunked_request_body(
                     raise ValueError("chunked trailers exceed limit")
                 if tr_line == b"\r\n":
                     upstream.sendall(tr_line)
-                    bytes_forwarded += len(tr_line)
+                    _add_sent(len(tr_line))
                     saw_final_chunk = True
                     break
                 tr_text = tr_line[:-2].decode("iso-8859-1", errors="replace")
@@ -864,7 +945,7 @@ def _relay_chunked_request_body(
                 ):
                     continue
                 upstream.sendall(tr_line)
-                bytes_forwarded += len(tr_line)
+                _add_sent(len(tr_line))
             break
 
         need = chunk_size
@@ -880,20 +961,23 @@ def _relay_chunked_request_body(
             piece = bytes(buf[:take])
             del buf[:take]
             upstream.sendall(piece)
-            bytes_forwarded += take
+            _add_sent(take)
             need -= take
 
         # Strictly verify the 2-byte CRLF terminator after chunk payload (blocks chunk framing desync)
         while len(buf) < 2 and not stop_event.is_set():
+            _check_abort()
             more = conn.recv(2 - len(buf))
             if not more:
                 raise OSError("unexpected EOF before chunk CRLF")
             buf.extend(more)
+        if stop_event.is_set():
+            raise OSError("gateway shutting down")
         if bytes(buf[:2]) != b"\r\n":
             raise ValueError("malformed chunk terminator (expected CRLF)")
         del buf[:2]
         upstream.sendall(b"\r\n")
-        bytes_forwarded += 2
+        _add_sent(2)
 
     if not saw_final_chunk:
         raise OSError("incomplete chunked request body")
@@ -1142,7 +1226,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
 
         # 2. Extract destination host & port
         if method_u == "CONNECT":
-            if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in target):
+            if not _is_safe_ascii_host(target):
                 _send_proxy_error(conn, 400, "Bad Request", "invalid CONNECT target")
                 return
             if target.startswith("["):
@@ -1193,6 +1277,9 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 _send_proxy_error(conn, 400, "Bad Request", "userinfo in proxy target URL is not allowed")
                 return
             dest_host = parsed.hostname
+            if not _is_safe_ascii_host(dest_host):
+                _send_proxy_error(conn, 400, "Bad Request", "invalid non-ASCII characters in target host")
+                return
             if not (1 <= dest_port <= 65535):
                 _send_proxy_error(conn, 400, "Bad Request", "invalid URL port")
                 return
@@ -1294,24 +1381,35 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             return
 
         candidates = resolved
-        # 4b. Also enforce `blocked_domains` against resolved IPs (defeats octal/hex/decimal/mapped IP & DNS indirection)
+        # 4b. Also enforce `blocked_domains` against resolved IPs (defeats octal/hex/decimal/mapped/NAT64 IP & DNS indirection)
         if gw.blocked_domains:
             for _fam, sa in candidates:
                 resolved_ip = normalize_host(str(sa[0]))
-                for pat in gw.blocked_domains:
-                    if domain_matches(resolved_ip, pat):
-                        blk_reason = f"resolved IP {resolved_ip} matched blocked rule '{pat}'"
-                        self.server.audit_log.record(
-                            node_id=node_id,
-                            client_ip=client_ip,
-                            method=method_u,
-                            host=dest_host,
-                            port=dest_port,
-                            action="block",
-                            reason=blk_reason,
-                        )
-                        _send_proxy_error(conn, 403, "Forbidden", blk_reason)
-                        return
+                ip_cands = [resolved_ip]
+                try:
+                    r_addr = ipaddress.ip_address(resolved_ip)
+                    if isinstance(r_addr, ipaddress.IPv6Address):
+                        if r_addr.ipv4_mapped is not None:
+                            ip_cands.append(str(r_addr.ipv4_mapped))
+                        if r_addr in _NAT64_WELL_KNOWN_NET:
+                            ip_cands.append(str(ipaddress.IPv4Address(int(r_addr) & 0xFFFFFFFF)))
+                except ValueError:
+                    pass
+                for cand_ip in ip_cands:
+                    for pat in gw.blocked_domains:
+                        if domain_matches(cand_ip, pat):
+                            blk_reason = f"resolved IP {cand_ip} matched blocked rule '{pat}'"
+                            self.server.audit_log.record(
+                                node_id=node_id,
+                                client_ip=client_ip,
+                                method=method_u,
+                                host=dest_host,
+                                port=dest_port,
+                                action="block",
+                                reason=blk_reason,
+                            )
+                            _send_proxy_error(conn, 403, "Forbidden", blk_reason)
+                            return
 
         upstream: socket.socket | None = None
         bytes_in = 0
@@ -1405,16 +1503,31 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
 
                 if is_chunked:
+                    chunk_sent = [0]
                     try:
-                        bytes_out += _relay_chunked_request_body(
+                        _relay_chunked_request_body(
                             conn,
                             upstream,
                             leftover,
                             idle_timeout=gw.idle_timeout_sec,
                             stop_event=self.server.stop_event,
                             abort_check=lambda: node_id in self.server.cluster_config.gateway.quarantined_nodes,
+                            sent_counter=chunk_sent,
                         )
+                        bytes_out += chunk_sent[0]
                     except ValueError as exc:
+                        bytes_out += chunk_sent[0]
+                        self.server.audit_log.record(
+                            node_id=node_id,
+                            client_ip=client_ip,
+                            method=method_u,
+                            host=dest_host,
+                            port=dest_port,
+                            action="block",
+                            reason=f"chunked request error: {exc}",
+                            bytes_in=bytes_in,
+                            bytes_out=bytes_out,
+                        )
                         code = 413 if "limit" in str(exc) else 400
                         _send_proxy_error(conn, code, "Bad Request" if code == 400 else "Payload Too Large", str(exc))
                         return

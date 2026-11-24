@@ -108,16 +108,49 @@ def _read_text_safe(path: Path) -> str | None:
         return None
 
 
-def _normalize_sysfs_temp(raw_val: str) -> float | None:
+BATTERY_HAZARD_STATES = frozenset(
+    {
+        "OVERHEAT",
+        "OVER_VOLTAGE",
+        "SAFETY_TIMER_EXPIRE",
+        "WATCHDOG_TIMER_EXPIRE",
+        "OVER_CURRENT",
+        "DEAD",
+        "UNSPECIFIED_FAILURE",
+    }
+)
+_PRIORITY_SERVICE_PORTS = frozenset({22, 53, 80, 1883, 3000, 3632, 5432, 6379, 8022, 8081, 8123, 8765, 50052})
+
+
+def is_battery_health_hazardous(health: Any) -> bool:
+    """Return True if a PMIC/Termux battery health value signals an acute hardware hazard."""
+    norm = str(health or "").strip().upper().replace(" ", "_").replace("-", "_")
+    return norm in BATTERY_HAZARD_STATES
+
+
+def _normalize_sysfs_temp(raw_val: str, unit: str = "auto") -> float | None:
     """Normalize Linux sysfs temperatures (tenths of °C or millidegrees °C)."""
+    s = str(raw_val).strip()
     try:
-        val = float(raw_val)
+        val = float(s)
     except ValueError:
         return None
-    if abs(val) > 1000:
-        val = val / 1000.0
-    elif abs(val) > 150:
-        val = val / 10.0
+    if not math.isfinite(val):
+        return None
+    has_dot = "." in s
+    if unit == "decideg":
+        if abs(val) > 1500:
+            val = val / 1000.0
+        elif not has_dot:
+            val = val / 10.0
+    elif unit == "millideg":
+        if abs(val) > 200 and not has_dot:
+            val = val / 1000.0
+    else:
+        if abs(val) > 1000:
+            val = val / 1000.0
+        elif abs(val) > 150:
+            val = val / 10.0
     if -20.0 <= val <= 130.0:
         return round(val, 2)
     return None
@@ -162,9 +195,9 @@ def read_battery_via_termux(timeout_sec: float = 4.0) -> BatteryInfo | None:
     return BatteryInfo(
         percentage=pct,
         temperature_c=temp_c,
-        status=str(data.get("status") or "UNKNOWN").upper(),
-        health=str(data.get("health") or "UNKNOWN").upper(),
-        plugged=str(data.get("plugged") or "UNKNOWN").upper(),
+        status=str(data.get("status") or "UNKNOWN").strip().upper().replace(" ", "_"),
+        health=str(data.get("health") or "UNKNOWN").strip().upper().replace(" ", "_"),
+        plugged=str(data.get("plugged") or "UNKNOWN").strip().upper().replace(" ", "_"),
         source="termux-api",
     )
 
@@ -211,15 +244,16 @@ def read_battery_via_sysfs(base_dir: Path = POWER_SUPPLY_DIR) -> BatteryInfo | N
         except ValueError:
             pct = None
 
-    temp_c = _normalize_sysfs_temp(temp_raw) if temp_raw is not None else None
-    status_norm = status_raw.upper().replace(" ", "_")
+    temp_c = _normalize_sysfs_temp(temp_raw, unit="decideg") if temp_raw is not None else None
+    status_norm = status_raw.strip().upper().replace(" ", "_")
+    health_norm = health_raw.strip().upper().replace(" ", "_")
     plugged = "PLUGGED" if status_norm in {"CHARGING", "FULL"} else "UNPLUGGED"
 
     return BatteryInfo(
         percentage=pct,
         temperature_c=temp_c,
         status=status_norm,
-        health=health_raw.upper(),
+        health=health_norm,
         plugged=plugged,
         source=f"sysfs:{battery_dir.name}",
     )
@@ -239,7 +273,7 @@ def read_thermal_zone_temp(base_dir: Path = THERMAL_DIR) -> float | None:
         raw = _read_text_safe(zone / "temp")
         if raw is None:
             continue
-        norm = _normalize_sysfs_temp(raw)
+        norm = _normalize_sysfs_temp(raw, unit="millideg")
         if norm is not None and norm > 5.0:
             ztype = (_read_text_safe(zone / "type") or "").lower()
             if any(k in ztype for k in ("cpu", "soc", "ap", "mtk", "tsens", "x86_pkg", "acpitz")):
@@ -500,12 +534,13 @@ def read_top_processes(limit: int = 5, timeout_sec: float = 1.5) -> list[dict[st
     output = ""
     for cmd in candidates:
         try:
-            output = subprocess.check_output(
-                cmd, stderr=subprocess.DEVNULL, text=True, timeout=timeout_sec
+            raw_out = subprocess.check_output(
+                cmd, stderr=subprocess.DEVNULL, timeout=timeout_sec
             )
+            output = raw_out.decode("utf-8", errors="replace")
             if output.strip():
                 break
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError, UnicodeDecodeError):
             continue
     if not output:
         return []
@@ -726,7 +761,7 @@ def collect_node_health(
     battery = read_battery_info()
     mem = read_memory_info()
     overheated = thermal_gate.evaluate(battery.temperature_c)
-    battery_hazard = battery.health.upper() in {"OVERHEAT", "OVER_VOLTAGE", "SAFETY_TIMER_EXPIRE"}
+    battery_hazard = is_battery_health_hazardous(battery.health)
     low_ram = (
         mem["total_mb"] > 0 and mem["available_mb"] < safety.min_free_ram_mb
     )
@@ -793,11 +828,16 @@ def collect_node_health(
         disk_total_gb = 0.0
 
     listening_map = _read_listening_tcp_map()
-    listening_ports = (
-        [{"port": p, "exposed": exp} for p, exp in sorted(listening_map.items())][:64]
-        if listening_map
-        else []
-    )
+    if listening_map:
+        # Prioritize known cluster/service ports (and llama RPC range >= 50050) so busy Docker/k3s hosts never drop them
+        prioritized = sorted(
+            listening_map.items(),
+            key=lambda kv: (0 if (kv[0] in _PRIORITY_SERVICE_PORTS or kv[0] >= 50050) else 1, kv[0]),
+        )[:128]
+        prioritized.sort(key=lambda kv: kv[0])
+        listening_ports = [{"port": p, "exposed": exp} for p, exp in prioritized]
+    else:
+        listening_ports = []
     caps = detect_capabilities(listening_map=listening_map)
     os_env = detect_os_environment()
     detected_tier, detected_pool = detect_node_tier(os_env, caps["tools"])
