@@ -21,7 +21,7 @@ import hmac
 import ipaddress
 import logging
 import re
-import select
+import selectors
 import socket
 import socketserver
 import threading
@@ -74,7 +74,11 @@ def _parse_host_header(host_val: str) -> tuple[str, int | None] | None:
             return None
         host_part = raw[1:end].strip()
         rest = raw[end + 1 :]
-        if not host_part or "[" in host_part or "]" in host_part:
+        if not host_part or "[" in host_part or "]" in host_part or "%" in host_part:
+            return None
+        try:
+            ipaddress.IPv6Address(host_part)
+        except ValueError:
             return None
         if not rest:
             port_val: int | None = None
@@ -245,7 +249,7 @@ def domain_matches(host: str, pattern: str) -> bool:
 
 def evaluate_policy(host: str, port: int, gw: GatewayConfig) -> tuple[bool, str]:
     """Evaluate Network Guard port/domain/mode policy for `(host, port)`."""
-    clean_host = host.strip().lower().rstrip(".")
+    clean_host = normalize_host(host).lower().rstrip(".")
     if not clean_host:
         return False, "empty destination host"
     if port not in gw.allowed_ports:
@@ -409,10 +413,17 @@ class GatewayAuditLog:
 
 
 def _read_http_head(conn: socket.socket, timeout_sec: float = 10.0) -> bytes | None:
-    """Read an HTTP request head up to `\\r\\n\\r\\n` with strict byte limit and total deadline."""
+    """Read an HTTP request head up to `\\r\\n\\r\\n` with strict header-byte limit and total deadline."""
     deadline = time.monotonic() + max(0.5, timeout_sec)
     buf = bytearray()
-    while b"\r\n\r\n" not in buf:
+    while True:
+        sep = buf.find(b"\r\n\r\n")
+        if sep != -1:
+            if sep + 4 > MAX_HEADER_BYTES:
+                return None
+            return bytes(buf)
+        if len(buf) > MAX_HEADER_BYTES:
+            return None
         rem = deadline - time.monotonic()
         if rem <= 0:
             return None
@@ -421,9 +432,6 @@ def _read_http_head(conn: socket.socket, timeout_sec: float = 10.0) -> bytes | N
         if not chunk:
             return None
         buf.extend(chunk)
-        if len(buf) > MAX_HEADER_BYTES:
-            return None
-    return bytes(buf)
 
 
 def _send_proxy_error(conn: socket.socket, code: int, title: str, detail: str, extra_headers: str = "") -> None:
@@ -464,62 +472,307 @@ def _relay_bidirectional(
     stop_event: threading.Event,
     abort_check: Any | None = None,
 ) -> tuple[int, int]:
-    """Relay bytes between client and upstream sockets with proper TCP half-close handling."""
+    """Non-blocking full-duplex TCP relay using `selectors` (deadlock-free, no 1024-FD cap)."""
     bytes_in = 0
     bytes_out = 0
+    max_buf = 64 * 1024
     client_sock.setblocking(False)
     upstream_sock.setblocking(False)
     last_activity = time.monotonic()
-    open_readers = [client_sock, upstream_sock]
 
-    while open_readers and not stop_event.is_set():
-        if abort_check is not None and abort_check():
-            break
-        try:
-            readable, _, errored = select.select(open_readers, [], open_readers, 0.5)
-        except (OSError, ValueError):
-            break
-        if errored or (abort_check is not None and abort_check()):
-            break
-        if not readable:
-            if time.monotonic() - last_activity >= idle_timeout:
+    peer = {client_sock: upstream_sock, upstream_sock: client_sock}
+    out_buf = {client_sock: bytearray(), upstream_sock: bytearray()}
+    eof_from = {client_sock: False, upstream_sock: False}
+    shut_wr_sent = {client_sock: False, upstream_sock: False}
+
+    sel = selectors.DefaultSelector()
+    try:
+        while not stop_event.is_set():
+            if abort_check is not None and abort_check():
                 break
-            continue
-        last_activity = time.monotonic()
-        abort = False
-        for sock in readable:
-            other = upstream_sock if sock is client_sock else client_sock
-            try:
-                data = sock.recv(RELAY_CHUNK_BYTES)
-            except (BlockingIOError, InterruptedError):
-                continue
-            except OSError:
-                abort = True
+            done_c2u = eof_from[client_sock] and not out_buf[upstream_sock]
+            done_u2c = eof_from[upstream_sock] and not out_buf[client_sock]
+            if done_c2u and done_u2c:
                 break
-            if not data:
-                # Propagate TCP half-close so peer finishes flushing remaining response bytes
-                if sock in open_readers:
-                    open_readers.remove(sock)
+
+            for s in (client_sock, upstream_sock):
+                mask = 0
+                if not eof_from[s] and len(out_buf[peer[s]]) < max_buf:
+                    mask |= selectors.EVENT_READ
+                if out_buf[s]:
+                    mask |= selectors.EVENT_WRITE
                 try:
-                    other.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-                continue
-            try:
-                other.setblocking(True)
-                other.settimeout(idle_timeout)
-                other.sendall(data)
-                other.setblocking(False)
-            except OSError:
-                abort = True
+                    existing = sel.get_key(s)
+                except KeyError:
+                    existing = None
+                if mask == 0:
+                    if existing is not None:
+                        sel.unregister(s)
+                elif existing is None:
+                    sel.register(s, mask)
+                elif existing.events != mask:
+                    sel.modify(s, mask)
+
+            if not sel.get_map():
                 break
-            if sock is client_sock:
-                bytes_out += len(data)
-            else:
-                bytes_in += len(data)
-        if abort:
-            break
+
+            try:
+                events = sel.select(timeout=0.5)
+            except (OSError, ValueError):
+                break
+            if abort_check is not None and abort_check():
+                break
+            if not events:
+                if time.monotonic() - last_activity >= idle_timeout:
+                    break
+                continue
+
+            last_activity = time.monotonic()
+            abort = False
+            for key, mask in events:
+                sock: socket.socket = key.fileobj  # type: ignore[assignment]
+                other = peer[sock]
+                if mask & selectors.EVENT_WRITE and out_buf[sock]:
+                    try:
+                        sent = sock.send(out_buf[sock])
+                    except (BlockingIOError, InterruptedError):
+                        sent = 0
+                    except OSError:
+                        abort = True
+                        break
+                    if sent > 0:
+                        del out_buf[sock][:sent]
+                        if sock is upstream_sock:
+                            bytes_out += sent
+                        else:
+                            bytes_in += sent
+                    if not out_buf[sock] and eof_from[other] and not shut_wr_sent[sock]:
+                        shut_wr_sent[sock] = True
+                        try:
+                            sock.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+
+                if mask & selectors.EVENT_READ and not eof_from[sock]:
+                    try:
+                        data = sock.recv(RELAY_CHUNK_BYTES)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except OSError:
+                        abort = True
+                        break
+                    if not data:
+                        eof_from[sock] = True
+                        if not out_buf[other] and not shut_wr_sent[other]:
+                            shut_wr_sent[other] = True
+                            try:
+                                other.shutdown(socket.SHUT_WR)
+                            except OSError:
+                                pass
+                    else:
+                        out_buf[other].extend(data)
+            if abort:
+                break
+    finally:
+        sel.close()
     return bytes_in, bytes_out
+
+
+def _relay_http_response(
+    conn: socket.socket,
+    upstream: socket.socket,
+    method_u: str,
+    req_version: str,
+    idle_timeout: float,
+    stop_event: threading.Event,
+    abort_check: Any | None = None,
+) -> tuple[int, bool]:
+    """Parse upstream HTTP response head(s), sanitize hop-by-hop headers, force `Connection: close`, and stream framed body."""
+    bytes_in = 0
+    response_started = False
+    buf = bytearray()
+    conn.settimeout(idle_timeout)
+    upstream.settimeout(idle_timeout)
+
+    def _check_abort() -> None:
+        if stop_event.is_set():
+            raise OSError("gateway shutting down")
+        if abort_check is not None and abort_check():
+            raise OSError("node quarantined during response relay")
+
+    def _recv_more(limit: int = RELAY_CHUNK_BYTES) -> bytes:
+        _check_abort()
+        return upstream.recv(limit)
+
+    def _fill_until(needle: bytes, max_buf: int = 65536) -> bool:
+        while needle not in buf:
+            if len(buf) > max_buf:
+                return False
+            chunk = _recv_more(4096)
+            if not chunk:
+                return False
+            buf.extend(chunk)
+        return True
+
+    # Read response head(s), forwarding any 1xx interim responses before the final response head
+    interim_count = 0
+    while True:
+        if not _fill_until(b"\r\n\r\n", max_buf=65536):
+            if not buf:
+                return bytes_in, response_started
+            # Non-standard upstream EOF without CRLFCRLF: fail cleanly if nothing started
+            raise OSError("truncated upstream HTTP response headers")
+        sep = buf.find(b"\r\n\r\n")
+        head_bytes = bytes(buf[:sep])
+        del buf[: sep + 4]
+
+        lines = head_bytes.decode("iso-8859-1", errors="replace").split("\r\n")
+        status_line = lines[0]
+        sparts = status_line.split(" ", 2)
+        if len(sparts) < 2 or not sparts[0].upper().startswith("HTTP/") or len(sparts[1]) != 3 or not sparts[1].isascii() or not sparts[1].isdigit():
+            raise OSError("malformed upstream HTTP status line")
+        status_code = int(sparts[1])
+        if 100 <= status_code < 200 and status_code != 101:
+            interim_count += 1
+            if interim_count > 8:
+                raise OSError("too many interim 1xx upstream responses")
+            if req_version == "HTTP/1.1":
+                interim = head_bytes + b"\r\n\r\n"
+                conn.sendall(interim)
+                bytes_in += len(interim)
+                response_started = True
+            continue
+
+        resp_pairs: list[tuple[str, str]] = []
+        for hline in lines[1:]:
+            if not hline or ":" not in hline:
+                continue
+            rk, rv = hline.split(":", 1)
+            resp_pairs.append((rk.strip(), rv.strip()))
+
+        conn_tokens = {
+            tok.strip().lower()
+            for k, v in resp_pairs
+            if k.lower() == "connection"
+            for tok in v.split(",")
+            if tok.strip()
+        }
+        hop_headers = (
+            {"connection", "keep-alive", "te", "trailers", "upgrade"}
+            | conn_tokens
+        ) - {"content-length", "transfer-encoding"}
+
+        is_chunked = False
+        content_len: int | None = None
+        for k, v in resp_pairs:
+            kl = k.lower()
+            if kl == "transfer-encoding" and "chunked" in v.lower():
+                is_chunked = True
+            elif kl == "content-length":
+                cl_parts = [p.strip() for p in v.split(",") if p.strip()]
+                if not cl_parts or not all(_ASCII_UINT_RE.fullmatch(p) for p in cl_parts):
+                    raise OSError("invalid upstream Content-Length")
+                for p in cl_parts:
+                    val = int(p)
+                    if content_len is not None and content_len != val:
+                        raise OSError("conflicting upstream Content-Length")
+                    content_len = val
+
+        # RFC 9112 §6.3: if both Transfer-Encoding and Content-Length appear, drop Content-Length
+        out_hdrs = [
+            f"{k}: {v}"
+            for k, v in resp_pairs
+            if not k.lower().startswith("proxy-")
+            and k.lower() not in hop_headers
+            and not (is_chunked and k.lower() == "content-length")
+        ]
+        out_hdrs.append("Connection: close")
+        clean_head = (status_line + "\r\n" + "\r\n".join(out_hdrs) + "\r\n\r\n").encode(
+            "iso-8859-1", errors="replace"
+        )
+        conn.sendall(clean_head)
+        bytes_in += len(clean_head)
+        response_started = True
+        break
+
+    # RFC 9112 §6.3: HEAD, 204, 304, and 1xx responses have zero body bytes
+    if method_u == "HEAD" or status_code in (204, 304) or (100 <= status_code < 200):
+        return bytes_in, response_started
+
+    if is_chunked:
+        while not stop_event.is_set():
+            _check_abort()
+            if not _fill_until(b"\r\n", max_buf=16384):
+                break
+            line_end = buf.find(b"\r\n")
+            size_line = bytes(buf[: line_end + 2])
+            del buf[: line_end + 2]
+            conn.sendall(size_line)
+            bytes_in += len(size_line)
+            size_tok = size_line[:-2].split(b";", 1)[0].strip()
+            if not _ASCII_HEX_RE.fullmatch(size_tok):
+                break
+            chunk_sz = int(size_tok, 16)
+            if chunk_sz == 0:
+                while not stop_event.is_set():
+                    _check_abort()
+                    if not _fill_until(b"\r\n", max_buf=16384):
+                        break
+                    tr_end = buf.find(b"\r\n")
+                    tr_line = bytes(buf[: tr_end + 2])
+                    del buf[: tr_end + 2]
+                    conn.sendall(tr_line)
+                    bytes_in += len(tr_line)
+                    if tr_line == b"\r\n":
+                        break
+                break
+            need = chunk_sz + 2  # payload + CRLF
+            while need > 0 and not stop_event.is_set():
+                _check_abort()
+                if not buf:
+                    more = _recv_more(min(RELAY_CHUNK_BYTES, need))
+                    if not more:
+                        return bytes_in, response_started
+                    buf.extend(more)
+                take = min(len(buf), need)
+                piece = bytes(buf[:take])
+                del buf[:take]
+                conn.sendall(piece)
+                bytes_in += take
+                need -= take
+        return bytes_in, response_started
+
+    if content_len is not None:
+        remaining = content_len
+        if buf and remaining > 0:
+            take = min(len(buf), remaining)
+            piece = bytes(buf[:take])
+            del buf[:take]
+            conn.sendall(piece)
+            bytes_in += take
+            remaining -= take
+        while remaining > 0 and not stop_event.is_set():
+            more = _recv_more(min(RELAY_CHUNK_BYTES, remaining))
+            if not more:
+                break
+            conn.sendall(more)
+            bytes_in += len(more)
+            remaining -= len(more)
+        return bytes_in, response_started
+
+    # Close-delimited response (HTTP/1.0 or no Content-Length/Transfer-Encoding): stream until EOF
+    if buf:
+        piece = bytes(buf)
+        buf.clear()
+        conn.sendall(piece)
+        bytes_in += len(piece)
+    while not stop_event.is_set():
+        more = _recv_more(RELAY_CHUNK_BYTES)
+        if not more:
+            break
+        conn.sendall(more)
+        bytes_in += len(more)
+    return bytes_in, response_started
 
 
 def _relay_chunked_request_body(
@@ -670,9 +923,10 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
         self._node_req_times: dict[str, collections.deque[float]] = {}
         self._active_conns_lock = threading.Lock()
         self._active_node_sockets: dict[str, set[socket.socket]] = {}
-        if ":" in str(addr[0]):
+        bind_host = normalize_host(str(addr[0])) or "0.0.0.0"
+        if ":" in bind_host:
             self.address_family = socket.AF_INET6
-        super().__init__(addr, _NetworkGuardHandler)
+        super().__init__((bind_host, addr[1]), _NetworkGuardHandler)
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._thread_sem.acquire(blocking=False):
@@ -707,17 +961,13 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
                 self._active_node_sockets.pop(node_id, None)
 
     def disconnect_node(self, node_id: str) -> int:
-        """Immediately sever all active proxy/CONNECT tunnels belonging to `node_id` (e.g. on quarantine)."""
+        """Immediately sever all active proxy/CONNECT tunnels belonging to `node_id` without cross-thread close FD races."""
         with self._active_conns_lock:
             socks = list(self._active_node_sockets.pop(node_id, set()))
         closed = 0
         for s in socks:
             try:
                 s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                s.close()
                 closed += 1
             except OSError:
                 pass
@@ -771,10 +1021,6 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
         for s in all_socks:
             try:
                 s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                s.close()
             except OSError:
                 pass
         super().shutdown()
@@ -936,7 +1182,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 return
             try:
                 parsed = urllib.parse.urlsplit(target)
-                dest_port = parsed.port or 80
+                dest_port = 80 if parsed.port is None else parsed.port
             except ValueError:
                 _send_proxy_error(conn, 400, "Bad Request", "malformed proxy target URL")
                 return
@@ -995,6 +1241,9 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 _send_proxy_error(conn, 400, "Bad Request", "multiple Transfer-Encoding headers not supported")
                 return
             if te_values:
+                if version == "HTTP/1.0":
+                    _send_proxy_error(conn, 400, "Bad Request", "Transfer-Encoding is not allowed in HTTP/1.0")
+                    return
                 if te_values[0].lower() != "chunked":
                     _send_proxy_error(conn, 501, "Not Implemented", "only Transfer-Encoding: chunked is supported")
                     return
@@ -1186,18 +1435,17 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                         bytes_out += len(chunk)
                         remaining -= len(chunk)
 
-                # Relay upstream HTTP response back to worker (both sockets have explicit idle timeout)
-                conn.settimeout(gw.idle_timeout_sec)
-                upstream.settimeout(gw.idle_timeout_sec)
-                while not self.server.stop_event.is_set():
-                    if node_id in self.server.cluster_config.gateway.quarantined_nodes:
-                        break
-                    resp_chunk = upstream.recv(RELAY_CHUNK_BYTES)
-                    if not resp_chunk:
-                        break
-                    response_started = True
-                    conn.sendall(resp_chunk)
-                    bytes_in += len(resp_chunk)
+                # Relay upstream HTTP response cleanly (sanitizes hop-by-hop headers, forces Connection: close, respects HEAD/204/304/CL/chunked)
+                r_in, response_started = _relay_http_response(
+                    conn,
+                    upstream,
+                    method_u=method_u,
+                    req_version=version,
+                    idle_timeout=gw.idle_timeout_sec,
+                    stop_event=self.server.stop_event,
+                    abort_check=lambda: node_id in self.server.cluster_config.gateway.quarantined_nodes,
+                )
+                bytes_in += r_in
 
             self.server.audit_log.record(
                 node_id=node_id,
@@ -1240,6 +1488,7 @@ class GatewayManager:
         self.config = config
         self.audit_log = GatewayAuditLog()
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._server: NetworkGuardServer | None = None
         self._thread: threading.Thread | None = None
         self._bound_host: str = ""
@@ -1259,14 +1508,16 @@ class GatewayManager:
             return int(self.config.gateway.port)
 
     def start(self) -> tuple[bool, str]:
-        with self._lock:
-            if self._server is not None:
-                return True, f"already running on port {self._server.server_address[1]}"
+        with self._lifecycle_lock:
+            with self._lock:
+                if self._server is not None:
+                    return True, f"already running on port {self._server.server_address[1]}"
             gw = self.config.gateway
             try:
                 srv = NetworkGuardServer((gw.bind_host, gw.port), self.config, self.audit_log)
             except OSError as exc:
-                self._last_error = str(exc)
+                with self._lock:
+                    self._last_error = str(exc)
                 return False, f"could not bind {gw.bind_host}:{gw.port}: {exc}"
             th = threading.Thread(
                 target=srv.serve_forever,
@@ -1275,11 +1526,12 @@ class GatewayManager:
                 daemon=True,
             )
             th.start()
-            self._server = srv
-            self._thread = th
-            self._bound_host = gw.bind_host
-            self._bound_max_conn = gw.max_connections
-            self._last_error = ""
+            with self._lock:
+                self._server = srv
+                self._thread = th
+                self._bound_host = gw.bind_host
+                self._bound_max_conn = gw.max_connections
+                self._last_error = ""
             actual_port = srv.server_address[1]
             LOG.info(
                 "Master Network Guard listening on %s:%d (mode=%s, allowlist=%d domains)",
@@ -1299,41 +1551,45 @@ class GatewayManager:
         return 0
 
     def stop(self) -> None:
-        with self._lock:
-            srv = self._server
-            self._server = None
-            self._thread = None
-        if srv is not None:
-            try:
-                srv.shutdown()
-            finally:
-                srv.server_close()
-            LOG.info("Master Network Guard stopped.")
+        with self._lifecycle_lock:
+            with self._lock:
+                srv = self._server
+                self._server = None
+                self._thread = None
+            if srv is not None:
+                try:
+                    srv.shutdown()
+                finally:
+                    srv.server_close()
+                LOG.info("Master Network Guard stopped.")
 
     def sync_with_config(self) -> tuple[bool, str]:
         """Start, stop, or rebind the Network Guard to match `self.config.gateway`."""
-        gw = self.config.gateway
-        if not gw.enabled:
-            self.stop()
-            return True, "disabled"
-        with self._lock:
-            needs_rebind = (
-                self._server is not None
-                and (
-                    (self._server.server_address[1] != gw.port and gw.port != 0)
-                    or self._bound_host != gw.bind_host
-                    or self._bound_max_conn != gw.max_connections
+        with self._lifecycle_lock:
+            gw = self.config.gateway
+            if not gw.enabled:
+                self.stop()
+                return True, "disabled"
+            with self._lock:
+                needs_rebind = (
+                    self._server is not None
+                    and (
+                        (self._server.server_address[1] != gw.port and gw.port != 0)
+                        or self._bound_host != gw.bind_host
+                        or self._bound_max_conn != gw.max_connections
+                    )
                 )
-            )
-        if needs_rebind:
-            self.stop()
-        if not self.is_running:
-            return self.start()
-        return True, f"running on port {self.bound_port}"
+            if needs_rebind:
+                self.stop()
+            if not self.is_running:
+                return self.start()
+            return True, f"running on port {self.bound_port}"
 
     def status(self, include_events: int = 60) -> dict[str, Any]:
         gw = self.config.gateway
         audit = self.audit_log.snapshot(limit=include_events)
+        with self._lock:
+            last_err = self._last_error
         return {
             "enabled": gw.enabled,
             "running": self.is_running,
@@ -1347,7 +1603,7 @@ class GatewayManager:
             "inject_proxy_env": gw.inject_proxy_env,
             "quarantined_nodes": list(gw.quarantined_nodes),
             "max_requests_per_min_per_node": gw.max_requests_per_min_per_node,
-            "last_error": self._last_error,
+            "last_error": last_err,
             "presets": GATEWAY_PRESETS,
             "stats": {
                 "total_allowed": audit["total_allowed"],

@@ -14,6 +14,7 @@ ROLE=""
 NODE_ID=""
 WITH_COMPUTE=0
 NON_INTERACTIVE=0
+DIR_EXPLICIT=0
 INSTALL_DIR="${PHONECLUSTER_DIR:-${HOME}/phonecluster}"
 REPO_URL="${PHONECLUSTER_REPO_URL:-https://github.com/andreasNosalSK/phonecluster.git}"
 
@@ -34,12 +35,16 @@ Options:
 EOF
 }
 
+has_tty() {
+  (exec < /dev/tty) 2>/dev/null
+}
+
 # Read safely from /dev/tty even when invoked via `curl ... | bash`
 ask() {
   local prompt="$1"
   local default_val="$2"
   local reply=""
-  if [[ -r /dev/tty ]]; then
+  if has_tty; then
     read -r -p "${prompt}" reply < /dev/tty || reply=""
   elif [[ -t 0 ]]; then
     read -r -p "${prompt}" reply || reply=""
@@ -57,7 +62,7 @@ while [[ $# -gt 0 ]]; do
     --with-compute) WITH_COMPUTE=1; shift ;;
     --dir)
       [[ $# -ge 2 ]] || { echo "Error: --dir requires a path" >&2; usage; exit 2; }
-      INSTALL_DIR="$2"; shift 2 ;;
+      INSTALL_DIR="$2"; DIR_EXPLICIT=1; shift 2 ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
@@ -66,11 +71,6 @@ done
 
 if [[ -n "${NODE_ID}" && ! "${NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
   echo "Error: Invalid --node-id '${NODE_ID}' (must start with alphanumeric and contain only A-Za-z0-9._-, max 40 chars)." >&2
-  exit 2
-fi
-
-if [[ "${INSTALL_DIR}" == *$'\n'* || "${INSTALL_DIR}" == *'"'* || "${INSTALL_DIR}" == *'$'* || "${INSTALL_DIR}" == *'`'* ]]; then
-  echo "Error: Unsupported special characters in --dir '${INSTALL_DIR}'." >&2
   exit 2
 fi
 
@@ -83,15 +83,22 @@ echo "============================================================"
 echo "  PhoneCluster Easy Installer"
 echo "============================================================"
 
-# Locate source directory if running from inside a cloned repo
+# Locate source directory if running from inside a cloned repo (unless --dir was explicitly set)
 SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 
-if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/phonecluster_cli.py" ]]; then
+if [[ "${DIR_EXPLICIT}" -eq 0 && -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/phonecluster_cli.py" ]]; then
   INSTALL_DIR="${SCRIPT_DIR}"
-else
+fi
+
+if [[ "${INSTALL_DIR}" == *$'\n'* || "${INSTALL_DIR}" == *'"'* || "${INSTALL_DIR}" == *'$'* || "${INSTALL_DIR}" == *'`'* || "${INSTALL_DIR}" == *'\'* ]]; then
+  echo "Error: Unsupported special characters in install directory '${INSTALL_DIR}'." >&2
+  exit 2
+fi
+
+if [[ ! -f "${INSTALL_DIR}/phonecluster_cli.py" ]]; then
   if ! command -v git >/dev/null 2>&1; then
     if [[ "${IS_TERMUX}" -eq 1 ]]; then
       echo "Installing git in Termux..."
@@ -187,7 +194,11 @@ if [[ "${IS_TERMUX}" -eq 1 && "${ROLE}" != "cli-only" && -n "${ROLE}" ]]; then
   EXTRA_ARGS=(--node-id "${NODE_ID}" --repo-dir "${INSTALL_DIR}")
   [[ "${ROLE}" == "master" ]] && EXTRA_ARGS+=(--master)
   [[ "${WITH_COMPUTE}" -eq 1 ]] && EXTRA_ARGS+=(--with-compute)
-  bash "${INSTALL_DIR}/scripts/02_termux_node_setup.sh" "${EXTRA_ARGS[@]}"
+  if has_tty; then
+    bash "${INSTALL_DIR}/scripts/02_termux_node_setup.sh" "${EXTRA_ARGS[@]}" < /dev/tty
+  else
+    bash "${INSTALL_DIR}/scripts/02_termux_node_setup.sh" "${EXTRA_ARGS[@]}"
+  fi
 else
   echo "[4/4] Skipping Termux:Boot (not running inside Termux or cli-only mode)."
 fi
@@ -209,8 +220,9 @@ echo
 
 if [[ "${ROLE}" == "master" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR}/config/cluster.json" ]]; then
   RUN_WIZ="$(ask "Launch the Guided Setup Wizard right now? [Y/n]: " "y")"
-  if [[ "${RUN_WIZ,,}" == "y" || "${RUN_WIZ,,}" == "yes" ]]; then
-    if [[ -r /dev/tty ]]; then
+  RUN_WIZ_LC="$(printf '%s' "${RUN_WIZ}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${RUN_WIZ_LC}" == "y" || "${RUN_WIZ_LC}" == "yes" ]]; then
+    if has_tty; then
       "${BIN_DIR}/phonecluster" wizard < /dev/tty
     else
       "${BIN_DIR}/phonecluster" wizard
@@ -220,8 +232,9 @@ elif [[ "${ROLE}" == "worker" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_D
   echo "Ready to join your cluster securely!"
   echo "  -> On your Master phone, open Pairing first (Web UI Tab 6 or run: pc pair)"
   RUN_JOIN="$(ask "Auto-search Wi-Fi for your Master phone and pair now? [Y/n]: " "y")"
-  if [[ "${RUN_JOIN,,}" == "y" || "${RUN_JOIN,,}" == "yes" ]]; then
-    if [[ -r /dev/tty ]]; then
+  RUN_JOIN_LC="$(printf '%s' "${RUN_JOIN}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${RUN_JOIN_LC}" == "y" || "${RUN_JOIN_LC}" == "yes" ]]; then
+    if has_tty; then
       "${BIN_DIR}/phonecluster" join < /dev/tty
     else
       "${BIN_DIR}/phonecluster" join

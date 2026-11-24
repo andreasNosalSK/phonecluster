@@ -22,12 +22,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import logging
+import math
 import os
 import re
 import secrets
-import select
+import selectors
 import socket
 import threading
 import time
@@ -40,6 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .auth import (
+    AuthRateLimiter,
     build_direct_opener,
     is_allowed_http_host,
     parse_strict_content_length,
@@ -243,6 +246,12 @@ class PairingBeaconResponder(threading.Thread):
         self.bound_port: int = discovery_port
 
     def bind(self) -> bool:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(socket, "SO_REUSEPORT"):
@@ -250,7 +259,12 @@ class PairingBeaconResponder(threading.Thread):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except OSError:
                 pass
-        bind_addr = "0.0.0.0" if (not self.listen_host or ":" in self.listen_host) else self.listen_host
+        # On Linux/Android, binding a unicast LAN IP drops IPv4 broadcasts; bind 0.0.0.0 unless loopback.
+        lh = normalize_host(self.listen_host)
+        if lh and ":" not in lh and lh.startswith("127."):
+            bind_addr = lh
+        else:
+            bind_addr = "0.0.0.0"
         try:
             sock.bind((bind_addr, self.discovery_port))
             sock.settimeout(0.4)
@@ -264,56 +278,78 @@ class PairingBeaconResponder(threading.Thread):
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._sock is not None:
+        if not self.is_alive() and self._sock is not None:
             try:
                 self._sock.close()
             except OSError:
                 pass
+            self._sock = None
 
     def run(self) -> None:
         if self._sock is None and not self.bind():
             return
-        assert self._sock is not None
+        sock = self._sock
+        assert sock is not None
         LOG.info("Temporary pairing beacon active on UDP %s:%d", self.listen_host, self.bound_port)
         reply_window_start = time.monotonic()
         replies_in_window = 0
-        while not self._stop_event.is_set() and time.monotonic() < self.expires_at:
-            try:
-                data, addr = self._sock.recvfrom(2048)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if not addr or addr[1] <= 0:
-                continue
-            now_m = time.monotonic()
-            if now_m - reply_window_start >= 1.0:
-                reply_window_start = now_m
-                replies_in_window = 0
-            if replies_in_window >= 20:
-                continue
-            try:
-                msg = json.loads(data.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if isinstance(msg, dict) and msg.get("type") == PAIR_SEARCH_TYPE:
-                rem = max(0, int(self.expires_at - time.monotonic()))
-                if rem <= 0:
-                    break
-                reply = {
-                    "type": PAIR_BEACON_TYPE,
-                    "cluster_name": self.cluster_name,
-                    "pair_port": self.pair_port,
-                    "session_id": self.session_id,
-                    "fingerprint": self.fingerprint,
-                    "expires_in_sec": rem,
-                }
+        try:
+            while not self._stop_event.is_set() and time.monotonic() < self.expires_at:
                 try:
-                    self._sock.sendto(json.dumps(reply).encode("utf-8"), addr)
-                    replies_in_window += 1
+                    data, addr = sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
                 except OSError:
-                    pass
-        self.stop()
+                    break
+                if not addr or addr[1] <= 0:
+                    continue
+                now_m = time.monotonic()
+                if now_m - reply_window_start >= 1.0:
+                    reply_window_start = now_m
+                    replies_in_window = 0
+                if replies_in_window >= 20:
+                    continue
+                try:
+                    msg = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(msg, dict) and msg.get("type") == PAIR_SEARCH_TYPE:
+                    rem = max(0, int(self.expires_at - time.monotonic()))
+                    if rem <= 0:
+                        break
+                    reply = {
+                        "type": PAIR_BEACON_TYPE,
+                        "cluster_name": self.cluster_name,
+                        "pair_port": self.pair_port,
+                        "session_id": self.session_id,
+                        "fingerprint": self.fingerprint,
+                        "expires_in_sec": rem,
+                    }
+                    try:
+                        sock.sendto(json.dumps(reply).encode("utf-8"), addr)
+                        replies_in_window += 1
+                    except OSError:
+                        pass
+        finally:
+            self._stop_event.set()
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if self._sock is sock:
+                self._sock = None
+
+
+def _parse_udp_int(val: Any) -> int | None:
+    """Safely parse a finite integer from an untrusted UDP JSON packet (rejects None/bool/inf/NaN)."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        if isinstance(val, float) and (not math.isfinite(val) or not val.is_integer()):
+            return None
+        return int(val)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def discover_pairing_masters(
@@ -328,41 +364,57 @@ def discover_pairing_masters(
 
     def _open_probe_sock() -> socket.socket:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.setblocking(False)
-        return s
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.setblocking(False)
+            return s
+        except OSError:
+            s.close()
+            raise
 
-    socks: list[socket.socket] = [_open_probe_sock()]
+    socks: list[socket.socket] = []
+    sel = selectors.DefaultSelector()
     found: dict[tuple[str, int], dict[str, Any]] = {}
+    per_ip_count: dict[str, int] = {}
     try:
-        def _send_probes(s: socket.socket) -> None:
+        def _add_and_probe() -> None:
+            s = _open_probe_sock()
+            socks.append(s)
+            sel.register(s, selectors.EVENT_READ)
             for dest in dests:
                 try:
                     s.sendto(probe, (dest, discovery_port))
                 except OSError:
                     pass
 
-        _send_probes(socks[0])
+        # Use multiple distinct ephemeral source ports to defeat Linux SO_REUSEPORT hash-pinning
+        # when DiscoveryResponder and PairingBeaconResponder share UDP 8766 on Master.
+        for _ in range(4):
+            try:
+                _add_and_probe()
+            except OSError:
+                if not socks:
+                    raise
+                break
+
         started = time.monotonic()
         deadline = started + max(0.2, timeout_sec)
         resent = False
         while time.monotonic() < deadline:
             if not resent and timeout_sec >= 0.8 and (time.monotonic() - started) >= (timeout_sec * 0.45):
-                # Use a fresh ephemeral source port on retry to bypass Linux SO_REUSEPORT 4-tuple pinning
-                # when both DiscoveryResponder and PairingBeaconResponder share UDP 8766 on Master!
-                try:
-                    s2 = _open_probe_sock()
-                    socks.append(s2)
-                    _send_probes(s2)
-                except OSError:
-                    _send_probes(socks[0])
+                for _ in range(2):
+                    try:
+                        _add_and_probe()
+                    except OSError:
+                        break
                 resent = True
             rem_t = max(0.02, min(0.25, deadline - time.monotonic()))
             try:
-                readable, _, _ = select.select(socks, [], [], rem_t)
+                events = sel.select(timeout=rem_t)
             except (OSError, ValueError):
                 break
-            for rs in readable:
+            for key, _mask in events:
+                rs: socket.socket = key.fileobj  # type: ignore[assignment]
                 try:
                     data, addr = rs.recvfrom(4096)
                 except OSError:
@@ -373,25 +425,28 @@ def discover_pairing_masters(
                     continue
                 if not isinstance(msg, dict) or msg.get("type") != PAIR_BEACON_TYPE:
                     continue
-                try:
-                    pair_port = int(msg.get("pair_port", DEFAULT_PAIR_PORT))
-                    expires_in_sec = max(0, int(msg.get("expires_in_sec", 0)))
-                except (TypeError, ValueError):
+                pair_port = _parse_udp_int(msg.get("pair_port", DEFAULT_PAIR_PORT))
+                expires_raw = _parse_udp_int(msg.get("expires_in_sec", 0))
+                if pair_port is None or expires_raw is None or not (1 <= pair_port <= 65535):
                     continue
-                if not (1 <= pair_port <= 65535):
-                    continue
+                expires_in_sec = max(0, expires_raw)
                 host_ip = str(addr[0])
-                key = (host_ip, pair_port)
-                if key not in found and len(found) < 64:
-                    found[key] = {
+                key_pair = (host_ip, pair_port)
+                if key_pair not in found and len(found) < 64 and per_ip_count.get(host_ip, 0) < 4:
+                    per_ip_count[host_ip] = per_ip_count.get(host_ip, 0) + 1
+                    raw_cn = msg.get("cluster_name")
+                    raw_sid = msg.get("session_id")
+                    raw_fp = msg.get("fingerprint")
+                    found[key_pair] = {
                         "host": host_ip,
                         "pair_port": pair_port,
-                        "cluster_name": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("cluster_name", "phonecluster")))[:64],
-                        "session_id": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("session_id", "")))[:64],
-                        "fingerprint": re.sub(r"[\x00-\x1f\x7f]", "", str(msg.get("fingerprint", "")))[:64],
+                        "cluster_name": re.sub(r"[\x00-\x1f\x7f]", "", raw_cn if isinstance(raw_cn, str) else "phonecluster")[:64],
+                        "session_id": re.sub(r"[\x00-\x1f\x7f]", "", raw_sid if isinstance(raw_sid, str) else "")[:64],
+                        "fingerprint": re.sub(r"[\x00-\x1f\x7f]", "", raw_fp if isinstance(raw_fp, str) else "")[:64],
                         "expires_in_sec": expires_in_sec,
                     }
     finally:
+        sel.close()
         for s in socks:
             try:
                 s.close()
@@ -417,6 +472,8 @@ class PairingSession:
     attempts_left: int = 5
     remaining_slots: int = 1
     paired_nodes: list[dict[str, Any]] = field(default_factory=list)
+    used_peer_pubs: set[int] = field(default_factory=set)
+    used_proofs: set[str] = field(default_factory=set)
 
 
 def _validate_ssh_pubkey(pubkey: str) -> str | None:
@@ -609,30 +666,43 @@ class PairingManager:
         if len(peer_pub_hex) > 600 or len(client_proof) > 128:
             return HTTPStatus.BAD_REQUEST, {"error": "Oversized dh_pub or client_proof."}
 
+        # Snapshot immutable session DH parameters and compute shared secret OUTSIDE `_attempt_lock`
+        # so unauthenticated bad-DH requests cannot stall legitimate pairing completions.
+        with self._lock:
+            self._cleanup_expired_locked()
+            if self._session is None:
+                return HTTPStatus.FORBIDDEN, {"error": "Pairing window is closed or expired."}
+            s0 = self._session
+            session_id = s0.session_id
+            pin = s0.pin
+            salt_hex = s0.salt_hex
+            dh_priv = s0.dh_priv
+            dh_pub_hex = format(s0.dh_pub, "x")
+
+        req_sid = str(body.get("session_id") or "").strip()
+        if req_sid != session_id:
+            return HTTPStatus.BAD_REQUEST, {"error": "session_id mismatch (pairing window rotated)."}
+
+        try:
+            meta_canonical = json.dumps(metadata, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except ValueError as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": f"Invalid pairing metadata JSON values: {exc}"}
+
+        try:
+            peer_pub = int(peer_pub_hex, 16)
+            shared_secret = compute_shared_secret(dh_priv, peer_pub)
+        except ValueError as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+
         # Strictly serialize PIN attempts so parallel sockets can NEVER exceed 5 guesses!
         with self._attempt_lock:
             with self._lock:
                 self._cleanup_expired_locked()
-                if self._session is None:
+                if self._session is None or self._session.session_id != session_id:
                     return HTTPStatus.FORBIDDEN, {"error": "Pairing window is closed or expired."}
-                s = self._session
-                session_id = s.session_id
-                pin = s.pin
-                salt_hex = s.salt_hex
-                dh_priv = s.dh_priv
-                dh_pub_hex = format(s.dh_pub, "x")
+                if peer_pub in self._session.used_peer_pubs or client_proof in self._session.used_proofs:
+                    return HTTPStatus.FORBIDDEN, {"error": "Replayed pairing proof rejected."}
 
-            req_sid = str(body.get("session_id") or "").strip()
-            if req_sid != session_id:
-                return HTTPStatus.BAD_REQUEST, {"error": "session_id mismatch (pairing window rotated)."}
-
-            try:
-                peer_pub = int(peer_pub_hex, 16)
-                shared_secret = compute_shared_secret(dh_priv, peer_pub)
-            except ValueError as exc:
-                return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
-
-            meta_canonical = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
             k_auth, k_enc, k_mac = derive_pairing_keys(pin, shared_secret, salt_hex, session_id)
             expected_client_proof = compute_proof(
                 k_auth, "client", session_id, dh_pub_hex, peer_pub_hex, meta_canonical
@@ -656,16 +726,20 @@ class PairingManager:
                     "attempts_left": left,
                 }
 
-        # Proof verified! Validate metadata cleanly and mint a unique least-privilege node_token.
-        try:
-            worker_port = int(metadata.get("worker_port", DEFAULT_WORKER_PORT))
-            ssh_port = int(metadata.get("ssh_port", DEFAULT_SSH_PORT))
-            cores = max(1, int(metadata.get("cpu_cores", 4)))
-            mem_mb = max(0, int(metadata.get("mem_total_mb", 0)))
-            max_conc = max(1, min(32, int(metadata.get("max_concurrency", 2))))
-            raw_tier = int(metadata.get("tier", 0))
-        except (TypeError, ValueError) as exc:
-            return HTTPStatus.BAD_REQUEST, {"error": f"Invalid numeric pairing metadata: {exc}"}
+        # Proof verified! Validate metadata cleanly (rejecting bool/inf/NaN) and mint a unique least-privilege node_token.
+        worker_port = _parse_udp_int(metadata.get("worker_port", DEFAULT_WORKER_PORT))
+        ssh_port = _parse_udp_int(metadata.get("ssh_port", DEFAULT_SSH_PORT))
+        cores_raw = _parse_udp_int(metadata.get("cpu_cores", 4))
+        mem_raw = _parse_udp_int(metadata.get("mem_total_mb", 0))
+        mc_raw = _parse_udp_int(metadata.get("max_concurrency", 2))
+        raw_tier = _parse_udp_int(metadata.get("tier", 0))
+        if None in (worker_port, ssh_port, cores_raw, mem_raw, mc_raw, raw_tier):
+            return HTTPStatus.BAD_REQUEST, {"error": "Invalid numeric pairing metadata."}
+        assert worker_port is not None and ssh_port is not None and cores_raw is not None
+        assert mem_raw is not None and mc_raw is not None and raw_tier is not None
+        cores = max(1, cores_raw)
+        mem_mb = max(0, mem_raw)
+        max_conc = max(1, min(32, mc_raw))
         if not (0 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
             return HTTPStatus.BAD_REQUEST, {"error": "worker_port must be 0..65535 and ssh_port must be 1..65535."}
         try:
@@ -681,13 +755,28 @@ class PairingManager:
             self._cleanup_expired_locked()
             if self._session is None or self._session.session_id != session_id:
                 return HTTPStatus.FORBIDDEN, {"error": "Pairing session closed before completion."}
+            if peer_pub in self._session.used_peer_pubs or client_proof in self._session.used_proofs:
+                return HTTPStatus.FORBIDDEN, {"error": "Replayed pairing proof rejected."}
 
-            # If this exact worker IP was previously paired, rotate its token & refresh metadata
+            # If this exact worker IP was previously paired, rotate its token & refresh metadata (with rollback if disk save fails)
             existing = next(
                 (n for n in self.config.nodes if normalize_host(n.host) == client_ip and n.role != "master"),
                 None,
             )
+            prev_snapshot: tuple[Any, ...] | None = None
+            appended_new = False
             if existing is not None:
+                prev_snapshot = (
+                    existing.host,
+                    existing.worker_port,
+                    existing.ssh_port,
+                    existing.ssh_user,
+                    existing.max_concurrency,
+                    existing.tier,
+                    existing.pool,
+                    existing.auth_token,
+                    existing.notes,
+                )
                 existing.host = client_ip
                 existing.worker_port = worker_port
                 existing.ssh_port = ssh_port
@@ -719,9 +808,31 @@ class PairingManager:
                     auth_token=node_token,
                 )
                 self.config.nodes.append(assigned_node)
+                appended_new = True
 
             if self.config_path is not None:
-                save_config(self.config, self.config_path)
+                try:
+                    save_config(self.config, self.config_path)
+                except OSError as exc:
+                    if existing is not None and prev_snapshot is not None:
+                        (
+                            existing.host,
+                            existing.worker_port,
+                            existing.ssh_port,
+                            existing.ssh_user,
+                            existing.max_concurrency,
+                            existing.tier,
+                            existing.pool,
+                            existing.auth_token,
+                            existing.notes,
+                        ) = prev_snapshot
+                    elif appended_new:
+                        self.config.nodes.pop()
+                    LOG.error("Failed to save cluster config during pairing: %s", exc)
+                    return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Failed to persist cluster config: {exc}"}
+
+            self._session.used_peer_pubs.add(peer_pub)
+            self._session.used_proofs.add(client_proof)
 
             master_node = next((n for n in self.config.nodes if n.role == "master"), self.config.nodes[0])
             effective_master_host = normalize_host(master_node.host)
@@ -805,9 +916,11 @@ class StandalonePairingServer(ThreadingHTTPServer):
     def __init__(self, addr: tuple[str, int], manager: PairingManager) -> None:
         self.manager = manager
         self._conn_sem = threading.BoundedSemaphore(32)
-        if ":" in str(addr[0]):
+        self.rate_limiter = AuthRateLimiter(max_failures=15, window_sec=60.0, block_sec=60.0)
+        bind_host = normalize_host(str(addr[0])) or "0.0.0.0"
+        if ":" in bind_host:
             self.address_family = socket.AF_INET6
-        super().__init__(addr, StandalonePairingHandler)
+        super().__init__((bind_host, addr[1]), StandalonePairingHandler)
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._conn_sem.acquire(blocking=False):
@@ -880,6 +993,14 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
         if origin or referer or sec_fetch_site == "cross-site":
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "browser cross-origin pairing POST rejected"})
             return
+        norm_ip = normalize_host(str(self.client_address[0]))
+        blocked, retry_after = self.server.rate_limiter.is_blocked(norm_ip)
+        if blocked:
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": f"too many failed pairing requests; retry in {retry_after}s", "retry_after_sec": retry_after},
+            )
+            return
         length, err_status, err_msg = parse_strict_content_length(self.headers, 64 * 1024)
         if length is None:
             self._send_json(err_status, {"error": err_msg})
@@ -890,12 +1011,17 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
                 if len(raw_bytes) != length:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "truncated request body"})
                     return
-                body = json.loads(raw_bytes.decode("utf-8"))
+
+                def _reject_nonfinite(tok: str) -> Any:
+                    raise ValueError(f"non-finite JSON constant '{tok}' not allowed")
+
+                body = json.loads(raw_bytes.decode("utf-8"), parse_constant=_reject_nonfinite)
             else:
                 body = {}
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be an object")
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+            self.server.rate_limiter.record_failure(norm_ip)
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return
         try:
@@ -905,6 +1031,10 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
         status, data = self.server.manager.complete_pairing(
             self.client_address[0], body, local_ip=local_ip
         )
+        if status == HTTPStatus.OK:
+            self.server.rate_limiter.record_success(norm_ip)
+        else:
+            self.server.rate_limiter.record_failure(norm_ip)
         self._send_json(status, data)
 
 
@@ -982,8 +1112,13 @@ def _http_json(url: str, method: str = "GET", body: dict[str, Any] | None = None
     except urllib.error.HTTPError as exc:
         try:
             raw = exc.read(16384).decode("utf-8", errors="replace")
+        except (OSError, http.client.HTTPException):
+            raw = ""
         finally:
-            exc.close()
+            try:
+                exc.close()
+            except OSError:
+                pass
         try:
             parsed = json.loads(raw)
             if not isinstance(parsed, dict):
@@ -991,7 +1126,7 @@ def _http_json(url: str, method: str = "GET", body: dict[str, Any] | None = None
         except json.JSONDecodeError:
             parsed = {"error": raw[:200]}
         return exc.code, parsed
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
         raise RuntimeError(f"Could not reach Master pairing endpoint {url}: {exc}") from exc
 
 
@@ -1051,7 +1186,7 @@ def join_cluster_via_pairing(
         or not pub_a_hex
         or len(pub_a_hex) > 600
         or not re.fullmatch(r"[0-9a-f]+", pub_a_hex)
-        or not re.fullmatch(r"[0-9a-f]{16,128}", salt_hex)
+        or not re.fullmatch(r"(?:[0-9a-f]{2}){8,64}", salt_hex)
     ):
         raise RuntimeError("Malformed pairing hello from Master (invalid session_id, dh_pub, or salt).")
     pub_a = int(pub_a_hex, 16)

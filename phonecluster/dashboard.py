@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import logging
@@ -38,6 +39,7 @@ from .config import (
     NodeConfig,
     SafetyConfig,
     format_host_port,
+    is_loopback_or_unspecified_host,
     normalize_host,
     save_config,
     validate_domain_pattern,
@@ -1403,7 +1405,8 @@ document.querySelector('nav.tabs').addEventListener('keydown', e => {
 });
 
 function metricBar(label, valueText, pct, tone) {
-  const clamped = Math.max(0, Math.min(100, pct || 0));
+  const numPct = Number(pct);
+  const clamped = Math.max(0, Math.min(100, Number.isFinite(numPct) ? numPct : 0));
   return '<div class="metric-row">'
     + '<div class="metric-head"><span>' + esc(label) + '</span><span class="mono">' + esc(valueText) + '</span></div>'
     + '<div class="bar ' + esc(tone || '') + '"><span style="width:' + clamped + '%"></span></div>'
@@ -1431,8 +1434,10 @@ function renderTasksBoard(live) {
     const procs = [];
     for (const n of (live.summary.nodes || [])) {
       if (!n.online) continue;
-      for (const p of ((n.health || {}).top_processes || [])) {
-        procs.push({ node_id: n.id, ...p });
+      const rawProcs = (n.health || {}).top_processes;
+      const procList = Array.isArray(rawProcs) ? rawProcs : [];
+      for (const p of procList) {
+        if (p && typeof p === 'object') procs.push({ node_id: n.id, ...p });
       }
     }
     procs.sort((a, b) => (b.cpu_pct - a.cpu_pct) || (b.mem_pct - a.mem_pct));
@@ -1643,7 +1648,10 @@ function renderNodesGrid(live) {
         badge = '<span class="pill bad">🔒 QUARANTINED</span>';
         cardCls = 'node-card offline';
       } else if (n.online && n.ready_for_jobs) {
-        badge = '<span class="pill ok">✓ READY (' + (h.active_jobs || 0) + '/' + (h.max_concurrency || n.max_concurrency || 2) + ')</span>';
+        const actNum = Number.isFinite(Number(h.active_jobs)) ? Number(h.active_jobs) : 0;
+        const maxNum = Number.isFinite(Number(h.max_concurrency)) && Number(h.max_concurrency) > 0
+          ? Number(h.max_concurrency) : (Number(n.max_concurrency) || 2);
+        badge = '<span class="pill ok">✓ READY (' + esc(actNum) + '/' + esc(maxNum) + ')</span>';
         cardCls = 'node-card';
       } else if (n.online) {
         const reasons = (Array.isArray(h.not_ready_reasons) && h.not_ready_reasons.length) ? h.not_ready_reasons : ['PAUSED'];
@@ -1655,7 +1663,8 @@ function renderNodesGrid(live) {
       if (!n.online) {
         bodyHtml = '<p class="hint">Unreachable: ' + esc(n.error || 'connection refused') + '</p>';
       } else {
-        const cores = h.cpu_cores || 1;
+        const rawCores = Number(h.cpu_cores);
+        const cores = (Number.isFinite(rawCores) && rawCores > 0) ? Math.floor(rawCores) : 1;
         const rawCpu = h.cpu_pct != null ? Number(h.cpu_pct) : Math.min(100, ((Number(h.load_1m) || 0) / cores) * 100);
         const cpuPct = Number.isFinite(rawCpu) ? rawCpu : 0;
         const perCore = Array.isArray(h.per_core_pct) ? h.per_core_pct : [];
@@ -1670,21 +1679,23 @@ function renderNodesGrid(live) {
           : '';
 
         bodyHtml += '<div class="cpu-btop-box">'
-          + '<div class="cpu-btop-top"><span><strong>CPU</strong> ' + cores + ' cores · load ' + esc(h.load_1m ?? 0) + '</span>'
+          + '<div class="cpu-btop-top"><span><strong>CPU</strong> ' + esc(cores) + ' cores · load ' + esc(h.load_1m ?? 0) + '</span>'
           + '<span class="mono"><strong>' + cpuPct.toFixed(1) + '%</strong></span></div>'
           + '<div class="spark-wrap" style="height:28px;margin-top:0">'
           + renderSparklineSvg(nHist.map(p => p.cpu_pct), 100, '#58a6ff', 'rgba(88,166,255,0.18)')
           + '</div>' + coreCols + '</div>';
 
-        const ramUsedMb = Math.max(0, (h.mem_total_mb || 0) - (h.mem_available_mb || 0));
-        const ramUsedPct = h.mem_total_mb ? (ramUsedMb / h.mem_total_mb) * 100 : 0;
+        const memTotNum = Number.isFinite(Number(h.mem_total_mb)) ? Math.max(0, Number(h.mem_total_mb)) : 0;
+        const memAvailNum = Number.isFinite(Number(h.mem_available_mb)) ? Math.max(0, Number(h.mem_available_mb)) : 0;
+        const ramUsedMb = Math.max(0, memTotNum - memAvailNum);
+        const ramUsedPct = memTotNum ? Math.min(100, (ramUsedMb / memTotNum) * 100) : 0;
         const tempNum = Number(h.temp_c);
         const hasTemp = h.temp_c != null && Number.isFinite(tempNum);
         const tempTone = !hasTemp ? '' : (tempNum >= maxTemp ? 'bad' : (tempNum >= resTemp ? 'warn' : 'ok'));
         const bat = h.battery_pct;
         const batTone = bat == null ? '' : (bat >= batHigh && (h.battery_status === 'CHARGING' || h.battery_status === 'FULL') ? 'warn' : (bat < 20 ? 'bad' : 'ok'));
 
-        bodyHtml += metricBar('Memory', ramUsedMb + ' / ' + (h.mem_total_mb || 0) + ' MB (' + ramUsedPct.toFixed(0) + '%)', ramUsedPct, ramUsedPct > 85 ? 'bad' : '');
+        bodyHtml += metricBar('Memory', ramUsedMb + ' / ' + memTotNum + ' MB (' + ramUsedPct.toFixed(0) + '%)', ramUsedPct, ramUsedPct > 85 ? 'bad' : '');
         bodyHtml += metricBar('Temperature', hasTemp ? tempNum.toFixed(1) + ' °C' : 'N/A', hasTemp ? (tempNum / 50) * 100 : 0, tempTone);
         bodyHtml += metricBar('Battery', bat != null ? bat + '% · ' + (h.battery_status || '?') : 'N/A', bat ?? 0, batTone);
 
@@ -1697,7 +1708,7 @@ function renderNodesGrid(live) {
         }
 
         // Top processes mini-panel
-        const procs = h.top_processes || [];
+        const procs = Array.isArray(h.top_processes) ? h.top_processes.filter(p => p && typeof p === 'object') : [];
         if (procs.length) {
           bodyHtml += '<div class="mini-procs"><div class="mini-procs-head"><span>Top Processes</span><span>CPU / MEM</span></div>'
             + procs.slice(0, 4).map(p =>
@@ -1779,13 +1790,15 @@ function clearTerminal() {
 function downloadTermLog() {
   const blob = new Blob([termTranscript.join('\n\n')], { type: 'text/plain' });
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  const blobUrl = URL.createObjectURL(blob);
+  a.href = blobUrl;
   a.download = 'phonecluster-terminal-' + Date.now() + '.log';
   a.click();
-  URL.revokeObjectURL(a.href);
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
 
 async function submitTerminalCommand() {
+  if (activeTermJob) return;
   const inp = document.getElementById('term-input');
   const cmd = inp.value.trim();
   if (!cmd) return;
@@ -2196,8 +2209,10 @@ function applyPipeJsonFromDrawer() {
   try {
     const parsed = JSON.parse(document.getElementById('pipe-json').value);
     const arr = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.steps) ? parsed.steps : null);
-    if (!arr || !arr.length) throw new Error('JSON must be a non-empty array of steps (or {"steps": [...]}).');
-    pipeSteps = arr.map((s, i) => ({
+    if (!arr || !arr.length || !arr.every(s => s && typeof s === 'object' && !Array.isArray(s))) {
+      throw new Error('JSON must be a non-empty array of step objects (or {"steps": [...]}).');
+    }
+    pipeSteps = arr.map((s, i) => Object.assign({}, s, {
       name: String(s.name || ('Step ' + (i + 1))),
       target: String(s.target || 'auto'),
       command: String(s.command || ''),
@@ -2227,10 +2242,11 @@ function downloadPipeJson() {
   const payload = { name: 'PhoneCluster Cross-Tier Pipeline', steps: pipeSteps };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  const blobUrl = URL.createObjectURL(blob);
+  a.href = blobUrl;
   a.download = 'phonecluster-pipeline-' + Date.now() + '.json';
   a.click();
-  URL.revokeObjectURL(a.href);
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
 
 function applyPipeTemplate(name) {
@@ -2347,10 +2363,11 @@ function downloadLastMapJson() {
   if (!lastMapData) return;
   const blob = new Blob([JSON.stringify(lastMapData, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  const blobUrl = URL.createObjectURL(blob);
+  a.href = blobUrl;
   a.download = 'phonecluster-batch-' + Date.now() + '.json';
   a.click();
-  URL.revokeObjectURL(a.href);
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
 
 async function loadWorkloads() {
@@ -2515,7 +2532,7 @@ async function workloadAction(action) {
 }
 
 let pairPollTimer = null;
-let knownPairedCount = 0;
+let knownPairedCount = null;
 
 function renderPairingState(st) {
   const box = document.getElementById('pair-active-box');
@@ -2534,8 +2551,14 @@ function renderPairingState(st) {
   document.getElementById('pair-rem').textContent = String(st.remaining_slots);
   document.getElementById('pair-timer').textContent = st.expires_in_sec + 's left';
 
+  if (!pairPollTimer) {
+    pairPollTimer = setInterval(pollPairingStatus, 1500);
+  }
+
   const recents = st.recent_paired || [];
-  if (recents.length > knownPairedCount) {
+  if (knownPairedCount === null) {
+    knownPairedCount = recents.length;
+  } else if (recents.length > knownPairedCount) {
     const latest = recents[recents.length - 1];
     knownPairedCount = recents.length;
     showToast('✓ Securely paired ' + latest.id + ' (' + latest.host + ') with its own unique token!', 'ok');
@@ -2550,8 +2573,6 @@ async function openPairingWindow() {
   knownPairedCount = (data.recent_paired || []).length;
   renderPairingState(data);
   showToast('Pairing window open for 2 minutes! Run `pc join` on your new phone.', 'ok');
-  if (pairPollTimer) clearInterval(pairPollTimer);
-  pairPollTimer = setInterval(pollPairingStatus, 1500);
 }
 
 async function closePairingWindow() {
@@ -2568,7 +2589,9 @@ async function pollPairingStatus() {
     if (!r.ok) return;
     const st = await r.json();
     const recents = st.recent_paired || [];
-    if (recents.length > knownPairedCount) {
+    if (knownPairedCount === null) {
+      knownPairedCount = recents.length;
+    } else if (recents.length > knownPairedCount) {
       const latest = recents[recents.length - 1];
       knownPairedCount = recents.length;
       showToast('✓ Securely paired ' + latest.id + ' (' + latest.host + ') with its own unique token!', 'ok');
@@ -3216,13 +3239,31 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 raw = raw_bytes.decode("utf-8")
             else:
                 raw = "{}"
-            body = json.loads(raw)
+
+            def _reject_nonfinite(tok: str) -> Any:
+                raise ValueError(f"non-finite JSON constant '{tok}' not allowed")
+
+            body = json.loads(raw, parse_constant=_reject_nonfinite)
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be an object")
             return body
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return None
+
+    @staticmethod
+    def _parse_int_arg(raw_val: Any, default: int | None = None) -> int:
+        if raw_val is None:
+            if default is None:
+                raise ValueError("missing integer value")
+            return default
+        if isinstance(raw_val, bool):
+            raise ValueError("expected integer, got boolean")
+        if isinstance(raw_val, float):
+            if not math.isfinite(raw_val) or not raw_val.is_integer():
+                raise ValueError("expected finite integer")
+            return int(raw_val)
+        return int(raw_val)
 
     def _require_auth(self) -> bool:
         client_ip = normalize_host(str(self.client_address[0]))
@@ -3365,7 +3406,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 with ctrl.config_lock:
                     master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
                     cfg_subnet = ctrl.config.network.lan_subnet
-                lan_subnet = infer_lan_subnet(master_node.host or detect_local_ip(), cfg_subnet)
+                seed_host = (
+                    detect_local_ip()
+                    if is_loopback_or_unspecified_host(master_node.host)
+                    else master_node.host
+                )
+                lan_subnet = infer_lan_subnet(seed_host, cfg_subnet)
                 self._send_json(
                     HTTPStatus.OK,
                     {
@@ -3449,9 +3495,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/pair/open":
             try:
-                ttl = int(body.get("ttl_sec", 120))
-                slots = int(body.get("max_devices", 1))
-            except (TypeError, ValueError):
+                ttl = self._parse_int_arg(body.get("ttl_sec"), 120)
+                slots = self._parse_int_arg(body.get("max_devices"), 1)
+            except (TypeError, ValueError, OverflowError):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "ttl_sec and max_devices must be integers"})
                 return
             data = self.server.pairing_manager.open_session(ttl_sec=ttl, max_devices=slots)
@@ -3465,13 +3511,16 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         def _parse_timeout(raw_val: Any) -> float | None:
             if raw_val in (None, ""):
                 return float(ctrl.config.default_job_timeout_sec)
+            if isinstance(raw_val, bool):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a positive number"})
+                return None
             try:
                 val = float(raw_val)
-                if not math.isfinite(val) or val <= 0:
-                    raise ValueError("timeout_sec must be a finite number > 0")
+                if not math.isfinite(val) or val <= 0 or val > 86400.0:
+                    raise ValueError("timeout_sec must be a finite number between 0 and 86400")
                 return val
-            except (TypeError, ValueError):
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a positive number"})
+            except (TypeError, ValueError, OverflowError):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a positive number <= 86400"})
                 return None
 
         if path == "/api/exec":
@@ -3630,7 +3679,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             allowed_schemes = ("http://", "https://", "mqtt://", "tcp://", "redis://", "postgresql://", "ssh://")
-            if not url or any(c.isspace() or ord(c) < 32 for c in url) or not url.startswith(allowed_schemes):
+            if not url or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url) or not url.startswith(allowed_schemes):
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"error": "url must start with http://, https://, mqtt://, tcp://, redis://, postgresql://, or ssh:// (no spaces/control chars)"},
@@ -3647,21 +3696,30 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
 
         elif path == "/api/services/custom/remove":
-            raw_name = str(body.get("name") or "").strip().lower()
+            raw_name = str(body.get("name") or "").strip()
             with ctrl.config_lock:
-                if not raw_name or raw_name not in ctrl.config.custom_services:
+                matched_key: str | None = None
+                if raw_name in ctrl.config.custom_services:
+                    matched_key = raw_name
+                else:
+                    lower_name = raw_name.lower()
+                    matched_key = next(
+                        (k for k in ctrl.config.custom_services if k.lower() == lower_name),
+                        None,
+                    )
+                if not matched_key:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": f"custom service '{raw_name}' not found"})
                     return
-                ctrl.config.custom_services.pop(raw_name, None)
+                ctrl.config.custom_services.pop(matched_key, None)
                 if self.server.config_path is not None:
                     save_config(ctrl.config, self.server.config_path)
-            self._send_json(HTTPStatus.OK, {"removed": raw_name})
+            self._send_json(HTTPStatus.OK, {"removed": matched_key})
 
         elif path == "/api/services/probe":
-            host = str(body.get("host") or "").strip()
+            host = normalize_host(str(body.get("host") or ""))
             try:
-                port = int(body.get("port", 0))
-            except (TypeError, ValueError):
+                port = self._parse_int_arg(body.get("port"), 0)
+            except (TypeError, ValueError, OverflowError):
                 port = 0
             if not host or port <= 0 or port > 65535:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "valid host and port required"})
@@ -3669,7 +3727,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             # Restrict probes strictly to endpoints already registered in the live Service Mesh
             svc_entries = ctrl.get_services_info().get("services", [])
             allowed = any(
-                str(e.get("host")) == host and int(e.get("port") or 0) == port
+                normalize_host(str(e.get("host") or "")) == host and int(e.get("port") or 0) == port
                 for e in svc_entries
             )
             if not allowed:
@@ -3683,26 +3741,31 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/gateway/settings":
             with ctrl.config_lock:
                 prev_gw = ctrl.config.gateway
+
+                def _gw_val(key: str, fallback: Any) -> Any:
+                    val = body.get(key)
+                    return fallback if val is None else val
+
                 merged = {
-                    "enabled": body.get("enabled", prev_gw.enabled),
-                    "bind_host": body.get("bind_host", prev_gw.bind_host),
-                    "port": body.get("port", prev_gw.port),
-                    "mode": body.get("mode", prev_gw.mode),
-                    "allowed_domains": body.get("allowed_domains", prev_gw.allowed_domains),
-                    "blocked_domains": body.get("blocked_domains", prev_gw.blocked_domains),
-                    "allowed_ports": body.get("allowed_ports", prev_gw.allowed_ports),
-                    "block_private_ips": body.get("block_private_ips", prev_gw.block_private_ips),
-                    "inject_proxy_env": body.get("inject_proxy_env", prev_gw.inject_proxy_env),
-                    "max_connections": body.get("max_connections", prev_gw.max_connections),
-                    "idle_timeout_sec": body.get("idle_timeout_sec", prev_gw.idle_timeout_sec),
-                    "quarantined_nodes": body.get("quarantined_nodes", prev_gw.quarantined_nodes),
-                    "max_requests_per_min_per_node": body.get(
+                    "enabled": _gw_val("enabled", prev_gw.enabled),
+                    "bind_host": _gw_val("bind_host", prev_gw.bind_host),
+                    "port": _gw_val("port", prev_gw.port),
+                    "mode": _gw_val("mode", prev_gw.mode),
+                    "allowed_domains": _gw_val("allowed_domains", prev_gw.allowed_domains),
+                    "blocked_domains": _gw_val("blocked_domains", prev_gw.blocked_domains),
+                    "allowed_ports": _gw_val("allowed_ports", prev_gw.allowed_ports),
+                    "block_private_ips": _gw_val("block_private_ips", prev_gw.block_private_ips),
+                    "inject_proxy_env": _gw_val("inject_proxy_env", prev_gw.inject_proxy_env),
+                    "max_connections": _gw_val("max_connections", prev_gw.max_connections),
+                    "idle_timeout_sec": _gw_val("idle_timeout_sec", prev_gw.idle_timeout_sec),
+                    "quarantined_nodes": _gw_val("quarantined_nodes", prev_gw.quarantined_nodes),
+                    "max_requests_per_min_per_node": _gw_val(
                         "max_requests_per_min_per_node", prev_gw.max_requests_per_min_per_node
                     ),
                 }
                 try:
                     updated_gw = GatewayConfig.from_dict(merged)
-                except (ValueError, TypeError) as exc:
+                except (ValueError, TypeError, OverflowError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
                 ctrl.config.gateway = updated_gw
@@ -3822,8 +3885,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/network/hardening":
             with ctrl.config_lock:
-                if "dashboard_require_auth" in body and body["dashboard_require_auth"] is not None:
-                    ctrl.config.dashboard_require_auth = bool(body["dashboard_require_auth"])
+                new_req_auth = (
+                    bool(body["dashboard_require_auth"])
+                    if "dashboard_require_auth" in body and body["dashboard_require_auth"] is not None
+                    else ctrl.config.dashboard_require_auth
+                )
                 cur_net = ctrl.config.network
                 master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
                 raw_ips = body.get("allowed_master_ips", cur_net.allowed_master_ips)
@@ -3839,14 +3905,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if ag_url:
                     try:
                         p_ag = urllib.parse.urlsplit(ag_url)
-                        _ = p_ag.port
+                        ag_port = p_ag.port
                     except ValueError:
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url is malformed"})
                         return
                     if (
-                        any(c.isspace() or ord(c) < 32 for c in ag_url)
+                        any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in ag_url)
                         or p_ag.scheme.lower() not in {"http", "https"}
                         or not p_ag.hostname
+                        or (ag_port is not None and not (1 <= ag_port <= 65535))
                     ):
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https:// with a valid hostname"})
                         return
@@ -3858,6 +3925,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     except ValueError:
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid lan_subnet CIDR '{lan_sub}'"})
                         return
+                # Apply mutations only after ALL inputs validated cleanly
+                ctrl.config.dashboard_require_auth = new_req_auth
                 ctrl.config.network = NetworkHardeningConfig(
                     enforce_worker_source_ip=bool(
                         cur_net.enforce_worker_source_ip
@@ -3915,7 +3984,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 with ctrl.config_lock:
                     master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
                     cfg_subnet = ctrl.config.network.lan_subnet
-                cidr = infer_lan_subnet(master_node.host or detect_local_ip(), cfg_subnet)
+                seed_host = (
+                    detect_local_ip()
+                    if is_loopback_or_unspecified_host(master_node.host)
+                    else master_node.host
+                )
+                cidr = infer_lan_subnet(seed_host, cfg_subnet)
             elif action == "distcc-start":
                 try:
                     cidr = str(ipaddress.ip_network(cidr, strict=False))
@@ -3968,7 +4042,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         if s.online and s.ready_for_jobs and s.node.role != "master" and s.node.id not in quarantined
                     ]
                     if ready_workers:
-                        cross_env = _build_env(snaps, ctrl.config)
+                        with ctrl.config_lock:
+                            cross_env = _build_env(snaps, ctrl.config)
                         outcomes = []
                         with _cf.ThreadPoolExecutor(max_workers=min(32, len(ready_workers))) as pool:
                             fut_map = {
@@ -4029,14 +4104,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             try:
-                tier = int(body.get("tier", 0))
-                worker_port = int(body.get("worker_port", DEFAULT_WORKER_PORT))
-                ssh_port = int(body.get("ssh_port", DEFAULT_SSH_PORT))
-                max_conc = max(1, min(32, int(body.get("max_concurrency", 2))))
-                weight = max(0.1, float(body.get("weight", 1.0)))
+                tier = self._parse_int_arg(body.get("tier"), 0)
+                worker_port = self._parse_int_arg(body.get("worker_port"), DEFAULT_WORKER_PORT)
+                ssh_port = self._parse_int_arg(body.get("ssh_port"), DEFAULT_SSH_PORT)
+                max_conc = max(1, min(32, self._parse_int_arg(body.get("max_concurrency"), 2)))
+                raw_w = body.get("weight", 1.0)
+                if raw_w is None:
+                    weight = 1.0
+                elif isinstance(raw_w, bool):
+                    raise ValueError("weight must be a number, not boolean")
+                else:
+                    weight = max(0.1, float(raw_w))
                 if not math.isfinite(weight):
                     raise ValueError("weight must be finite")
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid numeric node parameter"})
                 return
             if tier not in {0, 1, 2, 3}:
@@ -4085,47 +4166,67 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not node_id:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing node id"})
                 return
+            # Validate ALL fields upfront so an invalid later field never leaves partial in-memory mutations!
+            new_tier: int | None = None
+            new_pool: str | None = None
+            new_mc: int | None = None
+            new_weight: float | None = None
+            new_notes: str | None = None
+            if "tier" in body:
+                try:
+                    t_val = self._parse_int_arg(body["tier"])
+                except (TypeError, ValueError, OverflowError):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+                    return
+                if t_val not in {0, 1, 2, 3}:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
+                    return
+                new_tier = t_val
+            if "pool" in body:
+                try:
+                    new_pool = validate_pool_name(str(body["pool"] or "auto"))
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+            if "max_concurrency" in body:
+                try:
+                    mc_val = self._parse_int_arg(body["max_concurrency"])
+                    if not (1 <= mc_val <= 32):
+                        raise ValueError("must be between 1 and 32")
+                    new_mc = mc_val
+                except (TypeError, ValueError, OverflowError):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "max_concurrency must be an integer between 1 and 32"})
+                    return
+            if "weight" in body:
+                try:
+                    raw_w = body["weight"]
+                    if isinstance(raw_w, bool):
+                        raise ValueError("weight must be a number, not boolean")
+                    w_val = float(raw_w)
+                    if not math.isfinite(w_val) or w_val <= 0:
+                        raise ValueError("must be positive")
+                    new_weight = max(0.1, w_val)
+                except (TypeError, ValueError, OverflowError):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid weight"})
+                    return
+            if "notes" in body:
+                new_notes = str(body["notes"] or "")[:240]
+
             with ctrl.config_lock:
                 target_node = next((n for n in ctrl.config.nodes if n.id == node_id), None)
                 if target_node is None:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
                     return
-                if "tier" in body:
-                    try:
-                        t_val = int(body["tier"])
-                    except (TypeError, ValueError):
-                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
-                        return
-                    if t_val not in {0, 1, 2, 3}:
-                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
-                        return
-                    target_node.tier = t_val
-                if "pool" in body:
-                    try:
-                        target_node.pool = validate_pool_name(str(body["pool"] or "auto"))
-                    except ValueError as exc:
-                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                if "max_concurrency" in body:
-                    try:
-                        mc_val = int(body["max_concurrency"])
-                        if not (1 <= mc_val <= 32):
-                            raise ValueError("must be between 1 and 32")
-                        target_node.max_concurrency = mc_val
-                    except (TypeError, ValueError):
-                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "max_concurrency must be an integer between 1 and 32"})
-                        return
-                if "weight" in body:
-                    try:
-                        w_val = float(body["weight"])
-                        if not math.isfinite(w_val) or w_val <= 0:
-                            raise ValueError("must be positive")
-                        target_node.weight = max(0.1, w_val)
-                    except (TypeError, ValueError):
-                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid weight"})
-                        return
-                if "notes" in body:
-                    target_node.notes = str(body["notes"] or "")[:240]
+                if new_tier is not None:
+                    target_node.tier = new_tier
+                if new_pool is not None:
+                    target_node.pool = new_pool
+                if new_mc is not None:
+                    target_node.max_concurrency = new_mc
+                if new_weight is not None:
+                    target_node.weight = new_weight
+                if new_notes is not None:
+                    target_node.notes = new_notes
                 if self.server.config_path is not None:
                     save_config(ctrl.config, self.server.config_path)
                 updated_rec = {
@@ -4150,6 +4251,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     return
                 if target_node.role == "master":
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot remove the master node"})
+                    return
+                if len(ctrl.config.nodes) <= 1:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot remove the last remaining node in cluster"})
                     return
                 ctrl.config.nodes = [n for n in ctrl.config.nodes if n.id != node_id]
                 if node_id in ctrl.config.gateway.quarantined_nodes:
@@ -4178,7 +4282,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                             ),
                         }
                     )
-                except (ValueError, TypeError) as exc:
+                except (ValueError, TypeError, OverflowError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
                 ctrl.config.safety = updated
@@ -4227,9 +4331,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.OK, {"delivered": True, "http_status": resp.status})
             except urllib.error.HTTPError as exc:
                 code = exc.code
-                exc.close()
+                try:
+                    exc.close()
+                except OSError:
+                    pass
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": f"webhook returned HTTP {code}"})
-            except (urllib.error.URLError, OSError, ValueError) as exc:
+            except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
 
 

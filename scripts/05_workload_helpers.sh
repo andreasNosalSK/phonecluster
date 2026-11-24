@@ -32,8 +32,10 @@ case "${CMD}" in
         EXTRA_USER_ARGS=(--user nobody)
       fi
     fi
-    distccd --daemon --allow "${ALLOW_CIDR}" --jobs "${JOBS}" --listen 0.0.0.0 --port 3632 "${EXTRA_USER_ARGS[@]}" </dev/null >/dev/null 2>&1
-    echo "Started distccd (allow=${ALLOW_CIDR}, jobs=${JOBS}, port=3632)"
+    LISTEN_ADDR="0.0.0.0"
+    [[ "${ALLOW_CIDR}" == *:* ]] && LISTEN_ADDR="::"
+    distccd --daemon --allow "${ALLOW_CIDR}" --jobs "${JOBS}" --listen "${LISTEN_ADDR}" --port 3632 ${EXTRA_USER_ARGS[@]+"${EXTRA_USER_ARGS[@]}"} </dev/null >/dev/null 2>&1
+    echo "Started distccd (allow=${ALLOW_CIDR}, jobs=${JOBS}, listen=${LISTEN_ADDR}, port=3632)"
     ;;
 
   distcc-stop)
@@ -67,7 +69,16 @@ case "${CMD}" in
     if [[ -f "${PID_FILE}" ]]; then
       OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
       if [[ "${OLD_PID}" =~ ^[0-9]+$ ]] && (( OLD_PID > 1 )) && kill -0 "${OLD_PID}" 2>/dev/null; then
-        if [[ ! -d /proc ]] || ([[ -r "/proc/${OLD_PID}/cmdline" ]] && tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null | grep -q "rpc-server"); then
+        SHOULD_KILL=1
+        if [[ -d /proc ]]; then
+          if [[ -r "/proc/${OLD_PID}/cmdline" ]]; then
+            OLD_CMDLINE="$(tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null || true)"
+            [[ "${OLD_CMDLINE}" == *"rpc-server"* ]] || SHOULD_KILL=0
+          else
+            SHOULD_KILL=0
+          fi
+        fi
+        if [[ "${SHOULD_KILL}" -eq 1 ]]; then
           kill "${OLD_PID}" 2>/dev/null || true
         fi
       fi
@@ -92,7 +103,16 @@ case "${CMD}" in
       if [[ -f "${PF}" ]]; then
         OLD_PID="$(cat "${PF}" 2>/dev/null || true)"
         if [[ "${OLD_PID}" =~ ^[0-9]+$ ]] && (( OLD_PID > 1 )) && kill -0 "${OLD_PID}" 2>/dev/null; then
-          if [[ ! -d /proc ]] || ([[ -r "/proc/${OLD_PID}/cmdline" ]] && tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null | grep -q "rpc-server"); then
+          SHOULD_KILL=1
+          if [[ -d /proc ]]; then
+            if [[ -r "/proc/${OLD_PID}/cmdline" ]]; then
+              OLD_CMDLINE="$(tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null || true)"
+              [[ "${OLD_CMDLINE}" == *"rpc-server"* ]] || SHOULD_KILL=0
+            else
+              SHOULD_KILL=0
+            fi
+          fi
+          if [[ "${SHOULD_KILL}" -eq 1 ]]; then
             kill "${OLD_PID}" 2>/dev/null && STOPPED=1 || true
           fi
         fi
@@ -109,7 +129,7 @@ case "${CMD}" in
     fi
     ;;
 
-  help|-h|--help|*)
+  help|-h|--help)
     cat <<'EOF'
 Usage: bash scripts/05_workload_helpers.sh <subcommand> [args]
 
@@ -123,5 +143,10 @@ Tip: Run across all phones from your Master phone in one command:
   python3 phonecluster_cli.py run --target all "bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-start 192.168.1.0/24"
   eval "$(python3 phonecluster_cli.py distcc-env)"
 EOF
+    ;;
+
+  *)
+    echo "Error: Unknown subcommand '${CMD}'. Run with --help for usage." >&2
+    exit 2
     ;;
 esac

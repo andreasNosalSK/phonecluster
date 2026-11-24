@@ -129,14 +129,14 @@ def read_battery_via_termux(timeout_sec: float = 4.0) -> BatteryInfo | None:
     if not cmd:
         return None
     try:
-        raw = subprocess.check_output(
+        raw_bytes = subprocess.check_output(
             [cmd],
             stderr=subprocess.DEVNULL,
-            text=True,
             timeout=timeout_sec,
         )
+        raw = raw_bytes.decode("utf-8", errors="replace")
         data = json.loads(raw)
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+    except (subprocess.SubprocessError, UnicodeDecodeError, json.JSONDecodeError, OSError):
         return None
 
     if not isinstance(data, dict):
@@ -144,20 +144,20 @@ def read_battery_via_termux(timeout_sec: float = 4.0) -> BatteryInfo | None:
     pct_raw = data.get("percentage")
     temp_raw = data.get("temperature")
     pct: int | None = None
-    if pct_raw is not None:
+    if pct_raw is not None and not isinstance(pct_raw, bool):
         try:
             pct_f = float(pct_raw)
             if math.isfinite(pct_f):
                 pct = max(0, min(100, int(pct_f)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pct = None
     temp_c: float | None = None
-    if temp_raw is not None:
+    if temp_raw is not None and not isinstance(temp_raw, bool):
         try:
             tf = float(temp_raw)
             if math.isfinite(tf) and -20.0 <= tf <= 130.0:
                 temp_c = round(tf, 2)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             temp_c = None
     return BatteryInfo(
         percentage=pct,
@@ -179,16 +179,20 @@ def read_battery_via_sysfs(base_dir: Path = POWER_SUPPLY_DIR) -> BatteryInfo | N
         return None
 
     battery_dir: Path | None = None
+    fallback_dir: Path | None = None
     for entry in entries:
         if not entry.is_dir():
             continue
         ps_type = _read_text_safe(entry / "type")
-        if ps_type and ps_type.lower() == "battery":
+        is_bat_type = bool(ps_type and ps_type.lower() == "battery")
+        has_cap = (entry / "capacity").exists()
+        if is_bat_type and has_cap:
             battery_dir = entry
             break
-        if entry.name.lower() in {"battery", "bat0", "bat1", "bms"}:
-            battery_dir = entry
-            break
+        if fallback_dir is None and (is_bat_type or entry.name.lower() in {"battery", "bat0", "bat1", "bms"}):
+            fallback_dir = entry
+    if battery_dir is None:
+        battery_dir = fallback_dir
 
     if battery_dir is None:
         return None
@@ -274,7 +278,7 @@ def read_memory_info(meminfo_path: Path = MEMINFO_PATH) -> dict[str, int]:
                 continue
             key, rest = line.split(":", 1)
             parts = rest.strip().split()
-            if parts and parts[0].isdigit():
+            if parts and parts[0].isascii() and parts[0].isdigit():
                 values_kb[key.strip()] = int(parts[0])
     except OSError:
         return {"total_mb": 0, "available_mb": 0, "used_mb": 0}
@@ -318,8 +322,11 @@ def read_uptime_sec(uptime_path: Path = PROC_UPTIME_PATH) -> int | None:
     """Return system uptime in whole seconds from /proc/uptime."""
     try:
         first = uptime_path.read_text(encoding="utf-8").split()[0]
-        return max(0, int(float(first)))
-    except (OSError, ValueError, IndexError):
+        val = float(first)
+        if not math.isfinite(val):
+            return None
+        return max(0, int(val))
+    except (OSError, ValueError, OverflowError, IndexError):
         return None
 
 
@@ -365,7 +372,7 @@ class CpuSampler:
             if curr is not None and self._prev is not None:
                 total_pct = self._calc_delta(self._prev.get("cpu"), curr.get("cpu"))
                 core_names = sorted(
-                    (k for k in curr if k != "cpu" and k[3:].isdigit()),
+                    (k for k in curr if k != "cpu" and k[3:].isascii() and k[3:].isdigit()),
                     key=lambda k: int(k[3:]),
                 )
                 per_core: list[float] = []
@@ -418,7 +425,7 @@ def _read_net_bytes(
                 if iface == "lo" or iface.startswith("dummy"):
                     continue
                 cols = rest.split()
-                if len(cols) >= 9 and cols[0].isdigit() and cols[8].isdigit():
+                if len(cols) >= 9 and cols[0].isascii() and cols[0].isdigit() and cols[8].isascii() and cols[8].isdigit():
                     rx_total += int(cols[0])
                     tx_total += int(cols[8])
                     found = True
@@ -437,7 +444,7 @@ def _read_net_bytes(
                     continue
                 rx_s = _read_text_safe(iface_dir / "statistics" / "rx_bytes")
                 tx_s = _read_text_safe(iface_dir / "statistics" / "tx_bytes")
-                if rx_s and tx_s and rx_s.isdigit() and tx_s.isdigit():
+                if rx_s and tx_s and rx_s.isascii() and rx_s.isdigit() and tx_s.isascii() and tx_s.isdigit():
                     rx_total += int(rx_s)
                     tx_total += int(tx_s)
                     found = True
@@ -455,6 +462,7 @@ class NetSampler:
         self._lock = threading.Lock()
         self._prev_bytes = _read_net_bytes()
         self._prev_ts = time.monotonic()
+        self._last_result: tuple[float, float] = (0.0, 0.0)
 
     def sample(self) -> tuple[float | None, float | None]:
         """Return `(rx_kbps, tx_kbps)` or `(None, None)` if unavailable."""
@@ -463,16 +471,21 @@ class NetSampler:
             curr = _read_net_bytes()
             if curr is None:
                 return None, None
-            if self._prev_bytes is None or now - self._prev_ts < 0.2:
+            if self._prev_bytes is None:
                 self._prev_bytes = curr
                 self._prev_ts = now
-                return 0.0, 0.0
+                self._last_result = (0.0, 0.0)
+                return self._last_result
+            if now - self._prev_ts < 0.2:
+                # Preserve baseline across rapid overlapping polls so throughput isn't starved to 0.0
+                return self._last_result
             dt = max(0.2, now - self._prev_ts)
             d_rx = max(0, curr[0] - self._prev_bytes[0])
             d_tx = max(0, curr[1] - self._prev_bytes[1])
             self._prev_bytes = curr
             self._prev_ts = now
-            return round((d_rx / 1024.0) / dt, 1), round((d_tx / 1024.0) / dt, 1)
+            self._last_result = (round((d_rx / 1024.0) / dt, 1), round((d_tx / 1024.0) / dt, 1))
+            return self._last_result
 
 
 def read_top_processes(limit: int = 5, timeout_sec: float = 1.5) -> list[dict[str, Any]]:
@@ -500,7 +513,7 @@ def read_top_processes(limit: int = 5, timeout_sec: float = 1.5) -> list[dict[st
     procs: list[dict[str, Any]] = []
     for line in output.splitlines()[1:]:
         parts = line.split(None, 3)
-        if len(parts) < 4 or not parts[0].isdigit():
+        if len(parts) < 4 or not (parts[0].isascii() and parts[0].isdigit()):
             continue
         name = parts[3].strip()
         if name in {"ps", "sh"}:

@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${CHROOT_DIR}" || "${CHROOT_DIR}" == "/" || "${CHROOT_DIR}" != /* || "${CHROOT_DIR}" == *$'\n'* || "${CHROOT_DIR}" == *'"'* || "${CHROOT_DIR}" == *'$'* || "${CHROOT_DIR}" == *'`'* ]]; then
+if [[ -z "${CHROOT_DIR}" || "${CHROOT_DIR}" == "/" || "${CHROOT_DIR}" != /* || "${CHROOT_DIR}" == *$'\n'* || "${CHROOT_DIR}" == *'"'* || "${CHROOT_DIR}" == *'$'* || "${CHROOT_DIR}" == *'`'* || "${CHROOT_DIR}" == *'\'* ]]; then
   echo "Error: Invalid --dir '${CHROOT_DIR}' (must be a safe absolute path and not '/')." >&2
   exit 2
 fi
@@ -66,7 +66,8 @@ fi
 
 if [[ -f /proc/config.gz ]]; then
   echo -n "Namespaces (Docker Tier 3 check): "
-  if zcat /proc/config.gz 2>/dev/null | grep -q "CONFIG_PID_NS=y" && zcat /proc/config.gz 2>/dev/null | grep -q "CONFIG_NET_NS=y"; then
+  KCFG="$(zcat /proc/config.gz 2>/dev/null || true)"
+  if [[ "${KCFG}" == *"CONFIG_PID_NS=y"* && "${KCFG}" == *"CONFIG_NET_NS=y"* ]]; then
     echo "ENABLED (kernel supports Droidspaces/Docker!)"
   else
     echo "DISABLED (stock kernel — Tier 2 Debian 13 chroot works great; Docker requires Tier 3 custom kernel)"
@@ -93,7 +94,7 @@ if [[ ! -d "${CHROOT_DIR}/etc" ]]; then
   if [[ -z "${ROOTFS_URL}" ]]; then
     echo "Resolving latest Debian 13 (trixie) arm64 rootfs from images.linuxcontainers.org..."
     BASE_URL="https://images.linuxcontainers.org/images/debian/trixie/arm64/default/"
-    LATEST_DIR="$(curl -fsSL "${BASE_URL}" | grep -oE '[0-9]{8}_[0-9]{2}:[0-9]{2}/' | sort | tail -n 1)"
+    LATEST_DIR="$(curl -fsSL "${BASE_URL}" | grep -oE '[0-9]{8}_[0-9]{2}:[0-9]{2}/' | sort | tail -n 1 || true)"
     if [[ -z "${LATEST_DIR}" ]]; then
       echo "Error: Could not auto-detect latest Debian 13 rootfs. Pass --rootfs-url manually." >&2
       exit 1
@@ -110,7 +111,8 @@ if [[ ! -d "${CHROOT_DIR}/etc" ]]; then
   trap - EXIT
 fi
 
-# Basic DNS & Android group compatibility inside Debian chroot
+# Basic DNS & Android group compatibility inside Debian chroot (unlink symlinked resolv.conf first!)
+rm -f "${CHROOT_DIR}/etc/resolv.conf"
 printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > "${CHROOT_DIR}/etc/resolv.conf"
 grep -q "^aid_inet:" "${CHROOT_DIR}/etc/group" || echo "aid_inet:x:3003:root" >> "${CHROOT_DIR}/etc/group"
 grep -q "^aid_net_raw:" "${CHROOT_DIR}/etc/group" || echo "aid_net_raw:x:3004:root" >> "${CHROOT_DIR}/etc/group"

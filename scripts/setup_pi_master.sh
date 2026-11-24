@@ -44,8 +44,18 @@ if [[ ! "${RUN_USER}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]]; then
   exit 2
 fi
 
+if [[ "${REPO_DIR}" == *$'\n'* || "${REPO_DIR}" == *'"'* || "${REPO_DIR}" == *'$'* || "${REPO_DIR}" == *'`'* || "${REPO_DIR}" == *'\'* ]]; then
+  echo "Error: Unsupported special characters in repo directory '${REPO_DIR}'." >&2
+  exit 2
+fi
+
 if [[ -n "${LAN_SUBNET}" ]]; then
-  if ! python3 -c 'import ipaddress, sys; ipaddress.ip_network(sys.argv[1], strict=False)' "${LAN_SUBNET}" 2>/dev/null; then
+  if command -v python3 >/dev/null 2>&1; then
+    if ! python3 -c 'import ipaddress, sys; ipaddress.ip_network(sys.argv[1], strict=False)' "${LAN_SUBNET}" 2>/dev/null; then
+      echo "Error: Invalid --lan-subnet CIDR '${LAN_SUBNET}' (example: 192.168.1.0/24)." >&2
+      exit 2
+    fi
+  elif [[ ! "${LAN_SUBNET}" =~ ^[0-9A-Fa-f.:]+/[0-9]{1,3}$ ]]; then
     echo "Error: Invalid --lan-subnet CIDR '${LAN_SUBNET}' (example: 192.168.1.0/24)." >&2
     exit 2
   fi
@@ -62,7 +72,7 @@ if ! id -u "${RUN_USER}" >/dev/null 2>&1; then
 fi
 
 USER_HOME="$(getent passwd "${RUN_USER}" | cut -d: -f6 || echo "/home/${RUN_USER}")"
-MASTER_IP="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./) {print $i; exit}}')"
+MASTER_IP="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./) {print $i; exit}}' || true)"
 MASTER_IP="${MASTER_IP:-192.168.1.200}"
 if [[ -z "${LAN_SUBNET}" ]]; then
   LAN_SUBNET="$(echo "${MASTER_IP}" | awk -F. '{print $1"."$2"."$3".0/24"}')"
@@ -121,10 +131,22 @@ if [[ "${ENABLE_GATEWAY}" -eq 1 ]]; then
     --config "${CFG_PATH}" gateway --enable --mode allowlist
 fi
 
-# 4. Install systemd services for Master Dashboard (+ optional Network Guard) AND local node0 Worker
+# Re-validate --lan-subnet now that python3 is guaranteed installed
+if ! python3 -c 'import ipaddress, sys; ipaddress.ip_network(sys.argv[1], strict=False)' "${LAN_SUBNET}" 2>/dev/null; then
+  echo "Error: Invalid --lan-subnet CIDR '${LAN_SUBNET}' (example: 192.168.1.0/24)." >&2
+  exit 2
+fi
+
+# Detect Master node ID from cluster.json (supports pre-existing custom Master node IDs)
+MASTER_NODE_ID="$(python3 -c 'import json, sys; c=json.load(open(sys.argv[1], encoding="utf-8")); n=next((x for x in c["nodes"] if x.get("role")=="master"), c["nodes"][0]); print(n["id"])' "${CFG_PATH}" 2>/dev/null || echo "node0")"
+if [[ ! "${MASTER_NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
+  MASTER_NODE_ID="node0"
+fi
+
+# 4. Install systemd services for Master Dashboard (+ optional Network Guard) AND local Master Worker
 cat > /etc/systemd/system/phonecluster-worker.service <<EOF
 [Unit]
-Description=PhoneCluster Master Local Worker Agent (node0)
+Description=PhoneCluster Master Local Worker Agent (${MASTER_NODE_ID})
 After=network-online.target
 Wants=network-online.target
 
@@ -132,7 +154,7 @@ Wants=network-online.target
 Type=simple
 User=${RUN_USER}
 WorkingDirectory=${REPO_DIR}
-ExecStart=/usr/bin/python3 "${REPO_DIR}/phonecluster_cli.py" --config "${CFG_PATH}" worker --node-id node0 --bind 0.0.0.0
+ExecStart=/usr/bin/python3 "${REPO_DIR}/phonecluster_cli.py" --config "${CFG_PATH}" worker --node-id ${MASTER_NODE_ID} --bind 0.0.0.0
 Restart=always
 RestartSec=3
 NoNewPrivileges=true

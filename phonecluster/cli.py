@@ -30,6 +30,7 @@ from .config import (
     normalize_host,
     resolve_config_path,
     save_config,
+    validate_pool_name,
 )
 from .dashboard import serve_dashboard
 from .discovery import discover_lan_nodes
@@ -99,11 +100,11 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    port = args.port if args.port else node.worker_port
+    port = args.port if args.port is not None else node.worker_port
     if not (0 <= int(port) <= 65535):
         print(f"Error: worker port must be 0..65535 (got {port})", file=sys.stderr)
         return 2
-    max_conc = args.max_concurrency if args.max_concurrency else node.max_concurrency
+    max_conc = args.max_concurrency if args.max_concurrency is not None else node.max_concurrency
     if not (1 <= int(max_conc) <= 32):
         print(f"Error: --max-concurrency must be 1..32 (got {max_conc})", file=sys.stderr)
         return 2
@@ -234,8 +235,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
     watch_sec = getattr(args, "watch", 0.0)
     if watch_sec is None:
         watch_sec = 0.0
-    if not math.isfinite(watch_sec) or watch_sec < 0:
-        print(f"Error: --watch must be a finite number >= 0 (got {watch_sec})", file=sys.stderr)
+    if not math.isfinite(watch_sec) or watch_sec < 0 or watch_sec > 86400.0:
+        print(f"Error: --watch must be a finite number between 0 and 86400 (got {watch_sec})", file=sys.stderr)
         return 2
     if watch_sec == 0:
         _render_status_once(ctrl, args.json)
@@ -256,8 +257,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
 
-    if not math.isfinite(args.timeout) or args.timeout < 0:
-        print(f"Error: --timeout must be a finite number >= 0 (got {args.timeout})", file=sys.stderr)
+    if not math.isfinite(args.timeout) or args.timeout < 0 or args.timeout > 86400.0:
+        print(f"Error: --timeout must be a finite number between 0 and 86400 (got {args.timeout})", file=sys.stderr)
         return 2
     if not args.command and not args.script:
         print("Provide a shell command or --script <path>.", file=sys.stderr)
@@ -270,7 +271,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if not sp.is_file():
             print(f"Script not found or not a file: {sp}", file=sys.stderr)
             return 2
-        script_content = sp.read_text(encoding="utf-8")
+        try:
+            script_content = sp.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"Could not read script '{sp}': {exc}", file=sys.stderr)
+            return 2
         script_name = sp.name
 
     spec = JobSpec(
@@ -327,14 +332,14 @@ def _load_lines(source: str) -> list[str]:
 def _cmd_map(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
-    if not math.isfinite(args.timeout) or args.timeout < 0:
-        print(f"Error: --timeout must be a finite number >= 0 (got {args.timeout})", file=sys.stderr)
+    if not math.isfinite(args.timeout) or args.timeout < 0 or args.timeout > 86400.0:
+        print(f"Error: --timeout must be a finite number between 0 and 86400 (got {args.timeout})", file=sys.stderr)
         return 2
     if args.retries < 0:
         print(f"Error: --retries must be >= 0 (got {args.retries})", file=sys.stderr)
         return 2
-    if not math.isfinite(args.wait_ready) or args.wait_ready < 0:
-        print(f"Error: --wait-ready must be a finite number >= 0 (got {args.wait_ready})", file=sys.stderr)
+    if not math.isfinite(args.wait_ready) or args.wait_ready < 0 or args.wait_ready > 86400.0:
+        print(f"Error: --wait-ready must be a finite number between 0 and 86400 (got {args.wait_ready})", file=sys.stderr)
         return 2
     if args.repeat < 0:
         print(f"Error: --repeat must be >= 0 (got {args.repeat})", file=sys.stderr)
@@ -348,7 +353,11 @@ def _cmd_map(args: argparse.Namespace) -> int:
         if not sp.is_file():
             print(f"Script not found or not a file: {sp}", file=sys.stderr)
             return 2
-        content = sp.read_text(encoding="utf-8")
+        try:
+            content = sp.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"Could not read script '{sp}': {exc}", file=sys.stderr)
+            return 2
         if args.args_file:
             try:
                 arg_lines = _load_lines(args.args_file)
@@ -528,14 +537,14 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
     if args.port is not None and not (0 <= int(args.port) <= 65535):
         print(f"Error: --port must be between 0 and 65535 (got {args.port})", file=sys.stderr)
         return 2
-    if args.enable or args.disable or args.mode or args.port:
+    if args.enable or args.disable or args.mode or args.port is not None:
         if args.enable:
             cfg.gateway.enabled = True
         if args.disable:
             cfg.gateway.enabled = False
         if args.mode:
             cfg.gateway.mode = args.mode
-        if args.port:
+        if args.port is not None:
             cfg.gateway.port = int(args.port)
         save_config(cfg, cfg_path)
         state_txt = "ENABLED" if cfg.gateway.enabled else "DISABLED"
@@ -584,7 +593,7 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
     cfg.gateway.enabled = True
     if args.bind:
         cfg.gateway.bind_host = args.bind
-    if args.port:
+    if args.port is not None:
         cfg.gateway.port = args.port
     mgr = GatewayManager(cfg)
     ok, msg = mgr.start()
@@ -681,7 +690,7 @@ def _cmd_net_audit(args: argparse.Namespace) -> int:
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
-    if not (0 <= int(args.port) <= 65535):
+    if args.port is not None and not (0 <= int(args.port) <= 65535):
         print(f"Error: --port must be between 0 and 65535 (got {args.port})", file=sys.stderr)
         return 2
     cfg_path = resolve_config_path(args.config)
@@ -689,7 +698,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     if args.require_auth:
         cfg.dashboard_require_auth = True
     ctrl = MasterController(cfg)
-    port = args.port or cfg.dashboard_port
+    port = args.port if args.port is not None else cfg.dashboard_port
     serve_dashboard(args.bind, port, ctrl, config_path=cfg_path)
     return 0
 
@@ -710,14 +719,19 @@ def _cmd_pair(args: argparse.Namespace) -> int:
 
 
 def _cmd_join(args: argparse.Namespace) -> int:
-    if not math.isfinite(args.timeout) or args.timeout <= 0:
-        print(f"Error: --timeout must be a finite number > 0 (got {args.timeout})", file=sys.stderr)
+    if not math.isfinite(args.timeout) or args.timeout <= 0 or args.timeout > 300.0:
+        print(f"Error: --timeout must be a finite number between 0 and 300 (got {args.timeout})", file=sys.stderr)
         return 2
     if not (1 <= int(args.worker_port) <= 65535):
         print(f"Error: --worker-port must be between 1 and 65535 (got {args.worker_port})", file=sys.stderr)
         return 2
     if not (1 <= int(args.max_concurrency) <= 32):
         print(f"Error: --max-concurrency must be between 1 and 32 (got {args.max_concurrency})", file=sys.stderr)
+        return 2
+    try:
+        validated_pool = validate_pool_name(args.pool)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 2
     cfg_path = resolve_config_path(args.config)
     master_host = ""
@@ -728,13 +742,13 @@ def _cmd_join(args: argparse.Namespace) -> int:
     if args.master:
         raw_m = args.master.strip()
         if raw_m.lower().startswith(("http://", "https://")):
-            parsed_m = urllib.parse.urlsplit(raw_m)
-            master_host = normalize_host(parsed_m.hostname or "")
             try:
+                parsed_m = urllib.parse.urlsplit(raw_m)
+                master_host = normalize_host(parsed_m.hostname or "")
                 if parsed_m.port is not None:
                     pair_port = parsed_m.port
             except ValueError:
-                print(f"Error: invalid port in --master '{raw_m}'", file=sys.stderr)
+                print(f"Error: invalid --master URL '{raw_m}'", file=sys.stderr)
                 return 2
         elif raw_m.startswith("["):
             if "]:" in raw_m:
@@ -781,7 +795,11 @@ def _cmd_join(args: argparse.Namespace) -> int:
                     f"  {i}) {m['cluster_name']} at {m['host']}:{m['pair_port']} "
                     f"(fingerprint: {m['fingerprint']}, {m['expires_in_sec']}s left)"
                 )
-            sel = input("Select Master [1]: ").strip() or "1"
+            try:
+                sel = input("Select Master [1]: ").strip() or "1"
+            except (EOFError, KeyboardInterrupt):
+                print("\nPairing cancelled.", file=sys.stderr)
+                return 1
             idx = max(0, min(len(found) - 1, int(sel) - 1)) if (sel.isascii() and sel.isdigit()) else 0
             chosen = found[idx]
         master_host = chosen["host"]
@@ -795,15 +813,25 @@ def _cmd_join(args: argparse.Namespace) -> int:
             f"  Fingerprint : {fingerprint}  (verify this matches your Master screen!)\n"
         )
 
-    pin = args.pin or input("Enter the 6-digit Pairing PIN shown on Master: ").strip()
+    if args.pin:
+        pin = args.pin.strip()
+    else:
+        try:
+            pin = input("Enter the 6-digit Pairing PIN shown on Master: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nPairing cancelled.", file=sys.stderr)
+            return 1
     if not pin:
         print("Pairing cancelled (no PIN entered).", file=sys.stderr)
         return 1
 
     trust_ssh = bool(args.trust_ssh)
     if not trust_ssh and not args.no_ssh_key and sys.stdin.isatty():
-        ans = input("Trust Master's SSH public key for passwordless `pc ssh` / `pc sync`? [Y/n]: ").strip().lower()
-        trust_ssh = ans in {"", "y", "yes"}
+        try:
+            ans = input("Trust Master's SSH public key for passwordless `pc ssh` / `pc sync`? [Y/n]: ").strip().lower()
+            trust_ssh = ans in {"", "y", "yes"}
+        except (EOFError, KeyboardInterrupt):
+            trust_ssh = False
 
     try:
         res = join_cluster_via_pairing(
@@ -815,7 +843,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
             max_concurrency=args.max_concurrency,
             trust_ssh_key=trust_ssh,
             tier=args.tier,
-            pool=args.pool,
+            pool=validated_pool,
         )
     except (RuntimeError, ValueError) as exc:
         print(f"Pairing failed: {exc}", file=sys.stderr)
@@ -903,8 +931,8 @@ def _cmd_menu(args: argparse.Namespace) -> int:
 
 
 def _cmd_discover(args: argparse.Namespace) -> int:
-    if not math.isfinite(args.timeout) or args.timeout <= 0:
-        print(f"Error: --timeout must be a finite number > 0 (got {args.timeout})", file=sys.stderr)
+    if not math.isfinite(args.timeout) or args.timeout <= 0 or args.timeout > 300.0:
+        print(f"Error: --timeout must be a finite number between 0 and 300 (got {args.timeout})", file=sys.stderr)
         return 2
     found = discover_lan_nodes(timeout_sec=args.timeout)
     if args.json:
@@ -940,8 +968,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_top(args: argparse.Namespace) -> int:
-    if not math.isfinite(args.interval) or args.interval <= 0:
-        print(f"Error: --interval must be a finite number > 0 (got {args.interval})", file=sys.stderr)
+    if not math.isfinite(args.interval) or args.interval <= 0 or args.interval > 86400.0:
+        print(f"Error: --interval must be a finite number between 0 and 86400 (got {args.interval})", file=sys.stderr)
         return 2
     cfg = load_config(args.config)
     ctrl = MasterController(cfg)
@@ -958,16 +986,20 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
     limit = max(0, int(args.limit))
     rows: list[list[str]] = []
     for n in all_nodes:
-        nid = n["node_id"]
-        for j in n.get("active", []):
-            rows.append([nid, j["job_id"], "RUNNING", f"{j['running_sec']}s", str(j.get("command", ""))[:50]])
-        for j in n.get("recent", [])[:limit]:
+        nid = str(n.get("node_id", "?"))
+        for j in (n.get("active") if isinstance(n.get("active"), list) else []):
+            if not isinstance(j, dict):
+                continue
+            rows.append([nid, str(j.get("job_id", "?")), "RUNNING", f"{j.get('running_sec', 0)}s", str(j.get("command", ""))[:50]])
+        for j in (n.get("recent") if isinstance(n.get("recent"), list) else [])[:limit]:
+            if not isinstance(j, dict):
+                continue
             st = (
                 "CANCELLED"
                 if j.get("cancelled")
                 else ("TIMEOUT" if j.get("timed_out") else ("OK" if j.get("returncode") == 0 else f"FAIL({j.get('returncode')})"))
             )
-            rows.append([nid, j["job_id"], st, f"{j['duration_sec']}s", str(j.get("command", ""))[:50]])
+            rows.append([nid, str(j.get("job_id", "?")), st, f"{j.get('duration_sec', 0)}s", str(j.get("command", ""))[:50]])
     if not rows:
         print("No active or recent jobs across the cluster.")
         return 0
@@ -1071,7 +1103,7 @@ def _cmd_push_config(args: argparse.Namespace) -> int:
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
-    cfg_path = resolve_config_path(args.config)
+    cfg_path = resolve_config_path(args.config).resolve()
     script = REPO_ROOT / "scripts" / "03_sync_cluster.sh"
     if not script.exists():
         print(f"Error: sync script not found at {script}", file=sys.stderr)
@@ -1191,7 +1223,7 @@ def _cmd_update(args: argparse.Namespace) -> int:
     if rc != 0:
         return rc
     if args.sync:
-        cfg_path = resolve_config_path(args.config)
+        cfg_path = resolve_config_path(args.config).resolve()
         if cfg_path.exists():
             return subprocess.call(
                 ["bash", str(REPO_ROOT / "scripts" / "03_sync_cluster.sh"), "--config", str(cfg_path)],
@@ -1291,8 +1323,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker = sub.add_parser("worker", help="Run the worker HTTP agent + thermal/battery guard")
     p_worker.add_argument("--node-id", required=True, help="Node ID from cluster.json (e.g. node0)")
     p_worker.add_argument("--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    p_worker.add_argument("--port", type=int, default=0, help="Override worker HTTP port")
-    p_worker.add_argument("--max-concurrency", type=int, default=0, help="Override max concurrent jobs")
+    p_worker.add_argument("--port", type=int, default=None, help="Override worker HTTP port")
+    p_worker.add_argument("--max-concurrency", type=int, default=None, help="Override max concurrent jobs")
     p_worker.add_argument("--workdir", default=".", help="Default working directory for jobs")
     p_worker.add_argument(
         "--discover",
@@ -1481,7 +1513,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Policy mode: allowlist (default-deny), monitor (log-all), or block_all (air-gap)",
     )
     p_gw.add_argument("--bind", default="", help="Override bind address when running standalone")
-    p_gw.add_argument("--port", type=int, default=0, help="Proxy port (default: 8888)")
+    p_gw.add_argument("--port", type=int, default=None, help="Proxy port (default: 8888)")
     p_gw.add_argument("--serve", action="store_true", help="Also run standalone proxy in foreground after saving")
     p_gw.add_argument("--status", action="store_true", help="Show Network Guard configuration")
     p_gw.add_argument("--check-isolation", action="store_true", help="Test if router blocks direct WAN on workers")
@@ -1514,7 +1546,7 @@ def build_parser() -> argparse.ArgumentParser:
     # dashboard
     p_dash = sub.add_parser("dashboard", help="Start the Master web dashboard UI")
     p_dash.add_argument("--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    p_dash.add_argument("--port", type=int, default=0, help="Dashboard HTTP port (default from config: 8080)")
+    p_dash.add_argument("--port", type=int, default=None, help="Dashboard HTTP port (default from config: 8080)")
     p_dash.add_argument(
         "--require-auth",
         action="store_true",

@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
-import select
+import selectors
 import socket
 import struct
 import threading
@@ -21,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import validate_ssh_user
+from .config import normalize_host, validate_ssh_user
 from .telemetry import detect_os_environment, read_memory_info
 
 LOG = logging.getLogger("phonecluster.discovery")
@@ -156,6 +157,12 @@ class DiscoveryResponder(threading.Thread):
 
     def bind(self) -> bool:
         """Bind the UDP socket before starting the thread."""
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(socket, "SO_REUSEPORT"):
@@ -163,7 +170,12 @@ class DiscoveryResponder(threading.Thread):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except OSError:
                 pass
-        bind_addr = "0.0.0.0" if (not self.listen_host or ":" in self.listen_host) else self.listen_host
+        # On Linux/Android, binding a unicast LAN IP drops IPv4 broadcasts; bind 0.0.0.0 unless loopback.
+        lh = normalize_host(self.listen_host)
+        if lh and ":" not in lh and lh.startswith("127."):
+            bind_addr = lh
+        else:
+            bind_addr = "0.0.0.0"
         try:
             sock.bind((bind_addr, self.discovery_port))
             sock.settimeout(0.5)
@@ -181,44 +193,66 @@ class DiscoveryResponder(threading.Thread):
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._sock is not None:
+        if not self.is_alive() and self._sock is not None:
             try:
                 self._sock.close()
             except OSError:
                 pass
+            self._sock = None
 
     def run(self) -> None:
         if self._sock is None and not self.bind():
             return
-        assert self._sock is not None
+        sock = self._sock
+        assert sock is not None
         LOG.info("LAN discovery responder listening on UDP %s:%d", self.listen_host, self.bound_port)
         win_start = time.monotonic()
         replies = 0
-        while not self._stop_event.is_set():
-            try:
-                data, addr = self._sock.recvfrom(2048)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if not addr or addr[1] <= 0:
-                continue
-            now_m = time.monotonic()
-            if now_m - win_start >= 1.0:
-                win_start = now_m
-                replies = 0
-            if replies >= 20:
-                continue
-            try:
-                msg = json.loads(data.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if isinstance(msg, dict) and msg.get("type") == PROBE_TYPE:
+        try:
+            while not self._stop_event.is_set():
                 try:
-                    self._sock.sendto(self._build_reply(), addr)
-                    replies += 1
+                    data, addr = sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
                 except OSError:
-                    pass
+                    break
+                if not addr or addr[1] <= 0:
+                    continue
+                now_m = time.monotonic()
+                if now_m - win_start >= 1.0:
+                    win_start = now_m
+                    replies = 0
+                if replies >= 20:
+                    continue
+                try:
+                    msg = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(msg, dict) and msg.get("type") == PROBE_TYPE:
+                    try:
+                        sock.sendto(self._build_reply(), addr)
+                        replies += 1
+                    except OSError:
+                        pass
+        finally:
+            self._stop_event.set()
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if self._sock is sock:
+                self._sock = None
+
+
+def _parse_udp_int(val: Any) -> int | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        if isinstance(val, float) and (not math.isfinite(val) or not val.is_integer()):
+            return None
+        return int(val)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def discover_lan_nodes(
@@ -233,40 +267,56 @@ def discover_lan_nodes(
 
     def _open_probe_sock() -> socket.socket:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.setblocking(False)
-        return s
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.setblocking(False)
+            return s
+        except OSError:
+            s.close()
+            raise
 
-    socks: list[socket.socket] = [_open_probe_sock()]
+    socks: list[socket.socket] = []
+    sel = selectors.DefaultSelector()
     found: dict[tuple[str, int], dict[str, Any]] = {}
+    per_ip_count: dict[str, int] = {}
     try:
-        def _send_probes(s: socket.socket) -> None:
+        def _add_and_probe() -> None:
+            s = _open_probe_sock()
+            socks.append(s)
+            sel.register(s, selectors.EVENT_READ)
             for dest in dests:
                 try:
                     s.sendto(probe, (dest, discovery_port))
                 except OSError as exc:
                     LOG.debug("Broadcast to %s:%d failed: %s", dest, discovery_port, exc)
 
-        _send_probes(socks[0])
+        # Probe across multiple ephemeral source ports to defeat SO_REUSEPORT pinning
+        for _ in range(4):
+            try:
+                _add_and_probe()
+            except OSError:
+                if not socks:
+                    raise
+                break
+
         started = time.monotonic()
         deadline = started + max(0.2, timeout_sec)
         resent = False
         while time.monotonic() < deadline:
             if not resent and timeout_sec >= 0.8 and (time.monotonic() - started) >= (timeout_sec * 0.45):
-                # Fresh ephemeral source port avoids SO_REUSEPORT hash-pinning if pairing beacon shares port 8766
-                try:
-                    s2 = _open_probe_sock()
-                    socks.append(s2)
-                    _send_probes(s2)
-                except OSError:
-                    _send_probes(socks[0])
+                for _ in range(2):
+                    try:
+                        _add_and_probe()
+                    except OSError:
+                        break
                 resent = True
             rem_t = max(0.02, min(0.25, deadline - time.monotonic()))
             try:
-                readable, _, _ = select.select(socks, [], [], rem_t)
+                events = sel.select(timeout=rem_t)
             except (OSError, ValueError):
                 break
-            for rs in readable:
+            for key, _mask in events:
+                rs: socket.socket = key.fileobj  # type: ignore[assignment]
                 try:
                     data, addr = rs.recvfrom(4096)
                 except OSError:
@@ -277,25 +327,28 @@ def discover_lan_nodes(
                     continue
                 if not isinstance(msg, dict) or msg.get("type") != REPLY_TYPE:
                     continue
-                try:
-                    worker_port = int(msg.get("worker_port", 8765))
-                    ssh_port = int(msg.get("ssh_port", 8022))
-                    cpu_cores = max(1, min(1024, int(msg.get("cpu_cores", 1))))
-                    mem_total_mb = max(0, int(msg.get("mem_total_mb", 0)))
-                except (TypeError, ValueError):
+                worker_port = _parse_udp_int(msg.get("worker_port", 8765))
+                ssh_port = _parse_udp_int(msg.get("ssh_port", 8022))
+                raw_cores = _parse_udp_int(msg.get("cpu_cores", 1))
+                raw_mem = _parse_udp_int(msg.get("mem_total_mb", 0))
+                if None in (worker_port, ssh_port, raw_cores, raw_mem):
                     continue
+                assert worker_port is not None and ssh_port is not None and raw_cores is not None and raw_mem is not None
                 if not (1 <= worker_port <= 65535 and 1 <= ssh_port <= 65535):
                     continue
+                cpu_cores = max(1, min(1024, raw_cores))
+                mem_total_mb = max(0, raw_mem)
                 host_ip = str(addr[0])
-                key = (host_ip, worker_port)
-                if key not in found and len(found) < _MAX_DISCOVERED_NODES:
+                key_pair = (host_ip, worker_port)
+                if key_pair not in found and len(found) < _MAX_DISCOVERED_NODES and per_ip_count.get(host_ip, 0) < 8:
+                    per_ip_count[host_ip] = per_ip_count.get(host_ip, 0) + 1
                     role_raw = _CTRL_RE.sub("", str(msg.get("role") or "worker")).strip().lower()
                     raw_ssh_u = _CTRL_RE.sub("", str(msg.get("ssh_user") or "")).strip()[:64]
                     try:
                         safe_ssh_u = validate_ssh_user(raw_ssh_u)
                     except ValueError:
                         safe_ssh_u = ""
-                    found[key] = {
+                    found[key_pair] = {
                         "host": host_ip,
                         "node_id": _CTRL_RE.sub("", str(msg.get("node_id") or "")).strip()[:40],
                         "role": role_raw if role_raw in {"master", "worker"} else "worker",
@@ -308,6 +361,7 @@ def discover_lan_nodes(
                         "mem_total_mb": mem_total_mb,
                     }
     finally:
+        sel.close()
         for s in socks:
             try:
                 s.close()

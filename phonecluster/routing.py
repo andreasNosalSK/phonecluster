@@ -91,7 +91,8 @@ def resolve_node_tier_and_pool(
     elif isinstance(h_tier, int) and not isinstance(h_tier, bool) and h_tier in {1, 2, 3}:
         tier = h_tier
     else:
-        os_env = str(h.get("os_env", "")).lower()
+        raw_os = h.get("os_env")
+        os_env = raw_os.strip().lower() if isinstance(raw_os, str) else ""
         raw_tools = h.get("tools")
         tools = raw_tools if isinstance(raw_tools, dict) else {}
         if os_env == "termux":
@@ -103,10 +104,11 @@ def resolve_node_tier_and_pool(
         else:
             tier = 1
 
+    raw_h_pool = h.get("pool")
     if node.pool and node.pool != "auto":
         pool = node.pool
-    elif h.get("pool") and h.get("pool") != "auto" and node.tier == 0:
-        cand_pool = str(h["pool"]).strip().lower()
+    elif isinstance(raw_h_pool, str) and raw_h_pool.strip() and raw_h_pool.strip().lower() != "auto" and node.tier == 0:
+        cand_pool = raw_h_pool.strip().lower()
         pool = cand_pool if _SAFE_POOL_RE.fullmatch(cand_pool) else DEFAULT_POOL_BY_TIER.get(tier, "compute")
     else:
         pool = DEFAULT_POOL_BY_TIER.get(tier, "compute")

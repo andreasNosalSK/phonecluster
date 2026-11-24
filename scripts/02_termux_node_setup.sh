@@ -47,7 +47,7 @@ if [[ ! "${NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
   exit 2
 fi
 
-if [[ "${REPO_DIR}" == *$'\n'* || "${REPO_DIR}" == *'"'* || "${REPO_DIR}" == *'$'* || "${REPO_DIR}" == *'`'* ]]; then
+if [[ "${REPO_DIR}" == *$'\n'* || "${REPO_DIR}" == *'"'* || "${REPO_DIR}" == *'$'* || "${REPO_DIR}" == *'`'* || "${REPO_DIR}" == *'\'* ]]; then
   echo "Error: Unsupported special characters in --repo-dir '${REPO_DIR}'." >&2
   exit 2
 fi
@@ -70,8 +70,12 @@ echo "[2/4] Ensuring SSH daemon (port 8022) is ready..."
 mkdir -p "${HOME}/.ssh"
 chmod 700 "${HOME}/.ssh"
 if [[ ! -s "${HOME}/.ssh/authorized_keys" ]]; then
-  echo "Set an SSH password for initial login from your Master phone / PC:"
-  passwd
+  if (exec < /dev/tty) 2>/dev/null; then
+    echo "Set an SSH password for initial login from your Master phone / PC:"
+    passwd < /dev/tty || echo "Warning: passwd did not complete — run 'passwd' manually or pair via 'pc join'." >&2
+  else
+    echo "Note: Non-interactive shell — run 'passwd' manually in Termux if you need SSH password login." >&2
+  fi
 fi
 pgrep -x sshd >/dev/null 2>&1 || sshd
 

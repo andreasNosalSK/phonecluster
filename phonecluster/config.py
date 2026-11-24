@@ -41,7 +41,7 @@ def normalize_host(host: str) -> str:
 def is_loopback_or_unspecified_host(host: str) -> bool:
     """Return True if `host` refers to localhost, loopback, or an unspecified bind address."""
     h = normalize_host(host).lower()
-    if not h or h in {"localhost", "0.0.0.0", "::"}:
+    if not h or h.rstrip(".") == "localhost" or h in {"0.0.0.0", "::"}:
         return True
     try:
         addr = ipaddress.ip_address(h)
@@ -61,8 +61,47 @@ def format_host_for_url(host: str) -> str:
 _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 _SSH_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
 _POOL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 _DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
+
+
+def _parse_int_field(val: Any, default: int, field_name: str) -> int:
+    """Strictly parse an integer config field (rejects booleans, non-finite floats, and non-integers)."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        raise ValueError(f"{field_name} must be an integer, not a boolean")
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        if not math.isfinite(val) or not val.is_integer():
+            raise ValueError(f"{field_name} must be a finite integer")
+        return int(val)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return default
+        try:
+            return int(s)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer (got '{val}')") from exc
+    raise ValueError(f"{field_name} must be an integer")
+
+
+def _parse_float_field(val: Any, default: float, field_name: str) -> float:
+    """Strictly parse a finite float config field (rejects booleans and NaN/Infinity)."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        raise ValueError(f"{field_name} must be a number, not a boolean")
+    if isinstance(val, str) and not val.strip():
+        return default
+    try:
+        num = float(val)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be a finite number") from exc
+    if not math.isfinite(num):
+        raise ValueError(f"{field_name} must be a finite number")
+    return num
 
 
 def validate_domain_pattern(pattern: str) -> str:
@@ -75,7 +114,7 @@ def validate_domain_pattern(pattern: str) -> str:
         if not base or "*" in base or not _DOMAIN_LABEL_RE.fullmatch(base):
             raise ValueError(f"Invalid wildcard domain pattern '{pattern}' (use e.g. '*.github.com')")
         return f"*.{base}"
-    if "*" in raw or any(c in raw for c in "@/\\?#;'\""):
+    if "*" in raw or any(c in raw for c in "@/\\?#;'\"%"):
         raise ValueError(f"Invalid domain pattern '{pattern}'")
     clean = raw.rstrip(".")
     if not clean:
@@ -103,19 +142,20 @@ def validate_node_id(node_id: str) -> str:
 
 
 def validate_host(host: str) -> str:
-    """Validate and return a safe IPv4, IPv6, or RFC hostname (blocks URL/SSH/hosts injection)."""
+    """Validate and return a safe IPv4, IPv6, or RFC hostname (blocks URL/SSH/hosts/zone-ID injection)."""
     raw = str(host or "").strip()
     clean = normalize_host(raw)
     if not clean or len(clean) > 253 or clean.startswith("-"):
         raise ValueError(f"Invalid host '{raw}'")
-    if any(c.isspace() or ord(c) < 32 or c in "@/\\?#;'\"" for c in clean):
+    if any(c.isspace() or ord(c) < 32 or ord(c) == 127 or c in "@/\\?#;'\"%" for c in clean):
         raise ValueError(f"Invalid characters in host '{raw}'")
     try:
         ipaddress.ip_address(clean)
         return clean
     except ValueError:
         pass
-    if not _HOSTNAME_RE.fullmatch(clean.rstrip(".")):
+    host_no_dot = clean[:-1] if clean.endswith(".") else clean
+    if not host_no_dot or not _DOMAIN_LABEL_RE.fullmatch(host_no_dot.lower()):
         raise ValueError(f"Invalid host/IP '{raw}'")
     return clean
 
@@ -183,30 +223,46 @@ class NodeConfig:
     def from_dict(cls, data: dict[str, Any]) -> "NodeConfig":
         if "id" not in data or "host" not in data:
             raise ValueError(f"Node entry must define 'id' and 'host': {data}")
-        node_id = validate_node_id(str(data["id"]))
-        host = validate_host(str(data["host"]))
-        role = str(data.get("role", "worker")).lower()
+        if not isinstance(data["id"], str):
+            raise ValueError(f"Node 'id' must be a non-empty string: {data}")
+        if not isinstance(data["host"], str):
+            raise ValueError(f"Node 'host' must be a non-empty string: {data}")
+        node_id = validate_node_id(data["id"])
+        host = validate_host(data["host"])
+        raw_role = data.get("role", "worker")
+        if raw_role is not None and not isinstance(raw_role, str):
+            raise ValueError(f"Invalid role '{raw_role}' for node '{node_id}'")
+        role = (raw_role or "worker").strip().lower()
         if role not in {"master", "worker"}:
             raise ValueError(f"Invalid role '{role}' for node '{node_id}'")
-        worker_port = int(data.get("worker_port", DEFAULT_WORKER_PORT))
-        ssh_port = int(data.get("ssh_port", DEFAULT_SSH_PORT))
+        worker_port = _parse_int_field(data.get("worker_port"), DEFAULT_WORKER_PORT, f"worker_port for '{node_id}'")
+        ssh_port = _parse_int_field(data.get("ssh_port"), DEFAULT_SSH_PORT, f"ssh_port for '{node_id}'")
         if not (0 <= worker_port <= 65535):
             raise ValueError(f"worker_port must be 0..65535 for node '{node_id}'")
         if not (1 <= ssh_port <= 65535):
             raise ValueError(f"ssh_port must be 1..65535 for node '{node_id}'")
-        max_conc = int(data.get("max_concurrency", 2))
+        max_conc = _parse_int_field(data.get("max_concurrency"), 2, f"max_concurrency for '{node_id}'")
         if max_conc < 1:
             raise ValueError(f"max_concurrency must be >= 1 for node '{node_id}'")
-        weight = float(data.get("weight", 1.0))
-        if not math.isfinite(weight) or weight <= 0:
+        weight = _parse_float_field(data.get("weight"), 1.0, f"weight for '{node_id}'")
+        if weight <= 0:
             raise ValueError(f"weight must be a finite number > 0 for node '{node_id}'")
-        tier = int(data.get("tier", 0))
+        tier = _parse_int_field(data.get("tier"), 0, f"tier for '{node_id}'")
         if tier not in {0, 1, 2, 3}:
             raise ValueError(f"tier must be 0 (auto), 1, 2, or 3 for node '{node_id}'")
-        pool = validate_pool_name(str(data.get("pool") or "auto"))
-        ssh_user = validate_ssh_user(str(data.get("ssh_user") or ""))
+        raw_pool = data.get("pool")
+        if raw_pool is not None and not isinstance(raw_pool, str):
+            raise ValueError(f"Invalid pool '{raw_pool}' for node '{node_id}'")
+        pool = validate_pool_name(raw_pool or "auto")
+        raw_ssh_user = data.get("ssh_user")
+        if raw_ssh_user is not None and not isinstance(raw_ssh_user, str):
+            raise ValueError(f"Invalid ssh_user for node '{node_id}'")
+        ssh_user = validate_ssh_user(raw_ssh_user or "")
         raw_tags = data.get("tags")
         tags = [str(t) for t in raw_tags if t is not None] if isinstance(raw_tags, list) else []
+        raw_tok = data.get("auth_token")
+        if raw_tok is not None and not isinstance(raw_tok, str):
+            raise ValueError(f"auth_token for node '{node_id}' must be a string")
         return cls(
             id=node_id,
             host=host,
@@ -220,7 +276,7 @@ class NodeConfig:
             pool=pool,
             tags=tags,
             notes=str(data.get("notes") or ""),
-            auth_token=str(data.get("auth_token") or "").strip(),
+            auth_token=(raw_tok or "").strip(),
         )
 
 
@@ -239,18 +295,19 @@ class SafetyConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SafetyConfig":
+        raw_wb = data.get("battery_webhook_url")
+        if raw_wb is not None and not isinstance(raw_wb, str):
+            raise ValueError("safety.battery_webhook_url must be a string")
         cfg = cls(
-            max_temp_c=float(data.get("max_temp_c", 40.0)),
-            resume_temp_c=float(data.get("resume_temp_c", 37.0)),
-            min_free_ram_mb=int(data.get("min_free_ram_mb", 256)),
-            battery_low_pct=int(data.get("battery_low_pct", 45)),
-            battery_high_pct=int(data.get("battery_high_pct", 60)),
-            battery_poll_sec=int(data.get("battery_poll_sec", 60)),
-            webhook_cooldown_sec=int(data.get("webhook_cooldown_sec", 900)),
-            battery_webhook_url=str(data.get("battery_webhook_url") or ""),
+            max_temp_c=_parse_float_field(data.get("max_temp_c"), 40.0, "safety.max_temp_c"),
+            resume_temp_c=_parse_float_field(data.get("resume_temp_c"), 37.0, "safety.resume_temp_c"),
+            min_free_ram_mb=_parse_int_field(data.get("min_free_ram_mb"), 256, "safety.min_free_ram_mb"),
+            battery_low_pct=_parse_int_field(data.get("battery_low_pct"), 45, "safety.battery_low_pct"),
+            battery_high_pct=_parse_int_field(data.get("battery_high_pct"), 60, "safety.battery_high_pct"),
+            battery_poll_sec=_parse_int_field(data.get("battery_poll_sec"), 60, "safety.battery_poll_sec"),
+            webhook_cooldown_sec=_parse_int_field(data.get("webhook_cooldown_sec"), 900, "safety.webhook_cooldown_sec"),
+            battery_webhook_url=(raw_wb or ""),
         )
-        if not (math.isfinite(cfg.max_temp_c) and math.isfinite(cfg.resume_temp_c)):
-            raise ValueError("safety temperatures must be finite numbers")
         if cfg.resume_temp_c > cfg.max_temp_c:
             raise ValueError("safety.resume_temp_c must be <= safety.max_temp_c")
         if cfg.min_free_ram_mb < 0 or cfg.battery_poll_sec < 1 or cfg.webhook_cooldown_sec < 0:
@@ -263,15 +320,16 @@ class SafetyConfig:
         if wb:
             try:
                 p_wb = urllib.parse.urlsplit(wb)
-                _ = p_wb.port
+                wb_port = p_wb.port
             except ValueError as exc:
                 raise ValueError(
                     "safety.battery_webhook_url must be empty or a valid http:// / https:// URL"
                 ) from exc
             if (
-                any(c.isspace() or ord(c) < 32 for c in wb)
+                any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in wb)
                 or p_wb.scheme.lower() not in {"http", "https"}
                 or not p_wb.hostname
+                or (wb_port is not None and not (1 <= wb_port <= 65535))
             ):
                 raise ValueError("safety.battery_webhook_url must be empty or a valid http:// / https:// URL")
         cfg.battery_webhook_url = wb
@@ -306,10 +364,13 @@ class GatewayConfig:
     def from_dict(cls, data: dict[str, Any] | None) -> "GatewayConfig":
         if not isinstance(data, dict):
             return cls()
-        mode = str(data.get("mode", "allowlist")).strip().lower()
+        raw_mode = data.get("mode")
+        if raw_mode is not None and not isinstance(raw_mode, str):
+            raise ValueError("gateway.mode must be 'allowlist', 'monitor', or 'block_all'")
+        mode = (raw_mode or "allowlist").strip().lower()
         if mode not in {"allowlist", "monitor", "block_all"}:
             raise ValueError("gateway.mode must be 'allowlist', 'monitor', or 'block_all'")
-        port = int(data.get("port", DEFAULT_GATEWAY_PORT))
+        port = _parse_int_field(data.get("port"), DEFAULT_GATEWAY_PORT, "gateway.port")
         if not (0 <= port <= 65535):
             raise ValueError("gateway.port must be between 0 and 65535")
         raw_allowed = data.get("allowed_domains")
@@ -326,9 +387,14 @@ class GatewayConfig:
         )
         raw_ports = data.get("allowed_ports")
         if isinstance(raw_ports, list) and raw_ports:
-            ports = sorted({int(p) for p in raw_ports if 1 <= int(p) <= 65535})
-            if not ports:
-                ports = [80, 443]
+            parsed_ports: set[int] = set()
+            for p in raw_ports:
+                if p is None:
+                    continue
+                pv = _parse_int_field(p, 0, "gateway.allowed_ports")
+                if 1 <= pv <= 65535:
+                    parsed_ports.add(pv)
+            ports = sorted(parsed_ports) if parsed_ports else [80, 443]
         else:
             ports = [80, 443]
         raw_q = data.get("quarantined_nodes")
@@ -337,22 +403,36 @@ class GatewayConfig:
             if isinstance(raw_q, list)
             else []
         )
-        max_conn = max(4, min(256, int(data.get("max_connections", 32))))
-        raw_idle = float(data.get("idle_timeout_sec", 30.0))
-        if not math.isfinite(raw_idle) or raw_idle <= 0:
+        max_conn = max(4, min(256, _parse_int_field(data.get("max_connections"), 32, "gateway.max_connections")))
+        raw_idle = _parse_float_field(data.get("idle_timeout_sec"), 30.0, "gateway.idle_timeout_sec")
+        if raw_idle <= 0:
             raise ValueError("gateway.idle_timeout_sec must be a finite number > 0")
         idle_to = max(5.0, min(3600.0, raw_idle))
-        rpm = max(0, min(10000, int(data.get("max_requests_per_min_per_node", 120))))
+        rpm = max(
+            0,
+            min(
+                10000,
+                _parse_int_field(
+                    data.get("max_requests_per_min_per_node"),
+                    120,
+                    "gateway.max_requests_per_min_per_node",
+                ),
+            ),
+        )
+        raw_bind = data.get("bind_host")
+        if raw_bind is not None and not isinstance(raw_bind, str):
+            raise ValueError("gateway.bind_host must be a valid host or IP address")
+        bind_host = validate_host(raw_bind) if (raw_bind and raw_bind.strip()) else "0.0.0.0"
         return cls(
             enabled=bool(data.get("enabled", False)),
-            bind_host=str(data.get("bind_host") or "0.0.0.0").strip() or "0.0.0.0",
+            bind_host=bind_host,
             port=port,
             mode=mode,
             allowed_domains=allowed,
             blocked_domains=blocked,
             allowed_ports=ports,
-            block_private_ips=bool(data.get("block_private_ips", True)),
-            inject_proxy_env=bool(data.get("inject_proxy_env", True)),
+            block_private_ips=True if data.get("block_private_ips") is None else bool(data["block_private_ips"]),
+            inject_proxy_env=True if data.get("inject_proxy_env") is None else bool(data["inject_proxy_env"]),
             max_connections=max_conn,
             idle_timeout_sec=idle_to,
             quarantined_nodes=quarantined,
@@ -376,24 +456,31 @@ class NetworkHardeningConfig:
             return cls()
         raw_ips = data.get("allowed_master_ips")
         ips = (
-            [str(ip).strip() for ip in raw_ips if ip is not None and str(ip).strip()][:32]
+            [str(ip).strip() for ip in raw_ips if isinstance(ip, str) and ip.strip()][:32]
             if isinstance(raw_ips, list)
             else []
         )
-        ag_url = str(data.get("adguard_url") or "").strip()
+        raw_ag = data.get("adguard_url")
+        if raw_ag is not None and not isinstance(raw_ag, str):
+            raise ValueError("network.adguard_url must be a string")
+        ag_url = (raw_ag or "").strip()
         if ag_url:
             try:
                 p_ag = urllib.parse.urlsplit(ag_url)
-                _ = p_ag.port
+                ag_port = p_ag.port
             except ValueError as exc:
                 raise ValueError("network.adguard_url must be empty or a valid http:// / https:// URL") from exc
             if (
-                any(c.isspace() or ord(c) < 32 for c in ag_url)
+                any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in ag_url)
                 or p_ag.scheme.lower() not in {"http", "https"}
                 or not p_ag.hostname
+                or (ag_port is not None and not (1 <= ag_port <= 65535))
             ):
                 raise ValueError("network.adguard_url must be empty or a valid http:// / https:// URL")
-        lan_sub = str(data.get("lan_subnet") or "").strip()
+        raw_sub = data.get("lan_subnet")
+        if raw_sub is not None and not isinstance(raw_sub, str):
+            raise ValueError("network.lan_subnet must be a string CIDR")
+        lan_sub = (raw_sub or "").strip()
         if lan_sub:
             try:
                 lan_sub = str(ipaddress.ip_network(lan_sub, strict=False))
@@ -437,7 +524,8 @@ class ClusterConfig:
             if node.id in seen_ids:
                 raise ValueError(f"Duplicate node id '{node.id}' in configuration.")
             seen_ids.add(node.id)
-        token = str(data.get("auth_token") or "").strip()
+        raw_token = data.get("auth_token")
+        token = raw_token.strip() if isinstance(raw_token, str) else ""
         if not token:
             raise ValueError(
                 "Configuration must define a non-empty 'auth_token'. "
@@ -457,12 +545,12 @@ class ClusterConfig:
                 v_clean = re.sub(r"[\x00-\x1f\x7f]", "", str(v)).strip()
                 if k_clean and v_clean:
                     custom_services[k_clean] = v_clean
-        default_timeout = int(data.get("default_job_timeout_sec", 600))
-        health_timeout = float(data.get("health_timeout_sec", 3.0))
-        dash_port = int(data.get("dashboard_port", 8080))
+        default_timeout = _parse_int_field(data.get("default_job_timeout_sec"), 600, "default_job_timeout_sec")
+        health_timeout = _parse_float_field(data.get("health_timeout_sec"), 3.0, "health_timeout_sec")
+        dash_port = _parse_int_field(data.get("dashboard_port"), 8080, "dashboard_port")
         if default_timeout <= 0:
             raise ValueError("default_job_timeout_sec must be > 0")
-        if not math.isfinite(health_timeout) or health_timeout <= 0:
+        if health_timeout <= 0:
             raise ValueError("health_timeout_sec must be a finite number > 0")
         if not (0 <= dash_port <= 65535):
             raise ValueError("dashboard_port must be between 0 and 65535")
@@ -527,14 +615,21 @@ def create_default_config(
     """Generate a validated default cluster config with a fresh secret token."""
     clean_master = validate_host(master_host)
     clean_user = validate_ssh_user(ssh_user)
-    clean_ssh_port = int(ssh_port)
+    clean_ssh_port = _parse_int_field(ssh_port, DEFAULT_SSH_PORT, "ssh_port")
     if not (1 <= clean_ssh_port <= 65535):
         raise ValueError(f"ssh_port must be between 1 and 65535 (got {ssh_port})")
     raw_workers = worker_hosts if worker_hosts is not None else [
         "192.168.1.202",
         "192.168.1.203",
     ]
-    workers = [validate_host(w) for w in raw_workers if str(w).strip()]
+    workers: list[str] = []
+    for w in raw_workers:
+        if w is None:
+            continue
+        if not isinstance(w, str):
+            raise ValueError(f"Worker host must be a string (got {type(w).__name__})")
+        if w.strip():
+            workers.append(validate_host(w))
     nodes: list[NodeConfig] = [
         NodeConfig(
             id="node0",
@@ -579,7 +674,7 @@ def save_config(config: ClusterConfig, path: str | Path) -> Path:
     """Atomically write a ClusterConfig to disk with restrictive permissions (0600)."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(config.to_dict(), indent=2) + "\n"
+    payload = json.dumps(config.to_dict(), indent=2, allow_nan=False) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=str(out.parent))
     tmp_path = Path(tmp_name)
     try:

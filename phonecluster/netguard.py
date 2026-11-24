@@ -60,20 +60,40 @@ def _read_device_tree_model() -> str:
 
 
 def infer_lan_subnet(host_ip: str, configured: str = "") -> str:
-    """Return configured LAN CIDR or infer a `/24` subnet from `host_ip`."""
+    """Return configured LAN CIDR or infer a `/24` (IPv4) / `/64` (IPv6) subnet from `host_ip`."""
     if configured:
         try:
             net = ipaddress.ip_network(configured, strict=False)
             return str(net)
         except ValueError:
             pass
-    try:
-        ip = ipaddress.ip_address(host_ip)
-        if isinstance(ip, ipaddress.IPv4Address) and not ip.is_loopback:
-            return str(ipaddress.ip_network(f"{ip}/24", strict=False))
-    except ValueError:
-        pass
+    norm_ip = normalize_host(host_ip)
+    if norm_ip and "%" not in norm_ip:
+        try:
+            ip = ipaddress.ip_address(norm_ip)
+            if not (ip.is_loopback or ip.is_unspecified or ip.is_link_local or ip.is_multicast):
+                if isinstance(ip, ipaddress.IPv4Address):
+                    return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+                if isinstance(ip, ipaddress.IPv6Address):
+                    return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+        except ValueError:
+            pass
     return "192.168.1.0/24"
+
+
+def _effective_master_lan_host(master_host: str, lan_ip: str) -> str:
+    """Prefer `master_host` if it is a usable non-loopback IP; otherwise fall back to `lan_ip`."""
+    norm_m = normalize_host(master_host)
+    if norm_m and not is_loopback_or_unspecified_host(norm_m):
+        try:
+            ipaddress.ip_address(norm_m)
+            return norm_m
+        except ValueError:
+            pass
+    norm_lan = normalize_host(lan_ip)
+    if norm_lan and not is_loopback_or_unspecified_host(norm_lan):
+        return norm_lan
+    return norm_m or norm_lan
 
 
 def detect_controller_host_info(config: ClusterConfig) -> dict[str, Any]:
@@ -88,18 +108,19 @@ def detect_controller_host_info(config: ClusterConfig) -> dict[str, Any]:
 
     nodes_list = list(config.nodes)
     master_node = next((n for n in nodes_list if n.role == "master"), nodes_list[0])
-    subnet = infer_lan_subnet(master_node.host or lan_ip, config.network.lan_subnet)
+    subnet_seed = _effective_master_lan_host(master_node.host, lan_ip)
+    subnet = infer_lan_subnet(subnet_seed, config.network.lan_subnet)
 
     adguard_bin = bool(
         shutil.which("AdGuardHome") or Path("/opt/AdGuardHome/AdGuardHome").exists()
     )
     lmap = _read_listening_tcp_map()
     if lmap is not None:
-        adguard_local_3000 = 3000 in lmap
+        adguard_local_3000 = adguard_bin and (3000 in lmap)
         adguard_local_53 = 53 in lmap
         adguard_local_80 = adguard_bin and (80 in lmap)
     else:
-        adguard_local_3000 = is_local_port_open(3000)
+        adguard_local_3000 = adguard_bin and is_local_port_open(3000)
         adguard_local_53 = is_local_port_open(53)
         adguard_local_80 = adguard_bin and is_local_port_open(80)
 
@@ -156,8 +177,12 @@ def build_adguard_config_snippets(
     quarantined = set(config.gateway.quarantined_nodes)
     nodes_list = list(config.nodes)
     master_node = next((n for n in nodes_list if n.role == "master"), nodes_list[0])
-
-    rewrite_entries: list[tuple[str, str]] = [("master.cluster", master_node.host)]
+    master_answer = (
+        host_info.get("lan_ip") or master_node.host
+        if is_loopback_or_unspecified_host(master_node.host)
+        else master_node.host
+    )
+    rewrite_entries: list[tuple[str, str]] = [("master.cluster", master_answer)]
     seen_domains: set[str] = {"master.cluster"}
     for snap in snapshots:
         if snap.node.id in quarantined:
@@ -351,7 +376,9 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
 
 def apply_security_profile(config: ClusterConfig, profile: str) -> dict[str, Any]:
     """Apply a 1-click network security profile (`standard`, `airgap_workers`, or `lockdown`)."""
-    clean = profile.strip().lower()
+    clean = str(profile or "").strip().lower()
+    if clean not in {"standard", "airgap_workers", "lockdown"}:
+        raise ValueError("profile must be 'standard', 'airgap_workers', or 'lockdown'")
     master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
     m_host = normalize_host(master_node.host)
     if m_host and m_host not in config.network.allowed_master_ips:
@@ -374,7 +401,7 @@ def apply_security_profile(config: ClusterConfig, profile: str) -> dict[str, Any
         config.gateway.inject_proxy_env = True
         config.gateway.max_requests_per_min_per_node = max(60, config.gateway.max_requests_per_min_per_node or 120)
         desc = "Air-Gapped Old Phones — Master Allowlist Proxy ON, SSRF Guard ON, Per-Worker Rate Limit ON."
-    elif clean == "lockdown":
+    else:
         config.gateway.enabled = True
         config.gateway.mode = "block_all"
         config.gateway.block_private_ips = True
@@ -384,8 +411,6 @@ def apply_security_profile(config: ClusterConfig, profile: str) -> dict[str, Any
         config.network.enforce_worker_source_ip = True
         config.network.require_signed_requests = True
         desc = "Maximum Lockdown — Strict Air-Gap (block_all), Dashboard Read-Auth Lock ON, Worker Master-IP Allowlist ON, Strict Signed-Only HMAC Auth ON."
-    else:
-        raise ValueError("profile must be 'standard', 'airgap_workers', or 'lockdown'")
 
     return {"profile": clean, "description": desc}
 
@@ -404,11 +429,16 @@ def audit_cluster_network(
     adguard_url = config.network.adguard_url
     adguard_node = "custom" if adguard_url else ""
     if not adguard_url:
+        local_ag_host = (
+            host_info.get("lan_ip") or host_info["master_host"]
+            if is_loopback_or_unspecified_host(host_info["master_host"])
+            else host_info["master_host"]
+        )
         if host_info["local_adguard"]["port_80"]:
-            adguard_url = f"http://{format_host_for_url(host_info['master_host'])}"
+            adguard_url = f"http://{format_host_for_url(local_ag_host)}"
             adguard_node = "master (local)"
         elif host_info["local_adguard"]["port_3000"]:
-            adguard_url = f"http://{format_host_port(host_info['master_host'], 3000)}"
+            adguard_url = f"http://{format_host_port(local_ag_host, 3000)}"
             adguard_node = "master (local)"
         else:
             quarantined_set = set(config.gateway.quarantined_nodes)
@@ -471,7 +501,7 @@ def audit_cluster_network(
         unsynced = [
             s.node.id
             for s in online_workers
-            if not bool((s.health or {}).get("source_ip_allowlist_active", False))
+            if not bool((s.health if isinstance(s.health, dict) else {}).get("source_ip_allowlist_active", False))
         ]
         if unsynced:
             score += 7
@@ -499,10 +529,22 @@ def audit_cluster_network(
 
     # 4. Master Network Guard (20 pts)
     gw = config.gateway
-    gw_running = bool(gateway_manager.is_running) if gateway_manager is not None else gw.enabled
+    gw_status_snap = gateway_manager.status(include_events=1) if gateway_manager is not None else None
+    if gateway_manager is not None:
+        gw_running = bool(gateway_manager.is_running)
+    elif gw.enabled:
+        gw_p = int(gw.port or 0)
+        if gw_p > 0:
+            lmap_gw = _read_listening_tcp_map()
+            gw_running = (gw_p in lmap_gw) if lmap_gw is not None else is_local_port_open(gw_p)
+        else:
+            gw_running = False
+    else:
+        gw_running = False
     if gw.enabled and not gw_running:
         score += 5
-        err_note = f" ({gateway_manager.status(include_events=0).get('last_error')})" if gateway_manager is not None and gateway_manager.status(include_events=0).get("last_error") else ""
+        last_err_val = (gw_status_snap or {}).get("last_error") or ""
+        err_note = f" ({last_err_val})" if last_err_val else ""
         checks.append({
             "name": "Master Network Guard (WAN Filter)",
             "status": "warn",
@@ -577,8 +619,8 @@ def audit_cluster_network(
         allowed_ports.add(n.ssh_port)
 
     gw_per_node = (
-        gateway_manager.status(include_events=1).get("stats", {}).get("per_node", {})
-        if gateway_manager is not None
+        (gw_status_snap or {}).get("stats", {}).get("per_node", {})
+        if gw_status_snap is not None
         else {}
     )
     worker_surface: list[dict[str, Any]] = []
@@ -591,11 +633,14 @@ def audit_cluster_network(
         if isinstance(raw_ports, list):
             for p in raw_ports:
                 if isinstance(p, dict) and p.get("exposed"):
+                    raw_pv = p.get("port", 0)
+                    if isinstance(raw_pv, bool):
+                        continue
                     try:
-                        pv = int(p.get("port", 0))
+                        pv = int(raw_pv)
                         if 1 <= pv <= 65535:
                             exposed_ports.append(pv)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         pass
         unexpected = [p for p in exposed_ports if p not in allowed_ports]
         if unexpected:
@@ -641,7 +686,7 @@ def audit_cluster_network(
         unsynced_hmac = [
             s.node.id
             for s in online_workers
-            if not bool((s.health or {}).get("require_signed_requests", False))
+            if not bool((s.health if isinstance(s.health, dict) else {}).get("require_signed_requests", False))
         ]
         if unsynced_hmac:
             checks.append({

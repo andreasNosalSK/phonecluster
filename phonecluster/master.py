@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import concurrent.futures
+import http.client
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ from .auth import (
     build_direct_opener,
     build_signed_auth_headers,
     read_json_object_bounded,
+    safe_json_dumps,
 )
 from .config import (
     ClusterConfig,
@@ -51,6 +53,21 @@ _MAX_HEALTH_RESP_BYTES = 256 * 1024
 _MAX_JOBS_RESP_BYTES = 512 * 1024
 _MAX_CTRL_RESP_BYTES = 64 * 1024
 _MAX_EXEC_RESP_BYTES = 4 * 1024 * 1024  # Plenty for 512 KiB stdout + 512 KiB stderr + JSON overhead
+_MAX_JOB_TIMEOUT_SEC = 86400.0
+
+
+def _read_http_error_body(exc: urllib.error.HTTPError, limit: int) -> str:
+    """Read a bounded HTTP error response body safely without letting disconnect/HTTP errors escape."""
+    try:
+        raw = exc.read(limit)
+        return raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+    except (OSError, http.client.HTTPException):
+        return ""
+    finally:
+        try:
+            exc.close()
+        except OSError:
+            pass
 
 
 @dataclass
@@ -188,18 +205,20 @@ class JobOutcome:
 def _safe_int(val: Any, default: int) -> int:
     try:
         if isinstance(val, bool):
-            return int(val)
+            return default
         f = float(val)
         return int(f) if math.isfinite(f) else default
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _safe_float(val: Any, default: float) -> float:
     try:
+        if isinstance(val, bool):
+            return default
         f = float(val)
         return f if math.isfinite(f) else default
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -274,7 +293,8 @@ class MetricsHistory:
                 if n.get("online"):
                     mem_tot = max(0, _safe_int(h.get("mem_total_mb", 0), 0))
                     mem_avail = max(0, _safe_int(h.get("mem_available_mb", 0), 0))
-                    ram_pct = round(((mem_tot - mem_avail) / mem_tot) * 100.0, 1) if mem_tot else 0.0
+                    ram_pct = round((max(0, mem_tot - mem_avail) / mem_tot) * 100.0, 1) if mem_tot else 0.0
+                    ram_pct = min(100.0, max(0.0, ram_pct))
                     cpu_raw = h.get("cpu_pct")
                     cpu_val = _safe_float(cpu_raw, -1.0) if cpu_raw is not None else -1.0
                     if cpu_val < 0.0:
@@ -371,16 +391,13 @@ class MasterController:
                 latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
                 return NodeSnapshot(node=node, online=True, latency_ms=latency_ms, health=data)
         except urllib.error.HTTPError as exc:
-            try:
-                err_body = exc.read(4096).decode("utf-8", errors="replace")[:200]
-            finally:
-                exc.close()
+            err_body = _read_http_error_body(exc, 4096)[:200]
             return NodeSnapshot(
                 node=node,
                 online=False,
                 error=f"HTTP {exc.code}: {err_body}",
             )
-        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
             return NodeSnapshot(node=node, online=False, error=str(exc))
 
     def poll_health(self, tags: list[str] | None = None) -> list[NodeSnapshot]:
@@ -406,19 +423,22 @@ class MasterController:
         - `"error"`: non-retryable HTTP 4xx error
         """
         url = f"{node.base_url}/exec"
-        body = json.dumps(spec.to_payload()).encode("utf-8")
+        eff_timeout = _safe_float(spec.timeout_sec, float(self.config.default_job_timeout_sec))
+        if eff_timeout <= 0:
+            eff_timeout = float(self.config.default_job_timeout_sec)
+        eff_timeout = min(_MAX_JOB_TIMEOUT_SEC, eff_timeout)
+        payload = spec.to_payload()
+        payload["timeout_sec"] = eff_timeout
+        body = safe_json_dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url, data=body, headers=self._headers_for(node, "POST", "/exec", body), method="POST"
         )
-        http_timeout = max(spec.timeout_sec + 15.0, 30.0)
+        http_timeout = min(_MAX_JOB_TIMEOUT_SEC + 30.0, max(eff_timeout + 15.0, 30.0))
         try:
             with _DIRECT_OPENER.open(req, timeout=http_timeout) as resp:
                 return "ok", read_json_object_bounded(resp, _MAX_EXEC_RESP_BYTES)
         except urllib.error.HTTPError as exc:
-            try:
-                raw_err = exc.read(65536).decode("utf-8", errors="replace")
-            finally:
-                exc.close()
+            raw_err = _read_http_error_body(exc, 65536)
             try:
                 parsed_err = json.loads(raw_err)
                 err_data = parsed_err if isinstance(parsed_err, dict) else {"error": raw_err[:300]}
@@ -427,7 +447,7 @@ class MasterController:
             if exc.code in {HTTPStatus.SERVICE_UNAVAILABLE, HTTPStatus.TOO_MANY_REQUESTS}:
                 return "retryable", err_data
             return "error", {"http_status": exc.code, **err_data}
-        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
             return "retryable", {"error": str(exc)}
 
     def _with_node_env(
@@ -905,6 +925,31 @@ class MasterController:
         failed_steps = 0
 
         for idx, raw_step in enumerate(steps, start=1):
+            if not isinstance(raw_step, dict):
+                all_ok = False
+                failed_steps += 1
+                results.append(
+                    {
+                        "step_index": idx,
+                        "name": f"Step {idx}",
+                        "target": "auto",
+                        "workload": "",
+                        "ok": False,
+                        "node_id": "none",
+                        "node_tier": 0,
+                        "node_pool": "",
+                        "routing_reason": "Invalid pipeline step object",
+                        "returncode": -1,
+                        "duration_sec": 0.0,
+                        "stdout": "",
+                        "stderr": "",
+                        "error": "Pipeline step must be a JSON object.",
+                    }
+                )
+                prev_stdout, prev_node, prev_tier, prev_pool, prev_rc = "", "none", 0, "", -1
+                if stop_on_error:
+                    break
+                continue
             name = str(raw_step.get("name") or f"Step {idx}").strip()
             command = str(raw_step.get("command") or "").strip()
             target = str(raw_step.get("target") or "auto").strip() or "auto"
@@ -916,10 +961,12 @@ class MasterController:
                 timeout_sec = float(self.config.default_job_timeout_sec)
             else:
                 try:
+                    if isinstance(raw_timeout, bool):
+                        raise ValueError("must be a number, not boolean")
                     timeout_sec = float(raw_timeout)
-                    if not math.isfinite(timeout_sec) or timeout_sec <= 0:
-                        raise ValueError("must be a finite number > 0")
-                except (TypeError, ValueError):
+                    if not math.isfinite(timeout_sec) or timeout_sec <= 0 or timeout_sec > _MAX_JOB_TIMEOUT_SEC:
+                        raise ValueError(f"must be a finite number between 0 and {_MAX_JOB_TIMEOUT_SEC:g}")
+                except (TypeError, ValueError, OverflowError):
                     all_ok = False
                     failed_steps += 1
                     results.append(
@@ -937,9 +984,10 @@ class MasterController:
                             "duration_sec": 0.0,
                             "stdout": "",
                             "stderr": "",
-                            "error": f"Invalid timeout_sec '{raw_timeout}' (must be a positive number).",
+                            "error": f"Invalid timeout_sec '{raw_timeout}' (must be a positive number <= {_MAX_JOB_TIMEOUT_SEC:g}).",
                         }
                     )
+                    prev_stdout, prev_node, prev_tier, prev_pool, prev_rc = "", "none", 0, "", -1
                     if stop_on_error and not continue_on_err:
                         break
                     continue
@@ -966,6 +1014,7 @@ class MasterController:
                         "error": "Pipeline step 'env' must be a JSON object.",
                     }
                 )
+                prev_stdout, prev_node, prev_tier, prev_pool, prev_rc = "", "none", 0, "", -1
                 if stop_on_error and not continue_on_err:
                     break
                 continue
@@ -1005,6 +1054,7 @@ class MasterController:
                         "error": "Pipeline step requires a non-empty 'command'.",
                     }
                 )
+                prev_stdout, prev_node, prev_tier, prev_pool, prev_rc = "", "none", 0, "", -1
                 if stop_on_error and not continue_on_err:
                     break
                 continue
@@ -1203,6 +1253,7 @@ class MasterController:
         snapshots = self.poll_health()
         quarantined = self._quarantined_ids()
         total_cores = 0
+        cpu_weight_total = 0
         total_ram_mb = 0
         avail_ram_mb = 0
         online_count = 0
@@ -1232,7 +1283,9 @@ class MasterController:
                 if cpu_pct < 0.0:
                     load_1m = max(0.0, _safe_float(snap.health.get("load_1m", 0.0), 0.0))
                     cpu_pct = min(100.0, (load_1m / max(1, cores)) * 100.0)
-                weighted_cpu_sum += min(100.0, max(0.0, cpu_pct)) * max(1, cores)
+                w_cores = max(1, cores)
+                weighted_cpu_sum += min(100.0, max(0.0, cpu_pct)) * w_cores
+                cpu_weight_total += w_cores
                 if snap.health.get("net_rx_kbps") is not None:
                     total_net_rx += max(0.0, _safe_float(snap.health.get("net_rx_kbps"), 0.0))
                 if snap.health.get("net_tx_kbps") is not None:
@@ -1268,9 +1321,13 @@ class MasterController:
                 }
             )
 
-        cluster_cpu_pct = round(weighted_cpu_sum / total_cores, 1) if total_cores > 0 else 0.0
+        cluster_cpu_pct = (
+            min(100.0, max(0.0, round(weighted_cpu_sum / cpu_weight_total, 1)))
+            if cpu_weight_total > 0
+            else 0.0
+        )
         cluster_ram_pct = (
-            round(((total_ram_mb - avail_ram_mb) / total_ram_mb) * 100.0, 1)
+            min(100.0, max(0.0, round((max(0, total_ram_mb - avail_ram_mb) / total_ram_mb) * 100.0, 1)))
             if total_ram_mb > 0
             else 0.0
         )
@@ -1336,18 +1393,30 @@ class MasterController:
         host: str, port: int, timeout_sec: float = 1.5
     ) -> dict[str, Any]:
         """Measure TCP reachability & latency to a registered service mesh endpoint."""
+        clean_host = normalize_host(host)
         t0 = time.monotonic()
+        if isinstance(port, bool):
+            return {"reachable": False, "latency_ms": 0.0, "host": clean_host, "port": 0, "error": "invalid port"}
         try:
-            with socket.create_connection((host, int(port)), timeout=timeout_sec):
+            port_i = int(port)
+        except (TypeError, ValueError, OverflowError):
+            return {"reachable": False, "latency_ms": 0.0, "host": clean_host, "port": 0, "error": "invalid port"}
+        if not clean_host or not (1 <= port_i <= 65535):
+            return {"reachable": False, "latency_ms": 0.0, "host": clean_host, "port": port_i, "error": "invalid host or port"}
+        eff_to = _safe_float(timeout_sec, 1.5)
+        if eff_to <= 0 or eff_to > 60.0:
+            return {"reachable": False, "latency_ms": 0.0, "host": clean_host, "port": port_i, "error": "invalid timeout_sec"}
+        try:
+            with socket.create_connection((clean_host, port_i), timeout=eff_to):
                 ms = round((time.monotonic() - t0) * 1000.0, 1)
-                return {"reachable": True, "latency_ms": ms, "host": host, "port": int(port)}
-        except OSError as exc:
+                return {"reachable": True, "latency_ms": ms, "host": clean_host, "port": port_i}
+        except (OSError, OverflowError, ValueError) as exc:
             ms = round((time.monotonic() - t0) * 1000.0, 1)
             return {
                 "reachable": False,
                 "latency_ms": ms,
-                "host": host,
-                "port": int(port),
+                "host": clean_host,
+                "port": port_i,
                 "error": str(exc),
             }
 
@@ -1443,12 +1512,16 @@ class MasterController:
             f"printf '\\n{marker}%s\\n' \"$PWD\"\n"
             f"exit $__pc_rc"
         )
+        eff_term_timeout = _safe_float(timeout_sec, float(self.config.default_job_timeout_sec)) if timeout_sec is not None else float(self.config.default_job_timeout_sec)
+        if eff_term_timeout <= 0:
+            eff_term_timeout = float(self.config.default_job_timeout_sec)
+        eff_term_timeout = min(_MAX_JOB_TIMEOUT_SEC, eff_term_timeout)
         spec = JobSpec(
             index=0,
             job_id=job_id or f"term-{uuid.uuid4().hex[:8]}",
             command=wrapped,
             workdir=cwd or None,
-            timeout_sec=float(timeout_sec or self.config.default_job_timeout_sec),
+            timeout_sec=eff_term_timeout,
         )
         outcomes = self.run_single(spec, target=target, workload_hint=workload_hint)
         # Self-heal stale tracked `cwd` (e.g. directory removed or worker phone rebooted)
@@ -1492,12 +1565,9 @@ class MasterController:
                 recent = [j for j in raw_recent if isinstance(j, dict)] if isinstance(raw_recent, list) else []
                 return {**data, "node_id": node.id, "online": True, "active": active, "recent": recent}
         except urllib.error.HTTPError as exc:
-            try:
-                err = exc.read(4096).decode("utf-8", errors="replace")[:200]
-            finally:
-                exc.close()
+            err = _read_http_error_body(exc, 4096)[:200]
             return {"node_id": node.id, "online": False, "error": f"HTTP {exc.code}: {err}", "active": [], "recent": []}
-        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
             return {"node_id": node.id, "online": False, "error": str(exc), "active": [], "recent": []}
 
     def get_all_jobs(self) -> list[dict[str, Any]]:
@@ -1563,12 +1633,9 @@ class MasterController:
                 data = read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES)
                 return {**data, "node_id": node.id, "ok": True}
         except urllib.error.HTTPError as exc:
-            try:
-                raw = exc.read(4096).decode("utf-8", errors="replace")[:200]
-            finally:
-                exc.close()
+            raw = _read_http_error_body(exc, 4096)[:200]
             return {"node_id": node.id, "ok": False, "error": f"HTTP {exc.code}: {raw}"}
-        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
             return {"node_id": node.id, "ok": False, "error": str(exc)}
 
     def push_config_to_all(
@@ -1605,15 +1672,12 @@ class MasterController:
             with _DIRECT_OPENER.open(req, timeout=5.0) as resp:
                 return read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES)
         except urllib.error.HTTPError as exc:
-            try:
-                raw = exc.read(4096).decode("utf-8", errors="replace")
-            finally:
-                exc.close()
+            raw = _read_http_error_body(exc, 4096)
             try:
                 parsed = json.loads(raw)
                 data = parsed if isinstance(parsed, dict) else {"error": raw[:200]}
             except json.JSONDecodeError:
                 data = {"error": raw[:200]}
             return {"cancelled": False, "http_status": exc.code, **data}
-        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
             return {"cancelled": False, "error": str(exc)}

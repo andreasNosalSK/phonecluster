@@ -117,6 +117,7 @@ def _pad_visible(text: str, width: int) -> str:
 def _format_uptime(sec: int | None) -> str:
     if sec is None:
         return "-"
+    sec = max(0, sec)
     days, rem = divmod(sec, 86400)
     hours, rem = divmod(rem, 3600)
     mins, _ = divmod(rem, 60)
@@ -134,7 +135,7 @@ def make_sparkline(values: list[float], width: int = 14, max_val: float = 100.0)
     tail = values[-width:] if values else []
     chars: list[str] = []
     for v in tail:
-        ratio = max(0.0, min(1.0, float(v) / max(1.0, max_val)))
+        ratio = max(0.0, min(1.0, _safe_num(v, 0.0) / max(1.0, max_val)))
         idx = int(round(ratio * (len(SPARK_CHARS) - 1)))
         chars.append(SPARK_CHARS[idx])
     return "".join(chars).rjust(width, "▁" if tail else "·")
@@ -500,7 +501,10 @@ def _read_key(timeout_sec: float) -> str | None:
     ready, _, _ = select.select([sys.stdin], [], [], max(0.05, timeout_sec))
     if not ready:
         return None
-    ch = os.read(sys.stdin.fileno(), 1).decode("utf-8", errors="ignore")
+    raw = os.read(sys.stdin.fileno(), 1)
+    if not raw:
+        return "EOF"
+    ch = raw.decode("utf-8", errors="ignore")
     if ch == "\x1b":
         # Check for arrow key sequence like ESC [ A / B
         r2, _, _ = select.select([sys.stdin], [], [], 0.03)
@@ -539,7 +543,7 @@ def run_top_tui(
     once: bool = False,
 ) -> int:
     """Launch the interactive multi-device btop Terminal Control UI."""
-    if once or not sys.stdin.isatty() or termios is None or tty is None:
+    if once or not sys.stdin.isatty() or not sys.stdout.isatty() or termios is None or tty is None:
         summary = controller.cluster_summary()
         all_jobs = controller.get_all_jobs()
         frame = render_top_frame(
@@ -606,7 +610,7 @@ def run_top_tui(
             if key is None:
                 continue
 
-            if key in {"q", "Q", "\x03"}:
+            if key in {"q", "Q", "\x03", "EOF"}:
                 break
             elif key in {"UP", "k"}:
                 if nodes:
@@ -693,8 +697,16 @@ def run_top_tui(
                     sys.stdout.write("\033[?1049h\033[?25l")
                     sys.stdout.flush()
                 last_poll = 0.0
+    except KeyboardInterrupt:
+        pass
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        sys.stdout.write("\033[?25h\033[?1049l")
-        sys.stdout.flush()
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except (OSError, termios.error):
+            pass
+        try:
+            sys.stdout.write("\033[?25h\033[?1049l")
+            sys.stdout.flush()
+        except OSError:
+            pass
     return 0

@@ -26,6 +26,10 @@ _ASCII_UINT_RE = re.compile(r"^[0-9]{1,10}$")
 _ASCII_TS_RE = re.compile(r"^[0-9]{1,12}$")
 _ASCII_PORT_RE = re.compile(r"^[0-9]{1,5}$")
 _SINGLE_LABEL_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_MULTI_LABEL_HOST_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+_NAT64_WELL_KNOWN_NET = ipaddress.IPv6Network("64:ff9b::/96")
 _LOCAL_HOST_SUFFIXES = (
     ".local",
     ".lan",
@@ -78,6 +82,8 @@ def is_allowed_http_host(
             p_num = int(rest[1:])
             if not (1 <= p_num <= 65535):
                 return False
+        if "%" in host_part:
+            return False
         try:
             ipaddress.IPv6Address(host_part)
             return True
@@ -97,7 +103,7 @@ def is_allowed_http_host(
         host_part = raw
 
     h = host_part.strip().lower().rstrip(".")
-    if not h:
+    if not h or "%" in h:
         return False
 
     # 1. Any IPv4 literal (browsers never perform DNS rebinding against IP literals)
@@ -108,7 +114,9 @@ def is_allowed_http_host(
         pass
 
     # 2. Localhost, single-label LAN hostnames (e.g. `raspberrypi`), or private/mDNS/Tailscale suffixes
-    if h == "localhost" or h.endswith(_LOCAL_HOST_SUFFIXES):
+    if h == "localhost":
+        return True
+    if _MULTI_LABEL_HOST_RE.fullmatch(h) and h.endswith(_LOCAL_HOST_SUFFIXES):
         return True
     if "." not in h and _SINGLE_LABEL_HOST_RE.fullmatch(h):
         return True
@@ -196,6 +204,17 @@ def safe_json_dumps(obj: Any) -> str:
         return json.dumps(_sanitize_json_value(obj), allow_nan=False)
 
 
+def _is_webhook_ip_disallowed(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True if an IP (or mapped/NAT64-embedded IPv4) is link-local/metadata, unspecified, or multicast."""
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return _is_webhook_ip_disallowed(addr.ipv4_mapped)
+        if addr in _NAT64_WELL_KNOWN_NET:
+            embedded_v4 = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+            return _is_webhook_ip_disallowed(embedded_v4)
+    return bool(addr.is_link_local or addr.is_unspecified or addr.is_multicast)
+
+
 def is_webhook_target_unsafe(url: str) -> bool:
     """Block direct webhook SSRF to non-HTTP(S), link-local/cloud metadata (169.254/16, fe80::/10), unspecified, or multicast IPs.
 
@@ -207,9 +226,12 @@ def is_webhook_target_unsafe(url: str) -> bool:
         return True
     try:
         parsed = urllib.parse.urlsplit(clean)
-        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        raw_port = parsed.port
     except ValueError:
         return True
+    if raw_port is not None and not (1 <= raw_port <= 65535):
+        return True
+    port = raw_port if raw_port is not None else (443 if parsed.scheme.lower() == "https" else 80)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         return True
     host = parsed.hostname.strip().strip("[]").lower()
@@ -218,9 +240,7 @@ def is_webhook_target_unsafe(url: str) -> bool:
     # Check IP literal directly first (works even offline / without DNS)
     try:
         lit = ipaddress.ip_address(host)
-        if isinstance(lit, ipaddress.IPv6Address) and lit.ipv4_mapped is not None:
-            lit = lit.ipv4_mapped
-        return bool(lit.is_link_local or lit.is_unspecified or lit.is_multicast)
+        return _is_webhook_ip_disallowed(lit)
     except ValueError:
         pass
     # Best-effort DNS check for hostnames resolving to link-local / cloud metadata / unspecified / multicast
@@ -236,9 +256,7 @@ def is_webhook_target_unsafe(url: str) -> bool:
             addr = ipaddress.ip_address(ip_raw)
         except ValueError:
             return True
-        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-            addr = addr.ipv4_mapped
-        if addr.is_link_local or addr.is_unspecified or addr.is_multicast:
+        if _is_webhook_ip_disallowed(addr):
             return True
     return False
 
@@ -247,9 +265,12 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
     """Block webhook redirects to non-HTTP(S), link-local/cloud metadata, or cross-origin loopback."""
     try:
         parsed_new = urllib.parse.urlsplit(new_url)
-        new_port = parsed_new.port or 80
+        raw_new_port = parsed_new.port
     except ValueError:
         return True
+    if raw_new_port is not None and not (1 <= raw_new_port <= 65535):
+        return True
+    new_port = raw_new_port if raw_new_port is not None else (443 if parsed_new.scheme.lower() == "https" else 80)
     if parsed_new.scheme.lower() not in {"http", "https"} or not parsed_new.hostname:
         return True
     new_host = parsed_new.hostname.strip().strip("[]").lower()
@@ -260,19 +281,25 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
     except ValueError:
         return True
 
+    def _unwrap_v4(a: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+        if isinstance(a, ipaddress.IPv6Address):
+            if a.ipv4_mapped is not None:
+                return a.ipv4_mapped
+            if a in _NAT64_WELL_KNOWN_NET:
+                return ipaddress.IPv4Address(int(a) & 0xFFFFFFFF)
+        return a
+
     def _is_loopback_name(h: str) -> bool:
-        if h == "localhost":
+        if h.rstrip(".") == "localhost":
             return True
         try:
-            a = ipaddress.ip_address(h)
-            if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped is not None:
-                a = a.ipv4_mapped
+            a = _unwrap_v4(ipaddress.ip_address(h))
             return bool(a.is_loopback or a.is_unspecified)
         except ValueError:
             return False
 
     orig_is_loopback = _is_loopback_name(orig_host)
-    if new_host == "localhost" and not orig_is_loopback:
+    if new_host.rstrip(".") == "localhost" and not orig_is_loopback:
         return True
     try:
         infos = socket.getaddrinfo(new_host, new_port, type=socket.SOCK_STREAM)
@@ -286,11 +313,9 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
             addr = ipaddress.ip_address(ip_raw)
         except ValueError:
             return True
-        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-            addr = addr.ipv4_mapped
-        # Always block link-local / cloud metadata (169.254.0.0/16, fe80::/10) & unspecified on redirects
-        if addr.is_link_local or addr.is_unspecified or addr.is_multicast:
+        if _is_webhook_ip_disallowed(addr):
             return True
+        addr = _unwrap_v4(addr)
         # Block remote webhooks redirecting into local Master/Worker loopback services
         if addr.is_loopback and not orig_is_loopback:
             return True

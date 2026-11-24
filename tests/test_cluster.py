@@ -5783,5 +5783,740 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
             up.server_close()
 
 
+class TestPass11HardeningAndBugHunt(unittest.TestCase):
+    """Regression suite for Pass 11 security, stability, networking, UI, CLI, and script fixes."""
+
+    def test_config_auth_ipv6_zone_null_bool_and_webhook_hardening(self) -> None:
+        from phonecluster.auth import is_allowed_http_host, is_webhook_target_unsafe
+        from phonecluster.config import (
+            GatewayConfig,
+            NetworkHardeningConfig,
+            SafetyConfig,
+            is_loopback_or_unspecified_host,
+            validate_domain_pattern,
+            validate_host,
+        )
+
+        # 1. IPv6 % zone IDs, DEL, and malformed multi-dot hostnames rejected
+        for bad_host in ("fe80::1%$(id)", "fe80::1%eth0", "foo..bar", "foo...", "bad\x7fhost"):
+            with self.assertRaises(ValueError, msg=f"validate_host should reject {bad_host!r}"):
+                validate_host(bad_host)
+        for bad_dom in ("*.evil\x7f.com", "fe80::1%eth0", "a..b.com"):
+            with self.assertRaises(ValueError, msg=f"validate_domain_pattern should reject {bad_dom!r}"):
+                validate_domain_pattern(bad_dom)
+
+        # 2. Trailing-dot localhost detected as loopback
+        self.assertTrue(is_loopback_or_unspecified_host("localhost."))
+        self.assertTrue(is_loopback_or_unspecified_host("LOCALHOST."))
+
+        # 3. Host header guard rejects IPv6 scope IDs and malformed suffix-only / XSS hosts
+        for bad_hdr in (
+            "[::1%evil.com]:8080",
+            ".local",
+            ".local:8080",
+            "..localhost",
+            "foo<script>.ts.net",
+            "bad..host.lan",
+        ):
+            self.assertFalse(is_allowed_http_host({"Host": bad_hdr}), f"Host header {bad_hdr!r} must be rejected")
+        self.assertTrue(is_allowed_http_host({"Host": "my-phone.local:8080"}))
+        self.assertTrue(is_allowed_http_host({"Host": "[::1]:8080"}))
+
+        # 4. Webhook SSRF guard rejects explicit :0, NAT64 embedded metadata, and remote->localhost. / NAT64 loopback redirects
+        from phonecluster.auth import _is_webhook_redirect_target_unsafe
+        self.assertTrue(is_webhook_target_unsafe("http://example.com:0/hook"))
+        self.assertTrue(is_webhook_target_unsafe("http://[64:ff9b::169.254.169.254]/hook"))
+        self.assertTrue(_is_webhook_redirect_target_unsafe("https://ntfy.sh/topic", "http://localhost./hook"))
+        self.assertTrue(_is_webhook_redirect_target_unsafe("https://ntfy.sh/topic", "http://[64:ff9b::127.0.0.1]/hook"))
+
+        # 5. Strict config deserialization: no None->'None', no bool->int, no NaN, null preserves secure defaults
+        with self.assertRaises(ValueError):
+            NodeConfig.from_dict({"id": None, "host": "127.0.0.1"})
+        with self.assertRaises(ValueError):
+            NodeConfig.from_dict({"id": "n1", "host": None})
+        with self.assertRaises(ValueError):
+            NodeConfig.from_dict({"id": "n1", "host": "127.0.0.1", "worker_port": True})
+        with self.assertRaises(ValueError):
+            SafetyConfig.from_dict({"max_temp_c": True})
+        with self.assertRaises(ValueError):
+            SafetyConfig.from_dict({"max_temp_c": float("nan")})
+        with self.assertRaises(ValueError):
+            NetworkHardeningConfig.from_dict({"adguard_url": "http://10.0.0.2:0"})
+
+        gw_null = GatewayConfig.from_dict({"block_private_ips": None, "inject_proxy_env": None})
+        self.assertTrue(gw_null.block_private_ips)
+        self.assertTrue(gw_null.inject_proxy_env)
+
+    def test_core_master_worker_telemetry_and_routing_fixes(self) -> None:
+        import socketserver
+        from unittest import mock
+
+        from phonecluster.master import _safe_float, _safe_int
+        from phonecluster.routing import resolve_node_tier_and_pool
+        from phonecluster.telemetry import NetSampler
+        from phonecluster.worker import WorkerState, create_worker_server
+
+        # 1. _safe_int / _safe_float reject bool
+        self.assertEqual(_safe_int(False, -1), -1)
+        self.assertEqual(_safe_int(True, -1), -1)
+        self.assertEqual(_safe_float(True, 9.5), 9.5)
+
+        # 2. routing ignores non-str os_env=None / pool=True
+        n_plain = NodeConfig(id="n1", host="127.0.0.1", role="worker")
+        tier, pool = resolve_node_tier_and_pool(n_plain, {"os_env": None, "pool": True})
+        self.assertEqual(tier, 1)
+        self.assertEqual(pool, "compute")
+
+        # 3. NetSampler preserves baseline across rapid (<0.2s) polls instead of starving to (0.0, 0.0)
+        with mock.patch("phonecluster.telemetry._read_net_bytes", side_effect=[(0, 0), (10240, 20480), (10240, 20480)]):
+            with mock.patch("phonecluster.telemetry.time.monotonic", side_effect=[100.0, 101.0, 101.05]):
+                sampler = NetSampler()
+                r1 = sampler.sample()
+                self.assertAlmostEqual(r1[0], 10.0, places=1)
+                self.assertAlmostEqual(r1[1], 20.0, places=1)
+                # Rapid poll within 0.05s returns cached rate without wiping baseline
+                r2 = sampler.sample()
+                self.assertEqual(r2, r1)
+
+        # 4. cluster_summary CPU % never exceeds 100% when cpu_cores==0, and RAM % clamped [0, 100]
+        tok = "p11-core-tok-123456"
+        cfg = ClusterConfig(
+            cluster_name="p11-core",
+            auth_token=tok,
+            nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765)],
+        )
+        ctrl = MasterController(cfg)
+        fake_status = NodeSnapshot(
+            node=cfg.nodes[0],
+            online=True,
+            latency_ms=1.0,
+            health={
+                "cpu_cores": 0,
+                "cpu_pct": 50.0,
+                "mem_total_mb": 100,
+                "mem_available_mb": 200,
+                "ready_for_jobs": True,
+            },
+        )
+        with mock.patch.object(ctrl, "poll_health", return_value=[fake_status]):
+            summary = ctrl.cluster_summary()
+        self.assertLessEqual(summary["cluster_cpu_pct"], 100.0)
+        self.assertGreaterEqual(summary["cluster_ram_pct"], 0.0)
+        self.assertLessEqual(summary["cluster_ram_pct"], 100.0)
+
+        # 5. MasterController handles http.client.BadStatusLine AND boolean returncode safely
+        class _BadHttpHandler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                try:
+                    self.request.settimeout(1.0)
+                    raw = self.request.recv(4096)
+                    if b"/exec" in raw:
+                        body = json.dumps({"ok": True, "returncode": False, "stdout": "spoof"}).encode("utf-8")
+                        self.request.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                            + body
+                        )
+                    else:
+                        self.request.sendall(b"GARBAGE_NOT_HTTP\r\n\r\n")
+                except OSError:
+                    pass
+
+        class _ReuseSrv(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        bad_srv = _ReuseSrv(("127.0.0.1", 0), _BadHttpHandler)
+        bad_port = bad_srv.server_address[1]
+        threading.Thread(target=bad_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        try:
+            bad_node = NodeConfig(id="bad1", host="127.0.0.1", role="worker", worker_port=bad_port)
+            bad_ctrl = MasterController(ClusterConfig(cluster_name="bad", auth_token=tok, nodes=[bad_node]))
+            st = bad_ctrl.check_node_health(bad_node)
+            self.assertFalse(st.online)
+            self.assertTrue(bool(st.error))
+            spec_bad = JobSpec(index=0, job_id="j-bad-bool", command="echo hi", timeout_sec=5.0)
+            kind, data = bad_ctrl.exec_on_node(bad_node, spec_bad)
+            out = bad_ctrl._to_outcome(spec_bad, bad_node.id, kind, data, attempts=1)
+            self.assertEqual(out.returncode, -1)
+            self.assertFalse(out.ok)
+        finally:
+            bad_srv.shutdown()
+            bad_srv.server_close()
+
+        # 6. WorkerState slot leak guard, non-list not_ready_reasons, partial live config merge, and /exec input validation
+        w_state = WorkerState(
+            node_id="w11",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=2,
+            allowed_client_ips={"10.0.0.5"},
+        )
+        # Bool max_concurrency is rejected with 400 without mutating state
+        st_mc, _ = w_state.apply_live_config({"max_concurrency": True})
+        self.assertEqual(st_mc, 400)
+        self.assertEqual(w_state.max_concurrency, 2)
+        # Partial network push must NOT wipe allowed_client_ips
+        st_net, _ = w_state.apply_live_config({"network": {"require_signed_requests": True}})
+        self.assertEqual(st_net, 200)
+        self.assertIn("10.0.0.5", w_state.allowed_client_ips)
+        self.assertTrue(w_state.require_signed_requests)
+
+        # ready_for_jobs=False with non-list or empty not_ready_reasons still blocks jobs without crashing
+        w_state.health_provider = lambda: {"ready_for_jobs": False, "not_ready_reasons": "overheated"}
+        ok_r, info_r = w_state.try_reserve_slot("j-block", "echo hi")
+        self.assertFalse(ok_r)
+        self.assertTrue(info_r.get("reasons"))
+        w_state.health_provider = lambda: {"ready_for_jobs": False, "not_ready_reasons": []}
+        ok_r2, _ = w_state.try_reserve_slot("j-block2", "echo hi")
+        self.assertFalse(ok_r2)
+
+        # Exception during try_reserve_slot (both fast path and custom health_provider) must NOT leak active_jobs slot
+        w_state.health_provider = None
+        with mock.patch("phonecluster.worker.collect_node_health", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                w_state.try_reserve_slot("j-leak", "echo hi")
+        self.assertNotIn("j-leak", w_state.active_jobs)
+
+        # Live worker HTTP /exec validation checks
+        w_http_state = WorkerState(
+            node_id="w11-http",
+            role="worker",
+            auth_token=tok,
+            safety=SafetyConfig(),
+            max_concurrency=2,
+            health_provider=lambda: {
+                "ready_for_jobs": True,
+                "not_ready_reasons": [],
+                "temp_c": 30.0,
+                "mem_total_mb": 4096,
+                "mem_available_mb": 3000,
+                "cpu_cores": 4,
+                "load_1m": 0.1,
+            },
+        )
+        w_srv, _w_g, w_ev = create_worker_server("127.0.0.1", 0, w_http_state)
+        w_port = w_srv.server_address[1]
+        threading.Thread(target=w_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        try:
+            for bad_payload in (
+                {"command": "echo hi", "job_id": "bad\x00id"},
+                {"command": "echo hi", "timeout_sec": True},
+                {"command": "echo hi", "workdir": "~nonexistent_pc_user_xyz_999"},
+                {"script_content": "echo hi", "interpreter": "sh", "args": "'unclosed"},
+            ):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{w_port}/exec",
+                    data=json.dumps(bad_payload).encode("utf-8"),
+                    headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as exc:
+                    urllib.request.urlopen(req, timeout=3.0)
+                try:
+                    self.assertEqual(exc.exception.code, 400, f"Expected 400 for {bad_payload!r}")
+                finally:
+                    exc.exception.close()
+
+            # 7. run_pipeline resets prev_* env on validation error when continue_on_error=True
+            p_cfg = ClusterConfig(
+                cluster_name="p11-pipe",
+                auth_token=tok,
+                nodes=[NodeConfig(id="w11-http", host="127.0.0.1", role="worker", worker_port=w_port)],
+            )
+            p_ctrl = MasterController(p_cfg)
+            pipe_res = p_ctrl.run_pipeline(
+                steps=[
+                    {"name": "s1", "target": "w11-http", "command": "echo SECRET_PREV_OUT"},
+                    {"name": "s2-bad", "target": "w11-http", "command": "echo x", "timeout_sec": True},
+                    {"name": "s3", "target": "w11-http", "command": 'printf "PREV=[%s]" "$PHONECLUSTER_PREV_STDOUT"'},
+                ],
+                stop_on_error=False,
+            )
+            self.assertEqual(len(pipe_res["results"]), 3)
+            self.assertTrue(pipe_res["results"][0]["ok"])
+            self.assertEqual(pipe_res["results"][0]["stdout"].strip(), "SECRET_PREV_OUT")
+            self.assertFalse(pipe_res["results"][1]["ok"])
+            self.assertTrue(pipe_res["results"][2]["ok"])
+            self.assertEqual(pipe_res["results"][2]["stdout"], "PREV=[]")
+        finally:
+            w_ev.set()
+            w_srv.shutdown()
+            w_srv.server_close()
+
+    def test_gateway_http_response_relay_smuggling_head_204_and_14k_headers(self) -> None:
+        import socketserver
+        from phonecluster.gateway import derive_proxy_password
+
+        class _KeepAliveUpstream(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.settimeout(5.0)
+                try:
+                    buf = bytearray()
+                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                        c = self.request.recv(4096)
+                        if not c:
+                            return
+                        buf.extend(c)
+                    head_end = buf.find(b"\r\n\r\n")
+                    req_line = buf[: buf.find(b"\r\n")].decode("iso-8859-1", errors="replace")
+                    if req_line.startswith("HEAD /head-test"):
+                        self.request.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 99999\r\n"
+                            b"Connection: keep-alive, X-Custom-Hop\r\n"
+                            b"Keep-Alive: timeout=30\r\n"
+                            b"Proxy-Secret: leak\r\n"
+                            b"X-Custom-Hop: dropme\r\n\r\n"
+                        )
+                        # Deliberately hold socket open to ensure proxy does NOT stall for idle_timeout!
+                        time.sleep(3.0)
+                    elif req_line.startswith("GET /no-content"):
+                        self.request.sendall(b"HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n")
+                        time.sleep(3.0)
+                    elif req_line.startswith("GET /chunked"):
+                        self.request.sendall(
+                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                            b"Content-Length: 999\r\nConnection: keep-alive\r\n\r\n"
+                            b"5\r\nhello\r\n0\r\n\r\n"
+                        )
+                        time.sleep(3.0)
+                    elif req_line.startswith("POST /big-head"):
+                        # Drain 4096-byte body
+                        body_have = len(buf) - (head_end + 4)
+                        while body_have < 4096:
+                            c = self.request.recv(4096)
+                            if not c:
+                                break
+                            body_have += len(c)
+                        resp_b = f"got={body_have}".encode("ascii")
+                        self.request.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: "
+                            + str(len(resp_b)).encode("ascii")
+                            + b"\r\nConnection: close\r\n\r\n"
+                            + resp_b
+                        )
+                except OSError:
+                    pass
+
+        class _ReuseUp(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        up = _ReuseUp(("127.0.0.1", 0), _KeepAliveUpstream)
+        up_port = up.server_address[1]
+        threading.Thread(target=up.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        w_tok = "p11-gw-worker-token-999"
+        gw_cfg = ClusterConfig(
+            cluster_name="p11-gw",
+            auth_token="p11-gw-master-token-999",
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=8766, auth_token=w_tok),
+            ],
+            gateway=GatewayConfig(
+                enabled=True,
+                bind_host="127.0.0.1",
+                port=0,
+                mode="allowlist",
+                allowed_domains=["127.0.0.1", "::1"],
+                allowed_ports=[up_port],
+                block_private_ips=False,
+            ),
+        )
+        gw = GatewayManager(gw_cfg)
+        ok, msg = gw.start()
+        self.assertTrue(ok, msg)
+        auth_b64 = base64.b64encode(f"node1:{derive_proxy_password(w_tok, 'node1')}".encode("utf-8")).decode("ascii")
+
+        def _raw_proxy_call(payload: bytes) -> tuple[bytes, float]:
+            t0 = time.monotonic()
+            with socket.create_connection(("127.0.0.1", gw.bound_port), timeout=4.0) as s:
+                s.settimeout(4.0)
+                s.sendall(payload)
+                out = bytearray()
+                while True:
+                    c = s.recv(4096)
+                    if not c:
+                        break
+                    out.extend(c)
+            return bytes(out), time.monotonic() - t0
+
+        try:
+            # 1. HEAD finishes immediately without 30s hang, strips hop-by-hop/Proxy-*, sets Connection: close
+            resp_h, dt_h = _raw_proxy_call(
+                f"HEAD http://127.0.0.1:{up_port}/head-test HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{up_port}\r\nProxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+            )
+            self.assertLess(dt_h, 1.5, f"HEAD hung for {dt_h:.2f}s")
+            self.assertIn(b"200 OK", resp_h)
+            self.assertIn(b"Connection: close", resp_h)
+            self.assertNotIn(b"Proxy-Secret", resp_h)
+            self.assertNotIn(b"X-Custom-Hop", resp_h)
+            self.assertNotIn(b"Keep-Alive", resp_h)
+
+            # 2. 204 No Content finishes immediately
+            resp_204, dt_204 = _raw_proxy_call(
+                f"GET http://127.0.0.1:{up_port}/no-content HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{up_port}\r\nProxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+            )
+            self.assertLess(dt_204, 1.5)
+            self.assertIn(b"204 No Content", resp_204)
+
+            # 3. Chunked + conflicting Content-Length strips Content-Length and finishes immediately
+            resp_ch, dt_ch = _raw_proxy_call(
+                f"GET http://127.0.0.1:{up_port}/chunked HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{up_port}\r\nProxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+            )
+            self.assertLess(dt_ch, 1.5)
+            self.assertNotIn(b"Content-Length: 999", resp_ch)
+            self.assertIn(b"5\r\nhello\r\n0\r\n\r\n", resp_ch)
+
+            # 4. 14 KiB headers + 4 KiB body succeeds (headers alone < 16 KiB)
+            big_hdr = "".join(f"X-Pad-{i:03d}: " + ("a" * 120) + "\r\n" for i in range(100))
+            body_4k = b"B" * 4096
+            resp_big, _ = _raw_proxy_call(
+                f"POST http://127.0.0.1:{up_port}/big-head HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{up_port}\r\nProxy-Authorization: Basic {auth_b64}\r\n"
+                f"{big_hdr}Content-Length: 4096\r\n\r\n".encode("ascii")
+                + body_4k
+            )
+            self.assertIn(b"200 OK", resp_big)
+            self.assertIn(b"got=4096", resp_big)
+
+            # 5. Port :0 and HTTP/1.0 Transfer-Encoding: chunked rejected with 400
+            resp_p0, _ = _raw_proxy_call(
+                f"GET http://127.0.0.1:0/bad HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:0\r\nProxy-Authorization: Basic {auth_b64}\r\n\r\n".encode("ascii")
+            )
+            self.assertIn(b"400 Bad Request", resp_p0)
+
+            resp_te10, _ = _raw_proxy_call(
+                f"POST http://127.0.0.1:{up_port}/te10 HTTP/1.0\r\n"
+                f"Host: 127.0.0.1:{up_port}\r\nProxy-Authorization: Basic {auth_b64}\r\n"
+                f"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n".encode("ascii")
+            )
+            self.assertIn(b"400 Bad Request", resp_te10)
+
+            # 6. IPv6 canonicalization in evaluate_policy
+            allowed_v6, _ = evaluate_policy("0:0:0:0:0:0:0:1", up_port, gw_cfg.gateway)
+            self.assertTrue(allowed_v6)
+        finally:
+            gw.stop()
+            up.shutdown()
+            up.server_close()
+
+    def test_pairing_replay_rollback_udp_inf_netguard_and_doctor(self) -> None:
+        from unittest import mock
+
+        from phonecluster.discovery import REPLY_TYPE, discover_lan_nodes
+        from phonecluster.doctor import run_doctor
+        from phonecluster.netguard import apply_security_profile, infer_lan_subnet
+        from phonecluster.pairing import (
+            PAIR_BEACON_TYPE,
+            PairingManager,
+            compute_proof,
+            compute_shared_secret,
+            derive_pairing_keys,
+            discover_pairing_masters,
+            generate_dh_keypair,
+        )
+
+        # 1. Multi-device pairing rejects passive replay of client_proof / peer_pub
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "cluster.json"
+            cfg = ClusterConfig(
+                cluster_name="p11-pair",
+                auth_token="p11-pair-master-tok",
+                nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765)],
+            )
+            save_config(cfg, cfg_p)
+            pm = PairingManager(cfg, config_path=cfg_p, pair_port=8767, enable_beacon=False, fail_delay_sec=0.0)
+            opened = pm.open_session(ttl_sec=120, max_devices=2)
+            pin = opened["pin"]
+            h_code, hello = pm.public_hello()
+            self.assertEqual(h_code, 200)
+            sid = hello["session_id"]
+            salt_hex = hello["salt"]
+            srv_pub_hex = hello["dh_pub"]
+            srv_pub = int(srv_pub_hex, 16)
+
+            c_priv, c_pub = generate_dh_keypair()
+            c_pub_hex = format(c_pub, "x")
+            secret = compute_shared_secret(c_priv, srv_pub)
+            k_auth, _enc, _mac = derive_pairing_keys(pin, secret, salt_hex, sid)
+            meta = {"hostname": "phone-a", "worker_port": 8765, "ssh_port": 8022, "cpu_cores": 8, "mem_total_mb": 4096}
+            meta_canonical = json.dumps(meta, sort_keys=True, separators=(",", ":"))
+            proof = compute_proof(k_auth, "client", sid, srv_pub_hex, c_pub_hex, meta_canonical)
+
+            code1, res1 = pm.complete_pairing(
+                "10.0.0.21",
+                {"session_id": sid, "dh_pub": c_pub_hex, "client_proof": proof, "metadata": meta},
+            )
+            self.assertEqual(code1, 200, res1)
+            self.assertEqual(pm.admin_status()["remaining_slots"], 1)
+
+            # Passive attacker replays exact proof from another IP: MUST be rejected (403) and slot preserved!
+            code_rep, res_rep = pm.complete_pairing(
+                "10.0.0.99",
+                {"session_id": sid, "dh_pub": c_pub_hex, "client_proof": proof, "metadata": meta},
+            )
+            self.assertEqual(code_rep, 403, res_rep)
+            self.assertEqual(pm.admin_status()["remaining_slots"], 1)
+            self.assertNotIn("node2", [n.id for n in cfg.nodes])
+
+            # 2. Rollback in-memory config if save_config fails
+            c2_priv, c2_pub = generate_dh_keypair()
+            c2_pub_hex = format(c2_pub, "x")
+            sec2 = compute_shared_secret(c2_priv, srv_pub)
+            ka2, _, _ = derive_pairing_keys(pin, sec2, salt_hex, sid)
+            proof2 = compute_proof(ka2, "client", sid, srv_pub_hex, c2_pub_hex, meta_canonical)
+            with mock.patch("phonecluster.pairing.save_config", side_effect=OSError("disk full")):
+                code_fail, _ = pm.complete_pairing(
+                    "10.0.0.22",
+                    {"session_id": sid, "dh_pub": c2_pub_hex, "client_proof": proof2, "metadata": meta},
+                )
+            self.assertEqual(code_fail, 500)
+            self.assertEqual(len(cfg.nodes), 2)
+            self.assertEqual(pm.admin_status()["remaining_slots"], 1)
+            pm.close_session()
+
+        # 3. UDP discovery / pairing survive 1e400 (Infinity) and bool poison packets
+        udp_srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_srv.bind(("127.0.0.1", 0))
+        udp_port = udp_srv.getsockname()[1]
+        udp_srv.settimeout(0.15)
+        stop_ev = threading.Event()
+
+        def _inf_responder() -> None:
+            while not stop_ev.is_set():
+                try:
+                    raw, addr = udp_srv.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                msg = json.loads(raw.decode("utf-8"))
+                if msg.get("type") == "phonecluster_discover_v1":
+                    for p in (
+                        b'{"type":"' + REPLY_TYPE.encode() + b'","worker_port":1e400}',
+                        b'{"type":"' + REPLY_TYPE.encode() + b'","worker_port":true}',
+                        json.dumps({"type": REPLY_TYPE, "node_id": "clean1", "worker_port": 8765, "ssh_port": 8022}).encode(),
+                    ):
+                        udp_srv.sendto(p, addr)
+                else:
+                    for p in (
+                        b'{"type":"' + PAIR_BEACON_TYPE.encode() + b'","pair_port":1e400}',
+                        b'{"type":"' + PAIR_BEACON_TYPE.encode() + b'","pair_port":true}',
+                        json.dumps({"type": PAIR_BEACON_TYPE, "pair_port": 8767, "cluster_name": "cleanm", "expires_in_sec": 30}).encode(),
+                    ):
+                        udp_srv.sendto(p, addr)
+
+        t_u = threading.Thread(target=_inf_responder, daemon=True)
+        t_u.start()
+        try:
+            n_found = discover_lan_nodes(timeout_sec=0.35, discovery_port=udp_port, targets=["127.0.0.1"])
+            self.assertEqual(len(n_found), 1)
+            self.assertEqual(n_found[0]["node_id"], "clean1")
+            m_found = discover_pairing_masters(timeout_sec=0.35, discovery_port=udp_port, targets=["127.0.0.1"])
+            self.assertEqual(len(m_found), 1)
+            self.assertEqual(m_found[0]["cluster_name"], "cleanm")
+        finally:
+            stop_ev.set()
+            udp_srv.close()
+            t_u.join(timeout=2.0)
+
+        # 4. netguard infer_lan_subnet rejects 0.0.0.0 and apply_security_profile doesn't mutate on invalid profile
+        self.assertNotEqual(infer_lan_subnet("0.0.0.0"), "0.0.0.0/24")
+        self.assertEqual(infer_lan_subnet("192.168.42.9"), "192.168.42.0/24")
+        ng_cfg = ClusterConfig(
+            cluster_name="p11-ng",
+            auth_token="p11-ng-tok",
+            nodes=[NodeConfig(id="node0", host="192.168.42.9", role="master")],
+        )
+        orig_ips = list(ng_cfg.network.allowed_master_ips)
+        with self.assertRaises(ValueError):
+            apply_security_profile(ng_cfg, "totally-invalid-profile")
+        self.assertEqual(ng_cfg.network.allowed_master_ips, orig_ips)
+
+        # 5. doctor warns when gateway.enabled=True and gateway.port==0
+        with tempfile.TemporaryDirectory() as tmp:
+            doc_p = Path(tmp) / "doc.json"
+            doc_cfg = ClusterConfig(
+                cluster_name="p11-doc",
+                auth_token="p11-doc-tok",
+                nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master")],
+                gateway=GatewayConfig(enabled=True, bind_host="127.0.0.1", port=0),
+            )
+            save_config(doc_cfg, doc_p)
+            rep = run_doctor(config_path=doc_p, check_remote=False)
+        gw_checks = [c for c in rep["checks"] if "Network Guard" in c.get("name", "")]
+        self.assertTrue(gw_checks)
+        self.assertEqual(gw_checks[0]["status"], "warn")
+
+    def test_dashboard_atomic_api_xss_tui_cli_and_scripts(self) -> None:
+        import subprocess
+        from typing import Any
+        from unittest import mock
+
+        from phonecluster.cli import main as cli_main
+        from phonecluster.dashboard import DASHBOARD_HTML, DashboardHTTPServer
+        from phonecluster.tui import _format_uptime, _read_key
+
+        # 1. Dashboard API atomic validation, null preservation, case-insensitive service remove, last-node guard
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "cluster.json"
+            tok = "p11-dash-token-123456"
+            cfg = ClusterConfig(
+                cluster_name="p11-dash",
+                auth_token=tok,
+                nodes=[
+                    NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765, ssh_port=8022),
+                    NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=8766, ssh_port=8022),
+                ],
+                gateway=GatewayConfig(
+                    enabled=False,
+                    block_private_ips=True,
+                    quarantined_nodes=["node1"],
+                ),
+            )
+            save_config(cfg, cfg_p)
+            ctrl = MasterController(cfg)
+            dash = DashboardHTTPServer(
+                ("127.0.0.1", 0),
+                ctrl,
+                config_path=cfg_p,
+                enable_pairing_beacon=False,
+                pairing_fail_delay_sec=0.0,
+            )
+            d_port = dash.server_address[1]
+            threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+            def _dash_post(path: str, raw_body: bytes) -> tuple[int, dict[str, Any]]:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{d_port}{path}",
+                    data=raw_body,
+                    headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        return resp.status, json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as exc:
+                    try:
+                        return exc.code, json.loads(exc.read().decode("utf-8"))
+                    finally:
+                        exc.close()
+
+            try:
+                # Partial mutation guard on /api/nodes/update
+                st1, _ = _dash_post(
+                    "/api/nodes/update",
+                    json.dumps({"id": "node1", "tier": 2, "max_concurrency": 999}).encode("utf-8"),
+                )
+                self.assertEqual(st1, 400)
+                self.assertEqual(cfg.get_node("node1").tier, 0)  # type: ignore[union-attr]
+
+                # Partial mutation guard on /api/network/hardening
+                st2, _ = _dash_post(
+                    "/api/network/hardening",
+                    json.dumps({"dashboard_require_auth": True, "enforce_worker_source_ip": True, "adguard_url": "ftp://invalid"}).encode("utf-8"),
+                )
+                self.assertEqual(st2, 400)
+                self.assertFalse(cfg.dashboard_require_auth)
+                self.assertFalse(cfg.network.enforce_worker_source_ip)
+
+                # JSON null in /api/gateway/settings must NOT disable block_private_ips or clear quarantine
+                st3, _ = _dash_post(
+                    "/api/gateway/settings",
+                    json.dumps({"block_private_ips": None, "quarantined_nodes": None}).encode("utf-8"),
+                )
+                self.assertEqual(st3, 200)
+                self.assertTrue(cfg.gateway.block_private_ips)
+                self.assertEqual(cfg.gateway.quarantined_nodes, ["node1"])
+
+                # Case-insensitive custom service removal (works even for pre-existing mixed-case keys in cluster.json)
+                st_add, _ = _dash_post(
+                    "/api/services/custom",
+                    json.dumps({"name": "myapp", "url": "http://127.0.0.1:9000"}).encode("utf-8"),
+                )
+                self.assertEqual(st_add, 200)
+                self.assertEqual(len(cfg.custom_services), 1)
+                cfg.custom_services["MixedApp"] = "http://127.0.0.1:9001"
+                st_rm1_s, _ = _dash_post("/api/services/custom/remove", json.dumps({"name": "MYAPP"}).encode("utf-8"))
+                self.assertEqual(st_rm1_s, 200)
+                st_rm2_s, _ = _dash_post("/api/services/custom/remove", json.dumps({"name": "mixedapp"}).encode("utf-8"))
+                self.assertEqual(st_rm2_s, 200)
+                self.assertEqual(len(cfg.custom_services), 0)
+
+                # NaN JSON rejected with 400
+                st_nan, _ = _dash_post("/api/exec", b'{"command":"echo hi","timeout_sec":NaN}')
+                self.assertEqual(st_nan, 400)
+
+                # Removing node1 succeeds, then removing last remaining node (node0) is blocked with 400
+                st_rm1, _ = _dash_post("/api/nodes/remove", json.dumps({"id": "node1"}).encode("utf-8"))
+                self.assertEqual(st_rm1, 200)
+                st_rm0, _ = _dash_post("/api/nodes/remove", json.dumps({"id": "node0"}).encode("utf-8"))
+                self.assertEqual(st_rm0, 400)
+                self.assertEqual(len(cfg.nodes), 1)
+            finally:
+                dash.shutdown()
+                dash.server_close()
+
+        # 2. Dashboard HTML escapes worker active_jobs / max_concurrency / cpu_cores and guards top_processes
+        self.assertIn("esc(actNum)", DASHBOARD_HTML)
+        self.assertIn("esc(maxNum)", DASHBOARD_HTML)
+        self.assertIn("esc(cores)", DASHBOARD_HTML)
+        self.assertIn("Array.isArray(h.top_processes)", DASHBOARD_HTML)
+
+        # 3. TUI negative uptime & stdin EOF handling
+        self.assertEqual(_format_uptime(-5), "0m")
+        with mock.patch("phonecluster.tui.select.select", return_value=([0], [], [])):
+            with mock.patch("phonecluster.tui.os.read", return_value=b""):
+                self.assertEqual(_read_key(0.01), "EOF")
+
+        # 4. CLI validation: --max-concurrency 0 and huge --timeout fail cleanly with exit 2
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "c.json"
+            save_config(
+                ClusterConfig(
+                    cluster_name="p11-cli",
+                    auth_token="p11-cli-tok",
+                    nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master")],
+                ),
+                cfg_p,
+            )
+            self.assertEqual(cli_main(["--config", str(cfg_p), "worker", "--node-id", "node0", "--max-concurrency", "0"]), 2)
+            self.assertEqual(cli_main(["--config", str(cfg_p), "run", "--timeout", "1e10", "echo hi"]), 2)
+
+        # 5. Shell scripts hardening checks
+        repo = Path(__file__).resolve().parent.parent
+        p_unk = subprocess.run(
+            ["bash", str(repo / "scripts" / "05_workload_helpers.sh"), "definitely-unknown-subcmd"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(p_unk.returncode, 2)
+        p_hlp = subprocess.run(
+            ["bash", str(repo / "scripts" / "05_workload_helpers.sh"), "--help"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(p_hlp.returncode, 0)
+
+        sync_sh = (repo / "scripts" / "03_sync_cluster.sh").read_text(encoding="utf-8")
+        self.assertIn("<&3", sync_sh)
+        self.assertIn("SQ_NID", sync_sh)
+        self.assertIn("SQ_RDIR", sync_sh)
+
+        chroot_sh = (repo / "scripts" / "04_debian13_chroot_setup.sh").read_text(encoding="utf-8")
+        self.assertNotIn("zcat /proc/config.gz 2>/dev/null | grep -q", chroot_sh)
+
+        adb_sh = (repo / "scripts" / "setup_all_via_adb.sh").read_text(encoding="utf-8")
+        self.assertNotIn("mapfile ", adb_sh)
+        self.assertNotIn("install -r --", adb_sh)
+
+
 if __name__ == "__main__":
     unittest.main()

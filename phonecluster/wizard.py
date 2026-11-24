@@ -22,6 +22,7 @@ from .config import (
     NodeConfig,
     SafetyConfig,
     format_host_port,
+    is_loopback_or_unspecified_host,
     load_config,
     resolve_config_path,
     save_config,
@@ -159,10 +160,9 @@ def run_setup_wizard(
         else:
             print("No other phones replied yet (that's normal if you haven't started workers yet).")
 
-    manual_default = "" if len(nodes) > 1 else "192.168.1.202,192.168.1.203"
     extra_ips = _prompt(
-        "Enter any additional Worker phone IPs (comma-separated, or blank to skip)",
-        manual_default,
+        "Enter any additional Worker phone IPs (comma-separated, e.g. 192.168.1.202,192.168.1.203, or blank to skip)",
+        "",
         input_fn=input_fn,
     )
     existing_hosts = {n.host for n in nodes}
@@ -298,50 +298,34 @@ def run_interactive_menu(
             run_setup_wizard(cfg_path, input_fn=input_fn)
             continue
 
-        if choice == "5":
-            cfg = load_config(cfg_path)
-            run_cli_pairing_host(cfg, cfg_path, port=DEFAULT_PAIR_PORT, ttl_sec=120, max_devices=1)
-        elif choice == "1":
-            cfg = load_config(cfg_path)
-            run_top_tui(MasterController(cfg))
-        elif choice == "2":
-            ns = argparse.Namespace(config=str(cfg_path), json=False)
-            _cmd_status(ns)
-        elif choice == "3":
-            cfg = load_config(cfg_path)
-            ctrl = MasterController(cfg)
-            target = _prompt("Target ('best', 'all', or node id like 'node1')", "best", input_fn=input_fn)
-            cmd = _prompt("Shell command to run", "uname -a && nproc", input_fn=input_fn)
-            spec = JobSpec(index=0, job_id=f"menu-run-{uuid.uuid4().hex[:6]}", command=cmd, timeout_sec=cfg.default_job_timeout_sec)
-            for o in ctrl.run_single(spec, target=target):
-                print(f"\n=== [{o.node_id}] {'OK' if o.ok else 'FAIL'} ({o.duration_sec:.2f}s) ===")
-                if o.stdout:
-                    print(o.stdout.rstrip())
-                if o.stderr:
-                    print(o.stderr.rstrip(), file=sys.stderr)
-                if o.error:
-                    print(f"ERROR: {o.error}", file=sys.stderr)
-        elif choice == "4":
-            script = _prompt("Local script path (or blank to use a commands file)", "examples/sample_job.py", input_fn=input_fn)
-            if script:
-                args_file = _prompt("Arguments file (one arg list per line)", "examples/sample_args.txt", input_fn=input_fn)
-                subprocess.run(
-                    [
-                        sys.executable,
-                        str(Path(__file__).resolve().parent.parent / "phonecluster_cli.py"),
-                        "--config",
-                        str(cfg_path),
-                        "map",
-                        "--script",
-                        script,
-                        "--args-file",
-                        args_file,
-                    ],
-                    check=False,
-                )
-            else:
-                jobs_file = _prompt("Jobs file path (one shell command per line)", "", input_fn=input_fn)
-                if jobs_file:
+        try:
+            if choice == "5":
+                cfg = load_config(cfg_path)
+                run_cli_pairing_host(cfg, cfg_path, port=DEFAULT_PAIR_PORT, ttl_sec=120, max_devices=1)
+            elif choice == "1":
+                cfg = load_config(cfg_path)
+                run_top_tui(MasterController(cfg))
+            elif choice == "2":
+                ns = argparse.Namespace(config=str(cfg_path), json=False)
+                _cmd_status(ns)
+            elif choice == "3":
+                cfg = load_config(cfg_path)
+                ctrl = MasterController(cfg)
+                target = _prompt("Target ('best', 'all', or node id like 'node1')", "best", input_fn=input_fn)
+                cmd = _prompt("Shell command to run", "uname -a && nproc", input_fn=input_fn)
+                spec = JobSpec(index=0, job_id=f"menu-run-{uuid.uuid4().hex[:6]}", command=cmd, timeout_sec=cfg.default_job_timeout_sec)
+                for o in ctrl.run_single(spec, target=target):
+                    print(f"\n=== [{o.node_id}] {'OK' if o.ok else 'FAIL'} ({o.duration_sec:.2f}s) ===")
+                    if o.stdout:
+                        print(o.stdout.rstrip())
+                    if o.stderr:
+                        print(o.stderr.rstrip(), file=sys.stderr)
+                    if o.error:
+                        print(f"ERROR: {o.error}", file=sys.stderr)
+            elif choice == "4":
+                script = _prompt("Local script path (e.g. examples/sample_job.py, or blank to use a commands file)", "", input_fn=input_fn)
+                if script:
+                    args_file = _prompt("Arguments file (one arg list per line)", "examples/sample_args.txt", input_fn=input_fn)
                     subprocess.run(
                         [
                             sys.executable,
@@ -349,61 +333,83 @@ def run_interactive_menu(
                             "--config",
                             str(cfg_path),
                             "map",
-                            "--jobs-file",
-                            jobs_file,
+                            "--script",
+                            script,
+                            "--args-file",
+                            args_file,
                         ],
                         check=False,
                     )
-        elif choice == "7":
-            cfg = load_config(cfg_path)
-            ctrl = MasterController(cfg)
-            ip = detect_local_ip()
-            print(f"\nStarting Web Dashboard at: http://{ip}:{cfg.dashboard_port}")
-            print("Press Ctrl+C to return to the menu.")
-            serve_dashboard("0.0.0.0", cfg.dashboard_port, ctrl, config_path=cfg_path)
-        elif choice == "8":
-            cfg = load_config(cfg_path)
-            ctrl = MasterController(cfg)
-            print("\n--- Live Workload Endpoints ---")
-            print(f"distcc    : export DISTCC_HOSTS=\"{ctrl.build_distcc_hosts()}\"")
-            print(f"llama.cpp : --rpc {ctrl.build_llama_rpc_arg() or '(no rpc-server detected on port 50052)'}")
-            mpi = ctrl.build_mpi_hostfile().strip()
-            print(f"OpenMPI   :\n{mpi or '(no healthy nodes)'}")
-            if _prompt_yes_no("Start distccd compiler workers on all ready phones now?", default=False, input_fn=input_fn):
-                master_n = next((n for n in cfg.nodes if n.role == "master"), cfg.nodes[0])
-                default_cidr = infer_lan_subnet(master_n.host or detect_local_ip(), cfg.network.lan_subnet)
-                raw_cidr = _prompt("Allowed LAN subnet CIDR", default_cidr, input_fn=input_fn)
-                try:
-                    cidr = str(ipaddress.ip_network(raw_cidr, strict=False))
-                except ValueError:
-                    print(f"Invalid CIDR subnet '{raw_cidr}' — cancelled.")
-                    continue
-                helper_sh = Path(__file__).resolve().parent.parent / "scripts" / "05_workload_helpers.sh"
-                if helper_sh.exists():
-                    spec = JobSpec(
-                        index=0,
-                        job_id=f"menu-distcc-{uuid.uuid4().hex[:6]}",
-                        script_content=helper_sh.read_text(encoding="utf-8"),
-                        script_name="05_workload_helpers.sh",
-                        interpreter="bash",
-                        args=["distcc-start", cidr],
-                        timeout_sec=30.0,
-                    )
                 else:
-                    spec = JobSpec(
-                        index=0,
-                        job_id=f"menu-distcc-{uuid.uuid4().hex[:6]}",
-                        command=f"bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-start {shlex.quote(cidr)}",
-                        timeout_sec=30.0,
-                    )
-                for o in ctrl.run_single(spec, target="all"):
-                    print(f"[{o.node_id}] {'OK' if o.ok else 'FAIL'}: {(o.stdout or o.stderr or o.error).strip()}")
-        elif choice == "t":
-            cfg = load_config(cfg_path)
-            print(f"\nCluster auth_token (for Web UI Unlock): {cfg.auth_token}\n")
-            _cmd_jobs(argparse.Namespace(config=str(cfg_path), limit=5, json=False))
-        else:
-            print("Please enter a valid option (0-9 or t).")
+                    jobs_file = _prompt("Jobs file path (one shell command per line)", "", input_fn=input_fn)
+                    if jobs_file:
+                        subprocess.run(
+                            [
+                                sys.executable,
+                                str(Path(__file__).resolve().parent.parent / "phonecluster_cli.py"),
+                                "--config",
+                                str(cfg_path),
+                                "map",
+                                "--jobs-file",
+                                jobs_file,
+                            ],
+                            check=False,
+                        )
+            elif choice == "7":
+                cfg = load_config(cfg_path)
+                ctrl = MasterController(cfg)
+                ip = detect_local_ip()
+                print(f"\nStarting Web Dashboard at: http://{ip}:{cfg.dashboard_port}")
+                print("Press Ctrl+C to return to the menu.")
+                serve_dashboard("0.0.0.0", cfg.dashboard_port, ctrl, config_path=cfg_path)
+            elif choice == "8":
+                cfg = load_config(cfg_path)
+                ctrl = MasterController(cfg)
+                print("\n--- Live Workload Endpoints ---")
+                print(f"distcc    : export DISTCC_HOSTS=\"{ctrl.build_distcc_hosts()}\"")
+                print(f"llama.cpp : --rpc {ctrl.build_llama_rpc_arg() or '(no rpc-server detected on port 50052)'}")
+                mpi = ctrl.build_mpi_hostfile().strip()
+                print(f"OpenMPI   :\n{mpi or '(no healthy nodes)'}")
+                if _prompt_yes_no("Start distccd compiler workers on all ready phones now?", default=False, input_fn=input_fn):
+                    master_n = next((n for n in cfg.nodes if n.role == "master"), cfg.nodes[0])
+                    seed_h = detect_local_ip() if is_loopback_or_unspecified_host(master_n.host) else master_n.host
+                    default_cidr = infer_lan_subnet(seed_h, cfg.network.lan_subnet)
+                    raw_cidr = _prompt("Allowed LAN subnet CIDR", default_cidr, input_fn=input_fn)
+                    try:
+                        cidr = str(ipaddress.ip_network(raw_cidr, strict=False))
+                    except ValueError:
+                        print(f"Invalid CIDR subnet '{raw_cidr}' — cancelled.")
+                        continue
+                    helper_sh = Path(__file__).resolve().parent.parent / "scripts" / "05_workload_helpers.sh"
+                    if helper_sh.exists():
+                        spec = JobSpec(
+                            index=0,
+                            job_id=f"menu-distcc-{uuid.uuid4().hex[:6]}",
+                            script_content=helper_sh.read_text(encoding="utf-8"),
+                            script_name="05_workload_helpers.sh",
+                            interpreter="bash",
+                            args=["distcc-start", cidr],
+                            timeout_sec=30.0,
+                        )
+                    else:
+                        spec = JobSpec(
+                            index=0,
+                            job_id=f"menu-distcc-{uuid.uuid4().hex[:6]}",
+                            command=f"bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-start {shlex.quote(cidr)}",
+                            timeout_sec=30.0,
+                        )
+                    for o in ctrl.run_single(spec, target="all"):
+                        print(f"[{o.node_id}] {'OK' if o.ok else 'FAIL'}: {(o.stdout or o.stderr or o.error).strip()}")
+            elif choice == "t":
+                cfg = load_config(cfg_path)
+                print(f"\nCluster auth_token (for Web UI Unlock): {cfg.auth_token}\n")
+                _cmd_jobs(argparse.Namespace(config=str(cfg_path), limit=5, json=False))
+            else:
+                print("Please enter a valid option (0-9 or t).")
+        except KeyboardInterrupt:
+            print("\nReturned to menu.")
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            print(f"\nError: {exc}", file=sys.stderr)
 
 
 def _print_doctor_report(report: dict[str, Any]) -> None:

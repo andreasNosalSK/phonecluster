@@ -68,7 +68,7 @@ for n in cfg["nodes"]:
 PY
 )"
 
-while IFS='|' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
+while IFS='|' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE <&3; do
   [[ -z "${NODE_ID}" ]] && continue
   if [[ "${NODE_ID}" == "${SKIP_LOCAL}" ]]; then
     echo "--- Skipping local node '${NODE_ID}' (${HOST}) ---"
@@ -84,8 +84,9 @@ while IFS='|' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE; do
     ssh-copy-id -p "${SSH_PORT}" -- "${TARGET}"
   fi
 
-  # POSIX-safe single-quote escape of REMOTE_DIR via Python shlex.quote (immune to spaces/metacharacters/quotes)
+  # POSIX-safe single-quote escaping via Python shlex.quote (immune to spaces/metacharacters/quotes)
   SQ_RDIR="$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "${REMOTE_DIR}")"
+  SQ_NID="$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "${NODE_ID}")"
 
   # Stream project code via tar over SSH (without shipping Master's full cluster.json to workers)
   tar -C "${REPO_ROOT}" -cf - \
@@ -146,8 +147,8 @@ else:
 print(json.dumps(out, indent=2))
 PY
 
-  # Restart worker daemon cleanly on remote node
-  ssh -p "${SSH_PORT}" -- "${TARGET}" bash -s -- "${NODE_ID}" "${REMOTE_DIR}" <<'REMOTE'
+  # Restart worker daemon cleanly on remote node (arguments pre-quoted via shlex.quote so spaces/metachars stay literal)
+  ssh -p "${SSH_PORT}" -- "${TARGET}" "bash -s -- ${SQ_NID} ${SQ_RDIR}" <<'REMOTE'
 set -euo pipefail
 NODE_ID="$1"
 case "$2" in
@@ -165,7 +166,8 @@ if [[ -f "${PID_FILE}" ]]; then
     SHOULD_KILL=1
     if [[ -d /proc ]]; then
       if [[ -r "/proc/${OLD_PID}/cmdline" ]]; then
-        tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null | grep -q "phonecluster" || SHOULD_KILL=0
+        OLD_CMDLINE="$(tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null || true)"
+        [[ "${OLD_CMDLINE}" == *"phonecluster"* ]] || SHOULD_KILL=0
       else
         SHOULD_KILL=0
       fi
@@ -206,7 +208,7 @@ if ! kill -0 "${NEW_PID}" 2>/dev/null; then
 fi
 echo "Started worker '${NODE_ID}' (PID ${NEW_PID})"
 REMOTE
-done <<< "${NODES_PSV}"
+done 3<<< "${NODES_PSV}"
 
 echo
 echo "Sync complete! Verify the whole cluster with:"

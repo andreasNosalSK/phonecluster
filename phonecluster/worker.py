@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import http.client
 import ipaddress
 import json
 import logging
@@ -193,7 +194,8 @@ class WorkerState:
             health["require_signed_requests"] = bool(self.require_signed_requests)
             if active_count >= self.max_concurrency:
                 health["ready_for_jobs"] = False
-                reasons = list(health.get("not_ready_reasons", []))
+                raw_reasons = health.get("not_ready_reasons")
+                reasons = list(raw_reasons) if isinstance(raw_reasons, list) else []
                 reasons.append(f"busy ({active_count}/{self.max_concurrency})")
                 health["not_ready_reasons"] = reasons
             return health
@@ -243,26 +245,40 @@ class WorkerState:
             )
 
         if not force:
-            # Evaluate thermal/RAM safety outside the lock (fast path skips `ps`/port probes/CPU sampler!)
-            if self.health_provider is not None:
-                health = self.get_health()
-            else:
+            try:
+                # Evaluate thermal/RAM safety outside the lock (fast path skips `ps`/port probes/CPU sampler!)
+                if self.health_provider is not None:
+                    health = self.get_health()
+                else:
+                    with self.lock:
+                        cur_active = len(self.active_jobs)
+                    health = collect_node_health(
+                        node_id=self.node_id,
+                        role=self.role,
+                        safety=self.safety,
+                        thermal_gate=self.thermal_gate,
+                        active_jobs=cur_active,
+                        max_concurrency=self.max_concurrency,
+                        workdir=self.workdir,
+                        safety_only=True,
+                    )
+                # Exclude our own newly reserved slot when checking busy state
+                raw_reasons = health.get("not_ready_reasons")
+                reasons_list = [str(r) for r in raw_reasons if r is not None] if isinstance(raw_reasons, list) else []
+                non_busy_reasons = [r for r in reasons_list if not r.startswith("busy")]
+                if not non_busy_reasons:
+                    if health.get("overheated"):
+                        non_busy_reasons.append("overheated")
+                    if health.get("battery_hazard"):
+                        non_busy_reasons.append("battery_hazard")
+                    if not non_busy_reasons and health.get("ready_for_jobs") is False and not any(
+                        r.startswith("busy") for r in reasons_list
+                    ):
+                        non_busy_reasons.append("node not ready")
+            except Exception:
                 with self.lock:
-                    cur_active = len(self.active_jobs)
-                health = collect_node_health(
-                    node_id=self.node_id,
-                    role=self.role,
-                    safety=self.safety,
-                    thermal_gate=self.thermal_gate,
-                    active_jobs=cur_active,
-                    max_concurrency=self.max_concurrency,
-                    workdir=self.workdir,
-                    safety_only=True,
-                )
-            # Exclude our own newly reserved slot when checking busy state
-            non_busy_reasons = [
-                r for r in health.get("not_ready_reasons", []) if not r.startswith("busy")
-            ]
+                    self.active_jobs.pop(job_id, None)
+                raise
             if non_busy_reasons:
                 with self.lock:
                     self.active_jobs.pop(job_id, None)
@@ -347,17 +363,22 @@ class WorkerState:
                     "battery_webhook_url": raw_s.get("battery_webhook_url", cur_s.battery_webhook_url),
                 }
                 new_safety = SafetyConfig.from_dict(merged_s)
-            except (ValueError, TypeError) as exc:
+            except (ValueError, TypeError, OverflowError) as exc:
                 return HTTPStatus.BAD_REQUEST, {"error": f"invalid safety config: {exc}"}
 
         new_max_conc: int | None = None
         if "max_concurrency" in payload:
+            raw_mc = payload["max_concurrency"]
             try:
-                mc = int(payload["max_concurrency"])
+                if isinstance(raw_mc, bool):
+                    raise ValueError("must be an integer, not boolean")
+                if isinstance(raw_mc, float) and (not math.isfinite(raw_mc) or not raw_mc.is_integer()):
+                    raise ValueError("must be a finite integer")
+                mc = int(raw_mc)
                 if not (1 <= mc <= 32):
                     raise ValueError("must be between 1 and 32")
                 new_max_conc = mc
-            except (ValueError, TypeError) as exc:
+            except (ValueError, TypeError, OverflowError) as exc:
                 return HTTPStatus.BAD_REQUEST, {"error": f"invalid max_concurrency: {exc}"}
 
         new_net_cfg: NetworkHardeningConfig | None = None
@@ -366,9 +387,32 @@ class WorkerState:
             raw_n = payload.get("network")
             if not isinstance(raw_n, dict):
                 return HTTPStatus.BAD_REQUEST, {"error": "'network' must be a JSON object"}
+            with self.lock:
+                cur_enforce = bool(self.allowed_client_ips)
+                cur_signed = bool(self.require_signed_requests)
+                cur_allowed = sorted(self.allowed_client_ips - {"127.0.0.1", "::1"})
+            merged_n = {
+                "enforce_worker_source_ip": (
+                    cur_enforce
+                    if raw_n.get("enforce_worker_source_ip") is None
+                    else raw_n.get("enforce_worker_source_ip")
+                ),
+                "require_signed_requests": (
+                    cur_signed
+                    if raw_n.get("require_signed_requests") is None
+                    else raw_n.get("require_signed_requests")
+                ),
+                "allowed_master_ips": (
+                    cur_allowed
+                    if raw_n.get("allowed_master_ips") is None
+                    else raw_n.get("allowed_master_ips")
+                ),
+                "adguard_url": raw_n.get("adguard_url", ""),
+                "lan_subnet": raw_n.get("lan_subnet", ""),
+            }
             try:
-                new_net_cfg = NetworkHardeningConfig.from_dict(raw_n)
-            except (ValueError, TypeError) as exc:
+                new_net_cfg = NetworkHardeningConfig.from_dict(merged_n)
+            except (ValueError, TypeError, OverflowError) as exc:
                 return HTTPStatus.BAD_REQUEST, {"error": f"invalid network config: {exc}"}
             if new_net_cfg.enforce_worker_source_ip:
                 allowed = {"127.0.0.1", "::1"} | {
@@ -576,7 +620,7 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> No
         )
         with _WEBHOOK_OPENER.open(req, timeout=timeout):
             pass
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
         LOG.warning("Safety webhook POST to %s failed: %s", clean_url, exc)
 
 
@@ -662,7 +706,13 @@ def _run_process_bounded(
 
 def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """Run a shell command or staged inline script with timeout and cancellation."""
-    job_id = str(payload.get("job_id") or uuid.uuid4().hex[:12]).strip() or uuid.uuid4().hex[:12]
+    raw_job_id = payload.get("job_id")
+    if raw_job_id is not None:
+        if not isinstance(raw_job_id, str) or any(c in raw_job_id for c in "\x00\r\n") or len(raw_job_id) > 128:
+            return HTTPStatus.BAD_REQUEST, {"error": "'job_id' must be a single-line string (<= 128 chars, no NUL bytes)"}
+        job_id = raw_job_id.strip() or uuid.uuid4().hex[:12]
+    else:
+        job_id = uuid.uuid4().hex[:12]
     command = payload.get("command")
     script_content = payload.get("script_content")
     if command is not None and not isinstance(command, str):
@@ -692,12 +742,31 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
         else:
             return HTTPStatus.BAD_REQUEST, {"error": "'args' must be a list or string"}
 
+    parsed_interp_parts: list[str] = []
+    parsed_script_args: list[str] = []
+    if script_content:
+        interp_str = (raw_interp or "").strip()
+        try:
+            parsed_interp_parts = shlex.split(interp_str) if interp_str else []
+        except ValueError as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": f"invalid 'interpreter' quoting: {exc}"}
+        if isinstance(raw_args_chk, str):
+            try:
+                parsed_script_args = shlex.split(raw_args_chk)
+            except ValueError as exc:
+                return HTTPStatus.BAD_REQUEST, {"error": f"invalid 'args' quoting: {exc}"}
+        elif isinstance(raw_args_chk, list):
+            parsed_script_args = [str(a) for a in raw_args_chk]
+
+    raw_timeout = payload.get("timeout_sec", 600)
+    if isinstance(raw_timeout, bool):
+        return HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a finite number > 0"}
     try:
-        timeout_sec = float(payload.get("timeout_sec", 600))
-    except (TypeError, ValueError):
+        timeout_sec = float(raw_timeout)
+    except (TypeError, ValueError, OverflowError):
         return HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a finite number > 0"}
-    if not math.isfinite(timeout_sec) or timeout_sec <= 0:
-        return HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a finite number > 0"}
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0 or timeout_sec > 86400.0:
+        return HTTPStatus.BAD_REQUEST, {"error": "timeout_sec must be a finite number between 0 and 86400"}
 
     force = bool(payload.get("force", False))
     extra_env = payload.get("env") or {}
@@ -711,7 +780,7 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
         try:
             cwd = Path(req_workdir).expanduser()
             exists_dir = cwd.exists() and cwd.is_dir()
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             return HTTPStatus.BAD_REQUEST, {"error": f"invalid workdir path: {exc}"}
     else:
         cwd = state.workdir
@@ -756,17 +825,8 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             script_name = Path(str(payload.get("script_name") or "job.py").replace("\x00", "")).name
             raw_suffix = Path(script_name).suffix
             suffix = raw_suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,10}", raw_suffix) else ".py"
-            interpreter = str(payload.get("interpreter") or "").strip()
-            interp_parts = shlex.split(interpreter) if interpreter else []
-            if not interp_parts:
-                interp_parts = ["python3" if suffix == ".py" else "sh"]
-            raw_args = payload.get("args") or []
-            if isinstance(raw_args, str):
-                args = shlex.split(raw_args)
-            elif isinstance(raw_args, list):
-                args = [str(a) for a in raw_args]
-            else:
-                args = []
+            interp_parts = list(parsed_interp_parts) if parsed_interp_parts else ["python3" if suffix == ".py" else "sh"]
+            args = list(parsed_script_args)
 
             safe_job_prefix = re.sub(r"[^A-Za-z0-9._-]+", "_", job_id).strip("._")[:40] or "job"
             try:

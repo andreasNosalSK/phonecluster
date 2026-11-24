@@ -55,11 +55,34 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
             )
         )
 
-    # 2. SSH daemon check
-    ssh_8022 = is_local_port_open(8022)
-    ssh_22 = is_local_port_open(22)
-    if ssh_8022 or ssh_22:
-        port_txt = "8022 (Termux)" if ssh_8022 else "22 (Linux)"
+    # 2. SSH daemon check (uses /proc/net/tcp* when readable to avoid sshd log spam and detect LAN-only ListenAddress)
+    lmap_ssh = _read_listening_tcp_map()
+    if lmap_ssh is not None:
+        ssh_8022 = 8022 in lmap_ssh
+        ssh_22 = 22 in lmap_ssh
+    else:
+        ssh_8022 = is_local_port_open(8022)
+        ssh_22 = is_local_port_open(22)
+    custom_ssh_port: int | None = None
+    if not (ssh_8022 or ssh_22):
+        probe_cfg_path = resolve_config_path(config_path)
+        if probe_cfg_path.exists():
+            try:
+                probe_cfg = load_config(probe_cfg_path)
+                cand_ports = sorted({n.ssh_port for n in probe_cfg.nodes if n.ssh_port not in {22, 8022}})
+                for cp in cand_ports:
+                    if (lmap_ssh is not None and cp in lmap_ssh) or (lmap_ssh is None and is_local_port_open(cp)):
+                        custom_ssh_port = cp
+                        break
+            except Exception:
+                pass
+    if ssh_8022 or ssh_22 or custom_ssh_port is not None:
+        if ssh_8022:
+            port_txt = "8022 (Termux)"
+        elif ssh_22:
+            port_txt = "22 (Linux)"
+        else:
+            port_txt = f"{custom_ssh_port} (custom)"
         checks.append(CheckResult("SSH Server", "ok", f"Listening on port {port_txt}"))
     else:
         checks.append(
@@ -102,9 +125,21 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                 )
             )
 
-        boot_dir = Path.home() / ".termux" / "boot"
-        boot_scripts = list(boot_dir.glob("*.sh")) if boot_dir.exists() else []
-        if boot_scripts:
+        try:
+            boot_dir = Path.home() / ".termux" / "boot"
+            boot_scripts = list(boot_dir.glob("*.sh")) if boot_dir.exists() else []
+        except (OSError, RuntimeError) as exc:
+            boot_scripts = []
+            checks.append(
+                CheckResult(
+                    "Termux:Boot Auto-Start",
+                    "warn",
+                    f"Could not inspect ~/.termux/boot: {exc}",
+                    "Ensure HOME is set and ~/.termux/boot is readable.",
+                )
+            )
+            boot_dir = None
+        if boot_dir is not None and boot_scripts:
             checks.append(
                 CheckResult(
                     "Termux:Boot Auto-Start",
@@ -112,7 +147,7 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                     f"Found startup script(s): {', '.join(s.name for s in boot_scripts)}",
                 )
             )
-        else:
+        elif boot_dir is not None:
             checks.append(
                 CheckResult(
                     "Termux:Boot Auto-Start",
@@ -203,7 +238,14 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
             if cfg.gateway.enabled:
                 gw_port = int(cfg.gateway.port or 0)
                 if gw_port <= 0:
-                    gw_live = True
+                    checks.append(
+                        CheckResult(
+                            "Master Network Guard",
+                            "warn",
+                            f"Enabled in config (mode={cfg.gateway.mode}, ephemeral port=0) — cannot verify listening port offline",
+                            "Set an explicit fixed port (e.g. 8888) in config/cluster.json so doctor and firewall rules can verify it.",
+                        )
+                    )
                 else:
                     lmap = _read_listening_tcp_map()
                     if lmap is not None and gw_port in lmap:
@@ -219,23 +261,23 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                                 gw_live = False
                         if not gw_live:
                             gw_live = is_local_port_open(gw_port)
-                if gw_live:
-                    checks.append(
-                        CheckResult(
-                            "Master Network Guard",
-                            "ok",
-                            f"Enabled & listening (mode={cfg.gateway.mode}, port={gw_port}, SSRF guard={'ON' if cfg.gateway.block_private_ips else 'OFF'})",
+                    if gw_live:
+                        checks.append(
+                            CheckResult(
+                                "Master Network Guard",
+                                "ok",
+                                f"Enabled & listening (mode={cfg.gateway.mode}, port={gw_port}, SSRF guard={'ON' if cfg.gateway.block_private_ips else 'OFF'})",
+                            )
                         )
-                    )
-                else:
-                    checks.append(
-                        CheckResult(
-                            "Master Network Guard",
-                            "warn",
-                            f"Enabled in config (mode={cfg.gateway.mode}, port={gw_port}) but proxy is NOT currently listening on port {gw_port}",
-                            "Start Master Dashboard (`pc dashboard`) or standalone proxy (`pc gateway`) so worker jobs can reach allowlisted sites.",
+                    else:
+                        checks.append(
+                            CheckResult(
+                                "Master Network Guard",
+                                "warn",
+                                f"Enabled in config (mode={cfg.gateway.mode}, port={gw_port}) but proxy is NOT currently listening on port {gw_port}",
+                                "Start Master Dashboard (`pc dashboard`) or standalone proxy (`pc gateway`) so worker jobs can reach allowlisted sites.",
+                            )
                         )
-                    )
             else:
                 checks.append(
                     CheckResult(

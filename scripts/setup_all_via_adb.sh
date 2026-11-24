@@ -18,7 +18,10 @@ if ! command -v adb >/dev/null 2>&1; then
   exit 1
 fi
 
-mapfile -t SERIALS < <(adb devices | awk 'NR>1 && $2=="device" {print $1}')
+SERIALS=()
+while IFS= read -r _ser; do
+  [[ -n "${_ser}" ]] && SERIALS+=("${_ser}")
+done < <(adb devices | awk 'NR>1 && $2=="device" {print $1}')
 if [[ "${#SERIALS[@]}" -eq 0 ]]; then
   echo "No authorized Android devices found via ADB." >&2
   echo "Enable Developer Options -> USB Debugging on each phone, connect USB, and accept the RSA prompt." >&2
@@ -38,10 +41,10 @@ for SER in "${SERIALS[@]}"; do
   MODEL="$(adb -s "${SER}" shell getprop ro.product.model | tr -d '\r\n\t')"
   DEVICE="$(adb -s "${SER}" shell getprop ro.product.device | tr -d '\r\n\t')"
   VER="$(adb -s "${SER}" shell getprop ro.build.version.release | tr -d '\r\n\t')"
-  MEM_KB="$(adb -s "${SER}" shell "awk '/MemTotal/{print \$2}' /proc/meminfo" | tr -d '\r\n\t ' || true)"
+  MEM_KB="$(adb -s "${SER}" shell cat /proc/meminfo 2>/dev/null | awk '/MemTotal/{print $2; exit}' | tr -d '\r\n\t ' || true)"
   [[ "${MEM_KB}" =~ ^[0-9]+$ ]] || MEM_KB=0
   MEM_MB="$(( MEM_KB / 1024 ))"
-  WIFI_IP="$(adb -s "${SER}" shell "ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print \$2}' | cut -d/ -f1 | head -n1" | tr -d '\r\n\t ' || true)"
+  WIFI_IP="$(adb -s "${SER}" shell ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 | tr -d '\r\n\t ' || true)"
 
   echo ">>> Device ${SER}: ${MODEL} (${DEVICE}) | Android ${VER} | ${MEM_MB} MB RAM | Wi-Fi IP: ${WIFI_IP:-NOT CONNECTED}"
 
@@ -50,7 +53,7 @@ for SER in "${SERIALS[@]}"; do
     shopt -s nullglob
     for APK in "${APKS_DIR}"/*.apk; do
       echo "    Installing $(basename "${APK}")..."
-      adb -s "${SER}" install -r -- "${APK}" >/dev/null || echo "    Warning: Failed to install ${APK}"
+      adb -s "${SER}" install -r "${APK}" >/dev/null || echo "    Warning: Failed to install ${APK}"
     done
     shopt -u nullglob
   fi
@@ -75,12 +78,18 @@ for SER in "${SERIALS[@]}"; do
   MAJOR="${VER%%.*}"
   if [[ "${MAJOR}" =~ ^[0-9]+$ ]]; then
     if (( MAJOR == 12 )); then
-      adb -s "${SER}" shell "/system/bin/device_config set_sync_disabled_for_tests persistent" >/dev/null
-      adb -s "${SER}" shell "/system/bin/device_config put activity_manager max_phantom_processes 2147483647" >/dev/null
-      echo "    [OK] Applied Android 12 Phantom Process Killer fix (reboot phone to finalize)."
+      if adb -s "${SER}" shell "/system/bin/device_config set_sync_disabled_for_tests persistent" >/dev/null 2>&1 \
+        && adb -s "${SER}" shell "/system/bin/device_config put activity_manager max_phantom_processes 2147483647" >/dev/null 2>&1; then
+        echo "    [OK] Applied Android 12 Phantom Process Killer fix (reboot phone to finalize)."
+      else
+        echo "    [!] Warning: Could not apply Android 12 Phantom Process Killer fix (on MIUI, enable 'USB debugging (Security settings)')."
+      fi
     elif (( MAJOR == 13 )); then
-      adb -s "${SER}" shell "settings put global settings_enable_monitor_phantom_procs false" >/dev/null
-      echo "    [OK] Applied Android 13 Phantom Process Killer fix (reboot phone to finalize)."
+      if adb -s "${SER}" shell "settings put global settings_enable_monitor_phantom_procs false" >/dev/null 2>&1; then
+        echo "    [OK] Applied Android 13 Phantom Process Killer fix (reboot phone to finalize)."
+      else
+        echo "    [!] Warning: Could not apply Android 13 Phantom Process Killer fix (on MIUI, enable 'USB debugging (Security settings)')."
+      fi
     elif (( MAJOR >= 14 )); then
       echo "    [!] Android ${VER}: Enable Developer Options -> 'Disable child process restrictions', then reboot."
     else
