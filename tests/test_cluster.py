@@ -7394,8 +7394,17 @@ class TestPass12HardeningAndBugHunt(unittest.TestCase):
             self.assertEqual(p_adb_help.returncode, 0)
             self.assertFalse((Path(tmp) / "--help").exists())
 
+        import ast
         ci_yml = (repo / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertIn('"3.9"', ci_yml)
+        self.assertIn("fail-fast: false", ci_yml)
+        py_files = [repo / "phonecluster_cli.py"] + sorted((repo / "phonecluster").glob("*.py")) + sorted((repo / "tests").glob("*.py"))
+        for py_file in py_files:
+            src = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(src, filename=str(py_file), feature_version=(3, 9))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("isinstance", "issubclass"):
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.BinOp) and isinstance(node.args[1].op, ast.BitOr):
+                        self.fail(f"Python 3.10+ runtime union in {py_file.name}:{node.lineno}")
 
 
 if __name__ == "__main__":
