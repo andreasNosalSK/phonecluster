@@ -98,7 +98,11 @@ def run_setup_wizard(
         print(f"  (Invalid SSH username '{raw_user}', leaving blank)")
         ssh_user = ""
     ssh_port_str = _prompt("4. Default SSH port (8022 for Termux, 22 for Debian)", str(default_ssh_port), input_fn=input_fn)
-    ssh_port = int(ssh_port_str) if ssh_port_str.isdigit() and 1 <= int(ssh_port_str) <= 65535 else DEFAULT_SSH_PORT
+    ssh_port = (
+        int(ssh_port_str)
+        if ssh_port_str.isascii() and ssh_port_str.isdigit() and 1 <= int(ssh_port_str) <= 65535
+        else DEFAULT_SSH_PORT
+    )
 
     nodes: list[NodeConfig] = [
         NodeConfig(

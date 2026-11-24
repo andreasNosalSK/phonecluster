@@ -782,7 +782,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
                     f"(fingerprint: {m['fingerprint']}, {m['expires_in_sec']}s left)"
                 )
             sel = input("Select Master [1]: ").strip() or "1"
-            idx = max(0, min(len(found) - 1, int(sel) - 1)) if sel.isdigit() else 0
+            idx = max(0, min(len(found) - 1, int(sel) - 1)) if (sel.isascii() and sel.isdigit()) else 0
             chosen = found[idx]
         master_host = chosen["host"]
         pair_port = int(chosen["pair_port"])
@@ -842,18 +842,27 @@ def _cmd_join(args: argparse.Namespace) -> int:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"worker-{res['node_id']}.log"
         pid_file = log_dir / f"worker-{res['node_id']}.pid"
-        # Stop any previously running local worker PID (e.g. when re-pairing) so port 8765 is free
+        # Stop any previously running local worker PID (verify /proc cmdline to prevent killing unrelated PIDs after reboot!)
+        proc_fs_available = Path("/proc").is_dir()
         for old_pid_file in log_dir.glob("worker-*.pid"):
             try:
                 old_pid = int(old_pid_file.read_text(encoding="utf-8").strip())
                 if old_pid > 1 and old_pid != os.getpid():
-                    os.kill(old_pid, signal.SIGTERM)
-                    for _ in range(15):
-                        time.sleep(0.1)
+                    is_our_worker = True
+                    if proc_fs_available:
                         try:
-                            os.kill(old_pid, 0)
+                            cmdline = Path(f"/proc/{old_pid}/cmdline").read_bytes().decode("utf-8", errors="ignore")
+                            is_our_worker = "phonecluster" in cmdline
                         except OSError:
-                            break
+                            is_our_worker = False
+                    if is_our_worker:
+                        os.kill(old_pid, signal.SIGTERM)
+                        for _ in range(15):
+                            time.sleep(0.1)
+                            try:
+                                os.kill(old_pid, 0)
+                            except OSError:
+                                break
             except (OSError, ValueError):
                 pass
             if old_pid_file != pid_file:

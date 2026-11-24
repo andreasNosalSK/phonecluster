@@ -8,6 +8,7 @@ import hmac
 import ipaddress
 import json
 import math
+import os
 import re
 import secrets
 import socket
@@ -23,6 +24,115 @@ _NONCE_RE = re.compile(r"^[A-Fa-f0-9]{16,64}$")
 _SIG_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
 _ASCII_UINT_RE = re.compile(r"^[0-9]{1,10}$")
 _ASCII_TS_RE = re.compile(r"^[0-9]{1,12}$")
+_ASCII_PORT_RE = re.compile(r"^[0-9]{1,5}$")
+_SINGLE_LABEL_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_LOCAL_HOST_SUFFIXES = (
+    ".local",
+    ".lan",
+    ".home",
+    ".home.arpa",
+    ".internal",
+    ".cluster",
+    ".localhost",
+    ".ts.net",
+)
+
+
+def is_allowed_http_host(
+    headers: Mapping[str, str],
+    extra_allowed_hosts: set[str] | frozenset[str] | None = None,
+) -> bool:
+    """Validate HTTP `Host:` header(s) to defeat DNS rebinding & duplicate-Host smuggling.
+
+    Allows missing `Host` (HTTP/1.0), any IPv4/IPv6 literal, `localhost`, single-label
+    LAN hostnames, standard local/Tailscale suffixes (`.local`, `.lan`, `.home`,
+    `.home.arpa`, `.internal`, `.cluster`, `.localhost`, `.ts.net`), this host's own
+    hostname, configured cluster node hosts, and `PHONECLUSTER_ALLOWED_HOSTS`.
+    Rejects duplicate `Host` headers, malformed host/port syntax, and arbitrary public
+    multi-label internet domains (e.g. `evil.com`, `192.168.1.201.nip.io`).
+    """
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        host_vals = [str(v).strip() for v in (get_all("Host") or [])]
+    else:
+        host_vals = [str(v).strip() for k, v in headers.items() if k.lower() == "host"]
+
+    if not host_vals:
+        return True
+    if len(host_vals) > 1:
+        return False
+
+    raw = host_vals[0]
+    if not raw or any(c.isspace() or ord(c) < 32 or ord(c) == 127 or c in "@/\\?#;'\"" for c in raw):
+        return False
+
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end == -1:
+            return False
+        host_part = raw[1:end].strip()
+        rest = raw[end + 1 :]
+        if rest:
+            if not rest.startswith(":") or not _ASCII_PORT_RE.fullmatch(rest[1:]):
+                return False
+            p_num = int(rest[1:])
+            if not (1 <= p_num <= 65535):
+                return False
+        try:
+            ipaddress.IPv6Address(host_part)
+            return True
+        except ValueError:
+            return False
+    elif raw.count(":") > 1:
+        # Unbracketed IPv6 in Host header is invalid per RFC 9110 §7.2
+        return False
+    elif ":" in raw:
+        host_part, p_str = raw.rsplit(":", 1)
+        if not host_part or not _ASCII_PORT_RE.fullmatch(p_str):
+            return False
+        p_num = int(p_str)
+        if not (1 <= p_num <= 65535):
+            return False
+    else:
+        host_part = raw
+
+    h = host_part.strip().lower().rstrip(".")
+    if not h:
+        return False
+
+    # 1. Any IPv4 literal (browsers never perform DNS rebinding against IP literals)
+    try:
+        ipaddress.IPv4Address(h)
+        return True
+    except ValueError:
+        pass
+
+    # 2. Localhost, single-label LAN hostnames (e.g. `raspberrypi`), or private/mDNS/Tailscale suffixes
+    if h == "localhost" or h.endswith(_LOCAL_HOST_SUFFIXES):
+        return True
+    if "." not in h and _SINGLE_LABEL_HOST_RE.fullmatch(h):
+        return True
+
+    # 3. Local machine hostname, configured cluster node hostnames, or explicit env allowlist
+    allowed_set: set[str] = set()
+    try:
+        local_hn = socket.gethostname().strip().lower().rstrip(".")
+        if local_hn:
+            allowed_set.add(local_hn)
+    except OSError:
+        pass
+    if extra_allowed_hosts:
+        for item in extra_allowed_hosts:
+            clean_item = str(item or "").strip().strip("[]").lower().rstrip(".")
+            if clean_item:
+                allowed_set.add(clean_item)
+    env_hosts = os.environ.get("PHONECLUSTER_ALLOWED_HOSTS", "")
+    if env_hosts:
+        for item in env_hosts.split(","):
+            clean_item = item.strip().strip("[]").lower().rstrip(".")
+            if clean_item:
+                allowed_set.add(clean_item)
+    return h in allowed_set
 
 
 def parse_strict_content_length(
@@ -84,6 +194,53 @@ def safe_json_dumps(obj: Any) -> str:
         return json.dumps(obj, allow_nan=False)
     except ValueError:
         return json.dumps(_sanitize_json_value(obj), allow_nan=False)
+
+
+def is_webhook_target_unsafe(url: str) -> bool:
+    """Block direct webhook SSRF to non-HTTP(S), link-local/cloud metadata (169.254/16, fe80::/10), unspecified, or multicast IPs.
+
+    Legitimate local LAN/loopback Home Assistant / Node-RED webhooks (192.168.x.x, 127.0.0.1)
+    and public services (e.g. ntfy.sh) remain allowed.
+    """
+    clean = str(url or "").strip()
+    if not clean or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in clean):
+        return True
+    try:
+        parsed = urllib.parse.urlsplit(clean)
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError:
+        return True
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return True
+    host = parsed.hostname.strip().strip("[]").lower()
+    if not host or "%" in host:
+        return True
+    # Check IP literal directly first (works even offline / without DNS)
+    try:
+        lit = ipaddress.ip_address(host)
+        if isinstance(lit, ipaddress.IPv6Address) and lit.ipv4_mapped is not None:
+            lit = lit.ipv4_mapped
+        return bool(lit.is_link_local or lit.is_unspecified or lit.is_multicast)
+    except ValueError:
+        pass
+    # Best-effort DNS check for hostnames resolving to link-local / cloud metadata / unspecified / multicast
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    for _fam, _st, _pr, _cn, sa in infos:
+        ip_raw = str(sa[0])
+        if "%" in ip_raw:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip_raw)
+        except ValueError:
+            return True
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+        if addr.is_link_local or addr.is_unspecified or addr.is_multicast:
+            return True
+    return False
 
 
 def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:

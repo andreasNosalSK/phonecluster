@@ -161,15 +161,25 @@ mkdir -p "${LOG_DIR}"
 
 if [[ -f "${PID_FILE}" ]]; then
   OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
-  if [[ -n "${OLD_PID}" ]] && kill -0 "${OLD_PID}" 2>/dev/null; then
-    kill "${OLD_PID}" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "${OLD_PID}" 2>/dev/null || break
-      sleep 0.3
-    done
-    if kill -0 "${OLD_PID}" 2>/dev/null; then
-      kill -9 "${OLD_PID}" 2>/dev/null || true
-      sleep 0.2
+  if [[ "${OLD_PID}" =~ ^[0-9]+$ ]] && (( OLD_PID > 1 )) && kill -0 "${OLD_PID}" 2>/dev/null; then
+    SHOULD_KILL=1
+    if [[ -d /proc ]]; then
+      if [[ -r "/proc/${OLD_PID}/cmdline" ]]; then
+        tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null | grep -q "phonecluster" || SHOULD_KILL=0
+      else
+        SHOULD_KILL=0
+      fi
+    fi
+    if [[ "${SHOULD_KILL}" -eq 1 ]]; then
+      kill "${OLD_PID}" 2>/dev/null || true
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "${OLD_PID}" 2>/dev/null || break
+        sleep 0.3
+      done
+      if kill -0 "${OLD_PID}" 2>/dev/null; then
+        kill -9 "${OLD_PID}" 2>/dev/null || true
+        sleep 0.2
+      fi
     fi
   fi
 fi

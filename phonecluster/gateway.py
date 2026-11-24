@@ -46,6 +46,7 @@ LOG = logging.getLogger("phonecluster.gateway")
 
 MAX_HEADER_BYTES = 16 * 1024
 MAX_HTTP_BODY_BYTES = 32 * 1024 * 1024
+MAX_HTTP_CHUNKS = 65536
 MAX_TRAILER_BYTES = 16 * 1024
 MAX_TRAILER_LINES = 64
 RELAY_CHUNK_BYTES = 16 * 1024
@@ -435,6 +436,7 @@ def _send_proxy_error(conn: socket.socket, code: int, title: str, detail: str, e
         f"{extra_headers}\r\n"
     ).encode("utf-8")
     try:
+        conn.settimeout(5.0)
         conn.sendall(head + body)
     except OSError:
         pass
@@ -531,6 +533,7 @@ def _relay_chunked_request_body(
     """Stream an HTTP/1.1 `Transfer-Encoding: chunked` request body safely to upstream."""
     buf = bytearray(initial)
     total_body = 0
+    chunk_count = 0
     bytes_forwarded = 0
     saw_final_chunk = False
     conn.settimeout(idle_timeout)
@@ -553,6 +556,9 @@ def _relay_chunked_request_body(
 
     while not stop_event.is_set():
         _check_abort()
+        chunk_count += 1
+        if chunk_count > MAX_HTTP_CHUNKS:
+            raise ValueError("chunk count exceeds limit")
         if not _fill_until(b"\r\n"):
             raise OSError("truncated chunked request body")
         line_end = buf.find(b"\r\n")
@@ -1146,7 +1152,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                 upstream.sendall(req_head)
                 bytes_out += len(req_head)
 
-                if "100-continue" in headers_lower.get("expect", "").lower():
+                if version == "HTTP/1.1" and "100-continue" in headers_lower.get("expect", "").lower():
                     conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
 
                 if is_chunked:

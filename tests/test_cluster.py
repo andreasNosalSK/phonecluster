@@ -5533,6 +5533,255 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
             proc = subprocess.run(bad_cmd, capture_output=True, text=True, check=False)
             self.assertEqual(proc.returncode, 2, f"Expected exit 2 for {bad_cmd}, got {proc.returncode}: {proc.stderr}")
 
+    def test_pass10_dns_rebinding_host_guard_webhook_ssrf_and_worker_type_validation(self) -> None:
+        """Verify DNS-rebinding & duplicate-Host 403 guards across Dashboard/Worker/Pairing, webhook metadata SSRF block, batch caps, and strict worker /exec types."""
+        from unittest import mock
+        from phonecluster.auth import is_allowed_http_host, is_webhook_target_unsafe
+        from phonecluster.pairing import PairingManager, StandalonePairingServer
+
+        # 1. Unit checks for is_allowed_http_host
+        for good_h in (
+            "127.0.0.1:8080",
+            "192.168.1.201:8080",
+            "[::1]:8080",
+            "localhost:8080",
+            "raspberrypi",
+            "raspberrypi.local:8080",
+            "master.cluster",
+            "pi-node.tail1234.ts.net:8080",
+        ):
+            self.assertTrue(is_allowed_http_host({"Host": good_h}), f"Should allow Host: {good_h}")
+        self.assertTrue(is_allowed_http_host({"Host": "mycluster.example.org:8080"}, extra_allowed_hosts={"mycluster.example.org"}))
+        with mock.patch.dict(os.environ, {"PHONECLUSTER_ALLOWED_HOSTS": "custom.domain.org"}):
+            self.assertTrue(is_allowed_http_host({"Host": "custom.domain.org:8080"}))
+        for bad_h in (
+            "evil.com:8080",
+            "192.168.1.201.nip.io:8080",
+            "rebind.attacker.net",
+            "localhost:99999",
+            "localhost:abc",
+            "::1",
+            "[::1",
+        ):
+            self.assertFalse(is_allowed_http_host({"Host": bad_h}), f"Should reject Host: {bad_h}")
+
+        # 2. Direct webhook SSRF target checks
+        for unsafe_u in (
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fe80::1]/hook",
+            "http://[::ffff:169.254.169.254]/hook",
+            "http://0.0.0.0:8080/api/exec",
+            "http://224.0.0.1/mcast",
+            "file:///etc/passwd",
+        ):
+            self.assertTrue(is_webhook_target_unsafe(unsafe_u), f"Should block webhook target: {unsafe_u}")
+        for safe_u in (
+            "http://192.168.1.202:8123/api/webhook/battery",
+            "http://127.0.0.1:1880/hook",
+        ):
+            self.assertFalse(is_webhook_target_unsafe(safe_u), f"Should allow local webhook target: {safe_u}")
+
+        # 3. Live servers: Dashboard, Worker, and StandalonePairing all reject DNS-rebinding Host headers with 403
+        tok = "pass10-hardening-tok-123456"
+        st = WorkerState(
+            node_id="node0",
+            role="master",
+            auth_token=tok,
+            safety=SafetyConfig(max_temp_c=95.0, resume_temp_c=90.0, min_free_ram_mb=0),
+            max_concurrency=2,
+        )
+        wsrv, _wg, w_ev = create_worker_server("127.0.0.1", 0, st)
+        w_port = wsrv.server_address[1]
+        wt = threading.Thread(target=wsrv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        wt.start()
+
+        cfg = ClusterConfig(
+            cluster_name="p10-sec",
+            auth_token=tok,
+            nodes=[NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=w_port)],
+        )
+        dash = DashboardHTTPServer(("127.0.0.1", 0), MasterController(cfg), enable_pairing_beacon=False, pairing_fail_delay_sec=0.0)
+        d_port = dash.server_address[1]
+        dt = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        dt.start()
+
+        pm = PairingManager(config=cfg, enable_beacon=False, fail_delay_sec=0.0)
+        pm.open_session(ttl_sec=60, max_devices=1)
+        psrv = StandalonePairingServer(("127.0.0.1", 0), pm)
+        p_port = psrv.server_address[1]
+        pt = threading.Thread(target=psrv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        pt.start()
+
+        def _raw_http(port: int, raw: bytes) -> bytes:
+            with socket.create_connection(("127.0.0.1", port), timeout=4.0) as s:
+                s.sendall(raw)
+                s.settimeout(3.0)
+                return s.recv(4096)
+
+        try:
+            # DNS-rebinding Host rejected (403) on Dashboard GET, duplicate Host, Worker GET, and Pairing GET
+            self.assertIn(b"403 ", _raw_http(d_port, b"GET /api/live HTTP/1.1\r\nHost: evil.com:8080\r\nConnection: close\r\n\r\n"))
+            self.assertIn(b"403 ", _raw_http(d_port, f"GET /api/live HTTP/1.1\r\nHost: 127.0.0.1:{d_port}\r\nHost: evil.com\r\nConnection: close\r\n\r\n".encode("ascii")))
+            self.assertIn(b"200 ", _raw_http(d_port, f"HEAD / HTTP/1.1\r\nHost: 127.0.0.1:{d_port}\r\nConnection: close\r\n\r\n".encode("ascii")))
+            self.assertIn(b"403 ", _raw_http(w_port, f"GET /health HTTP/1.1\r\nHost: evil.com:{w_port}\r\nAuthorization: Bearer {tok}\r\nConnection: close\r\n\r\n".encode("ascii")))
+            self.assertIn(b"403 ", _raw_http(p_port, f"GET /api/pair/hello HTTP/1.1\r\nHost: evil.com:{p_port}\r\nConnection: close\r\n\r\n".encode("ascii")))
+
+            # Dashboard blocks cloud metadata SSRF on /api/settings/test-webhook & enforces batch/pipeline caps
+            def _post_code(port: int, path: str, body: dict[str, Any]) -> int:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        return resp.status
+                except urllib.error.HTTPError as exc:
+                    exc.close()
+                    return exc.code
+
+            self.assertEqual(_post_code(d_port, "/api/settings/test-webhook", {"battery_webhook_url": "http://169.254.169.254/latest/meta-data/"}), 400)
+            self.assertEqual(_post_code(d_port, "/api/settings/test-webhook", {"battery_webhook_url": "http://0.0.0.0:8080/"}), 400)
+            self.assertEqual(_post_code(d_port, "/api/pipeline", {"steps": [{"command": "echo x"}] * 101}), 400)
+            self.assertEqual(_post_code(d_port, "/api/map", {"mode": "commands", "commands": ["echo x"] * 2001}), 400)
+
+            # Worker /exec strictly rejects non-string command/script_content and NUL bytes with 400
+            for bad_exec in (
+                {"command": ["ls"]},
+                {"script_content": 12345},
+                {"command": "echo\x00hi"},
+                {"script_content": "print(1)", "interpreter": "python3\x00"},
+                {"script_content": "print(1)", "args": ["ok", "bad\x00arg"]},
+            ):
+                self.assertEqual(_post_code(w_port, "/exec", bad_exec), 400, f"Expected 400 for {bad_exec}")
+        finally:
+            pm.close_session()
+            psrv.shutdown()
+            psrv.server_close()
+            dash.shutdown()
+            dash.server_close()
+            w_ev.set()
+            wsrv.shutdown()
+            wsrv.server_close()
+            pt.join(timeout=2.0)
+            dt.join(timeout=2.0)
+            wt.join(timeout=2.0)
+
+    def test_pass10_unicode_isdigit_pid_reuse_guard_authorized_keys_mode_and_http10_expect(self) -> None:
+        """Verify Unicode superscript isdigit safety, stale PID-file reuse guard, 0600 authorized_keys creation, and HTTP/1.0 Expect: 100-continue compliance."""
+        import base64
+        import socketserver
+        import stat
+        import subprocess
+        from unittest import mock
+        from phonecluster.config import DEFAULT_SSH_PORT
+        from phonecluster.pairing import _install_ssh_pubkey
+        from phonecluster.routing import select_snapshots_for_target
+        from phonecluster.wizard import run_setup_wizard
+
+        # 1. Unicode superscript '²' does not crash tier routing or setup wizard
+        matched, reason = select_snapshots_for_target([], target="tier:\u00b2")
+        self.assertEqual(matched, [])
+        self.assertIn("Invalid tier target", reason)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wiz_cfg = Path(tmp) / "wiz_u.json"
+            answers = iter(["u-cluster", "127.0.0.1", "", "\u00b2", "n", "", "40", ""])
+            self.assertEqual(run_setup_wizard(wiz_cfg, input_fn=lambda _p: next(answers)), 0)
+            self.assertEqual(load_config(wiz_cfg).nodes[0].ssh_port, DEFAULT_SSH_PORT)
+
+            # 2. _install_ssh_pubkey creates authorized_keys with atomic 0600 mode
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            valid_blob = base64.b64encode(b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00 " + b"B" * 32).decode("ascii")
+            with mock.patch.object(Path, "home", return_value=fake_home):
+                self.assertTrue(_install_ssh_pubkey(f"ssh-ed25519 {valid_blob} test@master"))
+            ak_path = fake_home / ".ssh" / "authorized_keys"
+            self.assertTrue(ak_path.exists())
+            self.assertEqual(stat.S_IMODE(os.stat(ak_path).st_mode) & 0o077, 0)
+
+            # 3. 05_workload_helpers.sh llama-rpc-stop NEVER kills an unrelated process whose PID was reused in a stale .pid file
+            repo = Path(__file__).resolve().parent.parent
+            innocent = subprocess.Popen(["sleep", "30"])
+            try:
+                fake_tmp = Path(tmp) / "tmp_pid"
+                fake_tmp.mkdir()
+                stale_pid_file = fake_tmp / "llama-rpc-50052.pid"
+                stale_pid_file.write_text(f"{innocent.pid}\n", encoding="utf-8")
+                env_run = os.environ.copy()
+                env_run["HOME"] = str(fake_home)
+                env_run["TMPDIR"] = str(fake_tmp)
+                subprocess.run(
+                    ["bash", str(repo / "scripts" / "05_workload_helpers.sh"), "llama-rpc-stop"],
+                    env=env_run,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIsNone(innocent.poll(), "Stale PID-file cleanup MUST NOT kill an unrelated process!")
+                self.assertFalse(stale_pid_file.exists())
+            finally:
+                innocent.terminate()
+                innocent.wait(timeout=3.0)
+
+        # 4. Proxy does NOT send HTTP/1.1 100 Continue to an HTTP/1.0 client
+        class _OkUp(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.settimeout(2.0)
+                try:
+                    self.request.recv(4096)
+                    self.request.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                except OSError:
+                    pass
+
+        class _ReuseUp(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        up = _ReuseUp(("127.0.0.1", 0), _OkUp)
+        up_port = up.server_address[1]
+        threading.Thread(target=up.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        w_tok = "p10-http10-worker-tok-123"
+        gw_cfg = ClusterConfig(
+            cluster_name="p10-http10",
+            auth_token="p10-http10-master-tok-123",
+            nodes=[
+                NodeConfig(id="node0", host="127.0.0.1", role="master", worker_port=8765),
+                NodeConfig(id="node1", host="127.0.0.1", role="worker", worker_port=8766, auth_token=w_tok),
+            ],
+            gateway=GatewayConfig(
+                enabled=True,
+                bind_host="127.0.0.1",
+                port=0,
+                mode="allowlist",
+                allowed_domains=["127.0.0.1"],
+                allowed_ports=[up_port],
+                block_private_ips=False,
+            ),
+        )
+        gw = GatewayManager(gw_cfg)
+        ok, msg = gw.start()
+        self.assertTrue(ok, msg)
+        auth_b64 = base64.b64encode(f"node1:{derive_proxy_password(w_tok, 'node1')}".encode("utf-8")).decode("ascii")
+        try:
+            with socket.create_connection(("127.0.0.1", gw.bound_port), timeout=4.0) as s:
+                s.sendall(
+                    f"POST http://127.0.0.1:{up_port}/h10 HTTP/1.0\r\n"
+                    f"Host: 127.0.0.1:{up_port}\r\n"
+                    f"Proxy-Authorization: Basic {auth_b64}\r\n"
+                    f"Expect: 100-continue\r\n"
+                    f"Content-Length: 2\r\n\r\nhi".encode("ascii")
+                )
+                s.settimeout(3.0)
+                resp_b = s.recv(4096)
+                self.assertNotIn(b"100 Continue", resp_b)
+                self.assertIn(b"200 OK", resp_b)
+        finally:
+            gw.stop()
+            up.shutdown()
+            up.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,8 @@ from .auth import (
     ReplayCache,
     build_webhook_opener,
     extract_auth_scheme,
+    is_allowed_http_host,
+    is_webhook_target_unsafe,
     parse_hmac_auth_header,
     parse_strict_content_length,
     safe_json_dumps,
@@ -561,6 +563,9 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> No
     ):
         LOG.warning("Skipped invalid safety webhook URL (must be http:// or https:// with hostname)")
         return
+    if is_webhook_target_unsafe(clean_url):
+        LOG.warning("Blocked safety webhook URL %s by SSRF guard (link-local/metadata/unspecified)", clean_url)
+        return
     try:
         body = safe_json_dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -660,10 +665,32 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
     job_id = str(payload.get("job_id") or uuid.uuid4().hex[:12]).strip() or uuid.uuid4().hex[:12]
     command = payload.get("command")
     script_content = payload.get("script_content")
+    if command is not None and not isinstance(command, str):
+        return HTTPStatus.BAD_REQUEST, {"error": "'command' must be a string"}
+    if script_content is not None and not isinstance(script_content, str):
+        return HTTPStatus.BAD_REQUEST, {"error": "'script_content' must be a string"}
     if not command and not script_content:
         return HTTPStatus.BAD_REQUEST, {
             "error": "Provide either 'command' or 'script_content'."
         }
+    if command and "\x00" in command:
+        return HTTPStatus.BAD_REQUEST, {"error": "'command' must not contain NUL bytes"}
+    raw_interp = payload.get("interpreter")
+    if raw_interp is not None and (not isinstance(raw_interp, str) or "\x00" in raw_interp):
+        return HTTPStatus.BAD_REQUEST, {"error": "'interpreter' must be a string without NUL bytes"}
+    raw_sname = payload.get("script_name")
+    if raw_sname is not None and not isinstance(raw_sname, str):
+        return HTTPStatus.BAD_REQUEST, {"error": "'script_name' must be a string"}
+    raw_args_chk = payload.get("args")
+    if raw_args_chk is not None:
+        if isinstance(raw_args_chk, str):
+            if "\x00" in raw_args_chk:
+                return HTTPStatus.BAD_REQUEST, {"error": "'args' must not contain NUL bytes"}
+        elif isinstance(raw_args_chk, list):
+            if any("\x00" in str(a) for a in raw_args_chk):
+                return HTTPStatus.BAD_REQUEST, {"error": "'args' entries must not contain NUL bytes"}
+        else:
+            return HTTPStatus.BAD_REQUEST, {"error": "'args' must be a list or string"}
 
     try:
         timeout_sec = float(payload.get("timeout_sec", 600))
@@ -693,7 +720,7 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
         return HTTPStatus.BAD_REQUEST, {"error": f"workdir does not exist: {cwd}"}
 
     preview = (
-        f"script:{payload.get('script_name', 'inline')}"
+        f"script:{str(payload.get('script_name') or 'inline')[:100]}"
         if script_content
         else str(command).strip()[:120]
     )
@@ -970,7 +997,13 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         return raw
 
     def _authenticate(self, method: str, path: str, read_body: bool) -> tuple[bool, bytes]:
-        # Workers are strictly machine-to-machine (Master -> Worker); reject browser CSRF/DNS-rebinding calls.
+        # Workers are strictly machine-to-machine (Master -> Worker); reject browser CSRF & DNS-rebinding calls.
+        if not is_allowed_http_host(self.headers):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "forbidden: invalid or untrusted Host header (DNS rebinding guard)"},
+            )
+            return False, b""
         origin_hdr = self.headers.get("Origin", "").strip()
         sec_fetch_site = self.headers.get("Sec-Fetch-Site", "").strip().lower()
         if origin_hdr or sec_fetch_site == "cross-site":

@@ -66,7 +66,11 @@ case "${CMD}" in
     PID_FILE="${LOG_DIR}/llama-rpc-${PORT}.pid"
     if [[ -f "${PID_FILE}" ]]; then
       OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
-      [[ -n "${OLD_PID}" ]] && kill "${OLD_PID}" 2>/dev/null || true
+      if [[ "${OLD_PID}" =~ ^[0-9]+$ ]] && (( OLD_PID > 1 )) && kill -0 "${OLD_PID}" 2>/dev/null; then
+        if [[ ! -d /proc ]] || ([[ -r "/proc/${OLD_PID}/cmdline" ]] && tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null | grep -q "rpc-server"); then
+          kill "${OLD_PID}" 2>/dev/null || true
+        fi
+      fi
     fi
     pkill -x rpc-server 2>/dev/null || true
     sleep 0.2
@@ -87,8 +91,10 @@ case "${CMD}" in
     for PF in "${HOME}/phonecluster/logs"/llama-rpc-*.pid "${TMPDIR:-/tmp}"/llama-rpc-*.pid; do
       if [[ -f "${PF}" ]]; then
         OLD_PID="$(cat "${PF}" 2>/dev/null || true)"
-        if [[ -n "${OLD_PID}" ]] && kill "${OLD_PID}" 2>/dev/null; then
-          STOPPED=1
+        if [[ "${OLD_PID}" =~ ^[0-9]+$ ]] && (( OLD_PID > 1 )) && kill -0 "${OLD_PID}" 2>/dev/null; then
+          if [[ ! -d /proc ]] || ([[ -r "/proc/${OLD_PID}/cmdline" ]] && tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null | grep -q "rpc-server"); then
+            kill "${OLD_PID}" 2>/dev/null && STOPPED=1 || true
+          fi
         fi
         rm -f "${PF}"
       fi

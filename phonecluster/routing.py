@@ -235,7 +235,7 @@ def select_snapshots_for_target(
 
     if target.startswith("tier:"):
         raw_t = target.split(":", 1)[1].strip()
-        want_tier = int(raw_t) if raw_t.isdigit() else 0
+        want_tier = int(raw_t) if raw_t in {"1", "2", "3"} else 0
         if want_tier not in {1, 2, 3}:
             return [], f"Invalid tier target '{target}' (expected tier:1, tier:2, or tier:3)"
         matched = [

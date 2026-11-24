@@ -41,6 +41,7 @@ from typing import Any, Callable
 
 from .auth import (
     build_direct_opener,
+    is_allowed_http_host,
     parse_strict_content_length,
     read_json_object_bounded,
     safe_json_dumps,
@@ -851,6 +852,12 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self) -> None:  # noqa: N802
+        if not is_allowed_http_host(self.headers):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "forbidden: invalid or untrusted Host header (DNS rebinding guard)"},
+            )
+            return
         if self.path.split("?", 1)[0] == "/api/pair/hello":
             status, data = self.server.manager.public_hello()
             self._send_json(status, data)
@@ -858,6 +865,12 @@ class StandalonePairingHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if not is_allowed_http_host(self.headers):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "forbidden: invalid or untrusted Host header (DNS rebinding guard)"},
+            )
+            return
         if self.path.split("?", 1)[0] != "/api/pair/complete":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
@@ -997,7 +1010,8 @@ def _install_ssh_pubkey(pubkey: str) -> bool:
     existing = auth_keys.read_text(encoding="utf-8", errors="ignore") if auth_keys.exists() else ""
     if clean in existing.splitlines():
         return True
-    with auth_keys.open("a", encoding="utf-8") as fh:
+    fd = os.open(auth_keys, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
         if existing and not existing.endswith("\n"):
             fh.write("\n")
         fh.write(clean + "\n")

@@ -24,6 +24,8 @@ from typing import Any
 from .auth import (
     AuthRateLimiter,
     build_webhook_opener,
+    is_allowed_http_host,
+    is_webhook_target_unsafe,
     parse_strict_content_length,
     safe_json_dumps,
     verify_token,
@@ -809,7 +811,7 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
           <h2>Compiler PC (distcc)</h2>
           <p class="hint">Spread C/C++ builds across all healthy ARM64 cores.</p>
           <div class="row">
-            <input id="distcc-cidr" type="text" value="192.168.1.0/24" aria-label="Allowed LAN subnet" style="width:165px" />
+            <input id="distcc-cidr" type="text" value="192.168.1.0/24" aria-label="Allowed LAN subnet" style="width:165px" oninput="this.dataset.edited='user'" />
             <button class="small primary" onclick="workloadAction('distcc-start')">Start All</button>
             <button class="small danger" onclick="workloadAction('distcc-stop')">Stop All</button>
             <button class="small" onclick="copyEl('wl-distcc')">Copy Export</button>
@@ -1305,6 +1307,7 @@ function clearToken() {
   sessionStorage.removeItem('pc_token');
   localStorage.removeItem('pc_token');
   updateAuthBadge();
+  refreshAll();
   showToast('Controls locked (Read-Only Mode).', 'neutral');
 }
 
@@ -1894,6 +1897,7 @@ function applyMapTemplate(name) {
     document.getElementById('map-args').value = "10\n20\n30\n40\n50\n60";
   }
   showToast('Loaded template: ' + name, 'ok');
+  document.getElementById('map-template').value = '';
 }
 
 function loadFileInto(input, targetId) {
@@ -1924,7 +1928,13 @@ async function authPost(url, payload) {
     });
     const text = await r.text();
     try {
-      return JSON.parse(text);
+      const parsed = JSON.parse(text);
+      if (!r.ok && (!parsed || typeof parsed !== 'object' || !parsed.error)) {
+        return Object.assign(typeof parsed === 'object' && parsed ? parsed : {}, {
+          error: 'Request failed (HTTP ' + r.status + ')',
+        });
+      }
+      return parsed;
     } catch (_e) {
       return { error: 'Unexpected server response (HTTP ' + r.status + ')' };
     }
@@ -2356,7 +2366,7 @@ async function loadWorkloads() {
     }
     const d = await r.json();
     const cidrInput = document.getElementById('distcc-cidr');
-    if (cidrInput && d.lan_subnet && (!cidrInput.dataset.edited || cidrInput.value === '192.168.1.0/24')) {
+    if (cidrInput && d.lan_subnet && cidrInput.dataset.edited !== 'user') {
       cidrInput.value = d.lan_subnet;
       cidrInput.dataset.edited = 'auto';
     }
@@ -3235,7 +3245,39 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return self._require_auth()
         return True
 
+    def _check_host(self) -> bool:
+        """Defend against browser DNS rebinding & duplicate-Host smuggling."""
+        with self.server.controller.config_lock:
+            configured_hosts = {n.host for n in self.server.controller.config.nodes if n.host}
+        if not is_allowed_http_host(self.headers, extra_allowed_hosts=configured_hosts):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "forbidden: invalid or untrusted Host header (DNS rebinding guard)"},
+            )
+            return False
+        return True
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        if not self._check_host():
+            return
+        path = self.path.split("?", 1)[0]
+        if path in {"/", "/index.html"}:
+            raw = DASHBOARD_HTML.encode("utf-8")
+            self.send_response(int(HTTPStatus.OK))
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+        else:
+            self.send_response(int(HTTPStatus.NOT_FOUND))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self._check_host():
+            return
         path = self.path.split("?", 1)[0]
         if path in {"/", "/index.html"}:
             self._send(HTTPStatus.OK, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"))
@@ -3347,6 +3389,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._check_host():
+            return
         path = self.path.split("?", 1)[0]
         if path == "/api/pair/complete":
             if not self._check_same_origin():
@@ -3491,6 +3535,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if not script_content.strip() or not isinstance(args_lines, list) or not args_lines:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "provide script_content and non-empty args_lines"})
                     return
+                if len(args_lines) > 2000:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "maximum 2000 jobs per batch"})
+                    return
                 for idx, line in enumerate(args_lines):
                     try:
                         parsed_args = shlex.split(str("" if line is None else line))
@@ -3516,6 +3563,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 commands = body.get("commands") or []
                 if not isinstance(commands, list) or not commands:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "provide non-empty commands list"})
+                    return
+                if len(commands) > 2000:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "maximum 2000 jobs per batch"})
                     return
                 for idx, cmd in enumerate(commands):
                     if cmd is None:
@@ -3558,6 +3608,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"error": "provide a non-empty 'steps' array of pipeline step objects"},
+                )
+                return
+            if len(steps) > 100:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "maximum 100 steps per pipeline"},
                 )
                 return
             stop_on_error = bool(body.get("stop_on_error", True))
@@ -4147,6 +4203,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             ):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "enter a valid http:// or https:// webhook URL"})
                 return
+            if is_webhook_target_unsafe(url):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "webhook URL blocked by SSRF guard (link-local, cloud metadata, unspecified, or multicast targets are disallowed)"},
+                )
+                return
             test_payload = {
                 "event": "test",
                 "node_id": "master",
@@ -4155,12 +4217,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             }
             req = urllib.request.Request(
                 url,
-                data=json.dumps(test_payload).encode("utf-8"),
+                data=safe_json_dumps(test_payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
             try:
                 with _WEBHOOK_OPENER.open(req, timeout=5.0) as resp:
+                    resp.read(1024)
                     self._send_json(HTTPStatus.OK, {"delivered": True, "http_status": resp.status})
             except urllib.error.HTTPError as exc:
                 code = exc.code
