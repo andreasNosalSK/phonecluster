@@ -1,6 +1,6 @@
 # PhoneCluster
 
-**Turn spare Android 7+ phones into one unified, thermally safe Linux computer — with an accessible Web Control Center, Wi-Fi auto-discovery, and zero pip dependencies.**
+**Turn spare Android 7+ or Ubuntu Touch phones into one unified, thermally safe Linux & Docker computer — with an accessible Web Control Center, Wi-Fi auto-discovery, and zero pip dependencies.**
 
 [![CI](https://github.com/andreasNosalSK/phonecluster/actions/workflows/ci.yml/badge.svg)](https://github.com/andreasNosalSK/phonecluster/actions/workflows/ci.yml)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
@@ -35,7 +35,7 @@ PhoneCluster gives you **one entry point** (Web UI + interactive terminal menu +
   - **Thermal Gate with hysteresis** pauses jobs at `40 °C` and resumes at `37 °C`.
   - **24/7 Battery Guard** fires alerts or a smart-plug / Home Assistant webhook to keep unrooted Li-Po batteries in the safer `45–60%` range.
 - **Heterogeneous Multi-Tier Orchestration (One Seamless System!)**:
-  - Freely mix **Tier 1 (Unrooted Termux — compute/LLMs)** + **Tier 2 (Native Debian 13 ARM64 chroot — Mosquitto MQTT, AdGuard Home, glibc services)** + **Tier 3 (Custom Kernel + Droidspaces — Docker containers, Home Assistant)** inside the **same cluster**!
+  - Freely mix **Tier 1 (Unrooted Termux — compute/LLMs)** + **Tier 2 (Native Debian 13 ARM64 chroot — Mosquitto MQTT, AdGuard Home, glibc services)** + **Tier 3 (Ubuntu Touch + Snap Docker or Custom Kernel + Droidspaces — Docker containers, Swarm, Home Assistant)** inside the **same cluster**!
   - **Automatic Smart Routing (`--target auto` default)**: Docker commands automatically go to Tier 3, Debian/MQTT/AdGuard service commands go to Tier 2, and parallel Python/AI/compiler tasks spread across Tier 1 (spilling over cleanly to cool Tier 2/3 phones if Tier 1 gets busy or warm).
   - **Automatic Cross-Tier Service Mesh**: Every job on every tier automatically receives live `$PHONECLUSTER_MQTT_HOST`, `$PHONECLUSTER_HOMEASSISTANT_URL`, `$PHONECLUSTER_ADGUARD_URL`, `$PHONECLUSTER_LLAMA_API_URL`, `$PHONECLUSTER_POOL_*_HOSTS`, etc. — plus one-click `.cluster` DNS rewrites (`mqtt.cluster`, `ha.cluster`, `adguard.cluster`) and **Cross-Tier Pipelines** (`pc pipeline`).
 - **OS-Agnostic Upgrade Path**:
@@ -115,6 +115,8 @@ pc map --script examples/sample_job.py --args-file examples/sample_args.txt
 eval "$(pc distcc-env)"               # Compiler PC: export DISTCC_HOSTS from ready phones
 pc llama-rpc                          # Local AI: print --rpc ip1:50052,ip2:50052
 pc mpi-hostfile -o hosts.mpi          # OpenMPI: generate hostfile from ready phones
+pc docker status                      # Ubuntu Touch / Snap Docker: inspect containers & Swarm
+pc docker swarm-init                  # Optional: unite Tier 3 Docker phones into a Docker Swarm
 ```
 
 ---
@@ -125,7 +127,7 @@ pc mpi-hostfile -o hosts.mpi          # OpenMPI: generate hostfile from ready ph
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Unrooted Termux** *(Default)* | No | Parallel scripts/jobs, `distcc`, `OpenMPI`, `llama.cpp` RPC & 1.5B–3B local LLMs, Web Dashboard | No native Docker, no port 53, no kernel `ACC` (use PhoneCluster's smart-plug webhook instead). |
 | **Tier 2: Native Debian 13 ARM64 chroot** | Yes (Magisk + stock kernel) | **Full glibc Debian 13 (`apt`)**, Home Assistant Core venv, Mosquitto/Zigbee2MQTT, Nomad, Slurm, AdGuard Home (port 53), Tailscale/WireGuard, `vr-25/acc` battery limits | Stock Android 4.14 kernels omit namespaces/cgroups → no native Docker. |
-| **Tier 3: Custom Kernel + Droidspaces** | Yes + custom kernel | **Native Docker Engine**, Home Assistant Container, K3s | Requires cross-compiling kernel with container `CONFIG_*` flags + sparse `ext4` rootfs images. |
+| **Tier 3: Ubuntu Touch (Snap Docker) or Droidspaces** | No (UT) / Yes (Android) | **Docker Engine & Containers**, 2-phone Docker Swarm, Home Assistant Container, K3s | On Ubuntu Touch (`scripts/06_ubuntu_touch_node_setup.sh`), Snap Docker bind-mounts must live inside `$HOME` (`~/phonecluster/docker-data`); on Android, requires custom kernel + sparse `ext4` rootfs. |
 
 ---
 
@@ -133,6 +135,7 @@ pc mpi-hostfile -o hosts.mpi          # OpenMPI: generate hostfile from ready ph
 
 - **[Security Architecture & Pairing Protocol](docs/SECURITY.md)** — Threat model, 2048-bit DH + PIN pairing, per-node token isolation, stealth LAN posture, and shared Wi-Fi lockdown.
 - **[Complete Step-by-Step Setup Guide](docs/SETUP_GUIDE.md)** — Android settings, ADB fleet setup, secure pairing, and troubleshooting.
+- **[Ubuntu Touch & Snap Docker Guide](docs/UBUNTU_TOUCH_DOCKER.md)** — Clustering two Ubuntu Touch (UBports) phones with Docker via Snap, read-only rootfs `systemd --user` services, `repowerd` wake-locks, and optional Docker Swarm.
 - **[Debian 13 & Docker Upgrade Guide](docs/DEBIAN13_AND_DOCKER.md)** — Upgrading to Tier 2 rooted Debian 13 ARM64 chroot, ACC battery protection, Home Assistant, and Tier 3 Docker/Droidspaces.
 - **[Workloads & Automation Cookbook](docs/WORKLOADS.md)** — Recipes for Parallel Python/Bash, `distcc` Compiler PC, Local AI (`llama.cpp`), OpenMPI, and Home Assistant smart-plug battery protection.
 - **[REST & Discovery API Reference](docs/API.md)** — Worker endpoints, Dashboard API, and UDP LAN discovery schema.

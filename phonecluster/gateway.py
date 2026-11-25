@@ -149,7 +149,18 @@ GATEWAY_PRESETS: dict[str, dict[str, Any]] = {
             "registry-1.docker.io",
             "auth.docker.io",
             "production.cloudflare.docker.com",
+            "index.docker.io",
+            "hub.docker.com",
             "ghcr.io",
+        ],
+    },
+    "snap": {
+        "label": "Ubuntu Touch / Snap Store",
+        "domains": [
+            "api.snapcraft.io",
+            "*.snapcraftcontent.com",
+            "dashboard.snapcraft.io",
+            "login.ubuntu.com",
         ],
     },
     "homeassistant": {

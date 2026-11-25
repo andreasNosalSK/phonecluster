@@ -1512,6 +1512,294 @@ class MasterController:
                 "error": str(exc),
             }
 
+    def docker_cluster_status(self, timeout_sec: float = 12.0) -> dict[str, Any]:
+        """Inspect Docker / Snap Docker containers and Swarm state across all online Tier 3 / Docker nodes."""
+        snaps = self.poll_health()
+        with self.config_lock:
+            quarantined = set(self.config.gateway.quarantined_nodes)
+        docker_snaps = [
+            s
+            for s in snaps
+            if s.online
+            and s.node.id not in quarantined
+            and (
+                bool((s.health.get("tools") or {}).get("docker"))
+                or resolve_node_tier_and_pool(s.node, s.health)[0] == 3
+            )
+        ]
+        inspect_script = (
+            "import json, os, shutil, subprocess\n"
+            "from pathlib import Path\n"
+            "dk = shutil.which('docker') or ('/snap/bin/docker' if os.path.exists('/snap/bin/docker') else '')\n"
+            "out = {'docker_bin': dk, 'is_snap': dk.startswith('/snap/') or os.path.exists('/var/snap/docker'), "
+            "'ok': False, 'error': '', 'server_version': '', 'swarm_state': 'inactive', 'swarm_manager': False, "
+            "'swarm_nodes': 0, 'containers_running': 0, 'containers_total': 0, 'containers': [], "
+            "'volume_root': str(Path.home() / 'phonecluster' / 'docker-data')}\n"
+            "if not dk:\n"
+            "    out['error'] = 'docker binary not found'\n"
+            "    print(json.dumps(out)); raise SystemExit(0)\n"
+            "p = subprocess.run([dk, 'info', '--format', '{{json .}}'], capture_output=True, text=True, timeout=8)\n"
+            "if p.returncode != 0:\n"
+            "    out['error'] = (p.stderr or p.stdout or 'docker info failed').strip()[:260]\n"
+            "    print(json.dumps(out)); raise SystemExit(0)\n"
+            "try:\n"
+            "    info = json.loads(p.stdout)\n"
+            "except Exception as exc:\n"
+            "    out['error'] = f'invalid docker info JSON: {exc}'\n"
+            "    print(json.dumps(out)); raise SystemExit(0)\n"
+            "sw = info.get('Swarm') or {}\n"
+            "out['ok'] = True\n"
+            "out['server_version'] = str(info.get('ServerVersion') or '')\n"
+            "out['swarm_state'] = str(sw.get('LocalNodeState') or 'inactive').lower()\n"
+            "out['swarm_manager'] = bool(sw.get('ControlAvailable', False))\n"
+            "out['swarm_nodes'] = int(sw.get('Nodes') or 0)\n"
+            "out['containers_running'] = int(info.get('ContainersRunning') or 0)\n"
+            "out['containers_total'] = int(info.get('Containers') or 0)\n"
+            "ps = subprocess.run([dk, 'ps', '-a', '--format', '{{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'], "
+            "capture_output=True, text=True, timeout=8)\n"
+            "if ps.returncode == 0:\n"
+            "    for ln in ps.stdout.splitlines()[:25]:\n"
+            "        parts = ln.split('\\t')\n"
+            "        if len(parts) >= 3:\n"
+            "            out['containers'].append({'name': parts[0], 'image': parts[1], 'status': parts[2], "
+            "'ports': parts[3] if len(parts) > 3 else ''})\n"
+            "print(json.dumps(out))\n"
+        )
+
+        def _probe(snap: NodeSnapshot) -> dict[str, Any]:
+            spec = JobSpec(
+                index=0,
+                job_id=f"docker-status-{snap.node.id}-{uuid.uuid4().hex[:6]}",
+                script_content=inspect_script,
+                script_name="docker_status.py",
+                interpreter="python3",
+                timeout_sec=max(4.0, min(30.0, float(timeout_sec))),
+                force=True,
+            )
+            kind, data = self.exec_on_node(snap.node, spec)
+            base = {
+                "node_id": snap.node.id,
+                "host": snap.node.host,
+                "os_env": str(snap.health.get("os_env", "")),
+                "ubuntu_touch": bool(snap.health.get("ubuntu_touch")),
+                "docker_snap": bool(snap.health.get("docker_snap")),
+                "socket_accessible": bool(snap.health.get("docker_socket_accessible")),
+            }
+            if kind != "ok":
+                return {**base, "ok": False, "error": str(data.get("error", kind))}
+            stdout = str(data.get("stdout") or "").strip()
+            try:
+                parsed = json.loads(stdout)
+                if isinstance(parsed, dict):
+                    return {**base, **parsed, "node_id": snap.node.id, "host": snap.node.host}
+            except json.JSONDecodeError:
+                pass
+            return {**base, "ok": False, "error": (str(data.get("stderr") or stdout) or "unexpected output")[:240]}
+
+        rows: list[dict[str, Any]] = []
+        if docker_snaps:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(docker_snaps))) as pool:
+                rows = list(pool.map(_probe, docker_snaps))
+        return {
+            "nodes": rows,
+            "total_nodes": len(rows),
+            "ready_nodes": sum(1 for r in rows if r.get("ok")),
+            "swarm_active": any(r.get("swarm_state") == "active" for r in rows),
+            "swarm_managers": [r["node_id"] for r in rows if r.get("swarm_manager")],
+            "total_running_containers": sum(int(r.get("containers_running") or 0) for r in rows if r.get("ok")),
+        }
+
+    def docker_swarm_setup(
+        self,
+        manager_node_id: str | None = None,
+        worker_node_ids: list[str] | None = None,
+        advertise_addr: str = "",
+    ) -> dict[str, Any]:
+        """Initialize Docker Swarm on a Tier 3 / Ubuntu Touch manager and join peer Docker phones securely.
+
+        Transfers the Swarm worker join token solely via `PHONECLUSTER_SWARM_TOKEN` over
+        PhoneCluster's authenticated HTTP channel (never in CLI argv or returned API JSON).
+        """
+        if advertise_addr:
+            advertise_addr = validate_host(advertise_addr)
+        snaps = self.poll_health()
+        with self.config_lock:
+            quarantined = set(self.config.gateway.quarantined_nodes)
+        eligible = [
+            s
+            for s in snaps
+            if s.online
+            and s.node.id not in quarantined
+            and (
+                bool((s.health.get("tools") or {}).get("docker"))
+                or resolve_node_tier_and_pool(s.node, s.health)[0] == 3
+            )
+        ]
+        if not eligible:
+            return {
+                "ok": False,
+                "error": "No online Docker-capable (Tier 3) nodes found. Ensure Snap Docker is running and accessible.",
+                "workers": [],
+                "joined_count": 0,
+            }
+
+        mgr_snap: NodeSnapshot | None = None
+        if manager_node_id:
+            mgr_snap = next((s for s in eligible if s.node.id == manager_node_id), None)
+            if mgr_snap is None:
+                return {
+                    "ok": False,
+                    "error": f"Manager node '{manager_node_id}' is not online or does not have Docker ready.",
+                    "workers": [],
+                    "joined_count": 0,
+                }
+        else:
+            mgr_snap = next((s for s in eligible if s.node.role == "master"), eligible[0])
+
+        adv = advertise_addr or normalize_host(mgr_snap.node.host)
+        if not adv or is_loopback_or_unspecified_host(adv):
+            lan_ip = normalize_host(detect_local_ip())
+            if lan_ip and not is_loopback_or_unspecified_host(lan_ip):
+                adv = lan_ip
+        if not adv:
+            return {
+                "ok": False,
+                "error": "Could not determine a non-loopback LAN advertise address for Swarm manager.",
+                "workers": [],
+                "joined_count": 0,
+            }
+
+        mgr_script = (
+            "import json, os, shutil, subprocess\n"
+            "dk = shutil.which('docker') or ('/snap/bin/docker' if os.path.exists('/snap/bin/docker') else '')\n"
+            "adv = os.environ.get('PHONECLUSTER_SWARM_ADV', '').strip()\n"
+            "if not dk:\n"
+            "    print(json.dumps({'ok': False, 'error': 'docker binary not found'})); raise SystemExit(0)\n"
+            "st = subprocess.run([dk, 'info', '--format', '{{.Swarm.LocalNodeState}}|{{.Swarm.ControlAvailable}}'], "
+            "capture_output=True, text=True, timeout=10)\n"
+            "if st.returncode != 0:\n"
+            "    print(json.dumps({'ok': False, 'error': (st.stderr or st.stdout).strip()[:260]})); raise SystemExit(0)\n"
+            "parts = st.stdout.strip().split('|')\n"
+            "state = (parts[0] if parts else '').lower()\n"
+            "is_mgr = (parts[1].lower() == 'true') if len(parts) > 1 else False\n"
+            "initialized = False\n"
+            "if state != 'active':\n"
+            "    init_cmd = [dk, 'swarm', 'init'] + (['--advertise-addr', adv] if adv else [])\n"
+            "    r = subprocess.run(init_cmd, capture_output=True, text=True, timeout=20)\n"
+            "    if r.returncode != 0:\n"
+            "        print(json.dumps({'ok': False, 'error': (r.stderr or r.stdout).strip()[:280]})); raise SystemExit(0)\n"
+            "    initialized = True\n"
+            "elif not is_mgr:\n"
+            "    print(json.dumps({'ok': False, 'error': 'node is already a Swarm worker, not a manager'})); raise SystemExit(0)\n"
+            "tk = subprocess.run([dk, 'swarm', 'join-token', '-q', 'worker'], capture_output=True, text=True, timeout=10)\n"
+            "if tk.returncode != 0 or not tk.stdout.strip():\n"
+            "    print(json.dumps({'ok': False, 'error': (tk.stderr or 'failed to fetch worker join token').strip()[:240]})); raise SystemExit(0)\n"
+            "print(json.dumps({'ok': True, 'initialized': initialized, 'token': tk.stdout.strip()}))\n"
+        )
+        mgr_spec = JobSpec(
+            index=0,
+            job_id=f"swarm-mgr-{mgr_snap.node.id}-{uuid.uuid4().hex[:6]}",
+            script_content=mgr_script,
+            script_name="swarm_init.py",
+            interpreter="python3",
+            env={"PHONECLUSTER_SWARM_ADV": adv},
+            timeout_sec=30.0,
+            force=True,
+        )
+        m_kind, m_data = self.exec_on_node(mgr_snap.node, mgr_spec)
+        if m_kind != "ok":
+            return {
+                "ok": False,
+                "manager_node_id": mgr_snap.node.id,
+                "manager_addr": format_host_port(adv, 2377),
+                "error": str(m_data.get("error", m_kind)),
+                "workers": [],
+                "joined_count": 0,
+            }
+        try:
+            m_parsed = json.loads(str(m_data.get("stdout") or "").strip())
+        except json.JSONDecodeError:
+            m_parsed = {"ok": False, "error": str(m_data.get("stderr") or m_data.get("stdout") or "invalid manager output")[:240]}
+        if not isinstance(m_parsed, dict) or not m_parsed.get("ok") or not m_parsed.get("token"):
+            return {
+                "ok": False,
+                "manager_node_id": mgr_snap.node.id,
+                "manager_addr": format_host_port(adv, 2377),
+                "error": str((m_parsed or {}).get("error", "Swarm init failed")),
+                "workers": [],
+                "joined_count": 0,
+                "note": "If your Ubuntu Touch Halium kernel lacks VXLAN/overlay modules, use direct PhoneCluster Tier 3 container jobs (`pc run --target tier:3` / `pc map`) instead of Swarm overlay networks.",
+            }
+
+        join_token = str(m_parsed["token"])
+        manager_addr = format_host_port(adv, 2377)
+        target_workers = [s for s in eligible if s.node.id != mgr_snap.node.id]
+        if worker_node_ids is not None:
+            want_w = set(worker_node_ids)
+            target_workers = [s for s in target_workers if s.node.id in want_w]
+
+        join_script = (
+            "import json, os, shutil, subprocess\n"
+            "dk = shutil.which('docker') or ('/snap/bin/docker' if os.path.exists('/snap/bin/docker') else '')\n"
+            "tok = os.environ.get('PHONECLUSTER_SWARM_TOKEN', '').strip()\n"
+            "mgr = os.environ.get('PHONECLUSTER_SWARM_MANAGER', '').strip()\n"
+            "if not dk:\n"
+            "    print(json.dumps({'ok': False, 'error': 'docker binary not found'})); raise SystemExit(0)\n"
+            "st = subprocess.run([dk, 'info', '--format', '{{.Swarm.LocalNodeState}}'], capture_output=True, text=True, timeout=10)\n"
+            "if st.returncode == 0 and st.stdout.strip().lower() == 'active':\n"
+            "    print(json.dumps({'ok': True, 'already_active': True})); raise SystemExit(0)\n"
+            "r = subprocess.run([dk, 'swarm', 'join', '--token', tok, mgr], capture_output=True, text=True, timeout=20)\n"
+            "if r.returncode != 0:\n"
+            "    print(json.dumps({'ok': False, 'error': (r.stderr or r.stdout).strip()[:280]})); raise SystemExit(0)\n"
+            "print(json.dumps({'ok': True, 'already_active': False}))\n"
+        )
+
+        worker_results: list[dict[str, Any]] = []
+        for ws in target_workers:
+            w_spec = JobSpec(
+                index=0,
+                job_id=f"swarm-join-{ws.node.id}-{uuid.uuid4().hex[:6]}",
+                script_content=join_script,
+                script_name="swarm_join.py",
+                interpreter="python3",
+                env={
+                    "PHONECLUSTER_SWARM_TOKEN": join_token,
+                    "PHONECLUSTER_SWARM_MANAGER": manager_addr,
+                },
+                timeout_sec=30.0,
+                force=True,
+            )
+            wk, wd = self.exec_on_node(ws.node, w_spec)
+            if wk != "ok":
+                worker_results.append({"node_id": ws.node.id, "ok": False, "error": str(wd.get("error", wk))})
+                continue
+            try:
+                wp = json.loads(str(wd.get("stdout") or "").strip())
+                if isinstance(wp, dict):
+                    worker_results.append({"node_id": ws.node.id, **wp})
+                    continue
+            except json.JSONDecodeError:
+                pass
+            worker_results.append(
+                {"node_id": ws.node.id, "ok": False, "error": str(wd.get("stderr") or wd.get("stdout") or "join failed")[:240]}
+            )
+
+        joined_ok = sum(1 for r in worker_results if r.get("ok"))
+        all_ok = all(r.get("ok") for r in worker_results)
+        return {
+            "ok": all_ok,
+            "manager_node_id": mgr_snap.node.id,
+            "manager_addr": manager_addr,
+            "manager_initialized": bool(m_parsed.get("initialized")),
+            "workers": worker_results,
+            "joined_count": joined_ok,
+            "note": (
+                "Swarm active across Docker nodes. Remember: Snap Docker bind mounts must live inside $HOME (e.g. ~/phonecluster/docker-data)."
+                if all_ok
+                else "Some worker(s) could not join Swarm (Halium kernels sometimes lack VXLAN/netfilter modules). Direct PhoneCluster Tier 3 container scheduling (`pc run --target tier:3`) remains fully available."
+            ),
+        }
+
     def check_workers_wan_isolation(
         self,
         probe_host: str = "1.1.1.1",

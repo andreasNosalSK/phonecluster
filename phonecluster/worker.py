@@ -52,11 +52,16 @@ from .config import (
 )
 from .discovery import DISCOVERY_PORT, DiscoveryResponder
 from .telemetry import (
+    SNAP_BIN_DIR,
+    SNAP_DOCKER_VAR_DIR,
     CpuSampler,
     NetSampler,
     ThermalGate,
     collect_node_health,
+    detect_os_environment,
+    find_executable,
     is_battery_health_hazardous,
+    is_ubuntu_touch_os,
 )
 
 LOG = logging.getLogger("phonecluster.worker")
@@ -841,6 +846,74 @@ def _run_process_bounded(
     return returncode, stdout_text, stderr_text, timed_out
 
 
+def _augment_job_env(env: dict[str, str], node_id: str, job_id: str) -> dict[str, str]:
+    """Ensure `/snap/bin` and `~/.local/bin` are in PATH and expose Snap Docker data root."""
+    path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+    extra_bins: list[str] = []
+    try:
+        local_bin = str(Path.home() / ".local" / "bin")
+        if Path(local_bin).is_dir():
+            extra_bins.append(local_bin)
+    except RuntimeError:
+        pass
+    if SNAP_BIN_DIR.is_dir():
+        extra_bins.append(str(SNAP_BIN_DIR))
+    for bdir in extra_bins:
+        if bdir not in path_parts:
+            path_parts.append(bdir)
+    if path_parts:
+        env["PATH"] = os.pathsep.join(path_parts)
+
+    if SNAP_DOCKER_VAR_DIR.exists() or (SNAP_BIN_DIR / "docker").exists():
+        env.setdefault("PHONECLUSTER_DOCKER_SNAP", "1")
+        try:
+            env.setdefault("PHONECLUSTER_DOCKER_DATA_DIR", str(Path.home() / "phonecluster" / "docker-data"))
+        except RuntimeError:
+            pass
+    env["PHONECLUSTER_NODE_ID"] = node_id
+    env["PHONECLUSTER_JOB_ID"] = job_id
+    return env
+
+
+def _start_ubuntu_touch_wakelock() -> subprocess.Popen[bytes] | None:
+    """Acquire a `repowerd-cli active` / `powerd-cli active` wakelock on Ubuntu Touch so Wi-Fi stays online."""
+    if os.environ.get("PHONECLUSTER_NO_WAKELOCK", "").strip().lower() in {"1", "true", "yes"}:
+        return None
+    if not is_ubuntu_touch_os(detect_os_environment()):
+        return None
+    cli = find_executable("repowerd-cli") or find_executable("powerd-cli")
+    if not cli:
+        return None
+    try:
+        proc = subprocess.Popen(
+            [cli, "active"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        LOG.info("Acquired Ubuntu Touch wake-lock via %s active (PID %d)", Path(cli).name, proc.pid)
+        return proc
+    except OSError as exc:
+        LOG.warning("Could not start Ubuntu Touch wake-lock (%s): %s", cli, exc)
+        return None
+
+
+def _stop_ubuntu_touch_wakelock(proc: subprocess.Popen[bytes] | None) -> None:
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1.0)
+    except OSError:
+        pass
+
+
 def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """Run a shell command or staged inline script with timeout and cancellation."""
     raw_job_id = payload.get("job_id")
@@ -956,8 +1029,7 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             clean_k = str(k).replace("\x00", "").strip()
             if clean_k and "=" not in clean_k:
                 env[clean_k] = str(v).replace("\x00", "")
-        env["PHONECLUSTER_NODE_ID"] = state.node_id
-        env["PHONECLUSTER_JOB_ID"] = job_id
+        _augment_job_env(env, state.node_id, job_id)
 
         if state.is_cancelled(job_id) or state._shutting_down:
             returncode = -15
@@ -1370,6 +1442,7 @@ def serve_worker(
     """Run the worker HTTP daemon (stealth on UDP by default) until interrupted."""
     server, guard, stop_event = create_worker_server(bind_host, port, state)
     guard.start()
+    wakelock_proc = _start_ubuntu_touch_wakelock()
 
     responder: DiscoveryResponder | None = None
     if enable_discovery:
@@ -1429,4 +1502,5 @@ def serve_worker(
         if responder is not None:
             responder.stop()
         state.cancel_all_jobs()
+        _stop_ubuntu_touch_wakelock(wakelock_proc)
         server.server_close()

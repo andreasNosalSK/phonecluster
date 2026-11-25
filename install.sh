@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PhoneCluster Universal One-Command Installer & Updater
-# Works on: Android Termux (unrooted), Debian 13 ARM64 chroot, and Linux/macOS PCs.
+# Works on: Android Termux (unrooted), Ubuntu Touch (Snap Docker), Debian 13 ARM64 chroot, and Linux/macOS PCs.
 #
 # True one-line remote install:
 #   curl -fsSL https://raw.githubusercontent.com/andreasNosalSK/phonecluster/main/install.sh | bash
@@ -79,6 +79,16 @@ if [[ "${PREFIX:-}" == *"com.termux"* ]] || [[ -n "${TERMUX_VERSION:-}" ]]; then
   IS_TERMUX=1
 fi
 
+IS_UBUNTU_TOUCH=0
+if [[ "${IS_TERMUX}" -eq 0 ]] && {
+  [[ -n "${UBUNTU_TOUCH:-}" || -n "${LOMIRI_SESSION:-}" ]] \
+  || [[ -f "/etc/system-image/channel.ini" || -f "/etc/ubuntu-build" ]] \
+  || command -v repowerd-cli >/dev/null 2>&1 \
+  || command -v powerd-cli >/dev/null 2>&1;
+}; then
+  IS_UBUNTU_TOUCH=1
+fi
+
 echo "============================================================"
 echo "  PhoneCluster Easy Installer"
 echo "============================================================"
@@ -125,8 +135,14 @@ elif [[ ! -f "${INSTALL_DIR}/phonecluster_cli.py" ]]; then
   git clone "${REPO_URL}" "${INSTALL_DIR}"
 fi
 
+ENV_LABEL="Standard Linux / Debian"
+if [[ "${IS_TERMUX}" -eq 1 ]]; then
+  ENV_LABEL="Android Termux"
+elif [[ "${IS_UBUNTU_TOUCH}" -eq 1 ]]; then
+  ENV_LABEL="Ubuntu Touch (UBports)"
+fi
 echo "Install path : ${INSTALL_DIR}"
-echo "Environment  : $([[ "${IS_TERMUX}" -eq 1 ]] && echo "Android Termux" || echo "Standard Linux / Debian")"
+echo "Environment  : ${ENV_LABEL}"
 echo
 
 # 1. Install OS packages cleanly
@@ -157,6 +173,10 @@ mkdir -p "${BIN_DIR}"
 
 cat > "${BIN_DIR}/phonecluster" <<EOF
 #!/usr/bin/env sh
+if [ -d "/snap/bin" ]; then
+  PATH="/snap/bin:\${PATH}"
+  export PATH
+fi
 export PHONECLUSTER_CONFIG="\${PHONECLUSTER_CONFIG:-${INSTALL_DIR}/config/cluster.json}"
 exec python3 "${INSTALL_DIR}/phonecluster_cli.py" "\$@"
 EOF
@@ -196,7 +216,7 @@ if [[ -n "${NODE_ID}" && ! "${NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]];
   exit 2
 fi
 
-# 4. Termux boot + SSH setup
+# 4. OS boot & persistence setup (Termux:Boot on Android, systemd --user + Snap Docker on Ubuntu Touch)
 if [[ "${IS_TERMUX}" -eq 1 && "${ROLE}" != "cli-only" && -n "${ROLE}" ]]; then
   echo "[4/4] Setting up Termux SSH + Termux:Boot auto-start for '${NODE_ID}' (${ROLE})..."
   EXTRA_ARGS=(--node-id "${NODE_ID}" --repo-dir "${INSTALL_DIR}")
@@ -207,8 +227,17 @@ if [[ "${IS_TERMUX}" -eq 1 && "${ROLE}" != "cli-only" && -n "${ROLE}" ]]; then
   else
     bash "${INSTALL_DIR}/scripts/02_termux_node_setup.sh" "${EXTRA_ARGS[@]}"
   fi
+elif [[ "${IS_UBUNTU_TOUCH}" -eq 1 && "${ROLE}" != "cli-only" && -n "${ROLE}" ]]; then
+  echo "[4/4] Setting up Ubuntu Touch SSH + Snap Docker + systemd --user auto-start for '${NODE_ID}' (${ROLE})..."
+  EXTRA_ARGS=(--node-id "${NODE_ID}" --repo-dir "${INSTALL_DIR}")
+  [[ "${ROLE}" == "master" ]] && EXTRA_ARGS+=(--master)
+  if has_tty; then
+    bash "${INSTALL_DIR}/scripts/06_ubuntu_touch_node_setup.sh" "${EXTRA_ARGS[@]}" < /dev/tty
+  else
+    bash "${INSTALL_DIR}/scripts/06_ubuntu_touch_node_setup.sh" "${EXTRA_ARGS[@]}"
+  fi
 else
-  echo "[4/4] Skipping Termux:Boot (not running inside Termux or cli-only mode)."
+  echo "[4/4] Skipping mobile auto-start setup (not Termux/Ubuntu Touch, or cli-only mode)."
 fi
 
 echo

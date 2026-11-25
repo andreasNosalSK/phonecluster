@@ -1,0 +1,57 @@
+{
+  "cluster_name": "ubuntu-touch-docker-cluster",
+  "auth_token": "REPLACE_ME_WITH_STRONG_RANDOM_TOKEN",
+  "dashboard_port": 8080,
+  "default_job_timeout_sec": 600,
+  "safety": {
+    "max_temp_c": 40.0,
+    "resume_temp_c": 37.0,
+    "min_free_ram_mb": 256,
+    "battery_low_pct": 45,
+    "battery_high_pct": 60,
+    "battery_poll_sec": 60,
+    "webhook_cooldown_sec": 900,
+    "battery_webhook_url": ""
+  },
+  "custom_services": {},
+  "nodes": [
+    {
+      "id": "ut-master",
+      "host": "192.168.1.201",
+      "role": "master",
+      "worker_port": 8765,
+      "ssh_port": 22,
+      "ssh_user": "phablet",
+      "max_concurrency": 2,
+      "weight": 1.0,
+      "tier": 3,
+      "pool": "docker",
+      "tags": [
+        "master",
+        "ubuntu-touch",
+        "docker",
+        "snap"
+      ],
+      "notes": "Ubuntu Touch Phone #1 — Master + Snap Docker (Swarm Manager)"
+    },
+    {
+      "id": "ut-worker1",
+      "host": "192.168.1.202",
+      "role": "worker",
+      "worker_port": 8765,
+      "ssh_port": 22,
+      "ssh_user": "phablet",
+      "max_concurrency": 2,
+      "weight": 1.0,
+      "tier": 3,
+      "pool": "docker",
+      "tags": [
+        "worker",
+        "ubuntu-touch",
+        "docker",
+        "snap"
+      ],
+      "notes": "Ubuntu Touch Phone #2 — Worker + Snap Docker (Swarm Worker)"
+    }
+  ]
+}

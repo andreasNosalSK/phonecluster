@@ -2,6 +2,7 @@
 
 Works seamlessly on:
 - Unrooted Android via Termux + Termux:API (`termux-battery-status`)
+- Ubuntu Touch (UBports) with Docker via Snap (`/sys/class/power_supply/*`, UPower, `/snap/bin/docker`)
 - Rooted Debian 13 ARM64 chroot / Droidspaces (`/sys/class/power_supply/*`)
 - Standard Linux PCs / Raspberry Pis (gracefully handles missing battery)
 """
@@ -33,6 +34,12 @@ PROC_NET_DEV_PATH = Path("/proc/net/dev")
 PROC_UPTIME_PATH = Path("/proc/uptime")
 SYS_NET_DIR = Path("/sys/class/net")
 OS_RELEASE_PATH = Path("/etc/os-release")
+UBUNTU_TOUCH_CHANNEL_PATH = Path("/etc/system-image/channel.ini")
+UBUNTU_TOUCH_BUILD_PATH = Path("/etc/ubuntu-build")
+SNAP_BIN_DIR = Path("/snap/bin")
+SNAP_DOCKER_VAR_DIR = Path("/var/snap/docker")
+DOCKER_SOCKET_PATHS = (Path("/var/run/docker.sock"), Path("/run/docker.sock"))
+PODMAN_SOCKET_PATH = Path("/run/podman/podman.sock")
 
 
 @dataclass
@@ -81,10 +88,100 @@ class ThermalGate:
             return self._overheated
 
 
+def is_ubuntu_touch_os(os_env: str) -> bool:
+    """Return True if `os_env` represents an Ubuntu Touch (UBports) device."""
+    norm = str(os_env or "").strip().lower()
+    return norm == "ubuntu-touch" or norm.startswith("ubuntu-touch-")
+
+
+def find_executable(name: str) -> str | None:
+    """Locate an executable on PATH, falling back to `/snap/bin` and `~/.local/bin`."""
+    found = shutil.which(name)
+    if found:
+        return found
+    extra_dirs = [SNAP_BIN_DIR]
+    try:
+        extra_dirs.append(Path.home() / ".local" / "bin")
+    except RuntimeError:
+        pass
+    for d in extra_dirs:
+        cand = d / name
+        try:
+            if cand.exists() and os.access(cand, os.X_OK) and not cand.is_dir():
+                return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+def detect_docker_runtime() -> dict[str, Any]:
+    """Inspect Docker/Podman availability including Snap-installed Docker on Ubuntu Touch."""
+    docker_bin = find_executable("docker")
+    podman_bin = find_executable("podman")
+    snap_docker_bin = SNAP_BIN_DIR / "docker"
+    is_snap = bool(
+        (docker_bin and str(docker_bin).startswith(f"{SNAP_BIN_DIR}/"))
+        or (
+            docker_bin
+            and snap_docker_bin.exists()
+            and SNAP_DOCKER_VAR_DIR.exists()
+        )
+        or (not docker_bin and snap_docker_bin.exists())
+    )
+    if not docker_bin and snap_docker_bin.exists():
+        docker_bin = str(snap_docker_bin)
+
+    socket_path = ""
+    socket_exists = False
+    socket_accessible = False
+    for sock in (*DOCKER_SOCKET_PATHS, PODMAN_SOCKET_PATH):
+        try:
+            if sock.exists():
+                socket_path = str(sock)
+                socket_exists = True
+                socket_accessible = bool(os.access(sock, os.R_OK | os.W_OK))
+                break
+        except OSError:
+            continue
+
+    compose_avail = bool(
+        find_executable("docker-compose")
+        or Path("/snap/docker/current/bin/docker-compose").exists()
+        or Path("/usr/libexec/docker/cli-plugins/docker-compose").exists()
+        or Path("/usr/lib/docker/cli-plugins/docker-compose").exists()
+    )
+    snap_volume_root = ""
+    if is_snap:
+        try:
+            snap_volume_root = str(Path.home() / "phonecluster" / "docker-data")
+        except RuntimeError:
+            snap_volume_root = ""
+
+    return {
+        "installed": bool(docker_bin or podman_bin),
+        "docker_bin": docker_bin or "",
+        "podman_bin": podman_bin or "",
+        "is_snap": is_snap,
+        "socket_path": socket_path,
+        "socket_exists": socket_exists,
+        "socket_accessible": socket_accessible,
+        "compose_available": compose_avail,
+        "snap_volume_root": snap_volume_root,
+    }
+
+
 def detect_os_environment() -> str:
-    """Identify whether we are running in Termux, Debian 13, or generic Linux."""
+    """Identify Termux, Ubuntu Touch (UBports), Debian 13, or generic Linux."""
     if os.environ.get("TERMUX_VERSION") or "com.termux" in os.environ.get("PREFIX", ""):
         return "termux"
+    is_ut = bool(
+        os.environ.get("UBUNTU_TOUCH")
+        or os.environ.get("LOMIRI_SESSION")
+        or UBUNTU_TOUCH_CHANNEL_PATH.exists()
+        or UBUNTU_TOUCH_BUILD_PATH.exists()
+        or shutil.which("repowerd-cli")
+        or shutil.which("powerd-cli")
+    )
     if OS_RELEASE_PATH.exists():
         try:
             text = OS_RELEASE_PATH.read_text(encoding="utf-8", errors="ignore")
@@ -93,11 +190,16 @@ def detect_os_environment() -> str:
                 if "=" in line and not line.startswith("#"):
                     k, v = line.split("=", 1)
                     kv[k.strip()] = v.strip().strip('"')
-            distro_id = kv.get("ID", "linux")
-            ver = kv.get("VERSION_ID", "")
+            distro_id = kv.get("ID", "linux").strip().lower()
+            ver = kv.get("VERSION_ID", "").strip()
+            pretty = kv.get("PRETTY_NAME", "").lower()
+            if is_ut or "ubuntu touch" in pretty or distro_id in {"ubuntu-touch", "ubports"}:
+                return f"ubuntu-touch-{ver}" if ver else "ubuntu-touch"
             return f"{distro_id}-{ver}" if ver else distro_id
         except OSError:
             pass
+    if is_ut:
+        return "ubuntu-touch"
     return platform.system().lower()
 
 
@@ -119,7 +221,7 @@ BATTERY_HAZARD_STATES = frozenset(
         "UNSPECIFIED_FAILURE",
     }
 )
-_PRIORITY_SERVICE_PORTS = frozenset({22, 53, 80, 1883, 3000, 3632, 5432, 6379, 8022, 8081, 8123, 8765, 50052})
+_PRIORITY_SERVICE_PORTS = frozenset({22, 53, 80, 1883, 2377, 3000, 3632, 5432, 6379, 8022, 8081, 8123, 8765, 50052})
 
 
 def is_battery_health_hazardous(health: Any) -> bool:
@@ -285,11 +387,86 @@ def read_thermal_zone_temp(base_dir: Path = THERMAL_DIR) -> float | None:
     return max(other_readings) if other_readings else None
 
 
+def read_battery_via_upower(timeout_sec: float = 3.0) -> BatteryInfo | None:
+    """Fallback battery telemetry via UPower (helpful on Ubuntu Touch Halium devices with restricted sysfs)."""
+    upower_cmd = shutil.which("upower")
+    if not upower_cmd:
+        return None
+    try:
+        dev_list = subprocess.check_output(
+            [upower_cmd, "-e"],
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_sec,
+        ).decode("utf-8", errors="replace")
+    except (subprocess.SubprocessError, OSError):
+        return None
+    bat_dev = next((ln.strip() for ln in dev_list.splitlines() if "battery" in ln.lower()), "")
+    if not bat_dev:
+        return None
+    try:
+        raw = subprocess.check_output(
+            [upower_cmd, "-i", bat_dev],
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_sec,
+        ).decode("utf-8", errors="replace")
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    pct: int | None = None
+    temp_c: float | None = None
+    status = "UNKNOWN"
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        kl = k.strip().lower()
+        vl = v.strip()
+        if kl == "percentage":
+            try:
+                pf = float(vl.rstrip("%").strip())
+                if math.isfinite(pf):
+                    pct = max(0, min(100, int(round(pf))))
+            except ValueError:
+                pass
+        elif kl == "state":
+            st_l = vl.lower().replace("-", " ")
+            if "fully charged" in st_l:
+                status = "FULL"
+            elif "discharging" in st_l:
+                status = "DISCHARGING"
+            elif "charging" in st_l:
+                status = "CHARGING"
+            elif "pending charge" in st_l:
+                status = "NOT_CHARGING"
+        elif kl == "temperature":
+            parts = vl.split()
+            if parts:
+                try:
+                    tf = float(parts[0])
+                    if math.isfinite(tf) and -20.0 <= tf <= 130.0:
+                        temp_c = round(tf, 2)
+                except ValueError:
+                    pass
+    if pct is None and temp_c is None and status == "UNKNOWN":
+        return None
+    plugged = "PLUGGED" if status in {"CHARGING", "FULL"} else "UNPLUGGED"
+    return BatteryInfo(
+        percentage=pct,
+        temperature_c=temp_c,
+        status=status,
+        health="UNKNOWN",
+        plugged=plugged,
+        source="upower",
+    )
+
+
 def read_battery_info() -> BatteryInfo:
-    """Collect battery & temperature telemetry across Termux or Debian/Linux."""
+    """Collect battery & temperature telemetry across Termux, Ubuntu Touch, or Debian/Linux."""
     info = read_battery_via_termux()
     if info is None:
         info = read_battery_via_sysfs()
+    if info is None and is_ubuntu_touch_os(detect_os_environment()):
+        info = read_battery_via_upower()
     if info is None:
         info = BatteryInfo()
     if info.temperature_c is None:
@@ -663,33 +840,37 @@ def detect_capabilities(listening_map: dict[int, bool] | None = None) -> dict[st
     probes), and falls back to `is_local_port_open()` on platforms where `/proc/net/tcp*`
     is restricted (e.g. strict Android SELinux).
     """
+    docker_rt = detect_docker_runtime()
     adguard_installed = bool(
-        shutil.which("AdGuardHome")
+        find_executable("AdGuardHome")
         or Path("/opt/AdGuardHome/AdGuardHome").exists()
-        or shutil.which("pihole")
+        or find_executable("pihole")
     )
     tools = {
-        "python3": bool(shutil.which("python3")),
-        "clang": bool(shutil.which("clang")),
-        "gcc": bool(shutil.which("gcc")),
-        "distccd": bool(shutil.which("distccd")),
-        "mpirun": bool(shutil.which("mpirun")),
+        "python3": bool(find_executable("python3")),
+        "clang": bool(find_executable("clang")),
+        "gcc": bool(find_executable("gcc")),
+        "distccd": bool(find_executable("distccd")),
+        "mpirun": bool(find_executable("mpirun")),
         "llama_rpc": bool(
-            shutil.which("rpc-server")
+            find_executable("rpc-server")
             or Path.home().joinpath("llama.cpp/build/bin/rpc-server").exists()
         ),
         "llama_cli": bool(
-            shutil.which("llama-cli")
-            or shutil.which("llama-server")
+            find_executable("llama-cli")
+            or find_executable("llama-server")
             or Path.home().joinpath("llama.cpp/build/bin/llama-cli").exists()
         ),
-        "docker": bool(shutil.which("docker") or shutil.which("podman")),
-        "k3s": bool(shutil.which("k3s") or shutil.which("kubectl")),
-        "homeassistant": bool(shutil.which("hass")),
-        "mosquitto": bool(shutil.which("mosquitto") or shutil.which("mosquitto_pub")),
+        "docker": bool(docker_rt["installed"]),
+        "docker_snap": bool(docker_rt["is_snap"]),
+        "docker_compose": bool(docker_rt["compose_available"]),
+        "snap": bool(find_executable("snap")),
+        "k3s": bool(find_executable("k3s") or find_executable("kubectl")),
+        "homeassistant": bool(find_executable("hass")),
+        "mosquitto": bool(find_executable("mosquitto") or find_executable("mosquitto_pub")),
         "adguard": adguard_installed,
-        "apt": bool(shutil.which("apt-get")),
-        "tmux": bool(shutil.which("tmux")),
+        "apt": bool(find_executable("apt-get")),
+        "tmux": bool(find_executable("tmux")),
     }
     lmap = listening_map if listening_map is not None else _read_listening_tcp_map()
 
@@ -706,16 +887,21 @@ def detect_capabilities(listening_map: dict[int, bool] | None = None) -> dict[st
         "llama_api_8081": _port_active(8081),
         "homeassistant_8123": _port_active(8123),
         "mosquitto_1883": _port_active(1883),
+        "docker_swarm_2377": _port_active(2377),
         "adguard_3000": _port_active(3000),
         "adguard_80": adguard_installed and _port_active(80),
         "dns_53": _port_active(53),
         "redis_6379": _port_active(6379),
         "postgres_5432": _port_active(5432),
     }
-    return {"tools": tools, "services": services}
+    return {"tools": tools, "services": services, "docker_runtime": docker_rt}
 
 
-def detect_node_tier(os_env: str, tools: dict[str, bool]) -> tuple[int, str]:
+def detect_node_tier(
+    os_env: str,
+    tools: dict[str, bool],
+    docker_runtime: dict[str, Any] | None = None,
+) -> tuple[int, str]:
     """Classify a device into Tier 1 (Termux/compute), Tier 2 (Debian/services), or Tier 3 (Docker).
 
     Respects explicit `PHONECLUSTER_TIER` env var (`1`, `2`, or `3`) when set.
@@ -728,11 +914,12 @@ def detect_node_tier(os_env: str, tools: dict[str, bool]) -> tuple[int, str]:
     if os_env == "termux":
         return 1, "compute"
 
-    docker_ready = bool(tools.get("docker")) and (
-        Path("/var/run/docker.sock").exists()
-        or Path("/run/podman/podman.sock").exists()
-        or bool(tools.get("k3s"))
-    )
+    if docker_runtime is not None:
+        sock_ready = bool(docker_runtime.get("socket_exists"))
+    else:
+        sock_ready = any(p.exists() for p in (*DOCKER_SOCKET_PATHS, PODMAN_SOCKET_PATH))
+
+    docker_ready = bool(tools.get("docker")) and (sock_ready or bool(tools.get("k3s")))
     if docker_ready:
         return 3, "docker"
 
@@ -840,13 +1027,15 @@ def collect_node_health(
         listening_ports = []
     caps = detect_capabilities(listening_map=listening_map)
     os_env = detect_os_environment()
-    detected_tier, detected_pool = detect_node_tier(os_env, caps["tools"])
+    docker_rt = caps.get("docker_runtime") or {}
+    detected_tier, detected_pool = detect_node_tier(os_env, caps["tools"], docker_runtime=docker_rt)
 
     return {
         "node_id": node_id,
         "role": role,
         "hostname": socket.gethostname(),
         "os_env": os_env,
+        "ubuntu_touch": is_ubuntu_touch_os(os_env),
         "tier": detected_tier,
         "pool": detected_pool,
         "arch": platform.machine(),
@@ -880,5 +1069,8 @@ def collect_node_health(
         "listening_ports": listening_ports,
         "tools": caps["tools"],
         "services": caps["services"],
+        "docker_snap": bool(docker_rt.get("is_snap")),
+        "docker_socket_accessible": bool(docker_rt.get("socket_accessible")),
+        "docker_volume_root": str(docker_rt.get("snap_volume_root") or ""),
         "timestamp": int(time.time()),
     }

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# 05_workload_helpers.sh — Start/stop distributed compute daemons on cluster phones
-# (Compiler farm via distccd, Distributed AI via llama.cpp rpc-server).
+# 05_workload_helpers.sh — Start/stop distributed compute & Docker cluster daemons on cluster phones
+# (Compiler farm via distccd, Distributed AI via llama.cpp rpc-server, Docker / Snap Docker Swarm).
 set -euo pipefail
+
+if [[ -d "/snap/bin" ]]; then
+  export PATH="/snap/bin:${HOME}/.local/bin:${PATH}"
+fi
 
 CMD="${1:-help}"
 shift || true
@@ -129,6 +133,79 @@ case "${CMD}" in
     fi
     ;;
 
+  docker-status)
+    DK_BIN="$(command -v docker 2>/dev/null || true)"
+    [[ -z "${DK_BIN}" && -x "/snap/bin/docker" ]] && DK_BIN="/snap/bin/docker"
+    if [[ -z "${DK_BIN}" ]]; then
+      echo "Error: docker binary not found (checked PATH and /snap/bin/docker)." >&2
+      exit 1
+    fi
+    IS_SNAP="no"
+    [[ "${DK_BIN}" == /snap/* || -d "/var/snap/docker" ]] && IS_SNAP="yes"
+    echo "Docker binary : ${DK_BIN} (snap=${IS_SNAP})"
+    echo "Volume root   : ${HOME}/phonecluster/docker-data"
+    "${DK_BIN}" info --format 'Server: {{.ServerVersion}} | Swarm: {{.Swarm.LocalNodeState}} (manager={{.Swarm.ControlAvailable}}, nodes={{.Swarm.Nodes}}) | Running: {{.ContainersRunning}}/{{.Containers}}'
+    "${DK_BIN}" ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+    ;;
+
+  docker-swarm-init)
+    ADV_ADDR="${1:-}"
+    if [[ -n "${ADV_ADDR}" ]] && [[ "${ADV_ADDR}" == -* || "${ADV_ADDR}" =~ [[:space:]] ]]; then
+      echo "Error: Invalid advertise address '${ADV_ADDR}'." >&2
+      exit 2
+    fi
+    DK_BIN="$(command -v docker 2>/dev/null || true)"
+    [[ -z "${DK_BIN}" && -x "/snap/bin/docker" ]] && DK_BIN="/snap/bin/docker"
+    if [[ -z "${DK_BIN}" ]]; then
+      echo "Error: docker binary not found (install via: sudo snap install docker)." >&2
+      exit 1
+    fi
+    SW_STATE="$("${DK_BIN}" info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)"
+    if [[ "${SW_STATE}" == "active" ]]; then
+      echo "Docker Swarm is already active on this node."
+    else
+      if [[ -n "${ADV_ADDR}" ]]; then
+        "${DK_BIN}" swarm init --advertise-addr "${ADV_ADDR}"
+      else
+        "${DK_BIN}" swarm init
+      fi
+    fi
+    ;;
+
+  docker-swarm-join)
+    MGR_ADDR="${1:-}"
+    if [[ -z "${MGR_ADDR}" || "${MGR_ADDR}" == -* || "${MGR_ADDR}" =~ [[:space:]] ]]; then
+      echo "Error: Usage: docker-swarm-join <manager_ip:2377> (pass token in PHONECLUSTER_SWARM_TOKEN env var)" >&2
+      exit 2
+    fi
+    if [[ -z "${PHONECLUSTER_SWARM_TOKEN:-}" ]]; then
+      echo "Error: PHONECLUSTER_SWARM_TOKEN environment variable is required (never pass secrets in CLI args)." >&2
+      exit 2
+    fi
+    DK_BIN="$(command -v docker 2>/dev/null || true)"
+    [[ -z "${DK_BIN}" && -x "/snap/bin/docker" ]] && DK_BIN="/snap/bin/docker"
+    if [[ -z "${DK_BIN}" ]]; then
+      echo "Error: docker binary not found." >&2
+      exit 1
+    fi
+    SW_STATE="$("${DK_BIN}" info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)"
+    if [[ "${SW_STATE}" == "active" ]]; then
+      echo "Already part of an active Docker Swarm."
+    else
+      "${DK_BIN}" swarm join --token "${PHONECLUSTER_SWARM_TOKEN}" "${MGR_ADDR}"
+    fi
+    ;;
+
+  docker-swarm-leave)
+    DK_BIN="$(command -v docker 2>/dev/null || true)"
+    [[ -z "${DK_BIN}" && -x "/snap/bin/docker" ]] && DK_BIN="/snap/bin/docker"
+    if [[ -z "${DK_BIN}" ]]; then
+      echo "Error: docker binary not found." >&2
+      exit 1
+    fi
+    "${DK_BIN}" swarm leave --force
+    ;;
+
   help|-h|--help)
     cat <<'EOF'
 Usage: bash scripts/05_workload_helpers.sh <subcommand> [args]
@@ -138,10 +215,15 @@ Subcommands:
   distcc-stop                      Stop distccd
   llama-rpc-start [dir] [port]     Start llama.cpp rpc-server (default: ~/llama.cpp, port 50052)
   llama-rpc-stop                   Stop llama.cpp rpc-server
+  docker-status                    Show Docker / Snap Docker version, Swarm state, and running containers
+  docker-swarm-init [adv_ip]       Initialize Docker Swarm manager on this phone
+  docker-swarm-join <mgr:2377>     Join Docker Swarm (reads token from PHONECLUSTER_SWARM_TOKEN env var)
+  docker-swarm-leave               Leave Docker Swarm on this phone
 
 Tip: Run across all phones from your Master phone in one command:
   python3 phonecluster_cli.py run --target all "bash ~/phonecluster/scripts/05_workload_helpers.sh distcc-start 192.168.1.0/24"
-  eval "$(python3 phonecluster_cli.py distcc-env)"
+  python3 phonecluster_cli.py docker status
+  python3 phonecluster_cli.py docker swarm-init
 EOF
     ;;
 

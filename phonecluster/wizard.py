@@ -34,7 +34,7 @@ from .discovery import detect_local_ip, discover_lan_nodes
 from .doctor import run_doctor
 from .master import JobSpec, MasterController
 from .netguard import infer_lan_subnet
-from .telemetry import detect_os_environment, read_memory_info
+from .telemetry import detect_docker_runtime, detect_os_environment, is_ubuntu_touch_os, read_memory_info
 
 
 def _prompt(
@@ -70,14 +70,19 @@ def run_setup_wizard(
     out_path = resolve_config_path(config_path)
     local_ip = detect_local_ip()
     os_env = detect_os_environment()
+    is_ut = is_ubuntu_touch_os(os_env)
+    docker_rt = detect_docker_runtime()
     mem = read_memory_info()
-    user = os.environ.get("USER", "")
+    user = os.environ.get("USER", "") or ("phablet" if is_ut else "")
     default_ssh_port = DEFAULT_SSH_PORT if os_env == "termux" else 22
 
     print("=" * 60)
     print("  PhoneCluster Guided Setup Wizard")
     print("=" * 60)
-    print(f"Detected device : {os_env} | IP {local_ip} | {os.cpu_count() or 1} cores | {mem['total_mb']} MB RAM")
+    dk_note = ""
+    if docker_rt.get("installed"):
+        dk_note = " | Docker (Snap)" if docker_rt.get("is_snap") else " | Docker"
+    print(f"Detected device : {os_env} | IP {local_ip} | {os.cpu_count() or 1} cores | {mem['total_mb']} MB RAM{dk_note}")
     print(f"Config target   : {out_path}")
     print()
 
@@ -93,13 +98,13 @@ def run_setup_wizard(
     except ValueError:
         print(f"  (Invalid master host '{raw_master}', falling back to detected IP {local_ip})")
         master_host = validate_host(local_ip)
-    raw_user = _prompt("3. Default SSH username on phones (from `whoami`)", user, input_fn=input_fn)
+    raw_user = _prompt("3. Default SSH username on phones (e.g. 'phablet' on Ubuntu Touch, or `whoami`)", user, input_fn=input_fn)
     try:
         ssh_user = validate_ssh_user(raw_user)
     except ValueError:
         print(f"  (Invalid SSH username '{raw_user}', leaving blank)")
         ssh_user = ""
-    ssh_port_str = _prompt("4. Default SSH port (8022 for Termux, 22 for Debian)", str(default_ssh_port), input_fn=input_fn)
+    ssh_port_str = _prompt("4. Default SSH port (8022 for Termux, 22 for Ubuntu Touch / Debian)", str(default_ssh_port), input_fn=input_fn)
     ssh_port = (
         int(ssh_port_str)
         if ssh_port_str.isascii() and ssh_port_str.isdigit() and 1 <= int(ssh_port_str) <= 65535

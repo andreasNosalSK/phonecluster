@@ -842,8 +842,12 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
         </div>
 
         <div class="card">
-          <h2>Home Assistant, Debian 13 &amp; Docker</h2>
+          <h2>Home Assistant, Ubuntu Touch &amp; Snap Docker</h2>
           <div id="wl-services" class="hint">Checking cluster services...</div>
+          <div class="row" style="margin-top:8px;">
+            <button class="small primary" onclick="workloadAction('docker-status')">Check Docker Containers</button>
+            <button class="small" onclick="workloadAction('docker-swarm-init')">Init 2-Phone Docker Swarm</button>
+          </div>
           <pre id="wl-action-out" class="code" style="display:none"></pre>
         </div>
       </div>
@@ -901,7 +905,7 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
                 <option value="0" selected>Auto-Detect</option>
                 <option value="1">Tier 1 · Termux Compute</option>
                 <option value="2">Tier 2 · Debian 13 Services</option>
-                <option value="3">Tier 3 · Docker / Droidspaces</option>
+                <option value="3">Tier 3 · Docker (Ubuntu Touch / Linux)</option>
               </select>
             </div>
             <div class="field"><label for="add-pool">Pool Name</label><input id="add-pool" value="auto" placeholder="auto / compute / services / docker" /></div>
@@ -1176,7 +1180,7 @@ function openNodeTierEditor(nodeId) {
     + '<option value="0"' + (cfgTier === 0 ? ' selected' : '') + '>Auto-Detect (from OS/Docker)</option>'
     + '<option value="1"' + (cfgTier === 1 ? ' selected' : '') + '>Tier 1 · Termux Compute &amp; AI</option>'
     + '<option value="2"' + (cfgTier === 2 ? ' selected' : '') + '>Tier 2 · Debian 13 Services</option>'
-    + '<option value="3"' + (cfgTier === 3 ? ' selected' : '') + '>Tier 3 · Docker / Droidspaces</option>'
+    + '<option value="3"' + (cfgTier === 3 ? ' selected' : '') + '>Tier 3 · Docker (Ubuntu Touch / Linux)</option>'
     + '</select></div>'
     + '<div class="field"><label for="ed-pool">Workload Pool</label>'
     + '<input id="ed-pool" value="' + esc(cfgPool) + '" placeholder="auto / compute / services / docker" /></div>'
@@ -2439,7 +2443,13 @@ async function loadWorkloads() {
     } else {
       svcHtml += '<p><strong>Home Assistant:</strong> Not detected on port 8123. Best deployed on Tier 2 (Rooted Debian 13 chroot) or Tier 3 (Docker).</p>';
     }
-    svcHtml += '<p><strong>Docker-ready nodes:</strong> ' + (d.docker_nodes.length ? esc(d.docker_nodes.join(', ')) : 'None yet (requires Tier 3 custom kernel + Droidspaces)') + '</p>';
+    svcHtml += '<p><strong>Docker-ready nodes:</strong> ' + (d.docker_nodes.length ? esc(d.docker_nodes.join(', ')) : 'None yet (install Snap Docker on Ubuntu Touch or Tier 3 Linux)') + '</p>';
+    if (Array.isArray(d.docker_snap_nodes) && d.docker_snap_nodes.length) {
+      svcHtml += '<p class="hint" style="margin-top:4px;">Snap Docker detected on <strong>' + esc(d.docker_snap_nodes.join(', ')) + '</strong> — keep bind-mount volumes under <code class="mono">~/phonecluster/docker-data</code> ($HOME).</p>';
+    }
+    if (Array.isArray(d.docker_socket_issues) && d.docker_socket_issues.length) {
+      svcHtml += '<p class="hint" style="color:var(--warn); margin-top:4px;">⚠ Docker socket permission needed on <strong>' + esc(d.docker_socket_issues.join(', ')) + '</strong> — run <code class="mono">bash scripts/06_ubuntu_touch_node_setup.sh</code>.</p>';
+    }
     document.getElementById('wl-services').innerHTML = svcHtml;
 
     // Cross-Tier Live Service Mesh Diagram + Table + .env + .cluster DNS hosts
@@ -3458,6 +3468,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 quarantined = ctrl._quarantined_ids()
                 ha_urls: list[str] = []
                 docker_nodes: list[str] = []
+                docker_snap_nodes: list[str] = []
+                docker_socket_issues: list[str] = []
                 for s in snaps:
                     if not s.online or s.node.id in quarantined:
                         continue
@@ -3467,8 +3479,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     tools_d = raw_tools if isinstance(raw_tools, dict) else {}
                     if svcs_d.get("homeassistant_8123"):
                         ha_urls.append(f"http://{format_host_port(s.node.host, 8123)}")
-                    if tools_d.get("docker") or resolve_node_tier_and_pool(s.node, s.health)[0] == 3:
+                    has_dk = bool(tools_d.get("docker")) or resolve_node_tier_and_pool(s.node, s.health)[0] == 3
+                    if has_dk:
                         docker_nodes.append(s.node.id)
+                        if isinstance(s.health, dict) and s.health.get("docker_snap"):
+                            docker_snap_nodes.append(s.node.id)
+                        if isinstance(s.health, dict) and tools_d.get("docker") and not s.health.get("docker_socket_accessible", True):
+                            docker_socket_issues.append(s.node.id)
                 with ctrl.config_lock:
                     master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
                     cfg_subnet = ctrl.config.network.lan_subnet
@@ -3486,6 +3503,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         "mpi_hostfile": ctrl.build_mpi_hostfile(snapshots=snaps),
                         "home_assistant_urls": ha_urls,
                         "docker_nodes": docker_nodes,
+                        "docker_snap_nodes": docker_snap_nodes,
+                        "docker_socket_issues": docker_socket_issues,
                         "lan_subnet": lan_subnet,
                         "services_info": ctrl.get_services_info(snapshots=snaps),
                     },
@@ -4135,6 +4154,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/workloads/action":
             action = str(body.get("action") or "").strip()
+            if action == "docker-status":
+                self._send_json(HTTPStatus.OK, ctrl.docker_cluster_status())
+                return
+            if action == "docker-swarm-init":
+                mgr_id = str(body.get("manager_node_id") or "").strip() or None
+                adv = str(body.get("advertise_addr") or "").strip()
+                if adv:
+                    try:
+                        adv = validate_host(adv)
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid advertise_addr: {exc}"})
+                        return
+                self._send_json(HTTPStatus.OK, ctrl.docker_swarm_setup(manager_node_id=mgr_id, advertise_addr=adv))
+                return
             cidr = str(body.get("cidr") or "").strip()
             if not cidr:
                 with ctrl.config_lock:

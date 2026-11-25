@@ -7411,5 +7411,375 @@ class TestPass12HardeningAndBugHunt(unittest.TestCase):
                         self.fail(f"Python 3.10+ runtime union in {py_file.name}:{node.lineno}")
 
 
+class TestUbuntuTouchAndSnapDockerClustering(unittest.TestCase):
+    """Verify Ubuntu Touch (UBports) + Snap Docker Tier 3 clustering upgrades."""
+
+    def test_ubuntu_touch_os_snap_docker_telemetry_upower_and_worker_env(self) -> None:
+        from unittest import mock
+        from phonecluster import telemetry as tel
+        from phonecluster.worker import _augment_job_env, _start_ubuntu_touch_wakelock, _stop_ubuntu_touch_wakelock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            os_rel = root / "os-release"
+            os_rel.write_text('ID=ubuntu\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04 LTS"\n', encoding="utf-8")
+            chan = root / "channel.ini"
+            chan.write_text("[service]\nchannel=24.04/arm64/android9plus/stable\n", encoding="utf-8")
+            snap_bin = root / "snap_bin"
+            snap_bin.mkdir()
+            fake_dk = snap_bin / "docker"
+            fake_dk.write_text("#!/bin/sh\necho docker\n", encoding="utf-8")
+            fake_dk.chmod(0o755)
+            snap_var = root / "var_snap_docker"
+            snap_var.mkdir()
+            fake_sock = root / "docker.sock"
+            fake_sock.write_text("", encoding="utf-8")
+
+            with mock.patch.object(tel, "OS_RELEASE_PATH", os_rel), mock.patch.object(
+                tel, "UBUNTU_TOUCH_CHANNEL_PATH", chan
+            ), mock.patch.dict(os.environ, {"TERMUX_VERSION": "", "PREFIX": ""}, clear=False):
+                detected = tel.detect_os_environment()
+            self.assertEqual(detected, "ubuntu-touch-24.04")
+            self.assertTrue(tel.is_ubuntu_touch_os(detected))
+            self.assertFalse(tel.is_ubuntu_touch_os("debian-13"))
+
+            # find_executable locates /snap/bin/docker even when /snap/bin is omitted from PATH
+            with mock.patch("phonecluster.telemetry.shutil.which", return_value=None), mock.patch.object(
+                tel, "SNAP_BIN_DIR", snap_bin
+            ), mock.patch.object(tel, "SNAP_DOCKER_VAR_DIR", snap_var), mock.patch.object(
+                tel, "DOCKER_SOCKET_PATHS", (fake_sock,)
+            ):
+                self.assertEqual(tel.find_executable("docker"), str(fake_dk))
+                rt = tel.detect_docker_runtime()
+                self.assertTrue(rt["installed"])
+                self.assertTrue(rt["is_snap"])
+                self.assertTrue(rt["socket_exists"])
+                self.assertTrue(rt["socket_accessible"])
+                self.assertIn("docker-data", rt["snap_volume_root"])
+                tier, pool = tel.detect_node_tier("ubuntu-touch-24.04", {"docker": True}, docker_runtime=rt)
+                self.assertEqual((tier, pool), (3, "docker"))
+
+            # Worker job env adds /snap/bin to PATH and exposes Snap Docker data dir
+            with mock.patch("phonecluster.worker.SNAP_BIN_DIR", snap_bin), mock.patch(
+                "phonecluster.worker.SNAP_DOCKER_VAR_DIR", snap_var
+            ):
+                env = _augment_job_env({"PATH": "/usr/bin:/bin"}, "ut-master", "j-snap-1")
+            self.assertIn(str(snap_bin), env["PATH"].split(os.pathsep))
+            self.assertEqual(env.get("PHONECLUSTER_DOCKER_SNAP"), "1")
+            self.assertIn("docker-data", env.get("PHONECLUSTER_DOCKER_DATA_DIR", ""))
+
+        # UPower battery fallback parsing
+        upower_list = b"/org/freedesktop/UPower/devices/battery_battery\n"
+        upower_info = (
+            b"  native-path:          battery\n"
+            b"  state:                charging\n"
+            b"  percentage:           58%\n"
+            b"  temperature:          34.5 degrees C\n"
+        )
+        with mock.patch("phonecluster.telemetry.shutil.which", return_value="/usr/bin/upower"), mock.patch(
+            "phonecluster.telemetry.subprocess.check_output", side_effect=[upower_list, upower_info]
+        ):
+            bat = tel.read_battery_via_upower()
+        self.assertIsNotNone(bat)
+        assert bat is not None
+        self.assertEqual(bat.percentage, 58)
+        self.assertEqual(bat.temperature_c, 34.5)
+        self.assertEqual(bat.status, "CHARGING")
+        self.assertEqual(bat.source, "upower")
+
+        # Wakelock honors PHONECLUSTER_NO_WAKELOCK=1 and invokes repowerd-cli active when enabled
+        with mock.patch.dict(os.environ, {"PHONECLUSTER_NO_WAKELOCK": "1"}, clear=False):
+            self.assertIsNone(_start_ubuntu_touch_wakelock())
+        fake_proc = mock.MagicMock(pid=4242)
+        fake_proc.poll.return_value = None
+        with mock.patch.dict(os.environ, {"PHONECLUSTER_NO_WAKELOCK": ""}, clear=False), mock.patch(
+            "phonecluster.worker.detect_os_environment", return_value="ubuntu-touch-24.04"
+        ), mock.patch("phonecluster.worker.find_executable", return_value="/usr/bin/repowerd-cli"), mock.patch(
+            "phonecluster.worker.subprocess.Popen", return_value=fake_proc
+        ) as popen_mock:
+            p_wl = _start_ubuntu_touch_wakelock()
+            self.assertIs(p_wl, fake_proc)
+            popen_mock.assert_called_once()
+            self.assertEqual(popen_mock.call_args.args[0], ["/usr/bin/repowerd-cli", "active"])
+            _stop_ubuntu_touch_wakelock(p_wl)
+            fake_proc.terminate.assert_called_once()
+
+    def test_routing_gateway_netguard_and_doctor_for_ubuntu_touch_snap_docker(self) -> None:
+        from unittest import mock
+        from phonecluster.doctor import run_doctor
+        from phonecluster.gateway import GATEWAY_PRESETS
+        from phonecluster.master import NodeSnapshot
+        from phonecluster.netguard import build_firewall_guides, detect_controller_host_info
+        from phonecluster.routing import build_cross_tier_env, classify_workload
+
+        # 1. Gateway Snap Store + Docker Hub presets
+        self.assertIn("snap", GATEWAY_PRESETS)
+        self.assertIn("api.snapcraft.io", GATEWAY_PRESETS["snap"]["domains"])
+        self.assertIn("hub.docker.com", GATEWAY_PRESETS["docker"]["domains"])
+
+        # 2. Routing: docker.compose & Swarm service discovery
+        self.assertEqual(classify_workload("docker-compose up -d").category, "docker")
+        cfg = ClusterConfig(
+            cluster_name="ut-cluster",
+            auth_token="ut-secret-token-1234567890",
+            nodes=[
+                NodeConfig(id="ut-master", host="192.168.1.201", role="master", ssh_port=22, ssh_user="phablet", tier=3, pool="docker"),
+                NodeConfig(id="ut-worker1", host="192.168.1.202", role="worker", ssh_port=22, ssh_user="phablet", tier=3, pool="docker", auth_token="ut-worker-tok-1234567890"),
+            ],
+        )
+        snaps = [
+            NodeSnapshot(
+                node=cfg.nodes[0],
+                online=True,
+                health={"ready_for_jobs": True, "tier": 3, "pool": "docker", "services": {"docker_swarm_2377": True}, "tools": {"docker": True}},
+            ),
+            NodeSnapshot(
+                node=cfg.nodes[1],
+                online=True,
+                health={"ready_for_jobs": True, "tier": 3, "pool": "docker", "services": {}, "tools": {"docker": True}},
+            ),
+        ]
+        env = build_cross_tier_env(snaps, cfg)
+        self.assertEqual(env.get("PHONECLUSTER_DOCKER_SWARM_MANAGER"), "192.168.1.201:2377")
+        self.assertEqual(env.get("PHONECLUSTER_POOL_DOCKER_HOSTS"), "192.168.1.201,192.168.1.202")
+
+        # 3. Netguard: Ubuntu Touch host info & LAN-only Docker Swarm firewall ports
+        with mock.patch("phonecluster.netguard.detect_os_environment", return_value="ubuntu-touch-24.04"), mock.patch(
+            "phonecluster.netguard._read_device_tree_model", return_value=""
+        ):
+            hinfo = detect_controller_host_info(cfg)
+        self.assertEqual(hinfo["kind"], "ubuntu_touch")
+        self.assertTrue(hinfo["is_ubuntu_touch"])
+        fw = build_firewall_guides(cfg, hinfo)
+        self.assertIn("2377", fw["nftables"])
+        self.assertIn("4789", fw["nftables"])
+        self.assertIn("port 2377 proto tcp", fw["ufw"])
+        self.assertIn("port 4789 proto udp", fw["ufw"])
+
+        # 4. Doctor: Ubuntu Touch auto-start, wake-lock, and Snap Docker socket permission warning
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "ut.json"
+            save_config(cfg, cfg_p)
+            fake_caps = {
+                "tools": {"python3": True, "docker": True, "docker_snap": True, "snap": True},
+                "services": {"sshd_22": True},
+                "docker_runtime": {
+                    "installed": True,
+                    "docker_bin": "/snap/bin/docker",
+                    "podman_bin": "",
+                    "is_snap": True,
+                    "socket_path": "/var/run/docker.sock",
+                    "socket_exists": True,
+                    "socket_accessible": False,
+                    "compose_available": True,
+                    "snap_volume_root": "/home/phablet/phonecluster/docker-data",
+                },
+            }
+            with mock.patch("phonecluster.doctor.detect_os_environment", return_value="ubuntu-touch-24.04"), mock.patch(
+                "phonecluster.doctor.detect_capabilities", return_value=fake_caps
+            ), mock.patch("phonecluster.doctor.find_executable", return_value="/usr/bin/repowerd-cli"):
+                rep = run_doctor(cfg_p, check_remote=False)
+            by_name = {c["name"]: c for c in rep["checks"]}
+            self.assertIn("Ubuntu Touch Auto-Start", by_name)
+            self.assertEqual(by_name["Ubuntu Touch Wake-Lock"]["status"], "ok")
+            self.assertEqual(by_name["Docker / Snap Runtime"]["status"], "warn")
+            self.assertIn("adduser", by_name["Docker / Snap Runtime"]["fix_hint"])
+
+    def test_two_phone_docker_status_swarm_setup_cli_dashboard_and_scripts(self) -> None:
+        import subprocess
+        import urllib.request
+        from unittest import mock
+        from phonecluster.cli import main as cli_main
+        from phonecluster.dashboard import DASHBOARD_HTML, DashboardHTTPServer
+        from phonecluster.master import NodeSnapshot
+
+        cfg = ClusterConfig(
+            cluster_name="ut-two-phones",
+            auth_token="ut-master-secret-1234567890",
+            nodes=[
+                NodeConfig(id="ut-master", host="192.168.1.201", role="master", ssh_port=22, ssh_user="phablet", tier=3, pool="docker"),
+                NodeConfig(id="ut-worker1", host="192.168.1.202", role="worker", ssh_port=22, ssh_user="phablet", tier=3, pool="docker", auth_token="ut-w1-secret-1234567890"),
+            ],
+        )
+        ctrl = MasterController(cfg)
+        snaps = [
+            NodeSnapshot(
+                node=cfg.nodes[0],
+                online=True,
+                health={
+                    "os_env": "ubuntu-touch-24.04",
+                    "ubuntu_touch": True,
+                    "tier": 3,
+                    "pool": "docker",
+                    "ready_for_jobs": True,
+                    "docker_snap": True,
+                    "docker_socket_accessible": True,
+                    "tools": {"docker": True, "docker_snap": True},
+                    "services": {},
+                },
+            ),
+            NodeSnapshot(
+                node=cfg.nodes[1],
+                online=True,
+                health={
+                    "os_env": "ubuntu-touch-24.04",
+                    "ubuntu_touch": True,
+                    "tier": 3,
+                    "pool": "docker",
+                    "ready_for_jobs": True,
+                    "docker_snap": True,
+                    "docker_socket_accessible": False,
+                    "tools": {"docker": True, "docker_snap": True},
+                    "services": {},
+                },
+            ),
+        ]
+
+        # 1. MasterController.docker_cluster_status aggregates both Ubuntu Touch Snap Docker nodes
+        def _fake_exec_status(node: NodeConfig, _spec: JobSpec) -> tuple[str, dict[str, Any]]:
+            payload = {
+                "docker_bin": "/snap/bin/docker",
+                "is_snap": True,
+                "ok": True,
+                "error": "",
+                "server_version": "27.5.1",
+                "swarm_state": "active",
+                "swarm_manager": node.id == "ut-master",
+                "swarm_nodes": 2 if node.id == "ut-master" else 0,
+                "containers_running": 1,
+                "containers_total": 1,
+                "containers": [{"name": f"web-{node.id}", "image": "nginx:alpine", "status": "Up 1h", "ports": "8088->80/tcp"}],
+                "volume_root": "/home/phablet/phonecluster/docker-data",
+            }
+            return "ok", {"stdout": json.dumps(payload), "stderr": "", "returncode": 0}
+
+        with mock.patch.object(ctrl, "poll_health", return_value=snaps), mock.patch.object(
+            ctrl, "exec_on_node", side_effect=_fake_exec_status
+        ):
+            st = ctrl.docker_cluster_status()
+        self.assertEqual(st["total_nodes"], 2)
+        self.assertEqual(st["ready_nodes"], 2)
+        self.assertTrue(st["swarm_active"])
+        self.assertEqual(st["swarm_managers"], ["ut-master"])
+        self.assertEqual(st["total_running_containers"], 2)
+
+        # 2. MasterController.docker_swarm_setup passes join token ONLY via env var and never returns it in JSON
+        captured_specs: dict[str, JobSpec] = {}
+        secret_tok = "SWMTKN-1-FAKE-UNIT-TEST-TOKEN-99999"
+
+        def _fake_exec_swarm(node: NodeConfig, spec: JobSpec) -> tuple[str, dict[str, Any]]:
+            captured_specs[node.id] = spec
+            if node.id == "ut-master":
+                return "ok", {"stdout": json.dumps({"ok": True, "initialized": True, "token": secret_tok}), "stderr": "", "returncode": 0}
+            return "ok", {"stdout": json.dumps({"ok": True, "already_active": False}), "stderr": "", "returncode": 0}
+
+        with mock.patch.object(ctrl, "poll_health", return_value=snaps), mock.patch.object(
+            ctrl, "exec_on_node", side_effect=_fake_exec_swarm
+        ):
+            sw_res = ctrl.docker_swarm_setup()
+        self.assertTrue(sw_res["ok"])
+        self.assertEqual(sw_res["manager_node_id"], "ut-master")
+        self.assertEqual(sw_res["manager_addr"], "192.168.1.201:2377")
+        self.assertEqual(sw_res["joined_count"], 1)
+        self.assertNotIn(secret_tok, json.dumps(sw_res))
+        self.assertEqual(captured_specs["ut-worker1"].env.get("PHONECLUSTER_SWARM_TOKEN"), secret_tok)
+        self.assertNotIn(secret_tok, captured_specs["ut-worker1"].command or "")
+
+        # 3. Dashboard /api/workloads & /api/workloads/action (docker-status)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "ut_dash.json"
+            save_config(cfg, cfg_p)
+            dash = DashboardHTTPServer(("127.0.0.1", 0), ctrl, config_path=cfg_p, enable_pairing_beacon=False)
+            d_port = dash.server_address[1]
+            dt = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            dt.start()
+            try:
+                with mock.patch.object(ctrl, "poll_health", return_value=snaps), mock.patch.object(
+                    ctrl, "exec_on_node", side_effect=_fake_exec_status
+                ):
+                    with urllib.request.urlopen(f"http://127.0.0.1:{d_port}/api/workloads", timeout=4.0) as resp:
+                        wl = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(wl["docker_nodes"], ["ut-master", "ut-worker1"])
+                    self.assertEqual(wl["docker_snap_nodes"], ["ut-master", "ut-worker1"])
+                    self.assertEqual(wl["docker_socket_issues"], ["ut-worker1"])
+
+                    req_act = urllib.request.Request(
+                        f"http://127.0.0.1:{d_port}/api/workloads/action",
+                        data=json.dumps({"action": "docker-status"}).encode("utf-8"),
+                        headers=build_auth_headers(cfg.auth_token),
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req_act, timeout=4.0) as resp:
+                        act_res = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(act_res["ready_nodes"], 2)
+            finally:
+                dash.shutdown()
+                dash.server_close()
+                dt.join(timeout=2.0)
+
+        self.assertIn("workloadAction('docker-status')", DASHBOARD_HTML)
+        self.assertIn("workloadAction('docker-swarm-init')", DASHBOARD_HTML)
+
+        # 4. CLI `pc docker status --json`
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "ut_cli.json"
+            save_config(cfg, cfg_p)
+            with mock.patch("phonecluster.cli.MasterController.docker_cluster_status", return_value=st):
+                self.assertEqual(cli_main(["--config", str(cfg_p), "docker", "status", "--json"]), 0)
+
+        # 5. Example config & shell scripts (06_ubuntu_touch_node_setup.sh, 05_workload_helpers.sh, install.sh, 03_sync_cluster.sh)
+        repo = Path(__file__).resolve().parent.parent
+        ut_ex = ClusterConfig.from_dict(
+            json.loads((repo / "examples" / "ubuntu_touch_docker_cluster.example.json").read_text(encoding="utf-8"))
+        )
+        self.assertEqual(len(ut_ex.nodes), 2)
+        self.assertTrue(all(n.ssh_user == "phablet" and n.tier == 3 and n.pool == "docker" for n in ut_ex.nodes))
+
+        ut_script = repo / "scripts" / "06_ubuntu_touch_node_setup.sh"
+        self.assertEqual(subprocess.run(["bash", str(ut_script), "--help"], capture_output=True).returncode, 0)
+        self.assertEqual(subprocess.run(["bash", str(ut_script), "--node-id", "bad id!"], capture_output=True).returncode, 2)
+        self.assertEqual(subprocess.run(["bash", str(ut_script), "--repo-dir", "/tmp/bad$dir"], capture_output=True).returncode, 2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "phablet"
+            fake_home.mkdir()
+            fake_repo = fake_home / "phonecluster"
+            fake_repo.mkdir()
+            env_ut = os.environ.copy()
+            env_ut["HOME"] = str(fake_home)
+            env_ut["USER"] = "phablet"
+            p_boot = subprocess.run(
+                ["bash", str(ut_script), "--boot-only", "--master", "--node-id", "ut-master", "--repo-dir", str(fake_repo)],
+                env=env_ut,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(p_boot.returncode, 0, p_boot.stderr)
+            pc_wrap = fake_home / ".local" / "bin" / "phonecluster"
+            self.assertTrue(pc_wrap.exists())
+            self.assertIn("/snap/bin", pc_wrap.read_text(encoding="utf-8"))
+            unit = fake_home / ".config" / "systemd" / "user" / "phonecluster-worker.service"
+            dash_unit = fake_home / ".config" / "systemd" / "user" / "phonecluster-dashboard.service"
+            self.assertTrue(unit.exists())
+            self.assertTrue(dash_unit.exists())
+            self.assertIn("/snap/bin", unit.read_text(encoding="utf-8"))
+            self.assertTrue((fake_repo / "docker-data").is_dir())
+
+        p_sw_no_tok = subprocess.run(
+            ["bash", str(repo / "scripts" / "05_workload_helpers.sh"), "docker-swarm-join", "192.168.1.201:2377"],
+            env={k: v for k, v in os.environ.items() if k != "PHONECLUSTER_SWARM_TOKEN"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(p_sw_no_tok.returncode, 2)
+
+        install_sh = (repo / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("06_ubuntu_touch_node_setup.sh", install_sh)
+        self.assertIn("/snap/bin", install_sh)
+        sync_sh = (repo / "scripts" / "03_sync_cluster.sh").read_text(encoding="utf-8")
+        self.assertIn("phonecluster-worker.service", sync_sh)
+        self.assertIn("/snap/bin", sync_sh)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -164,9 +164,20 @@ case "$2" in
   '~/'*) REMOTE_DIR="$HOME/${2#??}" ;;
   *) REMOTE_DIR="$2" ;;
 esac
+if [[ -d "/snap/bin" ]]; then
+  export PATH="/snap/bin:${HOME}/.local/bin:${PATH}"
+fi
 LOG_DIR="${REMOTE_DIR}/logs"
 PID_FILE="${LOG_DIR}/worker-${NODE_ID}.pid"
 mkdir -p "${LOG_DIR}"
+
+# Prefer systemd --user unit on Ubuntu Touch / systemd nodes if already enabled so systemd never fights nohup
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [[ -f "${HOME}/.config/systemd/user/phonecluster-worker.service" ]] && command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+  systemctl --user restart phonecluster-worker.service
+  echo "Restarted systemd --user phonecluster-worker.service for '${NODE_ID}'"
+  exit 0
+fi
 
 if [[ -f "${PID_FILE}" ]]; then
   OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"

@@ -39,7 +39,7 @@ DEFAULT_POOL_BY_TIER: dict[int, str] = {
 
 # Keyword patterns for transparent automatic workload routing
 _DOCKER_RE = re.compile(
-    r"(?:^|[\s;&|])(docker|docker-compose|podman|kubectl|k3s|crictl|nerdctl)\b",
+    r"(?:^|[\s;&|])(docker|docker-compose|docker\.compose|podman|kubectl|k3s|crictl|nerdctl|ctr)\b",
     re.IGNORECASE,
 )
 _SERVICE_RE = re.compile(
@@ -319,6 +319,7 @@ _SERVICE_SPEC: list[tuple[str, str, int, str]] = [
     ("llama_api", "llama_api_8081", 8081, "http"),
     ("llama_rpc", "llama_rpc_50052", 50052, "tcp"),
     ("distcc", "distccd_3632", 3632, "tcp"),
+    ("docker_swarm", "docker_swarm_2377", 2377, "tcp"),
     ("redis", "redis_6379", 6379, "redis"),
     ("postgres", "postgres_5432", 5432, "postgresql"),
 ]
@@ -524,6 +525,10 @@ def build_cross_tier_env(
         env["PHONECLUSTER_REDIS_URL"] = _pick_primary_service(by_name["redis"])["url"]
     if "postgres" in by_name:
         env["PHONECLUSTER_POSTGRES_HOST"] = _pick_primary_service(by_name["postgres"])["host"]
+    if "docker_swarm" in by_name:
+        sw = _pick_primary_service(by_name["docker_swarm"])
+        if sw.get("host") and int(sw.get("port") or 0) > 0:
+            env["PHONECLUSTER_DOCKER_SWARM_MANAGER"] = format_host_port(sw["host"], int(sw["port"]))
 
     # Pool host lists so any node can reach peers in other tiers (ready non-quarantined nodes listed first)
     quarantined = set(config.gateway.quarantined_nodes)

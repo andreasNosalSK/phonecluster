@@ -19,8 +19,10 @@ from .telemetry import (
     _read_listening_tcp_map,
     detect_capabilities,
     detect_os_environment,
+    find_executable,
     is_battery_health_hazardous,
     is_local_port_open,
+    is_ubuntu_touch_os,
     read_battery_via_termux,
 )
 
@@ -159,7 +161,50 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                 )
             )
 
-    # 4. Compute capabilities summary
+    # 3b. Ubuntu Touch (UBports) persistent service & wake-lock checks
+    if is_ubuntu_touch_os(os_env):
+        try:
+            ut_unit = Path.home() / ".config" / "systemd" / "user" / "phonecluster-worker.service"
+            has_ut_unit = ut_unit.exists()
+        except (OSError, RuntimeError):
+            has_ut_unit = False
+        if has_ut_unit:
+            checks.append(
+                CheckResult(
+                    "Ubuntu Touch Auto-Start",
+                    "ok",
+                    "Found systemd --user service (~/.config/systemd/user/phonecluster-worker.service)",
+                )
+            )
+        else:
+            checks.append(
+                CheckResult(
+                    "Ubuntu Touch Auto-Start",
+                    "warn",
+                    "No systemd --user worker service configured yet",
+                    "Run `bash scripts/06_ubuntu_touch_node_setup.sh --node-id <id>` (safe on read-only rootfs).",
+                )
+            )
+        wl_cli = find_executable("repowerd-cli") or find_executable("powerd-cli")
+        if wl_cli:
+            checks.append(
+                CheckResult(
+                    "Ubuntu Touch Wake-Lock",
+                    "ok",
+                    f"Keep-awake supported via {Path(wl_cli).name} active (auto-acquired by worker daemon)",
+                )
+            )
+        else:
+            checks.append(
+                CheckResult(
+                    "Ubuntu Touch Wake-Lock",
+                    "warn",
+                    "Neither repowerd-cli nor powerd-cli found — screen-off deep sleep may pause worker Wi-Fi",
+                    "Install UT Tweak Tool from OpenStore and enable 'Prevent app suspension', or run on AC power.",
+                )
+            )
+
+    # 4. Compute capabilities & Docker / Snap Docker runtime check
     caps = detect_capabilities()
     installed_tools = [k for k, v in caps["tools"].items() if v]
     checks.append(
@@ -169,6 +214,65 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
             f"Detected: {', '.join(installed_tools) if installed_tools else 'basic shell'}",
         )
     )
+    docker_rt = caps.get("docker_runtime") or {}
+    if docker_rt.get("installed") or is_ubuntu_touch_os(os_env):
+        dk_bin = str(docker_rt.get("docker_bin") or docker_rt.get("podman_bin") or "")
+        is_snap_dk = bool(docker_rt.get("is_snap"))
+        if not docker_rt.get("installed"):
+            checks.append(
+                CheckResult(
+                    "Docker / Snap Runtime",
+                    "warn",
+                    "Docker not detected on this Ubuntu Touch device",
+                    "Install Docker via Snap (`sudo snap install docker`) and run `bash scripts/06_ubuntu_touch_node_setup.sh`.",
+                )
+            )
+        elif not docker_rt.get("socket_exists"):
+            checks.append(
+                CheckResult(
+                    "Docker / Snap Runtime",
+                    "warn",
+                    f"Docker binary found ({dk_bin}), but daemon socket is not active",
+                    "Start Snap Docker: `sudo snap enable docker && sudo snap start docker` (or `sudo systemctl start docker`).",
+                )
+            )
+        elif not docker_rt.get("socket_accessible"):
+            checks.append(
+                CheckResult(
+                    "Docker / Snap Runtime",
+                    "warn",
+                    f"Docker socket ({docker_rt.get('socket_path')}) is not accessible by current user",
+                    "Grant group access: `sudo addgroup --system docker && sudo adduser $USER docker && sudo snap connect docker:home && sudo snap disable docker && sudo snap enable docker` (then re-login).",
+                )
+            )
+        else:
+            snap_notes: list[str] = []
+            if is_snap_dk:
+                snap_notes.append("Snap-confined")
+                try:
+                    dk_cfg_dir = Path.home() / ".docker"
+                    if dk_cfg_dir.exists() and hasattr(os, "getuid") and os.stat(dk_cfg_dir).st_uid == 0 and os.getuid() != 0:
+                        checks.append(
+                            CheckResult(
+                                "Snap Docker ~/.docker Permissions",
+                                "warn",
+                                f"{dk_cfg_dir} is owned by root (breaks non-root docker CLI)",
+                                f"Fix with: `sudo chown -R $USER:$USER {dk_cfg_dir}`",
+                            )
+                        )
+                except (OSError, RuntimeError):
+                    pass
+                vol_root = str(docker_rt.get("snap_volume_root") or "")
+                if vol_root:
+                    snap_notes.append(f"bind-mount root: {vol_root}")
+            label = f" ({', '.join(snap_notes)})" if snap_notes else ""
+            checks.append(
+                CheckResult(
+                    "Docker / Snap Runtime",
+                    "ok",
+                    f"Ready via {dk_bin} -> {docker_rt.get('socket_path')}{label}",
+                )
+            )
 
     # 5. Configuration file & security checks
     resolved_cfg = resolve_config_path(config_path)

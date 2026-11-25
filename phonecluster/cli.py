@@ -46,6 +46,7 @@ from .pairing import (
     join_cluster_via_pairing,
     run_cli_pairing_host,
 )
+from .telemetry import detect_os_environment, is_ubuntu_touch_os
 from .tui import run_top_tui
 from .wizard import _print_doctor_report, run_interactive_menu, run_setup_wizard
 from .worker import WorkerState, serve_worker
@@ -533,6 +534,105 @@ def _cmd_mpi_hostfile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_docker(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
+    action = str(args.action or "status").strip().lower()
+    if action == "status":
+        res = ctrl.docker_cluster_status(timeout_sec=args.timeout)
+        if args.json:
+            print(json.dumps(res, indent=2))
+            return 0 if res["ready_nodes"] > 0 or res["total_nodes"] == 0 else 1
+        nodes = res.get("nodes") or []
+        if not nodes:
+            print("No online Docker-capable (Tier 3) nodes found.")
+            print("Tip: On Ubuntu Touch, install Docker via Snap (`sudo snap install docker`) and run `bash scripts/06_ubuntu_touch_node_setup.sh`.")
+            return 1
+        rows = []
+        for n in nodes:
+            rt_tag = "snap" if n.get("is_snap") or n.get("docker_snap") else "native"
+            sw_txt = str(n.get("swarm_state") or "inactive")
+            if n.get("swarm_manager"):
+                sw_txt += " (mgr)"
+            if n.get("ok"):
+                rows.append([
+                    n["node_id"],
+                    n["host"],
+                    n.get("os_env") or "-",
+                    f"{n.get('server_version') or '?'} ({rt_tag})",
+                    sw_txt,
+                    f"{n.get('containers_running', 0)}/{n.get('containers_total', 0)}",
+                    "OK",
+                ])
+            else:
+                rows.append([
+                    n["node_id"],
+                    n["host"],
+                    n.get("os_env") or "-",
+                    rt_tag,
+                    "-",
+                    "-",
+                    f"ERR: {str(n.get('error') or 'unavailable')[:48]}",
+                ])
+        print(_fmt_table(["NODE", "HOST", "OS", "DOCKER", "SWARM", "CONTAINERS", "STATUS"], rows))
+        for n in nodes:
+            for c in n.get("containers") or []:
+                print(f"  [{n['node_id']}] {c.get('name')} ({c.get('image')}) — {c.get('status')} {c.get('ports') or ''}".rstrip())
+        return 0 if res["ready_nodes"] > 0 else 1
+
+    if action == "swarm-init":
+        if args.advertise_addr:
+            try:
+                validate_host(args.advertise_addr)
+            except ValueError as exc:
+                print(f"Error: invalid --advertise-addr: {exc}", file=sys.stderr)
+                return 2
+        res = ctrl.docker_swarm_setup(
+            manager_node_id=args.manager or None,
+            advertise_addr=args.advertise_addr or "",
+        )
+        if args.json:
+            print(json.dumps(res, indent=2))
+            return 0 if res.get("ok") else 1
+        if not res.get("ok") and not res.get("manager_node_id"):
+            print(f"Swarm setup failed: {res.get('error', 'unknown error')}", file=sys.stderr)
+            return 1
+        print(f"Swarm Manager : {res.get('manager_node_id')} ({res.get('manager_addr')})")
+        if res.get("error"):
+            print(f"Manager Error : {res['error']}", file=sys.stderr)
+        for w in res.get("workers") or []:
+            st = "OK (already active)" if w.get("already_active") else ("JOINED" if w.get("ok") else f"FAILED: {w.get('error')}")
+            print(f"  Worker {w.get('node_id')}: {st}")
+        if res.get("note"):
+            print(f"\nNote: {res['note']}")
+        return 0 if res.get("ok") else 1
+
+    if action == "ps":
+        spec = JobSpec(
+            index=0,
+            job_id=f"docker-ps-{uuid.uuid4().hex[:6]}",
+            command='docker ps -a --format "table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}"',
+            workload_hint="docker",
+            timeout_sec=args.timeout,
+        )
+        outcomes = ctrl.run_single(spec, target=args.target or "all")
+        if args.json:
+            print(json.dumps([o.to_dict() for o in outcomes], indent=2))
+            return 0 if any(o.ok for o in outcomes) else 1
+        for o in outcomes:
+            print(f"=== [{o.node_id}] {'OK' if o.ok else 'FAIL'} ===")
+            if o.stdout:
+                print(o.stdout.rstrip())
+            if o.stderr:
+                print(o.stderr.rstrip(), file=sys.stderr)
+            if o.error:
+                print(f"ERROR: {o.error}", file=sys.stderr)
+        return 0 if any(o.ok for o in outcomes) else 1
+
+    print(f"Unknown docker action: {action}", file=sys.stderr)
+    return 2
+
+
 def _cmd_gateway(args: argparse.Namespace) -> int:
     cfg_path = resolve_config_path(args.config)
     cfg = load_config(cfg_path)
@@ -886,12 +986,17 @@ def _cmd_join(args: argparse.Namespace) -> int:
     if res["ssh_key_trusted"]:
         print("  Master SSH Key   : Added to ~/.ssh/authorized_keys")
 
-    # Configure Termux:Boot automatically if running inside Termux (using --boot-only so air-gapped phones work offline!)
+    # Configure OS auto-start automatically (Termux:Boot on Android, systemd --user on Ubuntu Touch — offline-safe!)
     if "com.termux" in os.environ.get("PREFIX", ""):
         setup_sh = REPO_ROOT / "scripts" / "02_termux_node_setup.sh"
         if setup_sh.exists():
             print("  Updating Termux:Boot startup script for your new node ID...")
             subprocess.call(["bash", str(setup_sh), "--boot-only", "--node-id", res["node_id"], "--repo-dir", str(REPO_ROOT)])
+    elif is_ubuntu_touch_os(detect_os_environment()):
+        ut_setup_sh = REPO_ROOT / "scripts" / "06_ubuntu_touch_node_setup.sh"
+        if ut_setup_sh.exists():
+            print("  Updating Ubuntu Touch systemd --user service for your new node ID...")
+            subprocess.call(["bash", str(ut_setup_sh), "--boot-only", "--node-id", res["node_id"], "--repo-dir", str(REPO_ROOT)])
 
     if not args.no_start:
         log_dir = REPO_ROOT / "logs"
@@ -1541,6 +1646,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_mpi = sub.add_parser("mpi-hostfile", help="Generate an OpenMPI hostfile from healthy phones")
     p_mpi.add_argument("-o", "--output", default=None, help="Write hostfile to path instead of stdout")
     p_mpi.set_defaults(func=_cmd_mpi_hostfile)
+
+    # docker (Ubuntu Touch / Snap Docker & Tier 3 container cluster management)
+    p_dk = sub.add_parser("docker", help="Inspect Snap/native Docker containers or set up a 2-phone Docker Swarm")
+    p_dk.add_argument("action", nargs="?", default="status", choices=["status", "swarm-init", "ps"], help="Docker cluster action")
+    p_dk.add_argument("--manager", default="", help="Manager node ID for swarm-init (default: Master or first Tier 3 node)")
+    p_dk.add_argument("--advertise-addr", default="", help="LAN advertise IP for swarm-init")
+    p_dk.add_argument("--target", default="tier:3", help="Target for `docker ps` (default: tier:3)")
+    p_dk.add_argument("--timeout", type=float, default=15.0, help="Per-node command timeout in seconds")
+    p_dk.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_dk.set_defaults(func=_cmd_docker)
 
     # gateway (optional Master Network Guard / Watchguard proxy)
     p_gw = sub.add_parser(

@@ -24,7 +24,13 @@ from .config import (
 )
 from .discovery import detect_local_ip
 from .routing import build_service_registry, resolve_node_tier_and_pool
-from .telemetry import _read_listening_tcp_map, detect_os_environment, is_local_port_open, read_memory_info
+from .telemetry import (
+    _read_listening_tcp_map,
+    detect_os_environment,
+    is_local_port_open,
+    is_ubuntu_touch_os,
+    read_memory_info,
+)
 
 KNOWN_CLUSTER_PORTS: set[int] = {
     22,
@@ -108,6 +114,7 @@ def detect_controller_host_info(config: ClusterConfig) -> dict[str, Any]:
     lan_ip = detect_local_ip()
     is_pi = "raspberry pi" in model.lower()
     is_termux = os_env == "termux"
+    is_ut = is_ubuntu_touch_os(os_env)
 
     nodes_list = list(config.nodes)
     master_node = next((n for n in nodes_list if n.role == "master"), nodes_list[0])
@@ -133,6 +140,9 @@ def detect_controller_host_info(config: ClusterConfig) -> dict[str, Any]:
     elif is_termux:
         kind = "android_termux"
         friendly = f"Android Termux ({arch})"
+    elif is_ut:
+        kind = "ubuntu_touch"
+        friendly = f"Ubuntu Touch ({os_env}, {arch})"
     elif os_env.startswith("debian"):
         kind = "debian_linux"
         friendly = f"Debian Linux ({os_env}, {arch})"
@@ -146,13 +156,14 @@ def detect_controller_host_info(config: ClusterConfig) -> dict[str, Any]:
         "board_model": model,
         "is_raspberry_pi": is_pi,
         "is_termux": is_termux,
+        "is_ubuntu_touch": is_ut,
         "os_env": os_env,
         "arch": arch,
         "lan_ip": lan_ip,
         "master_host": master_node.host,
         "lan_subnet": subnet,
         "mem_total_mb": mem["total_mb"],
-        "can_run_native_adguard": not is_termux,
+        "can_run_native_adguard": (not is_termux) and (not is_ut),
         "docker_required_for_adguard": False,
         "tools": {
             "adguard_native": adguard_bin,
@@ -284,10 +295,18 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
     if cfg_ssh > 0 and cfg_ssh not in ssh_ports:
         ssh_ports.append(cfg_ssh)
 
+    has_docker_nodes = bool(host_info.get("is_ubuntu_touch")) or any(
+        n.tier == 3 or n.pool == "docker" for n in nodes_list
+    )
+    docker_tcp = {2377, 7946} if has_docker_nodes else set()
+    udp_ports = sorted({53, 8766} | ({4789, 7946} if has_docker_nodes else set()))
+    udp_port_list = ", ".join(str(p) for p in udp_ports)
+
     tcp_ports = sorted(
         p
         for p in (
             set(ssh_ports)
+            | docker_tcp
             | {
                 dash_port,
                 master_worker_port,
@@ -315,14 +334,14 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
         if v4_lan and ":" not in v4_lan:
             extra_family_lines.append(f"    # Also allow IPv4 LAN ({v4_lan}) for IPv4 SSH, workers, and UDP discovery")
             extra_family_lines.append(f"    ip saddr {v4_lan} tcp dport {{ {tcp_port_list} }} accept")
-            extra_family_lines.append(f"    ip saddr {v4_lan} udp dport {{ 53, 8766 }} accept")
+            extra_family_lines.append(f"    ip saddr {v4_lan} udp dport {{ {udp_port_list} }} accept")
     else:
         extra_family_lines.append("    # Keep link-local IPv6 SSH reachable (prevents mDNS/.local SSH lockout)")
         extra_family_lines.append(f"    ip6 saddr fe80::/10 tcp dport {{ {ssh_port_list} }} accept")
 
     nft_lines = [
         "#!/usr/sbin/nft -f",
-        "# Hardened PhoneCluster Master Firewall (Raspberry Pi / Debian 13)",
+        "# Hardened PhoneCluster Master Firewall (Raspberry Pi / Debian 13 / Ubuntu Touch)",
         f"# Allows LAN ({subnet}) + Tailscale/WireGuard ONLY; drops unsolicited WAN traffic.",
         "# NOTE: Scoped to its own table (no `flush ruleset` / forward drop) so Docker/NAT chains stay intact.",
         "table inet phonecluster_master",
@@ -341,7 +360,7 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
         "",
         f"    # Allow LAN ({subnet}) access to SSH, Dashboard, Worker, Pairing, Network Guard, AdGuard & Shared Services",
         f"    {addr_match} tcp dport {{ {tcp_port_list} }} accept",
-        f"    {addr_match} udp dport {{ 53, 8766 }} accept",
+        f"    {addr_match} udp dport {{ {udp_port_list} }} accept",
     ]
     nft_lines.extend(extra_family_lines)
     nft_lines.extend(
@@ -380,9 +399,17 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
             f"sudo ufw allow from {subnet} to any port 8081 proto tcp comment 'Cluster llama.cpp API'",
             f"sudo ufw allow from {subnet} to any port 8123 proto tcp comment 'Cluster Home Assistant'",
             f"sudo ufw allow from {subnet} to any port 50052 proto tcp comment 'Cluster llama.cpp RPC'",
-            "sudo ufw enable && sudo ufw status verbose",
         ]
     )
+    if has_docker_nodes:
+        ufw_lines.extend(
+            [
+                f"sudo ufw allow from {subnet} to any port 2377 proto tcp comment 'Docker Swarm Management (LAN)'",
+                f"sudo ufw allow from {subnet} to any port 7946 comment 'Docker Swarm Node Discovery (LAN)'",
+                f"sudo ufw allow from {subnet} to any port 4789 proto udp comment 'Docker Swarm Overlay VXLAN (LAN)'",
+            ]
+        )
+    ufw_lines.append("sudo ufw enable && sudo ufw status verbose")
     ufw_cmds = "\n".join(ufw_lines)
 
     eff_master_host = _effective_master_lan_host(master_node.host, str(host_info.get("lan_ip") or ""))
