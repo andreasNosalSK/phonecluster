@@ -197,6 +197,9 @@ def build_worker_proxy_env(
         return {}
 
     m_host = normalize_host(master_host) if master_host else ""
+    if "usb-hub" in node.tags and is_loopback_or_unspecified_host(node.host):
+        # ADB USB-hub workers reach Master's gateway over `adb reverse` on 127.0.0.1 even with Wi-Fi OFF
+        m_host = "127.0.0.1"
     if not m_host and config.nodes:
         master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
         m_host = normalize_host(master_node.host)

@@ -7781,5 +7781,243 @@ class TestUbuntuTouchAndSnapDockerClustering(unittest.TestCase):
         self.assertIn("/snap/bin", sync_sh)
 
 
+class TestUsbHubRouting(unittest.TestCase):
+    """Verify zero-Wi-Fi USB 3.0 Hub routing (ADB Peer Mesh & Layer-3 /30 RNDIS router)."""
+
+    def test_usb_hub_discovery_validation_and_6_phone_adb_peer_mesh(self) -> None:
+        from unittest import mock
+        from phonecluster.config import GatewayConfig
+        from phonecluster.gateway import build_worker_proxy_env
+        from phonecluster.master import NodeSnapshot
+        from phonecluster.routing import build_cross_tier_env
+        from phonecluster.usbhub import (
+            UsbHubWatchdog,
+            apply_adb_usb_hub,
+            detect_subnet_collisions,
+            list_adb_devices,
+            plan_adb_usb_hub,
+            sync_usb_hub_into_config,
+            validate_iface_name,
+            validate_subnet_prefix,
+            validate_usb_serial,
+        )
+
+        # 1. Strict input validation
+        self.assertEqual(validate_subnet_prefix("10.77"), "10.77")
+        self.assertEqual(validate_subnet_prefix("172.30"), "172.30")
+        self.assertEqual(validate_subnet_prefix("192.168"), "192.168")
+        for bad_pref in ("8.8", "172.15", "10.999", "10.77;id", ""):
+            with self.assertRaises(ValueError):
+                validate_subnet_prefix(bad_pref)
+        for bad_ser in ("-evil", "abc;rm", ""):
+            with self.assertRaises(ValueError):
+                validate_usb_serial(bad_ser)
+        for bad_if in ("-usb0", "usb0;id", ""):
+            with self.assertRaises(ValueError):
+                validate_iface_name(bad_if)
+
+        # 2. Parse 6 phones + 1 unauthorized phone from `adb devices -l`
+        adb_out = (
+            b"List of devices attached\n"
+            b"SER006 device usb:1-6 product:ut6 model:UT_Phone_6 device:p6 transport_id:6\n"
+            b"SER001 device usb:1-1 product:ut1 model:UT_Phone_1 device:p1 transport_id:1\n"
+            b"SER002 device usb:1-2 product:ut2 model:UT_Phone_2 device:p2 transport_id:2\n"
+            b"SER003 device usb:1-3 product:ut3 model:UT_Phone_3 device:p3 transport_id:3\n"
+            b"SER004 device usb:1-4 product:ut4 model:UT_Phone_4 device:p4 transport_id:4\n"
+            b"SER005 device usb:1-5 product:ut5 model:UT_Phone_5 device:p5 transport_id:5\n"
+            b"SER999 unauthorized usb:1-7 transport_id:7\n"
+        )
+        with mock.patch("phonecluster.usbhub.subprocess.check_output", return_value=adb_out):
+            devs = list_adb_devices(adb_bin="/usr/bin/adb")
+        self.assertEqual(len(devs), 7)
+
+        # 3. Deterministic 6-phone ADB hub plan with zero port collisions + full peer mesh
+        plan = plan_adb_usb_hub(devs, mesh_ports=(3632, 50052))
+        self.assertEqual(len(plan["nodes"]), 6)
+        worker_ports = [n["worker_port"] for n in plan["nodes"]]
+        ssh_ports = [n["ssh_port"] for n in plan["nodes"]]
+        self.assertEqual(worker_ports, [18761, 18762, 18763, 18764, 18765, 18766])
+        self.assertEqual(ssh_ports, [18021, 18022, 18023, 18024, 18025, 18026])
+        # Every local forward port on Master must be unique across all 6 phones
+        fwd_local_ports = [r["local_port"] for r in plan["forward_rules"]]
+        self.assertEqual(len(fwd_local_ports), len(set(fwd_local_ports)))
+        # Peer mesh gives usb1 access to all 5 sibling phones (usb2..usb6)
+        self.assertEqual(sorted(plan["peer_mesh_map"]["usb1"].keys()), ["usb2", "usb3", "usb4", "usb5", "usb6"])
+
+        # 4. apply_adb_usb_hub executes safe list-based adb commands & UsbHubWatchdog syncs cleanly
+        ok_proc = mock.MagicMock(returncode=0, stdout="", stderr="")
+        with mock.patch("phonecluster.usbhub.subprocess.run", return_value=ok_proc) as run_m:
+            res = apply_adb_usb_hub(plan, adb_bin="/usr/bin/adb")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["applied"], len(plan["forward_rules"]) + len(plan["reverse_rules"]))
+        self.assertTrue(all(isinstance(c.args[0], list) for c in run_m.call_args_list))
+
+        with mock.patch("phonecluster.usbhub.list_adb_devices", return_value=devs), mock.patch(
+            "phonecluster.usbhub.subprocess.run", return_value=ok_proc
+        ):
+            wd = UsbHubWatchdog(adb_bin="/usr/bin/adb")
+            wd_res = wd.sync_once()
+        self.assertEqual(len(wd_res["plan"]["nodes"]), 6)
+        self.assertEqual(len(wd.snapshot()["plan"]["nodes"]), 6)
+
+        # 5. Config merge + Gateway adb-reverse proxy env + Routing USB hub env
+        cfg = ClusterConfig(
+            cluster_name="usb-adb-cluster",
+            auth_token="master-usb-tok-1234567890",
+            nodes=[NodeConfig(id="node0", host="192.168.1.10", role="master")],
+            gateway=GatewayConfig(enabled=True, port=8888),
+        )
+        updated = sync_usb_hub_into_config(cfg, plan)
+        self.assertEqual(updated, ["usb1", "usb2", "usb3", "usb4", "usb5", "usb6"])
+        usb1 = cfg.get_node("usb1")
+        self.assertEqual(usb1.host, "127.0.0.1")
+        self.assertEqual(usb1.worker_port, 18761)
+        self.assertIn("usb-hub", usb1.tags)
+        self.assertTrue(usb1.auth_token and usb1.auth_token != cfg.auth_token)
+
+        # ADB USB worker uses 127.0.0.1:8888 (adb reverse) even when Master has a LAN IP
+        px_env = build_worker_proxy_env(cfg, usb1)
+        self.assertIn("@127.0.0.1:8888", px_env["HTTP_PROXY"])
+
+        snaps = [NodeSnapshot(node=usb1, online=True, health={"ready_for_jobs": True})]
+        cross_env = build_cross_tier_env(snaps, cfg)
+        self.assertEqual(cross_env.get("PHONECLUSTER_USB_HUB_NODES"), "usb1")
+
+        # 6. Collision detection catches Ubuntu Touch 10.15.19.82 overlap
+        cols = detect_subnet_collisions(
+            [
+                {"iface": "usb0", "ipv4_cidrs": ["10.15.19.100/24"]},
+                {"iface": "usb1", "ipv4_cidrs": ["10.15.19.101/24"]},
+            ]
+        )
+        self.assertEqual(len(cols), 1)
+        self.assertEqual(cols[0]["subnet"], "10.15.19.0/24")
+        self.assertEqual(cols[0]["interfaces"], ["usb0", "usb1"])
+
+    def test_rndis_layer3_usb_router_cli_dashboard_and_script(self) -> None:
+        import subprocess
+        import urllib.error
+        import urllib.request
+        from unittest import mock
+        from phonecluster.cli import main as cli_main
+        from phonecluster.dashboard import DASHBOARD_HTML, DashboardHTTPServer
+        from phonecluster.usbhub import (
+            build_rndis_router_commands,
+            list_usb_net_interfaces,
+            plan_rndis_usb_hub,
+            sync_usb_hub_into_config,
+        )
+
+        # 1. list_usb_net_interfaces discovers usb0/usb1/enx sorted stably by MAC
+        with tempfile.TemporaryDirectory() as tmp:
+            sys_net = Path(tmp) / "net"
+            sys_net.mkdir()
+            for name, mac in (("usb1", "02:aa:00:00:00:01"), ("usb0", "02:bb:00:00:00:02"), ("eth0", "aa:bb:cc:dd:ee:ff")):
+                d = sys_net / name
+                d.mkdir()
+                (d / "address").write_text(mac + "\n", encoding="utf-8")
+                (d / "operstate").write_text("up\n", encoding="utf-8")
+            ifaces = list_usb_net_interfaces(sys_net_dir=sys_net, include_ips=False)
+        self.assertEqual([i["iface"] for i in ifaces], ["usb1", "usb0"])  # MAC 02:aa sorts before 02:bb!
+
+        # 2. Layer-3 /30 subnet planner & router command builder (air-gapped by default, optional --nat-wan)
+        plan = plan_rndis_usb_hub(ifaces, subnet_prefix="10.77")
+        self.assertEqual(plan["cluster_cidr"], "10.77.0.0/16")
+        self.assertEqual(plan["nodes"][0]["host_ip"], "10.77.1.1")
+        self.assertEqual(plan["nodes"][0]["phone_ip"], "10.77.1.2")
+        self.assertEqual(plan["nodes"][1]["host_ip"], "10.77.2.1")
+        self.assertEqual(plan["nodes"][1]["phone_ip"], "10.77.2.2")
+
+        cmds_airgap = build_rndis_router_commands(plan, nat_wan=False)
+        host_txt = "\n".join(cmds_airgap["host_commands"])
+        self.assertIn("net.ipv4.ip_forward=1", host_txt)
+        self.assertIn("10.77.0.0/16 -d 10.77.0.0/16 -j ACCEPT", host_txt)
+        self.assertNotIn("MASQUERADE", host_txt)
+
+        cmds_nat = build_rndis_router_commands(plan, nat_wan=True, wan_iface="eth0")
+        self.assertIn("MASQUERADE", "\n".join(cmds_nat["host_commands"]))
+
+        cfg = ClusterConfig(
+            cluster_name="usb-rndis-cluster",
+            auth_token="rndis-master-tok-1234567890",
+            nodes=[NodeConfig(id="node0", host="10.77.1.1", role="master")],
+        )
+        sync_usb_hub_into_config(cfg, plan)
+        self.assertEqual(cfg.get_node("usb1").host, "10.77.1.2")
+        self.assertEqual(cfg.get_node("usb2").host, "10.77.2.2")
+        self.assertIn("10.77.0.0/16", cfg.network.allowed_master_ips)
+
+        # 3. Dashboard /api/usb-hub endpoint (with auth lock check) + HTML markers
+        fake_topo = {
+            "adb_installed": True,
+            "adb_devices": [],
+            "adb_ready_count": 0,
+            "usb_net_interfaces": ifaces,
+            "usb_net_count": 2,
+            "subnet_collisions": [{"subnet": "10.15.19.0/24", "interfaces": ["usb0", "usb1"]}],
+            "ipv4_forwarding_enabled": False,
+            "recommended_mode": "rndis",
+            "notes": ["collision"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_p = Path(tmp) / "usb_dash.json"
+            cfg.dashboard_require_auth = True
+            save_config(cfg, cfg_p)
+            ctrl = MasterController(cfg)
+            dash = DashboardHTTPServer(("127.0.0.1", 0), ctrl, config_path=cfg_p, enable_pairing_beacon=False)
+            d_port = dash.server_address[1]
+            dt = threading.Thread(target=dash.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            dt.start()
+            try:
+                with mock.patch("phonecluster.dashboard.detect_usb_hub_topology", return_value=fake_topo):
+                    # Locked when dashboard_require_auth=True
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{d_port}/api/usb-hub", timeout=4.0):
+                            self.fail("Expected 401 when dashboard_require_auth=True")
+                    except urllib.error.HTTPError as exc:
+                        try:
+                            self.assertEqual(exc.code, 401)
+                        finally:
+                            exc.close()
+                    req_ok = urllib.request.Request(
+                        f"http://127.0.0.1:{d_port}/api/usb-hub",
+                        headers=build_auth_headers(cfg.auth_token),
+                    )
+                    with urllib.request.urlopen(req_ok, timeout=4.0) as resp:
+                        body = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(body["topology"]["usb_net_count"], 2)
+                    self.assertEqual(len(body["rndis_plan"]["nodes"]), 2)
+            finally:
+                dash.shutdown()
+                dash.server_close()
+                dt.join(timeout=2.0)
+
+        self.assertIn("loadUsbHub()", DASHBOARD_HTML)
+
+        # 4. CLI `pc usb-hub scan` and `pc usb-hub setup --mode rndis --json`
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_cli = Path(tmp) / "usb_cli.json"
+            save_config(cfg, cfg_cli)
+            with mock.patch("phonecluster.cli.detect_usb_hub_topology", return_value=fake_topo):
+                self.assertEqual(cli_main(["--config", str(cfg_cli), "usb-hub", "scan", "--json"]), 0)
+                self.assertEqual(cli_main(["--config", str(cfg_cli), "usb-hub", "setup", "--mode", "rndis", "--json"]), 0)
+                self.assertEqual(cli_main(["--config", str(cfg_cli), "usb-hub", "setup", "--subnet-prefix", "8.8"]), 2)
+
+        # 5. scripts/07_usb_hub_router.sh CLI validation & dry-run phone-setup
+        repo = Path(__file__).resolve().parent.parent
+        sh_path = repo / "scripts" / "07_usb_hub_router.sh"
+        self.assertEqual(subprocess.run(["bash", str(sh_path), "--help"], capture_output=True).returncode, 0)
+        self.assertEqual(subprocess.run(["bash", str(sh_path), "setup-rndis", "--prefix", "8.8", "--dry-run"], capture_output=True).returncode, 2)
+        self.assertEqual(subprocess.run(["bash", str(sh_path), "phone-setup", "99", "--dry-run"], capture_output=True).returncode, 2)
+        p_dry = subprocess.run(
+            ["bash", str(sh_path), "phone-setup", "2", "--iface", "usb0", "--dry-run"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(p_dry.returncode, 0, p_dry.stderr)
+        self.assertIn("10.77.2.2/30 dev usb0", p_dry.stdout)
+        self.assertIn("10.77.0.0/16 via 10.77.2.1", p_dry.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

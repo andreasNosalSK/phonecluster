@@ -48,6 +48,19 @@ from .pairing import (
 )
 from .telemetry import detect_os_environment, is_ubuntu_touch_os
 from .tui import run_top_tui
+from .usbhub import (
+    DEFAULT_ADB_SSH_BASE_PORT,
+    DEFAULT_ADB_WORKER_BASE_PORT,
+    DEFAULT_USB_SUBNET_PREFIX,
+    UsbHubWatchdog,
+    apply_adb_usb_hub,
+    build_rndis_router_commands,
+    detect_usb_hub_topology,
+    plan_adb_usb_hub,
+    plan_rndis_usb_hub,
+    sync_usb_hub_into_config,
+    validate_subnet_prefix,
+)
 from .wizard import _print_doctor_report, run_interactive_menu, run_setup_wizard
 from .worker import WorkerState, serve_worker
 
@@ -630,6 +643,149 @@ def _cmd_docker(args: argparse.Namespace) -> int:
         return 0 if any(o.ok for o in outcomes) else 1
 
     print(f"Unknown docker action: {action}", file=sys.stderr)
+    return 2
+
+
+def _cmd_usb_hub(args: argparse.Namespace) -> int:
+    action = str(args.action or "scan").strip().lower()
+
+    if action == "scan":
+        topo = detect_usb_hub_topology()
+        if args.json:
+            print(json.dumps(topo, indent=2))
+            return 0
+        print(f"ADB installed    : {'yes' if topo['adb_installed'] else 'no'}")
+        print(f"ADB ready phones : {topo['adb_ready_count']} (total seen: {len(topo['adb_devices'])})")
+        for d in topo["adb_devices"]:
+            print(f"  - {d['serial']}  state={d['state']}  model={d.get('model') or '-'}")
+        print(f"USB-Net gadgets  : {topo['usb_net_count']}")
+        for it in topo["usb_net_interfaces"]:
+            ips = ", ".join(it.get("ipv4_cidrs") or []) or "(no IPv4)"
+            print(f"  - {it['iface']}  mac={it.get('mac') or '-'}  driver={it.get('driver')}  state={it.get('operstate')}  ip={ips}")
+        print(f"IPv4 Forwarding  : {'ON' if topo['ipv4_forwarding_enabled'] else 'OFF'}")
+        if topo["subnet_collisions"]:
+            print("WARNING — Subnet collisions detected:")
+            for col in topo["subnet_collisions"]:
+                print(f"  ! {col['subnet']} shared by: {', '.join(col['interfaces'])}")
+        print(f"Recommended mode : {topo['recommended_mode']}")
+        for note in topo["notes"]:
+            print(f"  Note: {note}")
+        return 0
+
+    if action == "setup":
+        try:
+            prefix = validate_subnet_prefix(args.subnet_prefix)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        topo = detect_usb_hub_topology()
+        mode = args.mode
+        if mode == "auto":
+            mode = topo["recommended_mode"]
+
+        if mode == "adb":
+            ready = [d for d in topo["adb_devices"] if d.get("state") == "device"]
+            if not ready:
+                print("No authorized ADB phones found on USB hub. Run `adb devices` and approve USB debugging.", file=sys.stderr)
+                return 1
+            plan = plan_adb_usb_hub(
+                ready,
+                worker_base_port=args.worker_base_port,
+                ssh_base_port=args.ssh_base_port,
+                remote_ssh_port=args.remote_ssh_port,
+                gateway_port=args.gateway_port,
+                enable_gateway_reverse=not args.no_gateway_reverse,
+                enable_peer_mesh=not args.no_peer_mesh,
+            )
+            apply_res = (
+                {"ok": True, "dry_run": True, "applied": 0, "failed": 0, "errors": []}
+                if args.dry_run
+                else apply_adb_usb_hub(plan)
+            )
+            updated: list[str] = []
+            if args.write_config and not args.dry_run:
+                cfg_path = resolve_config_path(args.config)
+                cfg = load_config(cfg_path)
+                updated = sync_usb_hub_into_config(cfg, plan)
+                save_config(cfg, cfg_path)
+            out = {"plan": plan, "apply": apply_res, "updated_nodes": updated}
+            if args.json:
+                print(json.dumps(out, indent=2))
+                return 0 if apply_res.get("ok") else 1
+            print(f"ADB USB Hub Plan ({len(plan['nodes'])} phone(s), {len(plan['forward_rules'])} forwards, {len(plan['reverse_rules'])} reverses):")
+            for n in plan["nodes"]:
+                print(f"  - {n['node_id']} ({n['serial']}) -> 127.0.0.1:{n['worker_port']} (worker), 127.0.0.1:{n['ssh_port']} (ssh)")
+            if args.dry_run:
+                print("(dry-run: no adb commands executed)")
+            else:
+                print(f"Applied {apply_res['applied']} tunnel rule(s), {apply_res['failed']} failed.")
+                for err in apply_res.get("errors") or []:
+                    print(f"  ERR: {err}", file=sys.stderr)
+            if updated:
+                print(f"Saved USB hub nodes into config: {', '.join(updated)}")
+            return 0 if apply_res.get("ok") else 1
+
+        if mode == "rndis":
+            ifaces = topo["usb_net_interfaces"]
+            if not ifaces:
+                print("No USB-Ethernet / RNDIS gadget interfaces detected on this host.", file=sys.stderr)
+                return 1
+            plan = plan_rndis_usb_hub(ifaces, subnet_prefix=prefix, ssh_port=args.remote_ssh_port)
+            cmds = build_rndis_router_commands(plan, nat_wan=args.nat_wan, wan_iface=args.wan_iface)
+            updated = []
+            if args.write_config and not args.dry_run:
+                cfg_path = resolve_config_path(args.config)
+                cfg = load_config(cfg_path)
+                updated = sync_usb_hub_into_config(cfg, plan)
+                save_config(cfg, cfg_path)
+            out = {"plan": plan, "commands": cmds, "updated_nodes": updated}
+            if args.json:
+                print(json.dumps(out, indent=2))
+                return 0
+            print(f"Layer-3 USB Hub Plan ({plan['cluster_cidr']}, {len(plan['nodes'])} phone(s)):")
+            for n in plan["nodes"]:
+                print(f"  - {n['node_id']} on {n['iface']} (mac={n['mac'] or '-'}): Master {n['host_ip']}/30 <-> Phone {n['phone_ip']}/30")
+            print("\nRun on Master Host (or execute `sudo bash scripts/07_usb_hub_router.sh setup-rndis`):")
+            for c in cmds["host_commands"]:
+                print(f"  {c}")
+            print("\nRun on each phone:")
+            for nid, pcmds in cmds["phone_commands"].items():
+                print(f"  [{nid}] {pcmds[1]}")
+            if updated:
+                print(f"\nSaved USB hub nodes into config: {', '.join(updated)}")
+            return 0
+
+        print(f"Error: unsupported mode {mode!r}", file=sys.stderr)
+        return 2
+
+    if action == "serve":
+        if not math.isfinite(args.interval) or args.interval < 1.0 or args.interval > 3600.0:
+            print(f"Error: --interval must be between 1 and 3600 seconds (got {args.interval})", file=sys.stderr)
+            return 2
+        wd = UsbHubWatchdog(
+            interval_sec=args.interval,
+            worker_base_port=args.worker_base_port,
+            ssh_base_port=args.ssh_base_port,
+            remote_ssh_port=args.remote_ssh_port,
+            gateway_port=args.gateway_port,
+            enable_gateway_reverse=not args.no_gateway_reverse,
+            enable_peer_mesh=not args.no_peer_mesh,
+        )
+        res = wd.sync_once()
+        print(
+            f"USB Hub Watchdog running (ADB phones={len(res['plan']['nodes'])}, "
+            f"tunnels={res['apply'].get('applied', 0)}, interval={args.interval:.1f}s). Press Ctrl+C to stop."
+        )
+        wd.start()
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            wd.stop()
+            wd.join(timeout=2.0)
+        return 0
+
+    print(f"Unknown usb-hub action: {action}", file=sys.stderr)
     return 2
 
 
@@ -1656,6 +1812,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_dk.add_argument("--timeout", type=float, default=15.0, help="Per-node command timeout in seconds")
     p_dk.add_argument("--json", action="store_true", help="Output raw JSON")
     p_dk.set_defaults(func=_cmd_docker)
+
+    # usb-hub (Zero-Wi-Fi powered USB 3.0 hub routing for 2-6+ phones)
+    p_usb = sub.add_parser("usb-hub", help="Discover and configure zero-Wi-Fi USB 3.0 hub routing (ADB mesh or RNDIS /30 router)")
+    p_usb.add_argument("action", nargs="?", default="scan", choices=["scan", "setup", "serve"], help="USB hub action")
+    p_usb.add_argument("--mode", default="auto", choices=["auto", "adb", "rndis"], help="Routing mode: auto, adb (zero-root), or rndis (L3 /30)")
+    p_usb.add_argument("--subnet-prefix", default=DEFAULT_USB_SUBNET_PREFIX, help="Private /16 prefix for rndis /30 subnets (default: 10.77)")
+    p_usb.add_argument("--worker-base-port", type=int, default=DEFAULT_ADB_WORKER_BASE_PORT, help="Base local port for ADB worker forwards (default: 18760)")
+    p_usb.add_argument("--ssh-base-port", type=int, default=DEFAULT_ADB_SSH_BASE_PORT, help="Base local port for ADB SSH forwards (default: 18020)")
+    p_usb.add_argument("--remote-ssh-port", type=int, default=22, help="Phone SSH port (22 for Ubuntu Touch/Debian, 8022 for Termux)")
+    p_usb.add_argument("--gateway-port", type=int, default=8888, help="Master Network Guard port for ADB reverse (default: 8888)")
+    p_usb.add_argument("--no-gateway-reverse", action="store_true", help="Disable ADB reverse tunnel to Master Network Guard")
+    p_usb.add_argument("--no-peer-mesh", action="store_true", help="Disable phone-to-phone ADB peer mesh forwarding")
+    p_usb.add_argument("--nat-wan", action="store_true", help="Include optional WAN NAT rules in rndis router output")
+    p_usb.add_argument("--wan-iface", default="", help="WAN interface name for --nat-wan (e.g. eth0, wlan0)")
+    p_usb.add_argument("--write-config", action="store_true", help="Save discovered USB hub phones into cluster.json")
+    p_usb.add_argument("--dry-run", action="store_true", help="Print plan without modifying tunnels or cluster.json")
+    p_usb.add_argument("--interval", type=float, default=5.0, help="Watchdog poll interval in seconds for `serve`")
+    p_usb.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_usb.set_defaults(func=_cmd_usb_hub)
 
     # gateway (optional Master Network Guard / Watchguard proxy)
     p_gw = sub.add_parser(

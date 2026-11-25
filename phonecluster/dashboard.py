@@ -56,6 +56,7 @@ from .master import JobSpec, MasterController
 from .netguard import apply_security_profile, audit_cluster_network, infer_lan_subnet
 from .pairing import PairingManager
 from .routing import resolve_node_tier_and_pool
+from .usbhub import detect_usb_hub_topology, plan_adb_usb_hub, plan_rndis_usb_hub
 
 LOG = logging.getLogger("phonecluster.dashboard")
 
@@ -1115,6 +1116,25 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
           </div>
           <pre id="net-fw-code" class="code" style="max-height:240px;">Loading...</pre>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+          <h2 style="margin:0;">5. USB 3.0 Hub Routing (Zero Wi-Fi Multi-Phone Mode)</h2>
+          <button class="small primary" onclick="loadUsbHub()">Scan USB Hub</button>
+        </div>
+        <p class="hint" style="margin-top:0;">Plug 2–6 phones into a <strong>powered USB 3.0 hub</strong> connected to your Master Host (Raspberry Pi / Linux PC). Phones communicate with Master and each other over USB with Wi-Fi OFF — using either zero-root <strong>ADB Peer Mesh</strong> or Layer-3 <strong>RNDIS /30 Subnets</strong> (ideal for Ubuntu Touch + Snap Docker Swarm).</p>
+        <div id="usb-hub-status" class="check-item" style="margin-bottom:10px;">Click <strong>Scan USB Hub</strong> to inspect attached ADB devices &amp; USB-Ethernet gadgets...</div>
+        <div class="row" style="justify-content:space-between; margin-bottom:4px;">
+          <strong>Quick USB Hub Commands</strong>
+          <button class="small" onclick="copyEl('usb-hub-cmds')">Copy</button>
+        </div>
+        <pre id="usb-hub-cmds" class="code">pc usb-hub scan
+# Mode 1 (Zero-root ADB Mesh — Android &amp; Ubuntu Touch):
+pc usb-hub setup --mode adb --write-config
+pc usb-hub serve
+# Mode 2 (Layer-3 /30 Subnets — Ubuntu Touch + Snap Docker Swarm):
+sudo bash scripts/07_usb_hub_router.sh setup-rndis</pre>
       </div>
     </section>
   </main>
@@ -2904,6 +2924,54 @@ async function loadNetworkAudit() {
     ).join('');
 
     setFwTab(activeFwTab);
+    loadUsbHub();
+  } catch (e) {}
+}
+
+async function loadUsbHub() {
+  const box = document.getElementById('usb-hub-status');
+  const cmdEl = document.getElementById('usb-hub-cmds');
+  if (!box) return;
+  try {
+    const r = await apiFetch('/api/usb-hub');
+    if (r.status === 401) {
+      box.textContent = 'Unlock with Master token to scan local USB hub devices.';
+      return;
+    }
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      box.textContent = 'USB hub scan error: ' + (d.error || ('HTTP ' + r.status));
+      return;
+    }
+    const topo = d.topology || {};
+    const adbN = Number(topo.adb_ready_count || 0);
+    const netN = Number(topo.usb_net_count || 0);
+    const cols = Array.isArray(topo.subnet_collisions) ? topo.subnet_collisions : [];
+    let html = '<span class="pill ' + ((adbN || netN) ? 'ok' : 'neutral') + '">'
+      + 'ADB Ready: ' + adbN + ' · USB-Net: ' + netN + '</span> '
+      + '<span class="pill ' + (topo.ipv4_forwarding_enabled ? 'ok' : 'neutral') + '">IPv4 Forward: '
+      + (topo.ipv4_forwarding_enabled ? 'ON' : 'OFF') + '</span> '
+      + '<span class="pill accent">Recommended: ' + esc(topo.recommended_mode || 'adb') + '</span>';
+    if (cols.length) {
+      html += '<div class="hint" style="color:var(--warn); margin-top:6px;">⚠ USB Subnet Collision: '
+        + cols.map(c => esc(c.subnet) + ' (' + esc((c.interfaces || []).join(', ')) + ')').join('; ')
+        + ' — run <code class="mono">sudo bash scripts/07_usb_hub_router.sh setup-rndis</code> to separate into /30 subnets.</div>';
+    }
+    if (Array.isArray(topo.notes) && topo.notes.length) {
+      html += '<div class="hint" style="margin-top:4px;">' + topo.notes.map(n => esc(n)).join('<br/>') + '</div>';
+    }
+    box.innerHTML = html;
+    if (cmdEl) {
+      const lines = ['# Detected: ' + adbN + ' ADB phone(s), ' + netN + ' USB-Ethernet interface(s)'];
+      if (topo.recommended_mode === 'rndis') {
+        lines.push('sudo bash scripts/07_usb_hub_router.sh setup-rndis');
+        lines.push('pc usb-hub setup --mode rndis --write-config');
+      } else {
+        lines.push('pc usb-hub setup --mode adb --write-config');
+        lines.push('pc usb-hub serve');
+      }
+      cmdEl.textContent = lines.join('\n');
+    }
   } catch (e) {}
 }
 
@@ -3432,6 +3500,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/services",
             "/api/gateway/status",
             "/api/network/audit",
+            "/api/usb-hub",
             "/api/discover",
         }:
             if not self._require_read_auth_if_locked():
@@ -3507,6 +3576,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         "docker_socket_issues": docker_socket_issues,
                         "lan_subnet": lan_subnet,
                         "services_info": ctrl.get_services_info(snapshots=snaps),
+                    },
+                )
+            elif path == "/api/usb-hub":
+                topo = detect_usb_hub_topology()
+                ready_adb = [d for d in topo["adb_devices"] if d.get("state") == "device"]
+                adb_plan = plan_adb_usb_hub(ready_adb) if ready_adb else {"mode": "adb", "nodes": [], "forward_rules": [], "reverse_rules": [], "peer_mesh_map": {}}
+                rndis_plan = plan_rndis_usb_hub(topo["usb_net_interfaces"]) if topo["usb_net_interfaces"] else {"mode": "rndis", "nodes": [], "cluster_cidr": "10.77.0.0/16"}
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "topology": topo,
+                        "adb_plan": adb_plan,
+                        "rndis_plan": rndis_plan,
                     },
                 )
             elif path == "/api/discover":

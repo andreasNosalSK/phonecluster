@@ -547,6 +547,10 @@ def build_cross_tier_env(
         if key:
             env[f"PHONECLUSTER_POOL_{key}_HOSTS"] = ",".join(hosts)
 
+    usb_nodes = [s.node.id for s in ordered_snaps if "usb-hub" in (s.node.tags or [])]
+    if usb_nodes:
+        env["PHONECLUSTER_USB_HUB_NODES"] = ",".join(usb_nodes)
+
     for cname, curl in config.custom_services.items():
         key = re.sub(r"[^A-Z0-9]+", "_", cname.upper()).strip("_")
         if key:

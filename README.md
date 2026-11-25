@@ -117,6 +117,8 @@ pc llama-rpc                          # Local AI: print --rpc ip1:50052,ip2:5005
 pc mpi-hostfile -o hosts.mpi          # OpenMPI: generate hostfile from ready phones
 pc docker status                      # Ubuntu Touch / Snap Docker: inspect containers & Swarm
 pc docker swarm-init                  # Optional: unite Tier 3 Docker phones into a Docker Swarm
+pc usb-hub scan                       # Zero-Wi-Fi USB 3.0 Hub: scan ADB & USB-Ethernet phones
+pc usb-hub setup --mode adb --write-config  # Or: sudo bash scripts/07_usb_hub_router.sh setup-rndis
 ```
 
 ---
@@ -136,6 +138,7 @@ pc docker swarm-init                  # Optional: unite Tier 3 Docker phones int
 - **[Security Architecture & Pairing Protocol](docs/SECURITY.md)** — Threat model, 2048-bit DH + PIN pairing, per-node token isolation, stealth LAN posture, and shared Wi-Fi lockdown.
 - **[Complete Step-by-Step Setup Guide](docs/SETUP_GUIDE.md)** — Android settings, ADB fleet setup, secure pairing, and troubleshooting.
 - **[Ubuntu Touch & Snap Docker Guide](docs/UBUNTU_TOUCH_DOCKER.md)** — Clustering two Ubuntu Touch (UBports) phones with Docker via Snap, read-only rootfs `systemd --user` services, `repowerd` wake-locks, and optional Docker Swarm.
+- **[USB 3.0 Hub Routing Guide (Zero Wi-Fi)](docs/USB_HUB_ROUTING.md)** — Connecting 2–6+ phones through one powered USB 3.0 hub via zero-root ADB Peer Mesh or Layer-3 `/30` RNDIS subnets (eliminating `10.15.19.82` / `192.168.42.x` collisions).
 - **[Debian 13 & Docker Upgrade Guide](docs/DEBIAN13_AND_DOCKER.md)** — Upgrading to Tier 2 rooted Debian 13 ARM64 chroot, ACC battery protection, Home Assistant, and Tier 3 Docker/Droidspaces.
 - **[Workloads & Automation Cookbook](docs/WORKLOADS.md)** — Recipes for Parallel Python/Bash, `distcc` Compiler PC, Local AI (`llama.cpp`), OpenMPI, and Home Assistant smart-plug battery protection.
 - **[REST & Discovery API Reference](docs/API.md)** — Worker endpoints, Dashboard API, and UDP LAN discovery schema.
