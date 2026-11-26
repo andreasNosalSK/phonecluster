@@ -38,6 +38,18 @@ from .doctor import run_doctor
 from .master import JobSpec, MasterController
 from .netguard import infer_lan_subnet
 from .telemetry import detect_docker_runtime, detect_os_environment, is_ubuntu_touch_os, read_memory_info
+from .usbhub import (
+    DEFAULT_USB_SUBNET_PREFIX,
+    apply_adb_usb_hub,
+    build_rndis_router_commands,
+    detect_usb_hub_topology,
+    plan_adb_usb_hub,
+    plan_rndis_usb_hub,
+    probe_adb_device_profile,
+    sync_usb_hub_into_config,
+    validate_subnet_prefix,
+    verify_usb_hub_connectivity,
+)
 
 
 def _prompt(
@@ -70,9 +82,13 @@ def run_setup_wizard(
     input_fn: Callable[[str], str] = input,
     *,
     master_id: str = "node0",
+    transport: str = "ask",
 ) -> int:
-    """Walk the user step-by-step through creating a working cluster config."""
+    """Walk the user step-by-step through creating a working cluster config (Wireless Wi-Fi/LAN or USB 3.0 Hub)."""
     master_id = validate_node_id(master_id)
+    clean_transport = str(transport or "ask").strip().lower()
+    if clean_transport not in {"ask", "wifi", "usb", "usb-adb", "usb-rndis"}:
+        raise ValueError("transport must be 'ask', 'wifi', 'usb', 'usb-adb', or 'usb-rndis'")
     out_path = resolve_config_path(config_path)
     local_ip = detect_local_ip()
     os_env = detect_os_environment()
@@ -90,6 +106,8 @@ def run_setup_wizard(
         dk_note = " | Docker (Snap)" if docker_rt.get("is_snap") else " | Docker"
     print(f"Detected device : {os_env} | IP {local_ip} | {os.cpu_count() or 1} cores | {mem['total_mb']} MB RAM{dk_note}")
     print(f"Config target   : {out_path}")
+    if clean_transport != "ask":
+        print(f"Connection mode : {clean_transport}")
     print()
 
     previous_revision = config_revision(out_path)
@@ -99,12 +117,19 @@ def run_setup_wizard(
             return 0
 
     cluster_name = _prompt("1. Name your cluster", "phone-cluster", input_fn=input_fn)
-    raw_master = _prompt(f"2. Static LAN IP of your Master phone ({master_id})", local_ip, input_fn=input_fn)
+    default_master_host = "127.0.0.1" if clean_transport == "usb-adb" else (
+        "10.77.1.1" if clean_transport == "usb-rndis" else local_ip
+    )
+    raw_master = _prompt(
+        f"2. Master host IP ({master_id}; LAN IP for Wi-Fi, 127.0.0.1 for ADB USB hub, or 10.77.1.1 for RNDIS USB hub)",
+        default_master_host,
+        input_fn=input_fn,
+    )
     try:
         master_host = validate_host(raw_master)
     except ValueError:
-        print(f"  (Invalid master host '{raw_master}', falling back to detected IP {local_ip})")
-        master_host = validate_host(local_ip)
+        print(f"  (Invalid master host '{raw_master}', falling back to detected IP {default_master_host})")
+        master_host = validate_host(default_master_host)
     raw_user = _prompt("3. Default SSH username on phones (e.g. 'phablet' on Ubuntu Touch, or `whoami`)", user, input_fn=input_fn)
     try:
         ssh_user = validate_ssh_user(raw_user)
@@ -134,80 +159,159 @@ def run_setup_wizard(
     ]
 
     worker_ids = (f"node{i}" for i in count(1) if f"node{i}" != master_id)
-    print("\n5. Finding Worker phones...")
-    discovered = []
-    if _prompt_yes_no("Scan your Wi-Fi now for phones already running PhoneCluster?", default=True, input_fn=input_fn):
-        print("Scanning LAN (2 seconds)...")
-        discovered = [d for d in discover_lan_nodes(timeout_sec=2.0) if d["host"] != master_host]
-        if discovered:
-            print(f"Found {len(discovered)} phone(s) on your Wi-Fi:")
-            for idx, item in enumerate(discovered, start=1):
-                print(
-                    f"  {idx}) {item['host']}  ({item['os_env']}, {item['cpu_cores']} cores, "
-                    f"{item['mem_total_mb']} MB RAM, user={item['ssh_user'] or '?'})"
-                )
-            if _prompt_yes_no("Add all discovered phones as Workers?", default=True, input_fn=input_fn):
-                for item in discovered:
-                    try:
-                        disc_host = validate_host(str(item["host"]))
-                    except ValueError:
-                        continue
-                    try:
-                        disc_user = validate_ssh_user(str(item.get("ssh_user") or "")) or ssh_user
-                    except ValueError:
-                        disc_user = ssh_user
-                    nid = next(worker_ids)
-                    nodes.append(
-                        NodeConfig(
-                            id=nid,
-                            host=disc_host,
-                            role="worker",
-                            auth_token=generate_auth_token(),
-                            worker_port=item["worker_port"],
-                            ssh_port=item["ssh_port"],
-                            ssh_user=disc_user,
-                            max_concurrency=2,
-                            weight=1.0,
-                            tags=["worker"],
-                            notes=f"Auto-discovered ({item['os_env']})",
-                        )
-                    )
-        else:
-            print("No other phones replied yet (that's normal if you haven't started workers yet).")
+    chosen_usb_mode = ""
+    usb_plan: dict[str, Any] | None = None
+    usb_rndis_cmds: dict[str, Any] | None = None
 
-    extra_ips = _prompt(
-        "Enter any additional Worker phone IPs (comma-separated, e.g. 192.168.1.202,192.168.1.203, or blank to skip)",
-        "",
-        input_fn=input_fn,
-    )
-    existing_hosts = {n.host for n in nodes}
-    for raw_ip in extra_ips.split(","):
-        cand = raw_ip.strip()
-        if not cand:
-            continue
-        try:
-            ip = validate_host(cand)
-        except ValueError:
-            print(f"  Skipping invalid worker host/IP '{cand}'.")
-            continue
-        if ip not in existing_hosts:
-            nid = next(worker_ids)
-            nodes.append(
-                NodeConfig(
-                    id=nid,
-                    host=ip,
-                    role="worker",
-                    auth_token=generate_auth_token(),
-                    worker_port=DEFAULT_WORKER_PORT,
-                    ssh_port=ssh_port,
-                    ssh_user=ssh_user,
-                    max_concurrency=2,
-                    weight=1.0,
-                    tags=["worker"],
-                    notes=f"Worker phone {len(nodes)}",
+    print("\n5. Worker Connection Mode (Wireless Wi-Fi/LAN vs USB 3.0 Hub):")
+    if clean_transport == "ask":
+        print("   [w] Wireless (Wi-Fi / LAN — scan Wi-Fi for phones, or type 'n' to enter IPs manually)")
+        print("   [u] USB 3.0 Hub (Zero Wi-Fi — auto-detect ADB or RNDIS /30 phones plugged into hub)")
+        mode_ans = _prompt("Connect workers via Wireless [w], USB Hub [u], or manual IPs [n]", "w", input_fn=input_fn).lower()
+    elif clean_transport == "wifi":
+        mode_ans = "w"
+    else:
+        mode_ans = clean_transport
+
+    if mode_ans in {"u", "usb", "adb", "usb-adb", "rndis", "usb-rndis"}:
+        print("Scanning local USB 3.0 hub for attached phones...")
+        topo = detect_usb_hub_topology()
+        ready_adb = [d for d in topo.get("adb_devices") or [] if d.get("state") == "device"]
+        usb_nets = list(topo.get("usb_net_interfaces") or [])
+        rec_mode = str(topo.get("recommended_mode") or "adb")
+        print(f"  Detected: {len(ready_adb)} authorized ADB phone(s), {len(usb_nets)} USB-Ethernet gadget(s) (recommended: {rec_mode})")
+        if topo.get("subnet_collisions"):
+            print("  Notice: USB subnet collision detected — RNDIS /30 router will isolate each phone cleanly.")
+        if mode_ans in {"adb", "usb-adb"}:
+            chosen_usb_mode = "adb"
+        elif mode_ans in {"rndis", "usb-rndis"}:
+            chosen_usb_mode = "rndis"
+        else:
+            picked = _prompt("USB Hub mode: 'adb' (zero-root peer mesh) or 'rndis' (Layer-3 /30 for Ubuntu Touch/Docker)", rec_mode, input_fn=input_fn).lower()
+            chosen_usb_mode = "rndis" if picked == "rndis" else "adb"
+
+        if chosen_usb_mode == "adb":
+            if ready_adb:
+                enriched_adb = []
+                for dev in ready_adb:
+                    prof = probe_adb_device_profile(dev["serial"])
+                    merged = dict(dev)
+                    if prof.get("os_env") != "unknown":
+                        merged["os_env"] = prof["os_env"]
+                        merged["remote_ssh_port"] = prof["remote_ssh_port"]
+                    if prof.get("ssh_user"):
+                        merged["ssh_user"] = prof["ssh_user"]
+                    if prof.get("usb_power_warning"):
+                        print(f"  WARNING: {dev['serial']} is discharging on USB — ensure your USB 3.0 hub has external 12V/3A-5A power!")
+                    enriched_adb.append(merged)
+                usb_plan = plan_adb_usb_hub(
+                    enriched_adb,
+                    remote_ssh_port=ssh_port,
+                    enable_gateway_reverse=False,
+                    enable_peer_mesh=True,
+                    existing_nodes=nodes,
                 )
-            )
-            existing_hosts.add(ip)
+                for n_item in usb_plan["nodes"]:
+                    print(
+                        f"  + {n_item['node_id']} ({n_item['serial']}, {n_item.get('os_env', 'adb')}) -> "
+                        f"127.0.0.1:{n_item['worker_port']} (worker), 127.0.0.1:{n_item['ssh_port']} (ssh->{n_item['remote_ssh_port']})"
+                    )
+                if _prompt_yes_no("Create ADB USB hub forwards & peer-mesh tunnels now?", default=True, input_fn=input_fn):
+                    res = apply_adb_usb_hub(usb_plan)
+                    print(f"  ADB tunnels: {res.get('applied', 0)} created, {res.get('unchanged', 0)} matched, {res.get('failed', 0)} failed.")
+            else:
+                print("  No authorized ADB phones detected right now (plug phones into USB hub, enable USB debugging, then run `pc usb-hub setup --mode adb --write-config`).")
+        else:
+            raw_pref = _prompt("USB /16 private subnet prefix for /30 links", DEFAULT_USB_SUBNET_PREFIX, input_fn=input_fn)
+            try:
+                prefix = validate_subnet_prefix(raw_pref)
+            except ValueError:
+                print(f"  (Invalid prefix '{raw_pref}', using {DEFAULT_USB_SUBNET_PREFIX})")
+                prefix = DEFAULT_USB_SUBNET_PREFIX
+            if usb_nets:
+                usb_plan = plan_rndis_usb_hub(usb_nets, subnet_prefix=prefix, ssh_port=ssh_port, ssh_user=ssh_user or "phablet")
+                usb_rndis_cmds = build_rndis_router_commands(usb_plan)
+                for n_item in usb_plan["nodes"]:
+                    print(
+                        f"  + {n_item['node_id']} ({n_item['iface']}, mac={n_item.get('mac') or '-'}): "
+                        f"Master {n_item['host_ip']}/30 <-> Phone {n_item['phone_ip']}/30"
+                    )
+            else:
+                print("  No USB-Ethernet / RNDIS gadgets detected yet (plug in Ubuntu Touch phones or enable Android USB Tethering, then run `sudo bash scripts/07_usb_hub_router.sh setup-rndis`).")
+    else:
+        discovered = []
+        if mode_ans in {"w", "wifi", "wireless", "y", "yes", "1"}:
+            print("Scanning LAN (2 seconds)...")
+            discovered = [d for d in discover_lan_nodes(timeout_sec=2.0) if d["host"] != master_host]
+            if discovered:
+                print(f"Found {len(discovered)} phone(s) on your Wi-Fi:")
+                for idx, item in enumerate(discovered, start=1):
+                    print(
+                        f"  {idx}) {item['host']}  ({item['os_env']}, {item['cpu_cores']} cores, "
+                        f"{item['mem_total_mb']} MB RAM, user={item['ssh_user'] or '?'})"
+                    )
+                if _prompt_yes_no("Add all discovered phones as Workers?", default=True, input_fn=input_fn):
+                    for item in discovered:
+                        try:
+                            disc_host = validate_host(str(item["host"]))
+                        except ValueError:
+                            continue
+                        try:
+                            disc_user = validate_ssh_user(str(item.get("ssh_user") or "")) or ssh_user
+                        except ValueError:
+                            disc_user = ssh_user
+                        nid = next(worker_ids)
+                        nodes.append(
+                            NodeConfig(
+                                id=nid,
+                                host=disc_host,
+                                role="worker",
+                                auth_token=generate_auth_token(),
+                                worker_port=item["worker_port"],
+                                ssh_port=item["ssh_port"],
+                                ssh_user=disc_user,
+                                max_concurrency=2,
+                                weight=1.0,
+                                tags=["worker"],
+                                notes=f"Auto-discovered ({item['os_env']})",
+                            )
+                        )
+            else:
+                print("No other phones replied yet (that's normal if you haven't started workers yet).")
+
+        extra_ips = _prompt(
+            "Enter any additional Worker phone IPs (comma-separated, e.g. 192.168.1.202,192.168.1.203, or blank to skip)",
+            "",
+            input_fn=input_fn,
+        )
+        existing_hosts = {n.host for n in nodes}
+        for raw_ip in extra_ips.split(","):
+            cand = raw_ip.strip()
+            if not cand:
+                continue
+            try:
+                ip = validate_host(cand)
+            except ValueError:
+                print(f"  Skipping invalid worker host/IP '{cand}'.")
+                continue
+            if ip not in existing_hosts:
+                nid = next(worker_ids)
+                nodes.append(
+                    NodeConfig(
+                        id=nid,
+                        host=ip,
+                        role="worker",
+                        auth_token=generate_auth_token(),
+                        worker_port=DEFAULT_WORKER_PORT,
+                        ssh_port=ssh_port,
+                        ssh_user=ssh_user,
+                        max_concurrency=2,
+                        weight=1.0,
+                        tags=["worker"],
+                        notes=f"Worker phone {len(nodes)}",
+                    )
+                )
+                existing_hosts.add(ip)
 
     print("\n6. Thermal & 24/7 Battery Safety Guard:")
     raw_temp = _prompt("Pause jobs on a phone if temperature reaches (°C)", "40.0", input_fn=input_fn)
@@ -244,6 +348,8 @@ def run_setup_wizard(
         nodes=nodes,
         safety=safety_cfg,
     )
+    if usb_plan is not None and usb_plan.get("nodes"):
+        sync_usb_hub_into_config(cfg, usb_plan)
     saved = save_config(cfg, out_path, expected_revision=previous_revision)
 
     print("\n" + "=" * 60)
@@ -253,13 +359,32 @@ def run_setup_wizard(
     print(f"Token   : {cfg.auth_token}")
     print("  (Copy this token when unlocking controls in the Web Dashboard!)")
     print("\nNext easy steps:")
-    print("  1. Sync code & start workers on all phones:")
-    print(f"       pc --config {saved} sync --setup-keys")
-    print("  2. Check your cluster health:")
-    print(f"       pc --config {saved} doctor")
-    print("  3. Open the friendly Web Control Center:")
-    print(f"       pc --config {saved} dashboard")
-    print(f"       -> http://{format_host_port(master_host, cfg.dashboard_port)}")
+    if chosen_usb_mode == "rndis":
+        print("  1. Configure Master Layer-3 USB Hub air-gap router:")
+        print(f"       sudo bash scripts/07_usb_hub_router.sh setup-rndis --prefix {usb_plan['subnet_prefix'] if usb_plan else DEFAULT_USB_SUBNET_PREFIX}")
+        if usb_rndis_cmds:
+            for nid, pcmds in usb_rndis_cmds["phone_commands"].items():
+                print(f"     On phone {nid}: {pcmds[1]}")
+        print("  2. Sync code & verify USB hub peer-to-peer communication:")
+        print(f"       pc --config {saved} sync --skip-node {master_id}")
+        print(f"       pc --config {saved} usb-hub verify")
+        print("  3. Open the Web Control Center:")
+        print(f"       pc --config {saved} dashboard")
+    elif chosen_usb_mode == "adb":
+        print("  1. Sync code & start workers over USB (Wi-Fi can stay OFF!):")
+        print(f"       pc --config {saved} sync --skip-node {master_id}")
+        print("  2. Verify USB hub & peer-mesh communication:")
+        print(f"       pc --config {saved} usb-hub verify")
+        print("  3. Open the Web Control Center (auto-heals ADB USB tunnels automatically!):")
+        print(f"       pc --config {saved} dashboard")
+    else:
+        print("  1. Sync code & start workers on all phones:")
+        print(f"       pc --config {saved} sync --setup-keys")
+        print("  2. Check your cluster health:")
+        print(f"       pc --config {saved} doctor")
+        print("  3. Open the friendly Web Control Center:")
+        print(f"       pc --config {saved} dashboard")
+        print(f"       -> http://{format_host_port(master_host, cfg.dashboard_port)}")
     return 0
 
 
@@ -288,7 +413,8 @@ def run_interactive_menu(
         print("  6) Cluster Doctor (Health, Security & Battery Check)")
         print("  7) Start Web Control Center (Browser btop + Terminal)")
         print("  8) Workloads Helper (distcc / llama.cpp / OpenMPI)")
-        print("  9) Guided Setup Wizard (Create/Edit cluster.json)")
+        print("  9) Guided Setup Wizard (Wireless Wi-Fi or USB 3.0 Hub)")
+        print("  u) USB 3.0 Hub Manager (Scan, Setup, Verify Peer Links)")
         print("  t) View Active/Recent Jobs & Show Auth Token")
         print("  0) Exit")
         print("-" * 52)
@@ -419,12 +545,49 @@ def run_interactive_menu(
                         )
                     for o in ctrl.run_single(spec, target="all"):
                         print(f"[{o.node_id}] {'OK' if o.ok else 'FAIL'}: {(o.stdout or o.stderr or o.error).strip()}")
+            elif choice == "u":
+                cfg = load_config(cfg_path)
+                topo = detect_usb_hub_topology()
+                print(
+                    f"\nUSB 3.0 Hub: ADB ready={topo['adb_ready_count']}, "
+                    f"USB-Net={topo['usb_net_count']}, IPv4 forward={'ON' if topo['ipv4_forwarding_enabled'] else 'OFF'}, "
+                    f"Recommended={topo['recommended_mode']}"
+                )
+                sub_c = _prompt("USB Hub action: [s]etup ADB & save, [v]erify hub & peer links, [b]ack", "v", input_fn=input_fn).lower()
+                if sub_c in {"s", "setup"}:
+                    ready_adb = [d for d in topo["adb_devices"] if d.get("state") == "device"]
+                    if not ready_adb:
+                        print("No authorized ADB phones found. For RNDIS /30 mode run: sudo bash scripts/07_usb_hub_router.sh setup-rndis")
+                    else:
+                        plan = plan_adb_usb_hub(
+                            ready_adb,
+                            gateway_port=cfg.gateway.port,
+                            enable_gateway_reverse=bool(cfg.gateway.enabled),
+                            existing_nodes=cfg.nodes,
+                            quarantined_nodes=cfg.gateway.quarantined_nodes,
+                        )
+                        res = apply_adb_usb_hub(plan)
+                        if res.get("ok"):
+                            updated = sync_usb_hub_into_config(cfg, plan)
+                            save_config(cfg, cfg_path)
+                            print(f"Saved USB hub phone(s): {', '.join(updated)} ({res.get('applied', 0)} tunnels created)")
+                        else:
+                            print(f"USB tunnel setup had errors: {res.get('errors')}")
+                elif sub_c in {"v", "verify"}:
+                    rep = verify_usb_hub_connectivity(MasterController(cfg))
+                    print(f"Result: {rep['summary']}")
+                    for row in rep["nodes"]:
+                        print(f"  - {row['node_id']} ({row['mode']}) -> {'ONLINE' if row['online'] else 'OFFLINE'} ({row['latency_ms']}ms)")
+                    for lk in rep["peer_links"]:
+                        print(f"  - Peer {lk['from']} -> {lk['to']} ({lk['mode']}): {'OK' if lk['ok'] else 'FAIL'} {lk.get('error', '')}")
+                    for w in rep["warnings"]:
+                        print(f"  WARN: {w}")
             elif choice == "t":
                 cfg = load_config(cfg_path)
                 print(f"\nCluster auth_token (for Web UI Unlock): {cfg.auth_token}\n")
                 _cmd_jobs(argparse.Namespace(config=str(cfg_path), limit=5, json=False))
             else:
-                print("Please enter a valid option (0-9 or t).")
+                print("Please enter a valid option (0-9, u, or t).")
         except KeyboardInterrupt:
             print("\nReturned to menu.")
         except (OSError, ValueError, FileNotFoundError) as exc:

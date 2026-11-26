@@ -2,6 +2,20 @@
 
 Connect **2 to 6+ phones** into a single **powered USB 3.0 hub** so they communicate with your Master and directly with each other over wired USB — **with Wi-Fi completely turned OFF**.
 
+## Quick Setup (Wireless vs USB 3.0 Hub)
+
+You can pick **Wireless (Wi-Fi/LAN)** or **USB 3.0 Hub (Zero Wi-Fi)** directly in three places:
+- **Guided CLI Wizard:** `pc wizard` (choose `[u] USB 3.0 Hub` at Step 5, or jump straight in with `pc wizard --transport usb`)
+- **Web Dashboard:** Open **Tab 6 → Phones, Safety & Doctor** and switch the top toggle to **🔌 USB 3.0 Hub (Zero Wi-Fi)** for 1-click scan, setup, peer-link verification, and Auto-Heal Watchdog control.
+- **Interactive Menu:** Run `pc` → press `u` (**USB 3.0 Hub Manager**).
+
+### Built-In Quality-of-Life Features
+- **Automatic Dashboard Watchdog:** `pc dashboard` automatically runs an in-process ADB USB auto-heal watchdog whenever ADB USB phones are configured (pass `--no-usb-watchdog` to disable), so cable reconnects and phone reboots recover automatically without a second terminal.
+- **Mixed OS Auto-Detection:** `pc usb-hub setup --mode adb --auto-detect --write-config` probes each phone over ADB to detect Ubuntu Touch (SSH port `22`, user `phablet`) vs Android Termux (SSH port `8022`) and warns if a phone is discharging on an underpowered hub.
+- **Peer-to-Peer Verification:** `pc usb-hub verify` (or the **Verify Hub & Peer Links** button in Tab 6) tests Master↔Phone latency, ADB tunnels, and live Phone↔Phone connectivity across all USB workers.
+- **Automatic Peer Discovery Env Vars:** Every job on a USB hub phone receives `PHONECLUSTER_USB_MODE` (`adb` or `rndis`), `PHONECLUSTER_USB_HUB_NODES`, and `PHONECLUSTER_USB_PEERS` (sibling RNDIS IPs or ADB peer-mesh `127.0.0.1:<port>` endpoints).
+- **Boot Persistence:** `pc usb-hub systemd-unit --mode adb` (or `--mode rndis`) generates a ready-to-enable `systemd` unit for Raspberry Pi / Linux Master hosts.
+
 ---
 
 ## Hardware Reality Check (Read First!)

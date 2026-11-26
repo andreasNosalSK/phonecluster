@@ -59,7 +59,19 @@ from .master import JobSpec, MasterController
 from .netguard import apply_security_profile, audit_cluster_network, infer_lan_subnet
 from .pairing import PairingManager
 from .routing import resolve_node_tier_and_pool
-from .usbhub import detect_usb_hub_topology, plan_adb_usb_hub, plan_rndis_usb_hub
+from .usbhub import (
+    DEFAULT_USB_SUBNET_PREFIX,
+    UsbHubWatchdog,
+    apply_adb_usb_hub,
+    build_rndis_router_commands,
+    detect_usb_hub_topology,
+    plan_adb_usb_hub,
+    plan_rndis_usb_hub,
+    probe_adb_device_profile,
+    sync_usb_hub_into_config,
+    validate_subnet_prefix,
+    verify_usb_hub_connectivity,
+)
 
 LOG = logging.getLogger("phonecluster.dashboard")
 
@@ -861,9 +873,22 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
 
     <!-- TAB 6: PHONES, SAFETY & DOCTOR -->
     <section id="panel-setup" class="panel" role="tabpanel" aria-labelledby="tab-setup">
+      <div class="card" style="margin-bottom:14px;">
+        <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <div>
+            <h2 style="margin:0;">How do you want to connect your phones?</h2>
+            <p class="hint" style="margin:2px 0 0;">Pick <strong>Wireless (Wi-Fi / LAN)</strong> for phones on your router, or <strong>USB 3.0 Hub (Zero Wi-Fi)</strong> to connect 2–6 phones through one powered USB 3.0 hub.</p>
+          </div>
+          <div class="row" style="margin:0;">
+            <button id="btn-setup-mode-wifi" class="primary" onclick="setSetupConnectionMode('wifi')">📶 Wireless (Wi-Fi / LAN)</button>
+            <button id="btn-setup-mode-usb" onclick="setSetupConnectionMode('usb')">🔌 USB 3.0 Hub (Zero Wi-Fi)</button>
+          </div>
+        </div>
+      </div>
+
       <div class="col-grid">
-        <div class="card">
-          <h2>1. Secure One-Tap Phone Pairing (Recommended)</h2>
+        <div id="setup-wireless-card" class="card">
+          <h2>1. Wireless Pairing — One-Tap PIN (Recommended)</h2>
           <p class="hint">Cluster is completely silent to strangers on Wi-Fi until you open a temporary 2-minute pairing window.</p>
           <div class="chips" style="margin-bottom:12px;">
             <span class="pill ok">✓ 2048-bit DH Encrypted</span>
@@ -921,6 +946,36 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
             <button class="small" onclick="scanLan()">Scan Opt-In Workers</button>
           </div>
           <div id="discover-list" aria-live="polite" class="hint"></div>
+        </div>
+
+        <div id="setup-usb-card" class="card" style="display:none;">
+          <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:6px;">
+            <h2 style="margin:0;">1. USB 3.0 Hub Setup (Zero Wi-Fi Multi-Phone)</h2>
+            <span id="setup-usb-wd-badge" class="pill neutral">Watchdog: OFF</span>
+          </div>
+          <p class="hint" style="margin-top:0;">Plug 2–6 phones into a <strong>powered USB 3.0 hub</strong> attached to your Master Host. Phones talk to Master <em>and to each other</em> over USB with Wi-Fi OFF.</p>
+          <div class="chips" style="margin-bottom:10px;">
+            <span class="pill ok">✓ Zero Wi-Fi Needed</span>
+            <span class="pill ok">✓ Phone-to-Phone Peer Mesh</span>
+            <span class="pill neutral">Auto-Detects Termux &amp; Ubuntu Touch</span>
+          </div>
+          <div class="row" style="margin-bottom:10px;">
+            <button class="small primary" onclick="loadUsbHub()">Scan USB Hub</button>
+            <button class="small primary" onclick="applyUsbHubSetup('adb')">⚡ Apply ADB Hub &amp; Save</button>
+            <button class="small" onclick="applyUsbHubSetup('rndis')">🌐 Save RNDIS /30 Phones</button>
+            <button class="small" onclick="verifyUsbHubUi()">✓ Verify Hub &amp; Peer Links</button>
+            <button id="btn-usb-wd-toggle" class="small" onclick="toggleUsbWatchdog()">Enable Auto-Heal Watchdog</button>
+          </div>
+          <div id="setup-usb-status" class="check-item" style="margin-bottom:10px;">Click <strong>Scan USB Hub</strong> to detect attached ADB devices and USB-Ethernet gadgets...</div>
+          <div id="setup-usb-verify-out" class="check-item" style="display:none; margin-bottom:10px;"></div>
+          <div class="row" style="justify-content:space-between; margin-bottom:4px;">
+            <strong>USB Hub Host &amp; Phone Commands</strong>
+            <button class="small" onclick="copyEl('setup-usb-cmds')">Copy</button>
+          </div>
+          <pre id="setup-usb-cmds" class="code">pc wizard --transport usb
+pc usb-hub scan --probe-devices
+pc usb-hub setup --mode adb --auto-detect --write-config
+pc usb-hub verify</pre>
         </div>
 
         <div class="card">
@@ -1126,7 +1181,12 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
       <div class="card">
         <div class="row" style="justify-content:space-between; margin-bottom:8px;">
           <h2 style="margin:0;">5. USB 3.0 Hub Routing (Zero Wi-Fi Multi-Phone Mode)</h2>
-          <button class="small primary" onclick="loadUsbHub()">Scan USB Hub</button>
+          <div class="row" style="margin:0;">
+            <button class="small primary" onclick="loadUsbHub()">Scan USB Hub</button>
+            <button class="small" onclick="applyUsbHubSetup('adb')">Apply ADB Hub</button>
+            <button class="small" onclick="verifyUsbHubUi()">Verify Peer Links</button>
+            <button class="small ghost" onclick="openUsbHubSetupTab()">Full USB Setup →</button>
+          </div>
         </div>
         <p class="hint" style="margin-top:0;">Plug 2–6 phones into a <strong>powered USB 3.0 hub</strong> connected to your Master Host (Raspberry Pi / Linux PC). Phones communicate with Master and each other over USB with Wi-Fi OFF — using either zero-root <strong>ADB Peer Mesh</strong> or Layer-3 <strong>RNDIS /30 Subnets</strong> (ideal for Ubuntu Touch + Snap Docker Swarm).</p>
         <div id="usb-hub-status" class="check-item" style="margin-bottom:10px;">Click <strong>Scan USB Hub</strong> to inspect attached ADB devices &amp; USB-Ethernet gadgets...</div>
@@ -3061,22 +3121,64 @@ async function loadNetworkAudit() {
   } catch (e) {}
 }
 
+let lastUsbWatchdogRunning = false;
+
+function setSetupConnectionMode(mode) {
+  const isUsb = mode === 'usb';
+  const wifiCard = document.getElementById('setup-wireless-card');
+  const usbCard = document.getElementById('setup-usb-card');
+  const btnWifi = document.getElementById('btn-setup-mode-wifi');
+  const btnUsb = document.getElementById('btn-setup-mode-usb');
+  if (wifiCard) wifiCard.style.display = isUsb ? 'none' : '';
+  if (usbCard) usbCard.style.display = isUsb ? '' : 'none';
+  if (btnWifi) btnWifi.classList.toggle('primary', !isUsb);
+  if (btnUsb) btnUsb.classList.toggle('primary', isUsb);
+  if (isUsb) loadUsbHub();
+}
+
+function openUsbHubSetupTab() {
+  selectTab('setup');
+  setSetupConnectionMode('usb');
+}
+
+function _renderUsbWatchdogBadge(wd) {
+  const running = Boolean(wd && wd.running);
+  lastUsbWatchdogRunning = running;
+  const badge = document.getElementById('setup-usb-wd-badge');
+  const btn = document.getElementById('btn-usb-wd-toggle');
+  if (badge) {
+    badge.className = 'pill ' + (running ? 'ok' : 'neutral');
+    badge.textContent = running ? 'Watchdog: AUTO-HEALING' : 'Watchdog: OFF';
+  }
+  if (btn) {
+    btn.textContent = running ? 'Stop Auto-Heal Watchdog' : 'Enable Auto-Heal Watchdog';
+  }
+}
+
 async function loadUsbHub() {
   const box = document.getElementById('usb-hub-status');
+  const setupBox = document.getElementById('setup-usb-status');
   const cmdEl = document.getElementById('usb-hub-cmds');
-  if (!box) return;
+  const setupCmdEl = document.getElementById('setup-usb-cmds');
+  if (!box && !setupBox) return;
   try {
     const r = await apiFetch('/api/usb-hub');
     if (r.status === 401) {
-      box.textContent = 'Unlock with Master token to scan local USB hub devices.';
+      const msg = 'Unlock with Master token to scan local USB hub devices.';
+      if (box) box.textContent = msg;
+      if (setupBox) setupBox.textContent = msg;
       return;
     }
     const d = await r.json();
     if (!r.ok || d.error) {
-      box.textContent = 'USB hub scan error: ' + (d.error || ('HTTP ' + r.status));
+      const msg = 'USB hub scan error: ' + (d.error || ('HTTP ' + r.status));
+      if (box) box.textContent = msg;
+      if (setupBox) setupBox.textContent = msg;
       return;
     }
     const topo = d.topology || {};
+    const wd = d.watchdog || {};
+    _renderUsbWatchdogBadge(wd);
     const adbN = Number(topo.adb_ready_count || 0);
     const netN = Number(topo.usb_net_count || 0);
     const cols = Array.isArray(topo.subnet_collisions) ? topo.subnet_collisions : [];
@@ -3084,7 +3186,20 @@ async function loadUsbHub() {
       + 'ADB Ready: ' + adbN + ' · USB-Net: ' + netN + '</span> '
       + '<span class="pill ' + (topo.ipv4_forwarding_enabled ? 'ok' : 'neutral') + '">IPv4 Forward: '
       + (topo.ipv4_forwarding_enabled ? 'ON' : 'OFF') + '</span> '
+      + '<span class="pill ' + (wd.running ? 'ok' : 'neutral') + '">Auto-Heal: ' + (wd.running ? 'ON' : 'OFF') + '</span> '
       + '<span class="pill accent">Recommended: ' + esc(topo.recommended_mode || 'adb') + '</span>';
+    const adbDevs = Array.isArray(topo.adb_devices) ? topo.adb_devices : [];
+    if (adbDevs.length) {
+      html += '<div class="hint" style="margin-top:6px;"><strong>ADB Phones:</strong> '
+        + adbDevs.map(dev => '<span class="mono">' + esc(dev.serial) + '</span> (' + esc(dev.state) + (dev.model ? ', ' + esc(dev.model) : '') + ')').join(' · ')
+        + '</div>';
+    }
+    const netIfs = Array.isArray(topo.usb_net_interfaces) ? topo.usb_net_interfaces : [];
+    if (netIfs.length) {
+      html += '<div class="hint" style="margin-top:4px;"><strong>USB-Ethernet Gadgets:</strong> '
+        + netIfs.map(it => '<span class="mono">' + esc(it.iface) + '</span> (' + esc(it.driver || 'usb') + ', ' + esc((it.ipv4_cidrs || []).join('/') || 'unassigned') + ')').join(' · ')
+        + '</div>';
+    }
     if (cols.length) {
       html += '<div class="hint" style="color:var(--warn); margin-top:6px;">⚠ USB Subnet Collision: '
         + cols.map(c => esc(c.subnet) + ' (' + esc((c.interfaces || []).join(', ')) + ')').join('; ')
@@ -3093,19 +3208,86 @@ async function loadUsbHub() {
     if (Array.isArray(topo.notes) && topo.notes.length) {
       html += '<div class="hint" style="margin-top:4px;">' + topo.notes.map(n => esc(n)).join('<br/>') + '</div>';
     }
-    box.innerHTML = html;
-    if (cmdEl) {
-      const lines = ['# Detected: ' + adbN + ' ADB phone(s), ' + netN + ' USB-Ethernet interface(s)'];
-      if (topo.recommended_mode === 'rndis') {
-        lines.push('sudo bash scripts/07_usb_hub_router.sh setup-rndis');
-        lines.push('pc usb-hub setup --mode rndis --write-config');
-      } else {
-        lines.push('pc usb-hub setup --mode adb --write-config');
-        lines.push('pc usb-hub serve');
-      }
-      cmdEl.textContent = lines.join('\n');
+    if (box) box.innerHTML = html;
+    if (setupBox) setupBox.innerHTML = html;
+    const lines = ['# Detected: ' + adbN + ' ADB phone(s), ' + netN + ' USB-Ethernet interface(s)'];
+    if (topo.recommended_mode === 'rndis') {
+      lines.push('sudo bash scripts/07_usb_hub_router.sh setup-rndis');
+      lines.push('pc usb-hub setup --mode rndis --write-config');
+      lines.push('pc usb-hub verify');
+    } else {
+      lines.push('pc usb-hub setup --mode adb --auto-detect --write-config');
+      lines.push('pc usb-hub verify');
+      lines.push('# Optional standalone watchdog (Dashboard also runs one automatically):');
+      lines.push('pc usb-hub serve');
     }
+    const cmdTxt = lines.join('\n');
+    if (cmdEl) cmdEl.textContent = cmdTxt;
+    if (setupCmdEl) setupCmdEl.textContent = cmdTxt;
   } catch (e) {}
+}
+
+async function applyUsbHubSetup(mode) {
+  const data = await authPost('/api/usb-hub/setup', { mode, auto_detect: true, start_watchdog: true });
+  if (data.error) { showToast('USB Hub setup error: ' + data.error, 'bad'); return; }
+  const count = (data.updated_nodes || []).length;
+  showToast('USB Hub (' + mode.toUpperCase() + ') saved ' + count + ' phone(s): ' + (data.updated_nodes || []).join(', '), 'ok');
+  if (data.watchdog) _renderUsbWatchdogBadge(data.watchdog);
+  const setupCmdEl = document.getElementById('setup-usb-cmds');
+  if (setupCmdEl && data.commands && Array.isArray(data.commands.host_commands)) {
+    const out = [].concat(data.commands.host_commands);
+    if (data.commands.phone_commands) {
+      for (const [nid, pcmds] of Object.entries(data.commands.phone_commands)) {
+        out.push('# Phone ' + nid + ': ' + (pcmds[1] || pcmds[0] || ''));
+      }
+    }
+    setupCmdEl.textContent = out.join('\n');
+  }
+  loadUsbHub();
+  refreshLive();
+}
+
+async function verifyUsbHubUi() {
+  const outEl = document.getElementById('setup-usb-verify-out');
+  if (outEl) { outEl.style.display = 'block'; outEl.textContent = 'Testing Master ↔ Phone & Phone ↔ Phone USB links...'; }
+  const data = await authPost('/api/usb-hub/verify', {});
+  if (data.error) {
+    if (outEl) outEl.textContent = 'Verification error: ' + data.error;
+    showToast('USB Hub verify error: ' + data.error, 'bad');
+    return;
+  }
+  let html = '<strong>' + esc(data.summary || 'USB Hub Check') + '</strong>';
+  const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+  if (nodes.length) {
+    html += '<div class="hint" style="margin-top:4px;">' + nodes.map(n =>
+      '<span class="pill ' + (n.online ? 'ok' : 'bad') + '">' + esc(n.node_id) + ' (' + esc(n.mode) + ') '
+      + (n.online ? esc(n.latency_ms) + 'ms' : 'OFFLINE') + '</span>'
+    ).join(' ') + '</div>';
+  }
+  const links = Array.isArray(data.peer_links) ? data.peer_links : [];
+  if (links.length) {
+    html += '<div class="hint" style="margin-top:6px;"><strong>Phone ↔ Phone Peer Links:</strong><br/>'
+      + links.map(lk =>
+        '<span class="mono">' + esc(lk.from) + ' → ' + esc(lk.to) + '</span> (' + esc(lk.mode) + '): '
+        + '<strong style="color:' + (lk.ok ? 'var(--ok)' : 'var(--bad)') + '">' + (lk.ok ? 'OK' : 'FAIL') + '</strong>'
+        + (lk.latency_ms != null ? ' ' + esc(lk.latency_ms) + 'ms' : '')
+        + (lk.error ? ' · ' + esc(lk.error) : '')
+      ).join('<br/>') + '</div>';
+  }
+  const warns = Array.isArray(data.warnings) ? data.warnings : [];
+  if (warns.length) {
+    html += '<div class="hint" style="color:var(--warn); margin-top:6px;">' + warns.map(w => '⚠ ' + esc(w)).join('<br/>') + '</div>';
+  }
+  if (outEl) { outEl.style.display = 'block'; outEl.innerHTML = html; }
+  showToast(data.summary || 'USB Hub check complete', data.ok ? 'ok' : 'warn');
+}
+
+async function toggleUsbWatchdog() {
+  const nextState = !lastUsbWatchdogRunning;
+  const data = await authPost('/api/usb-hub/watchdog', { enabled: nextState });
+  if (data.error) { showToast('Watchdog error: ' + data.error, 'bad'); return; }
+  _renderUsbWatchdogBadge(data.watchdog);
+  showToast(nextState ? 'USB Hub Auto-Heal Watchdog enabled!' : 'USB Hub Auto-Heal Watchdog stopped.', nextState ? 'ok' : 'neutral');
 }
 
 async function applySecurityProfile(profile) {
@@ -3340,6 +3522,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         config_path: Path | None = None,
         enable_pairing_beacon: bool = True,
         pairing_fail_delay_sec: float = 1.0,
+        enable_usb_watchdog: bool = True,
     ) -> None:
         self.controller = controller
         self.config_path = config_path
@@ -3347,6 +3530,8 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.latest_live: dict[str, Any] | None = None
         self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
         self._conn_sem = threading.BoundedSemaphore(64)
+        self._usb_watchdog_lock = threading.Lock()
+        self._usb_watchdog: UsbHubWatchdog | None = None
         if ":" in str(addr[0]):
             self.address_family = socket.AF_INET6
         super().__init__(addr, DashboardRequestHandler)
@@ -3367,6 +3552,50 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             else:
                 controller.gateway_port_override = -1
                 LOG.warning("Master Network Guard failed to start on boot: %s", msg)
+        if (
+            enable_usb_watchdog
+            and config_path is not None
+            and any(n.adb is not None for n in controller.config.nodes)
+        ):
+            self.start_usb_watchdog()
+
+    def usb_watchdog_status(self) -> dict[str, Any]:
+        with self._usb_watchdog_lock:
+            wd = self._usb_watchdog
+        if wd is None:
+            return {"running": False, "interval_sec": 5.0, "last_sync_ts": 0, "online_serials": []}
+        return wd.snapshot()
+
+    def start_usb_watchdog(self, interval_sec: float = 5.0) -> dict[str, Any]:
+        clean_iv = max(2.0, min(300.0, float(interval_sec)))
+        with self._usb_watchdog_lock:
+            if self._usb_watchdog is not None and self._usb_watchdog.is_alive():
+                return self._usb_watchdog.snapshot()
+            with self.controller.config_lock:
+                gw = self.controller.config.gateway
+                gw_port = int(gw.port or 8888)
+                gw_rev = bool(gw.enabled)
+            wd = UsbHubWatchdog(
+                interval_sec=clean_iv,
+                gateway_port=gw_port,
+                enable_gateway_reverse=gw_rev,
+                enable_peer_mesh=True,
+                config_path=self.config_path,
+            )
+            wd.start()
+            self._usb_watchdog = wd
+        LOG.info("Started built-in USB 3.0 Hub Auto-Heal Watchdog (interval=%.1fs)", clean_iv)
+        return wd.snapshot()
+
+    def stop_usb_watchdog(self) -> dict[str, Any]:
+        with self._usb_watchdog_lock:
+            wd = self._usb_watchdog
+            self._usb_watchdog = None
+        if wd is not None:
+            wd.stop()
+            wd.join(timeout=2.0)
+            LOG.info("Stopped built-in USB 3.0 Hub Auto-Heal Watchdog.")
+        return {"running": False, "interval_sec": 5.0, "last_sync_ts": 0, "online_serials": []}
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._conn_sem.acquire(blocking=False):
@@ -3386,6 +3615,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         try:
+            self.stop_usb_watchdog()
             self.pairing_manager.close_session()
             self.gateway_manager.stop()
         finally:
@@ -3719,17 +3949,28 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 ready_adb = [d for d in topo["adb_devices"] if d.get("state") == "device"]
                 try:
                     with self.server.controller.config_lock:
-                        adb_plan = plan_adb_usb_hub(ready_adb, existing_nodes=self.server.controller.config.nodes)
+                        cfg = self.server.controller.config
+                        adb_plan = plan_adb_usb_hub(
+                            ready_adb,
+                            gateway_port=int(cfg.gateway.port or 8888),
+                            enable_gateway_reverse=bool(cfg.gateway.enabled),
+                            existing_nodes=cfg.nodes,
+                            quarantined_nodes=cfg.gateway.quarantined_nodes,
+                        )
+                        gw_port = int(cfg.gateway.port or 8888)
                 except ValueError as exc:
                     self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
                     return
                 rndis_plan = plan_rndis_usb_hub(topo["usb_net_interfaces"]) if topo["usb_net_interfaces"] else {"mode": "rndis", "nodes": [], "cluster_cidr": "10.77.0.0/16"}
+                rndis_cmds = build_rndis_router_commands(rndis_plan, gateway_port=gw_port) if rndis_plan.get("nodes") else {"cluster_cidr": rndis_plan["cluster_cidr"], "host_commands": [], "phone_commands": {}}
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "topology": topo,
                         "adb_plan": adb_plan,
                         "rndis_plan": rndis_plan,
+                        "rndis_commands": rndis_cmds,
+                        "watchdog": self.server.usb_watchdog_status(),
                     },
                 )
             elif path == "/api/discover":
@@ -3787,6 +4028,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/settings/test-webhook",
             "/api/pair/open",
             "/api/pair/close",
+            "/api/usb-hub/setup",
+            "/api/usb-hub/verify",
+            "/api/usb-hub/watchdog",
         }
         if path not in valid_paths:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -4738,6 +4982,121 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
 
+        elif path == "/api/usb-hub/setup":
+            mode = str(body.get("mode") or "auto").strip().lower()
+            if mode not in {"auto", "adb", "rndis"}:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "mode must be 'auto', 'adb', or 'rndis'"})
+                return
+            topo = detect_usb_hub_topology()
+            if mode == "auto":
+                mode = str(topo.get("recommended_mode") or "adb")
+            if mode == "adb":
+                ready_adb = [d for d in topo.get("adb_devices") or [] if d.get("state") == "device"]
+                if not ready_adb:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "No authorized ADB phones found on USB hub."})
+                    return
+                if bool(body.get("auto_detect", True)):
+                    enriched = []
+                    for dev in ready_adb:
+                        prof = probe_adb_device_profile(dev["serial"])
+                        item = dict(dev)
+                        if prof.get("os_env") != "unknown":
+                            item["os_env"] = prof["os_env"]
+                            item["remote_ssh_port"] = prof["remote_ssh_port"]
+                        if prof.get("ssh_user"):
+                            item["ssh_user"] = prof["ssh_user"]
+                        enriched.append(item)
+                    ready_adb = enriched
+                with ctrl.config_lock:
+                    prev_nodes = list(ctrl.config.nodes)
+                    prev_allowed = list(ctrl.config.network.allowed_master_ips)
+                    try:
+                        plan = plan_adb_usb_hub(
+                            ready_adb,
+                            gateway_port=int(ctrl.config.gateway.port or 8888),
+                            enable_gateway_reverse=bool(ctrl.config.gateway.enabled),
+                            enable_peer_mesh=bool(body.get("peer_mesh", True)),
+                            existing_nodes=ctrl.config.nodes,
+                            quarantined_nodes=ctrl.config.gateway.quarantined_nodes,
+                        )
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                apply_res = apply_adb_usb_hub(plan)
+                if not apply_res.get("ok"):
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "ADB tunnel setup failed", "plan": plan, "apply": apply_res})
+                    return
+                with ctrl.config_lock:
+                    try:
+                        updated = sync_usb_hub_into_config(ctrl.config, plan)
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    if not self._save_config_or_rollback(
+                        lambda: (
+                            setattr(ctrl.config, "nodes", prev_nodes),
+                            setattr(ctrl.config.network, "allowed_master_ips", prev_allowed),
+                        )
+                    ):
+                        return
+                wd_state = self.server.start_usb_watchdog() if bool(body.get("start_watchdog", True)) else self.server.usb_watchdog_status()
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"mode": "adb", "plan": plan, "apply": apply_res, "updated_nodes": updated, "watchdog": wd_state},
+                )
+            else:
+                try:
+                    prefix = validate_subnet_prefix(str(body.get("subnet_prefix") or DEFAULT_USB_SUBNET_PREFIX))
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                ifaces = list(topo.get("usb_net_interfaces") or [])
+                if not ifaces:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "No USB-Ethernet / RNDIS phone gadgets detected."})
+                    return
+                plan = plan_rndis_usb_hub(ifaces, subnet_prefix=prefix)
+                with ctrl.config_lock:
+                    prev_nodes = list(ctrl.config.nodes)
+                    prev_allowed = list(ctrl.config.network.allowed_master_ips)
+                    gw_port = int(ctrl.config.gateway.port or 8888)
+                    try:
+                        updated = sync_usb_hub_into_config(ctrl.config, plan)
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    if not self._save_config_or_rollback(
+                        lambda: (
+                            setattr(ctrl.config, "nodes", prev_nodes),
+                            setattr(ctrl.config.network, "allowed_master_ips", prev_allowed),
+                        )
+                    ):
+                        return
+                cmds = build_rndis_router_commands(plan, nat_wan=bool(body.get("nat_wan", False)), gateway_port=gw_port)
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"mode": "rndis", "plan": plan, "commands": cmds, "updated_nodes": updated, "watchdog": self.server.usb_watchdog_status()},
+                )
+
+        elif path == "/api/usb-hub/verify":
+            report = verify_usb_hub_connectivity(ctrl)
+            self._send_json(HTTPStatus.OK, report)
+
+        elif path == "/api/usb-hub/watchdog":
+            enabled = bool(body.get("enabled", True))
+            if enabled:
+                raw_iv = body.get("interval_sec", 5.0)
+                try:
+                    iv = float(raw_iv) if not isinstance(raw_iv, bool) else 5.0
+                    if not math.isfinite(iv) or not (2.0 <= iv <= 300.0):
+                        raise ValueError("interval_sec must be between 2 and 300")
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                wd = self.server.start_usb_watchdog(interval_sec=iv)
+            else:
+                wd = self.server.stop_usb_watchdog()
+            self._send_json(HTTPStatus.OK, {"watchdog": wd})
+
 
 def _collect_live(controller: MasterController) -> dict[str, Any]:
     return {
@@ -4772,9 +5131,15 @@ def serve_dashboard(
     port: int,
     controller: MasterController,
     config_path: Path | None = None,
+    enable_usb_watchdog: bool = True,
 ) -> None:
     """Start the Master Phone's accessible btop Web Control Center."""
-    server = DashboardHTTPServer((bind_host, port), controller, config_path=config_path)
+    server = DashboardHTTPServer(
+        (bind_host, port),
+        controller,
+        config_path=config_path,
+        enable_usb_watchdog=enable_usb_watchdog,
+    )
     stop_event = threading.Event()
     _start_background_sampler(server, stop_event, interval_sec=4.0)
 

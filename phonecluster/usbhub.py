@@ -25,18 +25,28 @@ a powered USB 3.0 hub connected to a Master Host such as a Raspberry Pi or Linux
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
-from .config import AdbNodeConfig, ClusterConfig, NodeConfig, is_loopback_or_unspecified_host, load_config
+from .config import (
+    AdbNodeConfig,
+    ClusterConfig,
+    NodeConfig,
+    is_loopback_or_unspecified_host,
+    load_config,
+    validate_ssh_user,
+)
 
 LOG = logging.getLogger("phonecluster.usbhub")
 
@@ -398,27 +408,42 @@ def plan_adb_usb_hub(
                 if node_id not in occupied_ids and not (slot_ports & occupied_ports):
                     occupied_ports.update(slot_ports)
                     break
-            adb = AdbNodeConfig(serial, remote_worker_port, remote_ssh_port, start, enable_peer_mesh)
+            dev_w_port = remote_worker_port
+            if isinstance(dev.get("remote_worker_port"), int) and 1 <= int(dev["remote_worker_port"]) <= 65535:
+                dev_w_port = int(dev["remote_worker_port"])
+            dev_s_port = remote_ssh_port
+            if isinstance(dev.get("remote_ssh_port"), int) and 1 <= int(dev["remote_ssh_port"]) <= 65535:
+                dev_s_port = int(dev["remote_ssh_port"])
+            adb = AdbNodeConfig(serial, dev_w_port, dev_s_port, start, enable_peer_mesh)
 
         is_quarantined = node_id in quarantined
         if is_quarantined:
             quarantined_serials.append(serial)
         peer_mesh = (not is_quarantined) and enable_peer_mesh and (adb.peer_mesh or not registered_only)
 
-        nodes_plan.append(
-            {
-                "node_id": node_id,
-                "serial": serial,
-                "model": str(dev.get("model") or ""),
-                "host": "127.0.0.1",
-                "worker_port": local_w_port,
-                "ssh_port": local_s_port,
-                "remote_worker_port": adb.remote_worker_port,
-                "remote_ssh_port": adb.remote_ssh_port,
-                "mesh_base_port": adb.mesh_base_port,
-                "peer_mesh": peer_mesh,
-            }
-        )
+        entry: dict[str, Any] = {
+            "node_id": node_id,
+            "serial": serial,
+            "model": str(dev.get("model") or ""),
+            "host": "127.0.0.1",
+            "worker_port": local_w_port,
+            "ssh_port": local_s_port,
+            "remote_worker_port": adb.remote_worker_port,
+            "remote_ssh_port": adb.remote_ssh_port,
+            "mesh_base_port": adb.mesh_base_port,
+            "peer_mesh": peer_mesh,
+        }
+        raw_user = str(dev.get("ssh_user") or "").strip()
+        if raw_user:
+            try:
+                clean_u = validate_ssh_user(raw_user)
+                if clean_u:
+                    entry["ssh_user"] = clean_u
+            except ValueError:
+                pass
+        if dev.get("os_env"):
+            entry["os_env"] = str(dev["os_env"])[:48]
+        nodes_plan.append(entry)
         forward_rules.append(
             {"serial": serial, "node_id": node_id, "local_port": local_w_port, "remote_port": adb.remote_worker_port, "label": "worker"}
         )
@@ -850,6 +875,7 @@ class UsbHubWatchdog(threading.Thread):
         self._last_serials: tuple[str, ...] = ()
         self._last_plan: dict[str, Any] = {"mode": "adb", "nodes": [], "forward_rules": [], "reverse_rules": [], "peer_mesh_map": {}}
         self._last_result: dict[str, Any] = {}
+        self._last_sync_ts: float = 0.0
 
     def sync_once(self) -> dict[str, Any]:
         devs = list_adb_devices(adb_bin=self.adb_bin)
@@ -881,11 +907,19 @@ class UsbHubWatchdog(threading.Thread):
                 self._last_serials = ready_serials
             self._last_plan = plan
             self._last_result = res
+            self._last_sync_ts = time.time()
         return {"plan": plan, "apply": res}
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return {"plan": dict(self._last_plan), "apply": dict(self._last_result)}
+            return {
+                "running": self.is_alive() and not self._stop_event.is_set(),
+                "interval_sec": self.interval_sec,
+                "last_sync_ts": int(self._last_sync_ts) if self._last_sync_ts else 0,
+                "online_serials": list(self._last_serials),
+                "plan": dict(self._last_plan),
+                "apply": dict(self._last_result),
+            }
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -897,3 +931,349 @@ class UsbHubWatchdog(threading.Thread):
             except Exception as exc:
                 LOG.warning("USB hub watchdog tick error: %s", exc)
             self._stop_event.wait(self.interval_sec)
+
+
+def probe_adb_device_profile(
+    serial: str,
+    *,
+    adb_bin: str | None = None,
+    timeout_sec: float = 3.0,
+) -> dict[str, Any]:
+    """Quickly probe an ADB-connected phone to auto-detect Termux vs Ubuntu Touch SSH port, user, and USB power."""
+    clean_serial = validate_usb_serial(serial)
+    cmd = adb_bin or shutil.which("adb")
+    base: dict[str, Any] = {
+        "serial": clean_serial,
+        "os_env": "unknown",
+        "remote_ssh_port": 8022,
+        "ssh_user": "",
+        "battery_pct": None,
+        "battery_status": "",
+        "usb_power_warning": False,
+    }
+    if not cmd:
+        return base
+    probe_sh = (
+        "if [ -f /etc/system-image/channel.ini ] || [ -d /etc/ubuntu-touch ]; then "
+        "  echo OS=ubuntu-touch; echo SSH_PORT=22; echo SSH_USER=phablet; "
+        "elif [ -d /data/data/com.termux/files/usr ]; then "
+        "  echo OS=termux; echo SSH_PORT=8022; "
+        "  TU=$(stat -c '%U' /data/data/com.termux/files/home 2>/dev/null || ls -ld /data/data/com.termux/files/home 2>/dev/null | awk '{print $3}'); "
+        "  echo SSH_USER=$TU; "
+        "else "
+        "  echo OS=android; echo SSH_PORT=8022; echo SSH_USER=; "
+        "fi; "
+        "for f in /sys/class/power_supply/battery/capacity /sys/class/power_supply/*/capacity; do "
+        "  [ -r \"$f\" ] && { echo BAT_PCT=$(cat \"$f\" 2>/dev/null); break; }; "
+        "done; "
+        "for f in /sys/class/power_supply/battery/status /sys/class/power_supply/*/status; do "
+        "  [ -r \"$f\" ] && { echo BAT_STATUS=$(cat \"$f\" 2>/dev/null); break; }; "
+        "done"
+    )
+    try:
+        res = subprocess.run(
+            [cmd, "-s", clean_serial, "shell", probe_sh],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return base
+    if res.returncode != 0:
+        return base
+    for line in res.stdout.splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if k == "OS" and v:
+            base["os_env"] = v[:32]
+        elif k == "SSH_PORT" and v.isascii() and v.isdigit() and 1 <= int(v) <= 65535:
+            base["remote_ssh_port"] = int(v)
+        elif k == "SSH_USER" and v:
+            try:
+                base["ssh_user"] = validate_ssh_user(v)
+            except ValueError:
+                pass
+        elif k == "BAT_PCT" and v.isascii() and v.isdigit():
+            pct = int(v)
+            if 0 <= pct <= 100:
+                base["battery_pct"] = pct
+        elif k == "BAT_STATUS" and v:
+            st = v.upper()[:24]
+            base["battery_status"] = st
+            if st in {"DISCHARGING", "NOT CHARGING", "NOT_CHARGING"}:
+                base["usb_power_warning"] = True
+    return base
+
+
+def _tcp_probe_local(host: str, port: int, timeout_sec: float = 0.5) -> tuple[bool, float]:
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=timeout_sec):
+            return True, round((time.monotonic() - t0) * 1000.0, 1)
+    except OSError:
+        return False, round((time.monotonic() - t0) * 1000.0, 1)
+
+
+def verify_usb_hub_connectivity(
+    controller: Any,
+    *,
+    adb_bin: str | None = None,
+    timeout_sec: float = 3.0,
+) -> dict[str, Any]:
+    """Verify Master<->Phone worker reachability, ADB tunnel bindings, and live Phone<->Phone peer links over USB."""
+    from .master import JobSpec
+
+    with controller.config_lock:
+        all_nodes = list(controller.config.nodes)
+        quarantined = set(controller.config.gateway.quarantined_nodes)
+
+    usb_nodes = [
+        n for n in all_nodes
+        if n.adb is not None or "usb-hub" in (n.tags or []) or "usb-mode:rndis" in (n.tags or []) or "usb-mode:adb" in (n.tags or [])
+    ]
+    if not usb_nodes:
+        return {
+            "ok": False,
+            "usb_node_count": 0,
+            "online_count": 0,
+            "nodes": [],
+            "peer_links": [],
+            "adb_tunnels": [],
+            "warnings": ["No USB hub nodes configured yet. Run `pc usb-hub setup` or Tab 6 -> USB 3.0 Hub first."],
+            "summary": "No USB hub nodes configured.",
+        }
+
+    snapshots = controller.poll_health()
+    snap_by_id = {s.node.id: s for s in snapshots}
+    warnings: list[str] = []
+    node_rows: list[dict[str, Any]] = []
+    online_rndis: list[NodeConfig] = []
+    adb_nodes: list[NodeConfig] = []
+
+    for n in usb_nodes:
+        snap = snap_by_id.get(n.id)
+        mode = "adb" if (n.adb is not None or "usb-mode:adb" in (n.tags or [])) else "rndis"
+        online = bool(snap and snap.online)
+        h = snap.health if (snap and snap.online and isinstance(snap.health, dict)) else {}
+        bat_status = str(h.get("battery_status") or "").upper()
+        bat_pct = h.get("battery_pct")
+        power_warn = online and bat_status in {"DISCHARGING", "NOT_CHARGING"}
+        if power_warn:
+            warnings.append(
+                f"{n.id} is discharging on USB ({bat_pct if bat_pct is not None else '?'}%) — check powered USB 3.0 hub PSU (12V/3A-5A)."
+            )
+        if n.id in quarantined:
+            warnings.append(f"{n.id} is quarantined — peer-mesh and gateway access intentionally blocked.")
+        node_rows.append(
+            {
+                "node_id": n.id,
+                "mode": mode,
+                "host": n.host,
+                "worker_port": n.worker_port,
+                "online": online,
+                "ready": bool(snap and snap.ready_for_jobs),
+                "latency_ms": snap.latency_ms if snap else None,
+                "battery_pct": bat_pct,
+                "battery_status": bat_status,
+                "power_warning": power_warn,
+                "quarantined": n.id in quarantined,
+                "error": "" if online else (snap.error if snap else "unreachable"),
+            }
+        )
+        if online and n.id not in quarantined:
+            if mode == "rndis":
+                online_rndis.append(n)
+            else:
+                adb_nodes.append(n)
+
+    # Check host IPv4 forwarding if RNDIS nodes exist
+    has_rndis = any(r["mode"] == "rndis" for r in node_rows)
+    if has_rndis and not read_ipv4_forwarding_enabled():
+        warnings.append("Master host net.ipv4.ip_forward=0 — RNDIS phones cannot route packets to each other. Run setup-rndis.")
+
+    # Live Phone <-> Phone peer checks for RNDIS /30 nodes
+    peer_links: list[dict[str, Any]] = []
+    if len(online_rndis) >= 2:
+        for src in online_rndis:
+            peers = [(dst.id, dst.host, int(dst.worker_port)) for dst in online_rndis if dst.id != src.id]
+            probe_code = (
+                "import json, socket, time\n"
+                f"peers = {peers!r}\n"
+                "out = []\n"
+                "for nid, host, port in peers:\n"
+                "    t0 = time.monotonic()\n"
+                "    try:\n"
+                f"        with socket.create_connection((host, port), timeout={min(2.5, max(0.5, float(timeout_sec)))}):\n"
+                "            out.append({'to': nid, 'host': host, 'port': port, 'ok': True, 'latency_ms': round((time.monotonic()-t0)*1000.0, 1), 'error': ''})\n"
+                "    except OSError as exc:\n"
+                "        out.append({'to': nid, 'host': host, 'port': port, 'ok': False, 'latency_ms': round((time.monotonic()-t0)*1000.0, 1), 'error': str(exc)[:120]})\n"
+                "print(json.dumps({'links': out}))\n"
+            )
+            spec = JobSpec(
+                index=0,
+                job_id=f"usb-peercheck-{src.id}-{uuid.uuid4().hex[:6]}",
+                script_content=probe_code,
+                script_name="usb_peer_check.py",
+                interpreter="python3",
+                timeout_sec=max(5.0, float(timeout_sec) * len(peers) + 3.0),
+                force=True,
+            )
+            kind, data = controller.exec_on_node(src, spec)
+            if kind == "ok" and data.get("returncode") == 0:
+                try:
+                    parsed = json.loads(str(data.get("stdout") or "").strip())
+                    for item in parsed.get("links") or []:
+                        peer_links.append({"from": src.id, "mode": "rndis", **item})
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    for dst_id, dst_host, dst_port in peers:
+                        peer_links.append({"from": src.id, "to": dst_id, "mode": "rndis", "host": dst_host, "port": dst_port, "ok": False, "latency_ms": None, "error": "invalid probe output"})
+            else:
+                err = str(data.get("error") or data.get("stderr") or kind)[:120]
+                for dst_id, dst_host, dst_port in peers:
+                    peer_links.append({"from": src.id, "to": dst_id, "mode": "rndis", "host": dst_host, "port": dst_port, "ok": False, "latency_ms": None, "error": err})
+
+    # Live ADB tunnel verification for ADB USB-hub nodes
+    adb_tunnels: list[dict[str, Any]] = []
+    adb_cmd = adb_bin or shutil.which("adb")
+    if adb_nodes and adb_cmd:
+        fwd_map: dict[str, tuple[str, str]] = {}
+        try:
+            fwd_res = subprocess.run([adb_cmd, "forward", "--list"], capture_output=True, text=True, timeout=timeout_sec)
+            if fwd_res.returncode == 0:
+                for line in fwd_res.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        fwd_map[parts[1]] = (parts[0], parts[2])
+        except (subprocess.SubprocessError, OSError):
+            pass
+        for n in adb_nodes:
+            serial = n.adb.serial if n.adb is not None else ""
+            w_bind = fwd_map.get(f"tcp:{n.worker_port}")
+            s_bind = fwd_map.get(f"tcp:{n.ssh_port}")
+            rev_ports: set[str] = set()
+            if serial:
+                try:
+                    rev_res = subprocess.run([adb_cmd, "-s", serial, "reverse", "--list"], capture_output=True, text=True, timeout=timeout_sec)
+                    if rev_res.returncode == 0:
+                        for line in rev_res.stdout.splitlines():
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                rev_ports.add(parts[1])
+                except (subprocess.SubprocessError, OSError):
+                    pass
+            worker_fwd_ok = bool(w_bind and (not serial or w_bind[0] == serial))
+            ssh_fwd_ok = bool(s_bind and (not serial or s_bind[0] == serial))
+            adb_tunnels.append(
+                {
+                    "node_id": n.id,
+                    "serial": serial,
+                    "worker_forward_ok": worker_fwd_ok,
+                    "ssh_forward_ok": ssh_fwd_ok,
+                    "reverse_count": len(rev_ports),
+                }
+            )
+            if not worker_fwd_ok:
+                warnings.append(f"ADB worker forward missing for {n.id} (127.0.0.1:{n.worker_port}) — click 'Apply ADB Hub' or enable Auto-Heal Watchdog.")
+        # Check peer mesh reachability between sibling ADB phones
+        if len(adb_nodes) >= 2:
+            for src in adb_nodes:
+                if src.adb is None or not src.adb.peer_mesh:
+                    continue
+                for dst in adb_nodes:
+                    if dst.id == src.id or dst.adb is None or not dst.adb.peer_mesh:
+                        continue
+                    mesh_port = dst.adb.mesh_base_port
+                    bind = fwd_map.get(f"tcp:{mesh_port}")
+                    mesh_bound = bool(bind and bind[0] == dst.adb.serial)
+                    peer_links.append(
+                        {
+                            "from": src.id,
+                            "to": dst.id,
+                            "mode": "adb-mesh",
+                            "host": "127.0.0.1",
+                            "port": mesh_port,
+                            "ok": mesh_bound,
+                            "latency_ms": None,
+                            "error": "" if mesh_bound else f"mesh forward tcp:{mesh_port} missing",
+                        }
+                    )
+
+    online_count = sum(1 for r in node_rows if r["online"])
+    peer_ok = all(link.get("ok") for link in peer_links) if peer_links else True
+    tunnels_ok = all(t["worker_forward_ok"] for t in adb_tunnels) if adb_tunnels else True
+    overall_ok = online_count == len(node_rows) and peer_ok and tunnels_ok
+    peer_summary = (
+        f", {sum(1 for l in peer_links if l['ok'])}/{len(peer_links)} peer link(s) OK"
+        if peer_links
+        else ""
+    )
+    return {
+        "ok": overall_ok,
+        "usb_node_count": len(node_rows),
+        "online_count": online_count,
+        "nodes": node_rows,
+        "peer_links": peer_links,
+        "adb_tunnels": adb_tunnels,
+        "warnings": warnings,
+        "summary": f"{online_count}/{len(node_rows)} USB phone(s) online{peer_summary}",
+    }
+
+
+def generate_usb_hub_systemd_unit(
+    mode: str,
+    *,
+    config_path: str | Path = "config/cluster.json",
+    repo_dir: str | Path = "/opt/phonecluster",
+    subnet_prefix: str = DEFAULT_USB_SUBNET_PREFIX,
+    nat_wan: bool = False,
+    wan_iface: str = "",
+    gateway_port: int = 8888,
+    interval_sec: float = 5.0,
+) -> str:
+    """Generate a ready-to-install systemd service unit for persistent USB 3.0 Hub routing across Master reboots."""
+    clean_mode = str(mode or "adb").strip().lower()
+    if clean_mode not in {"adb", "rndis"}:
+        raise ValueError("mode must be 'adb' or 'rndis'")
+    clean_prefix = validate_subnet_prefix(subnet_prefix)
+    gw_port = int(gateway_port) if 1 <= int(gateway_port) <= 65535 else 8888
+    cfg_str = str(config_path)
+    repo_str = str(repo_dir)
+    if any(c in "\r\n" for c in cfg_str + repo_str):
+        raise ValueError("config_path and repo_dir cannot contain newlines")
+
+    if clean_mode == "adb":
+        iv = max(1.0, min(300.0, float(interval_sec)))
+        return (
+            "[Unit]\n"
+            "Description=PhoneCluster USB 3.0 Hub Auto-Heal Watchdog (ADB Peer Mesh)\n"
+            "After=network.target\n\n"
+            "[Service]\n"
+            "Type=simple\n"
+            f'WorkingDirectory="{repo_str}"\n'
+            f'ExecStart=/usr/bin/env python3 "{repo_str}/phonecluster_cli.py" --config "{cfg_str}" usb-hub serve --interval {iv:.1f} --gateway-port {gw_port}\n'
+            "Restart=always\n"
+            "RestartSec=5\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        )
+
+    nat_args = ""
+    if nat_wan:
+        nat_args = " --nat-wan"
+        if wan_iface:
+            nat_args += f" --wan-iface {validate_iface_name(wan_iface)}"
+    return (
+        "[Unit]\n"
+        "Description=PhoneCluster USB 3.0 Hub Layer-3 /30 Router (RNDIS Air-Gap)\n"
+        "After=network-online.target\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "RemainAfterExit=yes\n"
+        f'ExecStart=/usr/bin/env bash "{repo_str}/scripts/07_usb_hub_router.sh" setup-rndis --prefix {clean_prefix} --gateway-port {gw_port}{nat_args}\n'
+        f'ExecStop=/usr/bin/env bash "{repo_str}/scripts/07_usb_hub_router.sh" teardown --prefix {clean_prefix}\n\n'
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )

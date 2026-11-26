@@ -604,9 +604,27 @@ def build_cross_tier_env(
         if key:
             env[f"PHONECLUSTER_POOL_{key}_HOSTS"] = ",".join(hosts)
 
-    usb_nodes = [s.node.id for s in ordered_snaps if "usb-hub" in (s.node.tags or [])]
+    usb_nodes = [s.node.id for s in ordered_snaps if "usb-hub" in (s.node.tags or []) or s.node.adb is not None]
     if usb_nodes:
         env["PHONECLUSTER_USB_HUB_NODES"] = ",".join(usb_nodes)
+    if for_node is not None and (for_node.adb is not None or "usb-hub" in (for_node.tags or [])):
+        usb_mode = "adb" if (for_node.adb is not None or "usb-mode:adb" in (for_node.tags or [])) else "rndis"
+        env["PHONECLUSTER_USB_MODE"] = usb_mode
+        peer_entries: list[str] = []
+        if usb_mode == "rndis":
+            for snap in ordered_snaps:
+                if snap.node.id == for_node.id or snap.node.adb is not None:
+                    continue
+                if "usb-mode:rndis" in (snap.node.tags or []) or "usb-hub" in (snap.node.tags or []):
+                    peer_entries.append(f"{snap.node.id}={snap.node.host}")
+        elif for_node.adb is not None and for_node.adb.peer_mesh:
+            for snap in ordered_snaps:
+                if snap.node.id == for_node.id or snap.node.adb is None or not snap.node.adb.peer_mesh:
+                    continue
+                for offset, svc_port in enumerate(USB_MESH_DEFAULT_PORTS):
+                    peer_entries.append(f"{snap.node.id}:{svc_port}=127.0.0.1:{snap.node.adb.mesh_base_port + offset}")
+        if peer_entries:
+            env["PHONECLUSTER_USB_PEERS"] = ",".join(peer_entries)
 
     for cname, curl in config.custom_services.items():
         key = re.sub(r"[^A-Z0-9]+", "_", cname.upper()).strip("_")

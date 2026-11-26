@@ -59,10 +59,13 @@ from .usbhub import (
     apply_adb_usb_hub,
     build_rndis_router_commands,
     detect_usb_hub_topology,
+    generate_usb_hub_systemd_unit,
     plan_adb_usb_hub,
     plan_rndis_usb_hub,
+    probe_adb_device_profile,
     sync_usb_hub_into_config,
     validate_subnet_prefix,
+    verify_usb_hub_connectivity,
 )
 from .wizard import _print_doctor_report, run_interactive_menu, run_setup_wizard
 from .worker import WorkerState, serve_worker
@@ -674,13 +677,27 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
 
     if action == "scan":
         topo = detect_usb_hub_topology()
+        if getattr(args, "probe_devices", False):
+            enriched = []
+            for d in topo["adb_devices"]:
+                item = dict(d)
+                if item.get("state") == "device":
+                    item["profile"] = probe_adb_device_profile(item["serial"])
+                enriched.append(item)
+            topo["adb_devices"] = enriched
         if args.json:
             print(json.dumps(topo, indent=2))
             return 0
         print(f"ADB installed    : {'yes' if topo['adb_installed'] else 'no'}")
         print(f"ADB ready phones : {topo['adb_ready_count']} (total seen: {len(topo['adb_devices'])})")
         for d in topo["adb_devices"]:
-            print(f"  - {d['serial']}  state={d['state']}  model={d.get('model') or '-'}")
+            prof = d.get("profile") if isinstance(d.get("profile"), dict) else None
+            extra = ""
+            if prof:
+                extra = f"  os={prof.get('os_env')}  ssh={prof.get('remote_ssh_port')}  user={prof.get('ssh_user') or '-'}"
+                if prof.get("usb_power_warning"):
+                    extra += "  [WARN: DISCHARGING - check powered hub!]"
+            print(f"  - {d['serial']}  state={d['state']}  model={d.get('model') or '-'}{extra}")
         print(f"USB-Net gadgets  : {topo['usb_net_count']}")
         for it in topo["usb_net_interfaces"]:
             ips = ", ".join(it.get("ipv4_cidrs") or []) or "(no IPv4)"
@@ -693,6 +710,68 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
         print(f"Recommended mode : {topo['recommended_mode']}")
         for note in topo["notes"]:
             print(f"  Note: {note}")
+        return 0
+
+    if action == "verify":
+        cfg_path = resolve_config_path(args.config)
+        cfg = load_config(cfg_path)
+        report = verify_usb_hub_connectivity(MasterController(cfg))
+        if args.json:
+            print(json.dumps(report, indent=2))
+            return 0 if report.get("ok") else 1
+        print(f"USB Hub Verification: {report['summary']}")
+        if report["nodes"]:
+            rows = [
+                [
+                    r["node_id"],
+                    r["mode"],
+                    format_host_port(r["host"], r["worker_port"]),
+                    "ONLINE" if r["online"] else "OFFLINE",
+                    f"{r['latency_ms']}ms" if r["latency_ms"] is not None else "-",
+                    f"{r['battery_pct']}% {r['battery_status']}" if r["battery_pct"] is not None else "-",
+                ]
+                for r in report["nodes"]
+            ]
+            print(_fmt_table(["NODE", "MODE", "ENDPOINT", "STATUS", "RTT", "POWER"], rows))
+        if report["peer_links"]:
+            p_rows = [
+                [
+                    f"{lk['from']} -> {lk['to']}",
+                    lk["mode"],
+                    format_host_port(lk["host"], int(lk["port"])),
+                    "OK" if lk["ok"] else "FAIL",
+                    f"{lk['latency_ms']}ms" if lk.get("latency_ms") is not None else (lk.get("error") or "-"),
+                ]
+                for lk in report["peer_links"]
+            ]
+            print("\nPhone-to-Phone Peer Links:")
+            print(_fmt_table(["LINK", "TRANSPORT", "TARGET", "STATUS", "DETAIL"], p_rows))
+        for w in report["warnings"]:
+            print(f"  WARN: {w}")
+        return 0 if report.get("ok") else 1
+
+    if action == "systemd-unit":
+        try:
+            prefix = validate_subnet_prefix(args.subnet_prefix)
+            cfg_path = resolve_config_path(args.config)
+            unit_mode = "adb" if args.mode == "auto" else args.mode
+            unit = generate_usb_hub_systemd_unit(
+                unit_mode,
+                config_path=cfg_path.resolve(),
+                repo_dir=REPO_ROOT,
+                subnet_prefix=prefix,
+                nat_wan=args.nat_wan,
+                wan_iface=args.wan_iface,
+                gateway_port=args.gateway_port,
+                interval_sec=args.interval,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps({"mode": unit_mode, "unit": unit}, indent=2))
+        else:
+            print(unit, end="")
         return 0
 
     if action == "setup":
@@ -711,6 +790,18 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
             if not ready:
                 print("No authorized ADB phones found on USB hub. Run `adb devices` and approve USB debugging.", file=sys.stderr)
                 return 1
+            if getattr(args, "auto_detect", False):
+                enriched_ready = []
+                for dev in ready:
+                    prof = probe_adb_device_profile(dev["serial"])
+                    item = dict(dev)
+                    if prof.get("os_env") != "unknown":
+                        item["os_env"] = prof["os_env"]
+                        item["remote_ssh_port"] = prof["remote_ssh_port"]
+                    if prof.get("ssh_user"):
+                        item["ssh_user"] = prof["ssh_user"]
+                    enriched_ready.append(item)
+                ready = enriched_ready
             cfg_path = resolve_config_path(args.config)
             cfg = load_config(cfg_path) if cfg_path.exists() or (args.write_config and not args.dry_run) else None
             eff_gw_port = args.gateway_port
@@ -1015,7 +1106,13 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         cfg.dashboard_require_auth = True
     ctrl = MasterController(cfg)
     port = args.port if args.port is not None else cfg.dashboard_port
-    serve_dashboard(args.bind, port, ctrl, config_path=cfg_path)
+    serve_dashboard(
+        args.bind,
+        port,
+        ctrl,
+        config_path=cfg_path,
+        enable_usb_watchdog=not getattr(args, "no_usb_watchdog", False),
+    )
     return 0
 
 
@@ -1255,7 +1352,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
 
 
 def _cmd_wizard(args: argparse.Namespace) -> int:
-    return run_setup_wizard(args.config, master_id=args.master_id)
+    return run_setup_wizard(args.config, master_id=args.master_id, transport=getattr(args, "transport", "ask"))
 
 
 def _cmd_menu(args: argparse.Namespace) -> int:
@@ -1661,8 +1758,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_join.set_defaults(func=_cmd_join)
 
     # wizard
-    p_wiz = sub.add_parser("wizard", help="Guided interactive setup wizard (easiest way to configure)")
+    p_wiz = sub.add_parser("wizard", help="Guided interactive setup wizard (choose Wireless Wi-Fi or USB 3.0 Hub)")
     p_wiz.add_argument("--master-id", default="node0", help="Master node ID used for its local worker (default: node0)")
+    p_wiz.add_argument(
+        "--transport",
+        default="ask",
+        choices=["ask", "wifi", "usb", "usb-adb", "usb-rndis"],
+        help="Worker connection mode: ask (default), wifi, usb, usb-adb, or usb-rndis",
+    )
     p_wiz.set_defaults(func=_cmd_wizard)
 
     # menu
@@ -1892,9 +1995,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_dk.set_defaults(func=_cmd_docker)
 
     # usb-hub (Zero-Wi-Fi powered USB 3.0 hub routing for 2-6+ phones)
-    p_usb = sub.add_parser("usb-hub", help="Discover and configure zero-Wi-Fi USB 3.0 hub routing (ADB mesh or RNDIS /30 router)")
-    p_usb.add_argument("action", nargs="?", default="scan", choices=["scan", "setup", "serve"], help="USB hub action")
+    p_usb = sub.add_parser("usb-hub", help="Discover, configure, and verify zero-Wi-Fi USB 3.0 hub routing (ADB mesh or RNDIS /30 router)")
+    p_usb.add_argument("action", nargs="?", default="scan", choices=["scan", "setup", "serve", "verify", "systemd-unit"], help="USB hub action")
     p_usb.add_argument("--mode", default="auto", choices=["auto", "adb", "rndis"], help="Routing mode: auto, adb (zero-root), or rndis (L3 /30)")
+    p_usb.add_argument("--auto-detect", action="store_true", help="Probe each ADB phone for OS (Ubuntu Touch vs Termux), SSH port (22 vs 8022), and SSH user")
+    p_usb.add_argument("--probe-devices", action="store_true", help="During `scan`, probe attached ADB phones for OS, SSH port, and USB charging power")
     p_usb.add_argument("--subnet-prefix", default=DEFAULT_USB_SUBNET_PREFIX, help="Private /16 prefix for rndis /30 subnets (default: 10.77)")
     p_usb.add_argument("--worker-base-port", type=int, default=DEFAULT_ADB_WORKER_BASE_PORT, help="Base local port for ADB worker forwards (default: 18760)")
     p_usb.add_argument("--ssh-base-port", type=int, default=DEFAULT_ADB_SSH_BASE_PORT, help="Base local port for ADB SSH forwards (default: 18020)")
@@ -1963,6 +2068,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-auth",
         action="store_true",
         help="Require Bearer auth_token even for read-only stats (recommended on shared/dorm Wi-Fi)",
+    )
+    p_dash.add_argument(
+        "--no-usb-watchdog",
+        action="store_true",
+        help="Disable automatic background ADB USB-hub tunnel auto-healing inside the dashboard",
     )
     p_dash.set_defaults(func=_cmd_dashboard)
 

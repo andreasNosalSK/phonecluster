@@ -30,8 +30,9 @@ PhoneCluster USB 3.0 Hub Router (Zero-Wi-Fi Multi-Phone Mode)
 
 Usage:
   bash scripts/07_usb_hub_router.sh scan
+  bash scripts/07_usb_hub_router.sh status
   bash scripts/07_usb_hub_router.sh setup-adb [--config <path>] [--no-peer-mesh] [--gateway-port 8888]
-  sudo bash scripts/07_usb_hub_router.sh setup-rndis [--prefix 10.77] [--nat-wan --wan-iface <if>] [--dry-run]
+  sudo bash scripts/07_usb_hub_router.sh setup-rndis [--prefix 10.77] [--gateway-port 8888] [--nat-wan --wan-iface <if>] [--dry-run]
   sudo bash scripts/07_usb_hub_router.sh phone-setup <index 1..62> [--prefix 10.77] [--iface auto|rndis0|usb0]
   sudo bash scripts/07_usb_hub_router.sh teardown [--prefix 10.77]
 
@@ -69,6 +70,24 @@ run_cmd() {
 case "${CMD}" in
   scan)
     exec python3 "${REPO_ROOT}/phonecluster_cli.py" --config "${CONFIG_PATH}" usb-hub scan
+    ;;
+
+  status)
+    echo "=== USB 3.0 Hub Router Live Status ==="
+    echo "IPv4 forwarding : $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo unknown)"
+    python3 "${REPO_ROOT}/phonecluster_cli.py" --config "${CONFIG_PATH}" usb-hub scan || true
+    if command -v iptables >/dev/null 2>&1; then
+      if iptables -S PHONECLUSTER_USB_FWD >/dev/null 2>&1; then
+        echo
+        echo "Firewall chain PHONECLUSTER_USB_FWD: ACTIVE"
+      else
+        echo
+        echo "Firewall chain PHONECLUSTER_USB_FWD: not installed (run setup-rndis)"
+      fi
+      if iptables -S PHONECLUSTER_USB_IN >/dev/null 2>&1; then
+        echo "Firewall chain PHONECLUSTER_USB_IN : ACTIVE"
+      fi
+    fi
     ;;
 
   setup-adb)
