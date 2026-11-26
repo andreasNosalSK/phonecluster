@@ -7768,9 +7768,21 @@ class TestUbuntuTouchAndSnapDockerClustering(unittest.TestCase):
             fake_home.mkdir()
             fake_repo = fake_home / "phonecluster"
             fake_repo.mkdir()
+            fake_bin = Path(tmp) / "bin"
+            fake_bin.mkdir()
+            sc_log = Path(tmp) / "systemctl.log"
+            fake_sc = fake_bin / "systemctl"
+            fake_sc.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{sc_log}"\nexit 0\n', encoding="utf-8")
+            fake_sc.chmod(0o755)
+            fake_lc = fake_bin / "loginctl"
+            fake_lc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_lc.chmod(0o755)
             env_ut = os.environ.copy()
             env_ut["HOME"] = str(fake_home)
             env_ut["USER"] = "phablet"
+            env_ut["PATH"] = f"{fake_bin}{os.pathsep}{env_ut.get('PATH', '')}"
+            env_ut["XDG_RUNTIME_DIR"] = str(fake_home / "runtime")
+            env_ut.pop("DBUS_SESSION_BUS_ADDRESS", None)
             p_boot = subprocess.run(
                 ["bash", str(ut_script), "--boot-only", "--master", "--node-id", "ut-master", "--repo-dir", str(fake_repo)],
                 env=env_ut,
@@ -7778,6 +7790,7 @@ class TestUbuntuTouchAndSnapDockerClustering(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(p_boot.returncode, 0, p_boot.stderr)
+            self.assertIn("--user enable phonecluster-worker.service phonecluster-dashboard.service", sc_log.read_text(encoding="utf-8"))
             pc_wrap = fake_home / ".local" / "bin" / "phonecluster"
             self.assertTrue(pc_wrap.exists())
             self.assertIn("/snap/bin", pc_wrap.read_text(encoding="utf-8"))
