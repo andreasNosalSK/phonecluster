@@ -88,6 +88,7 @@ class ActiveJob:
     process: subprocess.Popen[bytes] | None = None
     cancelled: bool = False
     reaped: bool = False
+    last_output: str = ""
     proc_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -125,14 +126,29 @@ class WorkerState:
         self.recent_jobs: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
         self._sample_health_in_background = False
         self._health_sample: tuple[float, dict[str, Any]] | None = None
+        self._health_wakeup = threading.Event()
         self.recent_alerts: collections.deque[dict[str, Any]] = collections.deque(maxlen=25)
         self._last_alert_ts: dict[str, float] = {}
         self._next_webhook_ts: dict[str, float] = {}
         self._allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
         self._allowed_exact_ips: set[str] = set()
+        self._has_hostname_allowlist = self._entries_contain_hostnames(self.allowed_client_ips)
+        self._last_dns_refresh = time.monotonic()
         exact, nets = self._build_allowed_clients(self.allowed_client_ips)
         self._allowed_exact_ips = exact
         self._allowed_networks = nets
+
+    @staticmethod
+    def _entries_contain_hostnames(raw_entries: set[str] | list[str]) -> bool:
+        for raw in raw_entries:
+            entry = normalize_host(raw)
+            if not entry or "/" in entry:
+                continue
+            try:
+                ipaddress.ip_address(entry)
+            except ValueError:
+                return True
+        return False
 
     @staticmethod
     def _build_allowed_clients(
@@ -176,14 +192,15 @@ class WorkerState:
         with self.lock:
             self._allowed_exact_ips = exact
             self._allowed_networks = nets
+            self._has_hostname_allowlist = self._entries_contain_hostnames(raw_copy)
+            self._last_dns_refresh = time.monotonic()
 
-    def is_client_ip_allowed(self, client_ip: str) -> bool:
-        """Return True if `client_ip` satisfies the optional Master source-IP allowlist."""
-        with self.lock:
-            if not self.allowed_client_ips:
-                return True
-            exact_ips = self._allowed_exact_ips
-            networks = self._allowed_networks
+    @staticmethod
+    def _match_allowed_client(
+        client_ip: str,
+        exact_ips: set[str],
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network],
+    ) -> bool:
         norm = normalize_host(client_ip)
         if norm in exact_ips or client_ip in exact_ips:
             return True
@@ -200,6 +217,26 @@ class WorkerState:
             pass
         return False
 
+    def is_client_ip_allowed(self, client_ip: str) -> bool:
+        """Return True if `client_ip` satisfies the optional Master source-IP allowlist."""
+        with self.lock:
+            if not self.allowed_client_ips:
+                return True
+            exact_ips = self._allowed_exact_ips
+            networks = self._allowed_networks
+            has_hostnames = self._has_hostname_allowlist
+            last_refresh = self._last_dns_refresh
+        if self._match_allowed_client(client_ip, exact_ips, networks):
+            return True
+        # Re-resolve dynamic hostnames (mDNS/DHCP/Tailscale) periodically on miss outside lock
+        if has_hostnames and (time.monotonic() - last_refresh) >= 30.0:
+            self._compile_allowed_clients()
+            with self.lock:
+                exact_ips = self._allowed_exact_ips
+                networks = self._allowed_networks
+            return self._match_allowed_client(client_ip, exact_ips, networks)
+        return False
+
     def start_health_sampler(self, stop_event: threading.Event) -> None:
         """Sample slow platform telemetry independently of HTTP requests."""
         if self.health_provider is not None:
@@ -211,6 +248,7 @@ class WorkerState:
 
         def sample_loop() -> None:
             while not stop_event.is_set():
+                self._health_wakeup.clear()
                 started_at = time.monotonic()
                 try:
                     health = self._collect_health()
@@ -218,9 +256,49 @@ class WorkerState:
                         self._health_sample = started_at, health
                 except Exception:
                     LOG.exception("Worker health sampling failed")
-                stop_event.wait(HEALTH_SAMPLE_INTERVAL_SEC)
+                # Sleep until interval elapses, wakeup is triggered, or daemon stops
+                deadline = time.monotonic() + HEALTH_SAMPLE_INTERVAL_SEC
+                while not stop_event.is_set() and not self._health_wakeup.is_set():
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        break
+                    self._health_wakeup.wait(min(0.25, rem))
 
         threading.Thread(target=sample_loop, name="worker-health", daemon=True).start()
+
+    def _merge_safety_telemetry(self, safety_health: dict[str, Any]) -> None:
+        """Merge live safety_only readings into the cached health snapshot so /health stays consistent with /exec."""
+        if not isinstance(safety_health, dict):
+            return
+        safety_keys = (
+            "mem_total_mb",
+            "mem_available_mb",
+            "temp_c",
+            "battery_pct",
+            "battery_status",
+            "battery_health",
+            "battery_plugged",
+            "battery_source",
+            "overheated",
+            "battery_hazard",
+            "low_ram",
+            "ready_for_jobs",
+            "not_ready_reasons",
+        )
+        changed = False
+        with self.lock:
+            if self._health_sample is not None:
+                sampled_at, existing = self._health_sample
+                merged = dict(existing)
+                prev_ready = merged.get("ready_for_jobs")
+                prev_hot = merged.get("overheated")
+                for k in safety_keys:
+                    if k in safety_health:
+                        merged[k] = safety_health[k]
+                self._health_sample = sampled_at, merged
+                changed = (merged.get("ready_for_jobs") != prev_ready) or (merged.get("overheated") != prev_hot)
+        if changed:
+            self._health_wakeup.set()
 
     def _collect_health(self) -> dict[str, Any]:
         return collect_node_health(
@@ -242,6 +320,7 @@ class WorkerState:
                     "job_id": j.job_id,
                     "command": j.command_preview,
                     "running_sec": round(now - j.started_at, 1),
+                    **({"last_output": j.last_output} if j.last_output else {}),
                 }
                 for j in self.active_jobs.values()
             ]
@@ -250,6 +329,8 @@ class WorkerState:
             max_concurrency = self.max_concurrency
             enforce_source_ip = bool(self.allowed_client_ips)
             require_signed_requests = bool(self.require_signed_requests)
+            shutting_down = bool(self._shutting_down)
+            gate_overheated = bool(self.thermal_gate.is_overheated)
         active_count = len(active_list)
         if self.health_provider is not None:
             health = dict(self.health_provider())
@@ -272,7 +353,16 @@ class WorkerState:
             require_signed_requests=require_signed_requests,
         )
         raw_reasons = health.get("not_ready_reasons")
-        reasons = list(raw_reasons) if isinstance(raw_reasons, list) else []
+        reasons = [r for r in raw_reasons if not str(r).startswith("busy")] if isinstance(raw_reasons, list) else []
+        if shutting_down:
+            if "shutting_down" not in reasons:
+                reasons.append("shutting_down")
+            health["ready_for_jobs"] = False
+        if gate_overheated and self.health_provider is None:
+            health["overheated"] = True
+            if not any("overheated" in str(r) or "cooling down" in str(r) for r in reasons):
+                reasons.append("overheated")
+            health["ready_for_jobs"] = False
         if health.get("telemetry_stale"):
             reasons.append("telemetry unavailable" if sample is None else "telemetry stale")
             health["ready_for_jobs"] = False
@@ -337,6 +427,7 @@ class WorkerState:
                         workdir=self.workdir,
                         safety_only=True,
                     )
+                    self._merge_safety_telemetry(health)
                 raw_reasons = health.get("not_ready_reasons")
                 reasons_list = [str(r) for r in raw_reasons if r is not None] if isinstance(raw_reasons, list) else []
                 non_busy_reasons = [r for r in reasons_list if not r.startswith("busy")]
@@ -563,6 +654,8 @@ class WorkerState:
             if new_allowed_ips is not None and compiled_clients is not None:
                 self.allowed_client_ips = new_allowed_ips
                 self._allowed_exact_ips, self._allowed_networks = compiled_clients
+                self._has_hostname_allowlist = self._entries_contain_hostnames(new_allowed_ips)
+                self._last_dns_refresh = time.monotonic()
             if new_net_cfg is not None:
                 self.require_signed_requests = bool(new_net_cfg.require_signed_requests)
             cfg_path = self.config_path
@@ -570,12 +663,15 @@ class WorkerState:
             cur_temp = self.safety.max_temp_c
             cur_ip_lock = bool(self.allowed_client_ips)
             cur_signed_only = bool(self.require_signed_requests)
+        if new_safety is not None:
+            self._health_wakeup.set()
 
         # Persist OUTSIDE `self.lock` (serialized by `_config_update_lock`) so eMMC fsync never stalls /health or /exec
         persisted = False
-        if cfg_path is not None and cfg_path.exists():
+        if cfg_path is not None and cfg_path.expanduser().exists():
             try:
                 disk_cfg = load_config(cfg_path)
+                before_dict = disk_cfg.to_dict()
                 disk_node = disk_cfg.get_node(self.node_id)
                 if disk_node.role != self.role or not hmac.compare_digest(
                     disk_cfg.token_for_node(disk_node), self.auth_token
@@ -588,9 +684,19 @@ class WorkerState:
                 if new_net_cfg is not None:
                     disk_cfg.network.enforce_worker_source_ip = new_net_cfg.enforce_worker_source_ip
                     disk_cfg.network.require_signed_requests = new_net_cfg.require_signed_requests
+                    # Avoid rewriting Master's shared cluster.json when only synthesized/reordered
+                    # allowed_master_ips differ from what Master Dashboard just saved.
                     if explicit_allowed_ips or new_net_cfg.enforce_worker_source_ip or new_net_cfg.allowed_master_ips:
-                        disk_cfg.network.allowed_master_ips = list(new_net_cfg.allowed_master_ips)
-                save_config(disk_cfg, cfg_path)
+                        if self.role == "master" and not new_net_cfg.enforce_worker_source_ip:
+                            pass
+                        elif self.role == "master" and set(disk_cfg.network.allowed_master_ips) == set(
+                            new_net_cfg.allowed_master_ips
+                        ):
+                            pass
+                        else:
+                            disk_cfg.network.allowed_master_ips = list(new_net_cfg.allowed_master_ips)
+                if disk_cfg.to_dict() != before_dict:
+                    save_config(disk_cfg, cfg_path)
                 persisted = True
             except Exception as exc:
                 LOG.warning("Live config applied in memory but disk save failed: %s", exc)
@@ -627,6 +733,7 @@ class WorkerState:
                     "job_id": j.job_id,
                     "command": j.command_preview,
                     "running_sec": round(time.time() - j.started_at, 2),
+                    **({"last_output": j.last_output} if j.last_output else {}),
                 }
                 for j in self.active_jobs.values()
             ]
@@ -892,6 +999,12 @@ def _run_process_bounded(
                     overflow[idx] += len(chunk) - rem
             else:
                 overflow[idx] += len(chunk)
+            if job is not None and chunk:
+                tail_text = chunk[-512:].decode("utf-8", errors="replace").strip()
+                if tail_text:
+                    lines = [ln.strip() for ln in tail_text.splitlines() if ln.strip()]
+                    if lines:
+                        job.last_output = " | ".join(lines[-2:])[-320:]
 
     deadline = time.monotonic() + max(0.05, float(timeout_sec))
     timed_out = False
@@ -1046,7 +1159,15 @@ def _private_script_stage_dir(cwd: Path) -> Path | None:
         is_world_writable = True
     if not is_world_writable:
         return None
-    base = Path(os.environ.get("PREFIX") or Path.home() / ".cache") / "phonecluster-jobs"
+    prefix_dir = os.environ.get("PREFIX")
+    if prefix_dir:
+        base_parent = Path(prefix_dir)
+    else:
+        try:
+            base_parent = Path.home() / ".cache"
+        except RuntimeError:
+            return None
+    base = base_parent / "phonecluster-jobs"
     try:
         base.mkdir(mode=0o700, parents=True, exist_ok=True)
         if base.is_symlink():
@@ -1265,6 +1386,9 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             except OSError:
                 pass
         cancelled = state.is_cancelled(job_id)
+        if returncode == -9 and not timed_out and not cancelled:
+            hint = "[Process killed by SIGKILL (-9) — likely OOM killer or Android 12+ Phantom Process Killer]"
+            stderr_text = f"{stderr_text}\n{hint}" if stderr_text else hint
         duration = round(time.monotonic() - started, 3)
         summary = {
             "job_id": job_id,
@@ -1313,6 +1437,7 @@ class BatteryGuardLoop(threading.Thread):
                 workdir=self.state.workdir,
                 safety_only=True,
             )
+            self.state._merge_safety_telemetry(health)
         safety = self.state.safety
         pct = health.get("battery_pct")
         status = str(health.get("battery_status", "UNKNOWN")).strip().upper().replace(" ", "_")
@@ -1395,11 +1520,11 @@ class WorkerHTTPServer(ThreadingHTTPServer):
         state: WorkerState,
     ) -> None:
         self.state = state
-        self._conn_sem = threading.BoundedSemaphore(64)
+        self._conn_sem = threading.BoundedSemaphore(max(64, int(state.max_concurrency) * 2 + 16))
         self._ip_conns_lock = threading.Lock()
         self._ip_conns: dict[str, int] = {}
-        self._max_conns_per_ip = 16
-        self._max_conns_loopback = 48
+        self._max_conns_per_ip = max(16, int(state.max_concurrency) + 16)
+        self._max_conns_loopback = max(48, int(state.max_concurrency) * 2 + 16)
         clean_host = normalize_host(str(server_address[0])) or "0.0.0.0"
         if ":" in clean_host:
             self.address_family = socket.AF_INET6
@@ -1408,7 +1533,8 @@ class WorkerHTTPServer(ThreadingHTTPServer):
     def _acquire_ip_slot(self, client_ip: str) -> str | None:
         key = AuthRateLimiter._norm_ip(client_ip)
         is_lb = key in {"127.0.0.1", "::1"} or key.startswith("127.")
-        cap = self._max_conns_loopback if is_lb else self._max_conns_per_ip
+        dyn_cap = max(self._max_conns_per_ip, int(self.state.max_concurrency) + 16)
+        cap = max(self._max_conns_loopback, dyn_cap) if is_lb else dyn_cap
         with self._ip_conns_lock:
             cur = self._ip_conns.get(key, 0)
             if cur >= cap:
@@ -1567,9 +1693,42 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
 
         if scheme == HMAC_AUTH_SCHEME.lower():
             parsed_hdr = parse_hmac_auth_header(self.headers)
-            if parsed_hdr is None or abs(time.time() - parsed_hdr[0]) > 60.0:
+            if parsed_hdr is None:
                 self.server.state.rate_limiter.record_failure(norm_ip)
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized: invalid or expired HMAC header"})
+                return False, b""
+            skew_sec = parsed_hdr[0] - time.time()
+            if abs(skew_sec) > 60.0:
+                # Reject oversized skewed bodies immediately before reading (DoS guard),
+                # but verify GET / small requests so genuine Master clock skew gets a clear diagnosis
+                # without falsely banning Master's IP in AuthRateLimiter.
+                cl_raw = (self.headers.get("Content-Length") or "0").strip()
+                small_body = (not read_body) or (cl_raw.isascii() and cl_raw.isdigit() and int(cl_raw) <= 65536)
+                if not small_body:
+                    self.server.state.rate_limiter.record_failure(norm_ip)
+                    self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized: invalid or expired HMAC header"})
+                    return False, b""
+                raw_body = self._read_raw_body() if read_body else b""
+                if raw_body is None:
+                    self.server.state.rate_limiter.record_failure(norm_ip)
+                    return False, b""
+                _ok, reason = verify_hmac_request(
+                    self.headers,
+                    method,
+                    path,
+                    raw_body,
+                    self.server.state.auth_token,
+                    replay_cache=self.server.state.replay_cache,
+                )
+                if "clock skew" in reason:
+                    # Cryptographically valid HMAC from genuine Master — report exact drift without IP ban
+                    self._send_json(
+                        HTTPStatus.UNAUTHORIZED,
+                        {"error": f"unauthorized: {reason}", "clock_skew_sec": int(skew_sec)},
+                    )
+                    return False, b""
+                self.server.state.rate_limiter.record_failure(norm_ip)
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": f"unauthorized: {reason}"})
                 return False, b""
             raw_body = self._read_raw_body() if read_body else b""
             if raw_body is None:
@@ -1584,7 +1743,8 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
                 replay_cache=self.server.state.replay_cache,
             )
             if not ok:
-                self.server.state.rate_limiter.record_failure(norm_ip)
+                if "clock skew" not in reason:
+                    self.server.state.rate_limiter.record_failure(norm_ip)
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": f"unauthorized: {reason}"})
                 return False, b""
             self.server.state.rate_limiter.record_success(norm_ip)

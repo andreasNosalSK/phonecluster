@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import http.client
 import ipaddress
 import json
@@ -43,6 +44,7 @@ from .config import (
     format_host_port,
     generate_auth_token,
     is_loopback_or_unspecified_host,
+    load_config,
     normalize_host,
     save_config,
     validate_allowed_master_entry,
@@ -68,6 +70,7 @@ from .usbhub import (
     plan_adb_usb_hub,
     plan_rndis_usb_hub,
     probe_adb_device_profile,
+    revoke_adb_device_reverses,
     sync_usb_hub_into_config,
     validate_subnet_prefix,
     verify_usb_hub_connectivity,
@@ -551,6 +554,11 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <div id="battery-banner" class="banner warn hidden" role="status" aria-live="polite">
     <div><strong>24/7 Battery Safety Alert:</strong> <span id="battery-banner-text"></span></div>
+  </div>
+
+  <div id="config-conflict-banner" class="banner warn hidden" role="status" aria-live="polite">
+    <div><strong>Config Changed on Disk:</strong> <span id="config-conflict-text">Another CLI or script updated cluster.json.</span></div>
+    <button class="small primary" onclick="reloadConfigFromDisk()">🔄 Reload Config from Disk</button>
   </div>
 
   <nav class="tabs" role="tablist" aria-label="Control Center Sections">
@@ -1190,6 +1198,7 @@ pc usb-hub verify</pre>
         </div>
         <p class="hint" style="margin-top:0;">Plug 2–6 phones into a <strong>powered USB 3.0 hub</strong> connected to your Master Host (Raspberry Pi / Linux PC). Phones communicate with Master and each other over USB with Wi-Fi OFF — using either zero-root <strong>ADB Peer Mesh</strong> or Layer-3 <strong>RNDIS /30 Subnets</strong> (ideal for Ubuntu Touch + Snap Docker Swarm).</p>
         <div id="usb-hub-status" class="check-item" style="margin-bottom:10px;">Click <strong>Scan USB Hub</strong> to inspect attached ADB devices &amp; USB-Ethernet gadgets...</div>
+        <div id="net-usb-verify-out" class="check-item" style="display:none; margin-bottom:10px;"></div>
         <div class="row" style="justify-content:space-between; margin-bottom:4px;">
           <strong>Quick USB Hub Commands</strong>
           <button class="small" onclick="copyEl('usb-hub-cmds')">Copy</button>
@@ -1433,7 +1442,7 @@ function scheduleRefresh() {
   const dot = document.getElementById('live-dot');
   if (pollMs > 0) {
     dot.classList.remove('paused');
-    refreshTimer = setInterval(refreshLive, pollMs);
+    refreshTimer = setInterval(() => refreshLive({ fresh: false }), pollMs);
   } else {
     dot.classList.add('paused');
   }
@@ -1582,9 +1591,10 @@ function renderTasksBoard(live) {
     ? '<p class="hint">Job status unavailable for ' + esc(unavailable.join(', ')) + '.</p>' : '';
   for (const node of snapshots) {
     for (const j of (node.active || [])) {
+      const cmdTxt = j.last_output ? (j.command + '  ⇢ ' + j.last_output) : j.command;
       rows.push({
         node_id: node.node_id, job_id: j.job_id, state: 'RUNNING',
-        command: j.command, duration: j.running_sec + 's', active: true
+        command: cmdTxt, duration: j.running_sec + 's', active: true
       });
     }
     for (const j of (node.recent || []).slice(0, 6)) {
@@ -1627,12 +1637,17 @@ async function apiFetch(url) {
 }
 
 let liveInFlight = false;
+let liveFreshQueued = false;
 
-async function refreshLive() {
-  if (liveInFlight) return;
+async function refreshLive(opts) {
+  const wantFresh = !(opts && opts.fresh === false);
+  if (liveInFlight) {
+    if (wantFresh) liveFreshQueued = true;
+    return;
+  }
   liveInFlight = true;
   try {
-    const r = await apiFetch('/api/live');
+    const r = await apiFetch(wantFresh ? '/api/live?fresh=1' : '/api/live');
     if (r.status === 401) {
       if (getToken()) {
         clearToken(true);
@@ -1644,6 +1659,10 @@ async function refreshLive() {
       if (grid) grid.innerHTML = '<div class="card"><p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p></div>';
       const tasks = document.getElementById('tasks-board-wrap');
       if (tasks) tasks.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
+      return;
+    }
+    if (r.status === 503) {
+      document.getElementById('last-updated').textContent = 'Connecting to cluster (waiting for first health sample)...';
       return;
     }
     if (!r.ok) {
@@ -1737,6 +1756,31 @@ async function refreshLive() {
     }
     onTermTargetChange();
 
+    // Mirror custom pools & individual phones into Parallel Batch target dropdown
+    const mapSel = document.getElementById('map-target');
+    if (mapSel && mapSel.dataset.sig !== termSig && document.activeElement !== mapSel) {
+      const prevMap = mapSel.value || 'auto';
+      let mapOpts = '<option value="auto">⚡ Auto-Route Each Job</option>'
+        + '<option value="tier:1">Tier 1 · Termux Compute</option>'
+        + '<option value="tier:2">Tier 2 · Debian 13 Services</option>'
+        + '<option value="tier:3">Tier 3 · Docker / Containers</option>'
+        + '<option value="all">All Ready Phones (Any Tier)</option>';
+      for (const pname of dynPools) {
+        mapOpts += '<option value="pool:' + esc(pname) + '">Pool: ' + esc(pname) + '</option>';
+      }
+      mapSel.innerHTML = mapOpts;
+      for (const n of (d.nodes || [])) {
+        const opt = document.createElement('option');
+        opt.value = n.id;
+        opt.textContent = n.id + ' (' + n.role + ' · T' + (n.tier || 1) + ':' + (n.pool || 'compute') + ')';
+        mapSel.appendChild(opt);
+      }
+      mapSel.dataset.sig = termSig;
+      if (Array.from(mapSel.options).some(o => o.value === prevMap)) {
+        mapSel.value = prevMap;
+      }
+    }
+
     renderPoolStrip(d);
     renderNodesGrid(live);
 
@@ -1762,6 +1806,10 @@ async function refreshLive() {
     document.getElementById('last-updated').textContent = 'Connection error: ' + e;
   } finally {
     liveInFlight = false;
+    if (liveFreshQueued) {
+      liveFreshQueued = false;
+      refreshLive({ fresh: true });
+    }
   }
 }
 
@@ -1813,7 +1861,10 @@ function renderNodesGrid(live) {
 
       let bodyHtml = '';
       if (!n.online) {
-        bodyHtml = '<p class="hint">Unreachable: ' + esc(n.error || 'connection refused') + '</p>';
+        const isUsbNode = Array.isArray(n.tags) && (n.tags.includes('usb-hub') || n.tags.includes('usb-mode:adb') || n.tags.includes('usb-mode:rndis'));
+        const fixCmd = isUsbNode ? ('pc usb-hub verify && pc sync --node-id ' + n.id) : ('pc sync --node-id ' + n.id);
+        bodyHtml = '<p class="hint">Unreachable: ' + esc(n.error || 'connection refused') + '</p>'
+          + '<p class="hint mono" style="font-size:0.78rem; margin-top:4px;">Tip: start worker via <code>' + esc(fixCmd) + '</code></p>';
       } else {
         const rawCores = Number(h.cpu_cores);
         const cores = (Number.isFinite(rawCores) && rawCores > 0) ? Math.floor(rawCores) : 1;
@@ -2127,6 +2178,12 @@ async function authPost(url, payload) {
     const text = await r.text();
     try {
       const parsed = JSON.parse(text);
+      if (r.status === 409 && parsed && typeof parsed === 'object' && String(parsed.error || '').toLowerCase().includes('changed on disk')) {
+        const cb = document.getElementById('config-conflict-banner');
+        const ct = document.getElementById('config-conflict-text');
+        if (ct) ct.textContent = String(parsed.error);
+        if (cb) cb.classList.remove('hidden');
+      }
       if (!r.ok && (!parsed || typeof parsed !== 'object' || !parsed.error)) {
         return Object.assign(typeof parsed === 'object' && parsed ? parsed : {}, {
           error: 'Request failed (HTTP ' + r.status + ')',
@@ -2139,6 +2196,15 @@ async function authPost(url, payload) {
   } catch (e) {
     return { error: 'Could not reach Master: ' + (e && e.message ? e.message : String(e)) };
   }
+}
+
+async function reloadConfigFromDisk() {
+  const data = await authPost('/api/config/reload', {});
+  if (data.error) { showToast('Reload failed: ' + data.error, 'bad'); return; }
+  const cb = document.getElementById('config-conflict-banner');
+  if (cb) cb.classList.add('hidden');
+  showToast('Reloaded cluster.json (' + (data.node_count ?? '?') + ' node(s)) from disk!', 'ok');
+  refreshAll();
 }
 
 function formatJobOutput(result) {
@@ -3155,7 +3221,8 @@ function _renderUsbWatchdogBadge(wd) {
   }
 }
 
-async function loadUsbHub() {
+async function loadUsbHub(opts) {
+  const preserveCmds = Boolean(opts && opts.preserveCommands);
   const box = document.getElementById('usb-hub-status');
   const setupBox = document.getElementById('setup-usb-status');
   const cmdEl = document.getElementById('usb-hub-cmds');
@@ -3222,8 +3289,8 @@ async function loadUsbHub() {
       lines.push('pc usb-hub serve');
     }
     const cmdTxt = lines.join('\n');
-    if (cmdEl) cmdEl.textContent = cmdTxt;
-    if (setupCmdEl) setupCmdEl.textContent = cmdTxt;
+    if (cmdEl && !preserveCmds) cmdEl.textContent = cmdTxt;
+    if (setupCmdEl && !preserveCmds) setupCmdEl.textContent = cmdTxt;
   } catch (e) {}
 }
 
@@ -3233,26 +3300,31 @@ async function applyUsbHubSetup(mode) {
   const count = (data.updated_nodes || []).length;
   showToast('USB Hub (' + mode.toUpperCase() + ') saved ' + count + ' phone(s): ' + (data.updated_nodes || []).join(', '), 'ok');
   if (data.watchdog) _renderUsbWatchdogBadge(data.watchdog);
+  let renderedCustomCmds = false;
   const setupCmdEl = document.getElementById('setup-usb-cmds');
-  if (setupCmdEl && data.commands && Array.isArray(data.commands.host_commands)) {
+  const netCmdEl = document.getElementById('usb-hub-cmds');
+  if (data.commands && Array.isArray(data.commands.host_commands)) {
     const out = [].concat(data.commands.host_commands);
     if (data.commands.phone_commands) {
       for (const [nid, pcmds] of Object.entries(data.commands.phone_commands)) {
         out.push('# Phone ' + nid + ': ' + (pcmds[1] || pcmds[0] || ''));
       }
     }
-    setupCmdEl.textContent = out.join('\n');
+    const txt = out.join('\n');
+    if (setupCmdEl) setupCmdEl.textContent = txt;
+    if (netCmdEl) netCmdEl.textContent = txt;
+    renderedCustomCmds = true;
   }
-  loadUsbHub();
-  refreshLive();
+  loadUsbHub({ preserveCommands: renderedCustomCmds });
+  refreshLive({ fresh: true });
 }
 
 async function verifyUsbHubUi() {
-  const outEl = document.getElementById('setup-usb-verify-out');
-  if (outEl) { outEl.style.display = 'block'; outEl.textContent = 'Testing Master ↔ Phone & Phone ↔ Phone USB links...'; }
+  const targets = [document.getElementById('setup-usb-verify-out'), document.getElementById('net-usb-verify-out')].filter(Boolean);
+  for (const el of targets) { el.style.display = 'block'; el.textContent = 'Testing Master ↔ Phone & Phone ↔ Phone USB links...'; }
   const data = await authPost('/api/usb-hub/verify', {});
   if (data.error) {
-    if (outEl) outEl.textContent = 'Verification error: ' + data.error;
+    for (const el of targets) el.textContent = 'Verification error: ' + data.error;
     showToast('USB Hub verify error: ' + data.error, 'bad');
     return;
   }
@@ -3278,7 +3350,7 @@ async function verifyUsbHubUi() {
   if (warns.length) {
     html += '<div class="hint" style="color:var(--warn); margin-top:6px;">' + warns.map(w => '⚠ ' + esc(w)).join('<br/>') + '</div>';
   }
-  if (outEl) { outEl.style.display = 'block'; outEl.innerHTML = html; }
+  for (const el of targets) { el.style.display = 'block'; el.innerHTML = html; }
   showToast(data.summary || 'USB Hub check complete', data.ok ? 'ok' : 'warn');
 }
 
@@ -3287,6 +3359,7 @@ async function toggleUsbWatchdog() {
   const data = await authPost('/api/usb-hub/watchdog', { enabled: nextState });
   if (data.error) { showToast('Watchdog error: ' + data.error, 'bad'); return; }
   _renderUsbWatchdogBadge(data.watchdog);
+  loadUsbHub({ preserveCommands: true });
   showToast(nextState ? 'USB Hub Auto-Heal Watchdog enabled!' : 'USB Hub Auto-Heal Watchdog stopped.', nextState ? 'ok' : 'neutral');
 }
 
@@ -3490,12 +3563,14 @@ function copyEl(id) {
 }
 
 function refreshAll() {
-  refreshLive();
+  refreshLive({ fresh: true });
   if (document.getElementById('panel-workloads').classList.contains('active')) loadWorkloads();
   if (document.getElementById('panel-network').classList.contains('active')) loadNetworkCenter();
   if (document.getElementById('panel-setup').classList.contains('active') && getToken()) {
     loadSafetySettings();
     pollPairingStatus();
+    const usbCard = document.getElementById('setup-usb-card');
+    if (usbCard && usbCard.style.display !== 'none') loadUsbHub();
   }
 }
 
@@ -3503,7 +3578,7 @@ initPreferences();
 updateAuthBadge();
 onTermTargetChange();
 renderPipeBuilder();
-refreshLive();
+refreshLive({ fresh: false });
 scheduleRefresh();
 </script>
 </body>
@@ -3528,6 +3603,8 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.config_path = config_path
         self.sample_live_in_background = False
         self.latest_live: dict[str, Any] | None = None
+        self._live_sample_lock = threading.Lock()
+        self._live_refresh_event = threading.Event()
         self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
         self._conn_sem = threading.BoundedSemaphore(64)
         self._usb_watchdog_lock = threading.Lock()
@@ -3559,6 +3636,20 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         ):
             self.start_usb_watchdog()
 
+    def invalidate_live(self) -> None:
+        """Mark cached `/api/live` snapshot stale and wake the background sampler immediately."""
+        self.latest_live = None
+        self._live_refresh_event.set()
+
+    def get_live_snapshot(self, fresh: bool = False) -> dict[str, Any] | None:
+        """Return cached background sample or trigger a coalesced live resample when `fresh=True`."""
+        if not self.sample_live_in_background or fresh:
+            with self._live_sample_lock:
+                live = _collect_live(self.controller)
+                self.latest_live = live
+                return live
+        return self.latest_live
+
     def usb_watchdog_status(self) -> dict[str, Any]:
         with self._usb_watchdog_lock:
             wd = self._usb_watchdog
@@ -3574,13 +3665,14 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             with self.controller.config_lock:
                 gw = self.controller.config.gateway
                 gw_port = int(gw.port or 8888)
-                gw_rev = bool(gw.enabled)
+                gw_rev = True if self.config_path is not None else bool(gw.enabled)
             wd = UsbHubWatchdog(
                 interval_sec=clean_iv,
                 gateway_port=gw_port,
                 enable_gateway_reverse=gw_rev,
                 enable_peer_mesh=True,
                 config_path=self.config_path,
+                gateway_port_getter=lambda: self.gateway_manager.bound_port if self.gateway_manager.is_running else 0,
             )
             wd.start()
             self._usb_watchdog = wd
@@ -3636,9 +3728,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def _save_config_or_rollback(self, rollback_fn: Any) -> bool:
         """Roll back the in-memory edit if the config changed elsewhere or the save failed."""
         if self.server.config_path is None:
+            self.server.invalidate_live()
             return True
         try:
             save_config(self.server.controller.config, self.server.config_path)
+            self.server.invalidate_live()
             return True
         except Exception as exc:
             try:
@@ -3647,7 +3741,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 LOG.error("Rollback after failed config save also failed: %s", rb_exc)
             LOG.error("Failed to save cluster config: %s", exc)
             if isinstance(exc, ConfigConflictError):
-                self._send_json(HTTPStatus.CONFLICT, {"error": f"{exc} Restart the dashboard to reload."})
+                self._send_json(HTTPStatus.CONFLICT, {"error": f"{exc} Click 'Reload Config from Disk' or restart the dashboard."})
             else:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Failed to persist cluster config: {exc}"})
             return False
@@ -3873,9 +3967,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/metrics":
                 self._send_json(HTTPStatus.OK, self.server.controller.metrics_history.snapshot())
             elif path == "/api/live":
-                live = self.server.latest_live
-                if not self.server.sample_live_in_background:
-                    live = _collect_live(self.server.controller)
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                want_fresh = str((qs.get("fresh") or [""])[0]).strip().lower() in {"1", "true", "yes"}
+                live = self.server.get_live_snapshot(fresh=want_fresh)
                 if live is None:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Waiting for first health sample"})
                 else:
@@ -3950,18 +4044,23 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 try:
                     with self.server.controller.config_lock:
                         cfg = self.server.controller.config
+                        existing_nodes_copy = list(cfg.nodes)
                         adb_plan = plan_adb_usb_hub(
                             ready_adb,
                             gateway_port=int(cfg.gateway.port or 8888),
                             enable_gateway_reverse=bool(cfg.gateway.enabled),
-                            existing_nodes=cfg.nodes,
+                            existing_nodes=existing_nodes_copy,
                             quarantined_nodes=cfg.gateway.quarantined_nodes,
                         )
                         gw_port = int(cfg.gateway.port or 8888)
                 except ValueError as exc:
                     self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
                     return
-                rndis_plan = plan_rndis_usb_hub(topo["usb_net_interfaces"]) if topo["usb_net_interfaces"] else {"mode": "rndis", "nodes": [], "cluster_cidr": "10.77.0.0/16"}
+                rndis_plan = (
+                    plan_rndis_usb_hub(topo["usb_net_interfaces"], existing_nodes=existing_nodes_copy)
+                    if topo["usb_net_interfaces"]
+                    else {"mode": "rndis", "nodes": [], "cluster_cidr": "10.77.0.0/16"}
+                )
                 rndis_cmds = build_rndis_router_commands(rndis_plan, gateway_port=gw_port) if rndis_plan.get("nodes") else {"cluster_cidr": rndis_plan["cluster_cidr"], "host_commands": [], "phone_commands": {}}
                 self._send_json(
                     HTTPStatus.OK,
@@ -4000,6 +4099,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             status, data = self.server.pairing_manager.complete_pairing(
                 self.client_address[0], body, local_ip=local_ip
             )
+            if status == HTTPStatus.OK:
+                self.server.invalidate_live()
             self._send_json(status, data)
             return
 
@@ -4031,6 +4132,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/usb-hub/setup",
             "/api/usb-hub/verify",
             "/api/usb-hub/watchdog",
+            "/api/config/reload",
         }
         if path not in valid_paths:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -4436,9 +4538,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if not self._save_config_or_rollback(_rb_quarantine):
                     return
                 q_copy = list(ctrl.config.gateway.quarantined_nodes)
+                q_adb_serial = (
+                    target_n.adb.serial
+                    if (quarantine and target_n.adb is not None)
+                    else ""
+                )
             closed_tunnels = (
                 self.server.gateway_manager.disconnect_node(node_id) if quarantine else 0
             )
+            adb_revoked = False
+            if q_adb_serial:
+                adb_revoked, _ = revoke_adb_device_reverses(q_adb_serial)
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -4446,6 +4556,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "quarantined": quarantine,
                     "quarantined_nodes": q_copy,
                     "disconnected_tunnels": closed_tunnels,
+                    "adb_reverses_revoked": adb_revoked,
                 },
             )
 
@@ -4497,6 +4608,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
 
         elif path == "/api/network/hardening":
+            # Pre-resolve detected LAN IP outside config_lock in case Master is configured on loopback (ADB USB hub)
+            detected_lan = normalize_host(detect_local_ip())
             with ctrl.config_lock:
                 new_req_auth = (
                     bool(body["dashboard_require_auth"])
@@ -4531,8 +4644,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     return
                 else:
                     ips = list(cur_net.allowed_master_ips)
-                # Ensure Master's own IP is ALWAYS preserved within the 32-entry cap (prevents self-lockout!)
+                # Ensure Master's own IP (or detected LAN IP when Master is loopback) is preserved within 32-entry cap
                 m_host = normalize_host(master_node.host)
+                if not m_host or is_loopback_or_unspecified_host(m_host):
+                    m_host = detected_lan if (detected_lan and not is_loopback_or_unspecified_host(detected_lan)) else ""
                 if m_host and not is_loopback_or_unspecified_host(m_host):
                     if m_host in ips:
                         ips = ips[:32]
@@ -4623,6 +4738,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             except KeyError as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
                 return
+            if res.get("cancelled"):
+                self.server.invalidate_live()
             status = HTTPStatus.OK if res.get("cancelled") else HTTPStatus.NOT_FOUND
             self._send_json(status, res)
 
@@ -5008,8 +5125,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         enriched.append(item)
                     ready_adb = enriched
                 with ctrl.config_lock:
-                    prev_nodes = list(ctrl.config.nodes)
-                    prev_allowed = list(ctrl.config.network.allowed_master_ips)
                     try:
                         plan = plan_adb_usb_hub(
                             ready_adb,
@@ -5027,17 +5142,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "ADB tunnel setup failed", "plan": plan, "apply": apply_res})
                     return
                 with ctrl.config_lock:
+                    prev_nodes = copy.deepcopy(ctrl.config.nodes)
+                    prev_allowed = list(ctrl.config.network.allowed_master_ips)
+
+                    def _rb_usb_adb() -> None:
+                        ctrl.config.nodes = prev_nodes
+                        ctrl.config.network.allowed_master_ips = prev_allowed
+
                     try:
                         updated = sync_usb_hub_into_config(ctrl.config, plan)
                     except ValueError as exc:
+                        _rb_usb_adb()
                         self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
                         return
-                    if not self._save_config_or_rollback(
-                        lambda: (
-                            setattr(ctrl.config, "nodes", prev_nodes),
-                            setattr(ctrl.config.network, "allowed_master_ips", prev_allowed),
-                        )
-                    ):
+                    if not self._save_config_or_rollback(_rb_usb_adb):
                         return
                 wd_state = self.server.start_usb_watchdog() if bool(body.get("start_watchdog", True)) else self.server.usb_watchdog_status()
                 self._send_json(
@@ -5054,22 +5172,23 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if not ifaces:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "No USB-Ethernet / RNDIS phone gadgets detected."})
                     return
-                plan = plan_rndis_usb_hub(ifaces, subnet_prefix=prefix)
                 with ctrl.config_lock:
-                    prev_nodes = list(ctrl.config.nodes)
+                    prev_nodes = copy.deepcopy(ctrl.config.nodes)
                     prev_allowed = list(ctrl.config.network.allowed_master_ips)
                     gw_port = int(ctrl.config.gateway.port or 8888)
+
+                    def _rb_usb_rndis() -> None:
+                        ctrl.config.nodes = prev_nodes
+                        ctrl.config.network.allowed_master_ips = prev_allowed
+
                     try:
+                        plan = plan_rndis_usb_hub(ifaces, subnet_prefix=prefix, existing_nodes=ctrl.config.nodes)
                         updated = sync_usb_hub_into_config(ctrl.config, plan)
                     except ValueError as exc:
+                        _rb_usb_rndis()
                         self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
                         return
-                    if not self._save_config_or_rollback(
-                        lambda: (
-                            setattr(ctrl.config, "nodes", prev_nodes),
-                            setattr(ctrl.config.network, "allowed_master_ips", prev_allowed),
-                        )
-                    ):
+                    if not self._save_config_or_rollback(_rb_usb_rndis):
                         return
                 cmds = build_rndis_router_commands(plan, nat_wan=bool(body.get("nat_wan", False)), gateway_port=gw_port)
                 self._send_json(
@@ -5097,6 +5216,38 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 wd = self.server.stop_usb_watchdog()
             self._send_json(HTTPStatus.OK, {"watchdog": wd})
 
+        elif path == "/api/config/reload":
+            if self.server.config_path is None:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Dashboard has no backing config_path to reload."})
+                return
+            try:
+                fresh_cfg = load_config(self.server.config_path)
+            except (OSError, ValueError) as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Failed to reload config: {exc}"})
+                return
+            with ctrl.config_lock:
+                ctrl.config = fresh_cfg
+                self.server.pairing_manager.config = fresh_cfg
+                self.server.gateway_manager.config = fresh_cfg
+                gw_ok, gw_msg = self.server.gateway_manager.sync_with_config()
+                if fresh_cfg.gateway.enabled:
+                    ctrl.gateway_port_override = self.server.gateway_manager.bound_port if gw_ok else -1
+                else:
+                    ctrl.gateway_port_override = None
+                node_count = len(fresh_cfg.nodes)
+                cluster_name = fresh_cfg.cluster_name
+            self.server.invalidate_live()
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "reloaded": True,
+                    "cluster_name": cluster_name,
+                    "node_count": node_count,
+                    "gateway_ok": gw_ok,
+                    "gateway_msg": gw_msg,
+                },
+            )
+
 
 def _collect_live(controller: MasterController) -> dict[str, Any]:
     return {
@@ -5115,11 +5266,18 @@ def _start_background_sampler(
     server.sample_live_in_background = True
     def _loop() -> None:
         while not stop_event.is_set():
+            server._live_refresh_event.clear()
             try:
-                server.latest_live = _collect_live(server.controller)
+                with server._live_sample_lock:
+                    server.latest_live = _collect_live(server.controller)
             except Exception:
                 LOG.exception("Dashboard live sampling failed")
-            stop_event.wait(interval_sec)
+            deadline = time.monotonic() + interval_sec
+            while not stop_event.is_set() and not server._live_refresh_event.is_set():
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                server._live_refresh_event.wait(min(0.25, rem))
 
     t = threading.Thread(target=_loop, name="metrics-sampler", daemon=True)
     t.start()
@@ -5159,27 +5317,33 @@ def serve_dashboard(
     def _handle_sigterm(_signum: int, _frame: Any) -> None:
         sigterm_event.set()
 
+    prev_sigterm: Any = None
+    sigterm_installed = False
     try:
-        signal.signal(signal.SIGTERM, _handle_sigterm)
+        prev_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
+        sigterm_installed = True
     except ValueError:
         pass  # Not on main thread
 
     lan_ip = detect_local_ip()
     actual_port = server.server_address[1]
-    print(f"PhoneCluster Web Control Center -> http://{lan_ip}:{actual_port}")
+    print(f"PhoneCluster Web Control Center -> http://{format_host_port(lan_ip, actual_port)}")
     print("Unlock controls with your token (run `pc token` to view it). Press Ctrl+C to stop.")
     LOG.info(
-        "PhoneCluster Web Control Center listening on http://%s:%d (LAN: http://%s:%d)",
-        bind_host,
-        actual_port,
-        lan_ip,
-        actual_port,
+        "PhoneCluster Web Control Center listening on http://%s (LAN: http://%s)",
+        format_host_port(bind_host, actual_port),
+        format_host_port(lan_ip, actual_port),
     )
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         pass
     finally:
+        if sigterm_installed:
+            try:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            except ValueError:
+                pass
         watcher_stop.set()
         stop_event.set()
         server.server_close()

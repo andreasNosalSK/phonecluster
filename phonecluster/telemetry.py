@@ -114,21 +114,29 @@ def find_executable(name: str) -> str | None:
     return None
 
 
+def _safe_home() -> Path | None:
+    try:
+        return Path.home()
+    except RuntimeError:
+        return None
+
+
 def detect_docker_runtime() -> dict[str, Any]:
     """Inspect Docker/Podman availability including Snap-installed Docker on Ubuntu Touch."""
     docker_bin = find_executable("docker")
     podman_bin = find_executable("podman")
     snap_docker_bin = SNAP_BIN_DIR / "docker"
+    snap_docker_exec = snap_docker_bin.is_file() and os.access(snap_docker_bin, os.X_OK)
     is_snap = bool(
         (docker_bin and str(docker_bin).startswith(f"{SNAP_BIN_DIR}/"))
         or (
             docker_bin
-            and snap_docker_bin.exists()
+            and snap_docker_exec
             and SNAP_DOCKER_VAR_DIR.exists()
         )
-        or (not docker_bin and snap_docker_bin.exists())
+        or (not docker_bin and snap_docker_exec)
     )
-    if not docker_bin and snap_docker_bin.exists():
+    if not docker_bin and snap_docker_exec:
         docker_bin = str(snap_docker_bin)
 
     socket_path = ""
@@ -318,10 +326,13 @@ def read_battery_via_sysfs(base_dir: Path = POWER_SUPPLY_DIR) -> BatteryInfo | N
     for entry in entries:
         if not entry.is_dir():
             continue
+        scope = (_read_text_safe(entry / "scope") or "").strip().lower()
+        if scope == "device":
+            continue
         ps_type = _read_text_safe(entry / "type")
         is_bat_type = bool(ps_type and ps_type.lower() == "battery")
-        has_cap = (entry / "capacity").exists()
-        if is_bat_type and has_cap:
+        has_readable_cap = _read_text_safe(entry / "capacity") is not None
+        if is_bat_type and has_readable_cap:
             battery_dir = entry
             break
         if fallback_dir is None and (is_bat_type or entry.name.lower() in {"battery", "bat0", "bat1", "bms"}):
@@ -349,7 +360,14 @@ def read_battery_via_sysfs(base_dir: Path = POWER_SUPPLY_DIR) -> BatteryInfo | N
     temp_c = _normalize_sysfs_temp(temp_raw, unit="decideg") if temp_raw is not None else None
     status_norm = status_raw.strip().upper().replace(" ", "_")
     health_norm = health_raw.strip().upper().replace(" ", "_")
-    plugged = "PLUGGED" if status_norm in {"CHARGING", "FULL"} else "UNPLUGGED"
+    if pct is None and temp_c is None and status_norm == "UNKNOWN" and health_norm == "UNKNOWN":
+        return None
+    if status_norm in {"CHARGING", "FULL"}:
+        plugged = "PLUGGED"
+    elif status_norm == "UNKNOWN":
+        plugged = "UNKNOWN"
+    else:
+        plugged = "UNPLUGGED"
 
     return BatteryInfo(
         percentage=pct,
@@ -449,7 +467,12 @@ def read_battery_via_upower(timeout_sec: float = 3.0) -> BatteryInfo | None:
                     pass
     if pct is None and temp_c is None and status == "UNKNOWN":
         return None
-    plugged = "PLUGGED" if status in {"CHARGING", "FULL"} else "UNPLUGGED"
+    if status in {"CHARGING", "FULL"}:
+        plugged = "PLUGGED"
+    elif status == "UNKNOWN":
+        plugged = "UNKNOWN"
+    else:
+        plugged = "UNPLUGGED"
     return BatteryInfo(
         percentage=pct,
         temperature_c=temp_c,
@@ -846,10 +869,15 @@ def detect_capabilities(listening_map: dict[int, bool] | None = None) -> dict[st
         or Path("/opt/AdGuardHome/AdGuardHome").exists()
         or find_executable("pihole")
     )
-    llama_dir = Path.home() / "llama.cpp"
+    home_dir = _safe_home()
+    llama_dir = (home_dir / "llama.cpp") if home_dir is not None else None
     local_rpc_binaries = (
-        directory / name for directory in (llama_dir / "build" / "bin", llama_dir)
-        for name in ("ggml-rpc-server", "rpc-server")
+        (
+            directory / name for directory in (llama_dir / "build" / "bin", llama_dir)
+            for name in ("ggml-rpc-server", "rpc-server")
+        )
+        if llama_dir is not None
+        else ()
     )
     tools = {
         "python3": bool(find_executable("python3")),
@@ -864,9 +892,9 @@ def detect_capabilities(listening_map: dict[int, bool] | None = None) -> dict[st
         "llama_cli": bool(
             find_executable("llama-cli")
             or find_executable("llama-server")
-            or Path.home().joinpath("llama.cpp/build/bin/llama-cli").exists()
+            or (llama_dir is not None and (llama_dir / "build" / "bin" / "llama-cli").exists())
         ),
-        "docker": bool(docker_rt["installed"]),
+        "docker": bool(docker_rt["docker_bin"]),
         "docker_snap": bool(docker_rt["is_snap"]),
         "docker_compose": bool(docker_rt["compose_available"]),
         "snap": bool(find_executable("snap")),
@@ -928,7 +956,7 @@ def detect_node_tier(
     else:
         sock_ready = any(p.exists() for p in (*DOCKER_SOCKET_PATHS, PODMAN_SOCKET_PATH))
 
-    docker_ready = bool(tools.get("docker")) and (sock_ready or bool(tools.get("k3s")))
+    docker_ready = bool(tools.get("docker") or tools.get("podman")) and (sock_ready or bool(tools.get("k3s")))
     if docker_ready:
         return 3, "docker"
 
@@ -964,9 +992,12 @@ def collect_node_health(
 
     reasons: list[str] = []
     if overheated:
-        reasons.append(
-            f"overheated ({battery.temperature_c}C >= {safety.max_temp_c}C)"
-        )
+        if battery.temperature_c is not None and battery.temperature_c >= safety.max_temp_c:
+            reasons.append(f"overheated ({battery.temperature_c}C >= {safety.max_temp_c}C)")
+        elif battery.temperature_c is not None:
+            reasons.append(f"cooling down ({battery.temperature_c}C > {safety.resume_temp_c}C resume)")
+        else:
+            reasons.append(f"overheated (temp sensor unavailable; waiting for <= {safety.resume_temp_c}C)")
     if battery_hazard:
         reasons.append(f"battery_health ({battery.health.upper()})")
     if low_ram:

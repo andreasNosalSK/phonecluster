@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .auth import is_webhook_target_unsafe
+from .bundled import bundled_script
 from .config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SSH_PORT,
@@ -160,6 +161,7 @@ def run_setup_wizard(
 
     worker_ids = (f"node{i}" for i in count(1) if f"node{i}" != master_id)
     chosen_usb_mode = ""
+    chosen_rndis_prefix = DEFAULT_USB_SUBNET_PREFIX
     usb_plan: dict[str, Any] | None = None
     usb_rndis_cmds: dict[str, Any] | None = None
 
@@ -219,6 +221,11 @@ def run_setup_wizard(
                 if _prompt_yes_no("Create ADB USB hub forwards & peer-mesh tunnels now?", default=True, input_fn=input_fn):
                     res = apply_adb_usb_hub(usb_plan)
                     print(f"  ADB tunnels: {res.get('applied', 0)} created, {res.get('unchanged', 0)} matched, {res.get('failed', 0)} failed.")
+                    for err in res.get("errors") or []:
+                        print(f"    ERR: {err}", file=sys.stderr)
+                    if not res.get("ok"):
+                        if not _prompt_yes_no("Some ADB tunnels failed. Save these USB nodes to cluster.json anyway?", default=False, input_fn=input_fn):
+                            usb_plan = None
             else:
                 print("  No authorized ADB phones detected right now (plug phones into USB hub, enable USB debugging, then run `pc usb-hub setup --mode adb --write-config`).")
         else:
@@ -228,8 +235,9 @@ def run_setup_wizard(
             except ValueError:
                 print(f"  (Invalid prefix '{raw_pref}', using {DEFAULT_USB_SUBNET_PREFIX})")
                 prefix = DEFAULT_USB_SUBNET_PREFIX
+            chosen_rndis_prefix = prefix
             if usb_nets:
-                usb_plan = plan_rndis_usb_hub(usb_nets, subnet_prefix=prefix, ssh_port=ssh_port, ssh_user=ssh_user or "phablet")
+                usb_plan = plan_rndis_usb_hub(usb_nets, subnet_prefix=prefix, ssh_port=ssh_port, ssh_user=ssh_user or "phablet", existing_nodes=nodes)
                 usb_rndis_cmds = build_rndis_router_commands(usb_plan)
                 for n_item in usb_plan["nodes"]:
                     print(
@@ -361,7 +369,7 @@ def run_setup_wizard(
     print("\nNext easy steps:")
     if chosen_usb_mode == "rndis":
         print("  1. Configure Master Layer-3 USB Hub air-gap router:")
-        print(f"       sudo bash scripts/07_usb_hub_router.sh setup-rndis --prefix {usb_plan['subnet_prefix'] if usb_plan else DEFAULT_USB_SUBNET_PREFIX}")
+        print(f"       sudo bash scripts/07_usb_hub_router.sh setup-rndis --prefix {usb_plan['subnet_prefix'] if usb_plan else chosen_rndis_prefix}")
         if usb_rndis_cmds:
             for nid, pcmds in usb_rndis_cmds["phone_commands"].items():
                 print(f"     On phone {nid}: {pcmds[1]}")
@@ -504,7 +512,7 @@ def run_interactive_menu(
                 cfg = load_config(cfg_path)
                 ctrl = MasterController(cfg)
                 ip = detect_local_ip()
-                print(f"\nStarting Web Dashboard at: http://{ip}:{cfg.dashboard_port}")
+                print(f"\nStarting Web Dashboard at: http://{format_host_port(ip, cfg.dashboard_port)}")
                 print("Press Ctrl+C to return to the menu.")
                 serve_dashboard("0.0.0.0", cfg.dashboard_port, ctrl, config_path=cfg_path)
             elif choice == "8":
@@ -516,8 +524,8 @@ def run_interactive_menu(
                 mpi = ctrl.build_mpi_hostfile().strip()
                 print(f"OpenMPI   :\n{mpi or '(no healthy nodes)'}")
                 if _prompt_yes_no("Start distccd compiler workers on all ready phones now?", default=False, input_fn=input_fn):
-                    master_n = next((n for n in cfg.nodes if n.role == "master"), cfg.nodes[0])
-                    seed_h = detect_local_ip() if is_loopback_or_unspecified_host(master_n.host) else master_n.host
+                    master_n = next((n for n in cfg.nodes if n.role == "master"), cfg.nodes[0] if cfg.nodes else None)
+                    seed_h = detect_local_ip() if (master_n is None or is_loopback_or_unspecified_host(master_n.host)) else master_n.host
                     default_cidr = infer_lan_subnet(seed_h, cfg.network.lan_subnet)
                     raw_cidr = _prompt("Allowed LAN subnet CIDR", default_cidr, input_fn=input_fn)
                     try:
@@ -525,8 +533,8 @@ def run_interactive_menu(
                     except ValueError:
                         print(f"Invalid CIDR subnet '{raw_cidr}' — cancelled.")
                         continue
-                    helper_sh = Path(__file__).resolve().parent.parent / "scripts" / "05_workload_helpers.sh"
-                    if helper_sh.exists():
+                    helper_sh = bundled_script("05_workload_helpers.sh")
+                    if helper_sh is not None:
                         spec = JobSpec(
                             index=0,
                             job_id=f"menu-distcc-{uuid.uuid4().hex[:6]}",
@@ -547,6 +555,7 @@ def run_interactive_menu(
                         print(f"[{o.node_id}] {'OK' if o.ok else 'FAIL'}: {(o.stdout or o.stderr or o.error).strip()}")
             elif choice == "u":
                 cfg = load_config(cfg_path)
+                prev_rev = config_revision(cfg_path)
                 topo = detect_usb_hub_topology()
                 print(
                     f"\nUSB 3.0 Hub: ADB ready={topo['adb_ready_count']}, "
@@ -559,8 +568,20 @@ def run_interactive_menu(
                     if not ready_adb:
                         print("No authorized ADB phones found. For RNDIS /30 mode run: sudo bash scripts/07_usb_hub_router.sh setup-rndis")
                     else:
+                        enriched_adb = []
+                        for dev in ready_adb:
+                            prof = probe_adb_device_profile(dev["serial"])
+                            item = dict(dev)
+                            if prof.get("os_env") != "unknown":
+                                item["os_env"] = prof["os_env"]
+                                item["remote_ssh_port"] = prof["remote_ssh_port"]
+                            if prof.get("ssh_user"):
+                                item["ssh_user"] = prof["ssh_user"]
+                            if prof.get("usb_power_warning"):
+                                print(f"  WARNING: {dev['serial']} is discharging on USB — check your powered USB 3.0 hub PSU!")
+                            enriched_adb.append(item)
                         plan = plan_adb_usb_hub(
-                            ready_adb,
+                            enriched_adb,
                             gateway_port=cfg.gateway.port,
                             enable_gateway_reverse=bool(cfg.gateway.enabled),
                             existing_nodes=cfg.nodes,
@@ -569,7 +590,7 @@ def run_interactive_menu(
                         res = apply_adb_usb_hub(plan)
                         if res.get("ok"):
                             updated = sync_usb_hub_into_config(cfg, plan)
-                            save_config(cfg, cfg_path)
+                            save_config(cfg, cfg_path, expected_revision=prev_rev)
                             print(f"Saved USB hub phone(s): {', '.join(updated)} ({res.get('applied', 0)} tunnels created)")
                         else:
                             print(f"USB tunnel setup had errors: {res.get('errors')}")

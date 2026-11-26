@@ -11,6 +11,8 @@
 #   bash scripts/06_ubuntu_touch_node_setup.sh --node-id node1
 set -euo pipefail
 
+CURRENT_USER="${USER:-$(id -un)}"
+CURRENT_GROUP="$(id -gn "${CURRENT_USER}" 2>/dev/null || echo "${CURRENT_USER}")"
 NODE_ID=""
 REPO_DIR="${HOME}/phonecluster"
 IS_MASTER=0
@@ -110,15 +112,15 @@ if [[ "${BOOT_ONLY}" -eq 0 && "${NO_DOCKER_FIX}" -eq 0 ]]; then
 
       NEED_RESTART=0
       if [[ ! -r /var/run/docker.sock || ! -w /var/run/docker.sock ]]; then
-        echo "  Configuring 'docker' group for user '${USER}'..."
+        echo "  Configuring 'docker' group for user '${CURRENT_USER}'..."
         sudo addgroup --system docker 2>/dev/null || sudo groupadd -r docker 2>/dev/null || true
-        sudo adduser "${USER}" docker 2>/dev/null || sudo usermod -aG docker "${USER}" 2>/dev/null || true
+        sudo adduser "${CURRENT_USER}" docker 2>/dev/null || sudo usermod -aG docker "${CURRENT_USER}" 2>/dev/null || true
         NEED_RESTART=1
       fi
 
       if [[ -d "${HOME}/.docker" && "$(stat -c '%u' "${HOME}/.docker" 2>/dev/null || echo 1)" -eq 0 && "$(id -u)" -ne 0 ]]; then
         echo "  Fixing root-owned ~/.docker directory permissions..."
-        sudo chown -R "${USER}:${USER}" "${HOME}/.docker" 2>/dev/null || true
+        sudo chown -R "${CURRENT_USER}:${CURRENT_GROUP}" "${HOME}/.docker" 2>/dev/null || true
       fi
 
       if [[ "${NEED_RESTART}" -eq 1 || ! -S /var/run/docker.sock ]]; then
@@ -193,7 +195,7 @@ fi
 
 # Populate XDG_RUNTIME_DIR for SSH sessions so `systemctl --user` connects cleanly
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
   systemctl --user daemon-reload
   units=(phonecluster-worker.service)
   if [[ "${IS_MASTER}" -eq 1 ]]; then
@@ -210,12 +212,12 @@ else
 fi
 
 if [[ "${BOOT_ONLY}" -eq 0 ]] && command -v loginctl >/dev/null 2>&1; then
-  loginctl enable-linger "${USER}" 2>/dev/null || sudo loginctl enable-linger "${USER}" 2>/dev/null || true
+  loginctl enable-linger "${CURRENT_USER}" 2>/dev/null || sudo loginctl enable-linger "${CURRENT_USER}" 2>/dev/null || true
 fi
 
 echo
 echo "=== Ubuntu Touch Setup Complete ==="
-echo "  User / SSH   : ${USER} (port 22)"
+echo "  User / SSH   : ${CURRENT_USER} (port 22)"
 echo "  Docker Data  : ${DOCKER_DATA_DIR} (Snap-safe bind-mount root)"
 echo "  Wake-Lock    : Automatically held by worker daemon via repowerd-cli / powerd-cli"
 echo "  Systemd Unit : ${UNIT_DIR}/phonecluster-worker.service"

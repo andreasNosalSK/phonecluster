@@ -372,6 +372,9 @@ def discover_pairing_masters(
     targets: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Auto-search the local Wi-Fi/LAN for Master phones with an open Pairing Window."""
+    if isinstance(discovery_port, bool) or not (1 <= int(discovery_port) <= 65535):
+        raise ValueError(f"discovery_port must be between 1 and 65535 (got {discovery_port})")
+    discovery_port = int(discovery_port)
     probe = json.dumps({"type": PAIR_SEARCH_TYPE, "ts": int(time.time())}).encode("utf-8")
     local_ip = detect_local_ip()
     dests = targets if targets is not None else _candidate_broadcast_addresses(local_ip)
@@ -398,7 +401,7 @@ def discover_pairing_masters(
             for dest in dests:
                 try:
                     s.sendto(probe, (dest, discovery_port))
-                except OSError:
+                except (OSError, OverflowError):
                     pass
 
         # Use multiple distinct ephemeral source ports to defeat Linux SO_REUSEPORT hash-pinning
@@ -677,7 +680,12 @@ class PairingManager:
         self, client_ip: str, body: dict[str, Any], local_ip: str = ""
     ) -> tuple[int, dict[str, Any]]:
         """Verify DH + PIN proof, mint a unique per-node token, and return encrypted bundle."""
-        client_ip = normalize_host(client_ip)
+        try:
+            client_ip = validate_host(normalize_host(client_ip))
+        except ValueError:
+            return HTTPStatus.BAD_REQUEST, {
+                "error": "Unsupported client IP address (e.g. scoped IPv6 link-local %zone). Pair over IPv4 or global/ULA IPv6."
+            }
         local_ip = normalize_host(local_ip)
         blocked, retry_after = self._dh_rate_limiter.is_blocked(client_ip)
         if blocked:
@@ -694,6 +702,9 @@ class PairingManager:
         if len(peer_pub_hex) > 600 or len(client_proof) > 128:
             self._dh_rate_limiter.record_failure(client_ip)
             return HTTPStatus.BAD_REQUEST, {"error": "Oversized dh_pub or client_proof."}
+        if not re.fullmatch(r"[0-9a-f]+", peer_pub_hex):
+            self._dh_rate_limiter.record_failure(client_ip)
+            return HTTPStatus.BAD_REQUEST, {"error": "Invalid dh_pub hex format."}
 
         # Snapshot immutable session DH parameters and compute shared secret OUTSIDE `_attempt_lock`
         # so unauthenticated bad-DH requests cannot stall legitimate pairing completions.
@@ -790,11 +801,30 @@ class PairingManager:
             if peer_pub in self._session.used_peer_pubs or client_proof in self._session.used_proofs:
                 return HTTPStatus.FORBIDDEN, {"error": "Replayed pairing proof rejected."}
 
-            # If this exact worker IP was previously paired, rotate its token & refresh metadata (with rollback if disk save fails)
-            existing = next(
-                (n for n in self.config.nodes if normalize_host(n.host) == client_ip and n.role != "master"),
-                None,
-            )
+            # If this exact non-loopback LAN worker IP was previously paired, rotate its token & refresh metadata.
+            # Never match ADB USB-hub workers (host=127.0.0.1) by loopback IP!
+            if is_loopback_or_unspecified_host(client_ip):
+                existing = next(
+                    (
+                        n
+                        for n in self.config.nodes
+                        if normalize_host(n.host) == client_ip
+                        and n.role != "master"
+                        and n.adb is None
+                        and "usb-mode:adb" not in (n.tags or [])
+                        and n.worker_port == worker_port
+                    ),
+                    None,
+                )
+            else:
+                existing = next(
+                    (
+                        n
+                        for n in self.config.nodes
+                        if normalize_host(n.host) == client_ip and n.role != "master" and n.adb is None
+                    ),
+                    None,
+                )
             prev_snapshot: tuple[Any, ...] | None = None
             appended_new = False
             if existing is not None:
@@ -1278,10 +1308,8 @@ def join_cluster_via_pairing(
     ):
         raise RuntimeError("Malformed pairing hello from Master (invalid session_id, dh_pub, or salt).")
     pub_a = int(pub_a_hex, 16)
-    try:
-        validate_dh_public(pub_a)
-    except ValueError as exc:
-        raise RuntimeError(f"Master sent invalid DH public key: {exc}") from exc
+    if not validate_dh_public(pub_a):
+        raise RuntimeError("Master sent invalid DH public key (failed safe-prime subgroup check).")
     actual_fp = fingerprint_public_key(pub_a)
     hello_fp = str(hello.get("fingerprint") or "").strip().upper()
     if hello_fp and not hmac.compare_digest(hello_fp, actual_fp):
@@ -1309,8 +1337,16 @@ def join_cluster_via_pairing(
         else ({1: "compute", 2: "services", 3: "docker"}.get(eff_tier, det_pool))
     )
     actual_ssh_port = ssh_port if ssh_port is not None else (8022 if os_env == "termux" else 22)
+    fallback_user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if not fallback_user:
+        try:
+            import pwd
+
+            fallback_user = pwd.getpwuid(os.getuid()).pw_name
+        except (ImportError, KeyError, AttributeError, OSError):
+            fallback_user = ""
     try:
-        actual_user = validate_ssh_user(ssh_user or os.environ.get("USER", ""))
+        actual_user = validate_ssh_user(ssh_user or fallback_user)
     except ValueError:
         actual_user = ""
     mem = read_memory_info()

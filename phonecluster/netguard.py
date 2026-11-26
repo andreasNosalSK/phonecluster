@@ -38,10 +38,12 @@ KNOWN_CLUSTER_PORTS: set[int] = {
     80,
     443,
     1883,
+    2377,
     3000,
     3632,
     5432,
     6379,
+    7946,
     8022,
     8080,
     8081,
@@ -330,8 +332,16 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
     addr_match = f"ip6 saddr {subnet}" if is_v6_subnet else f"ip saddr {subnet}"
     extra_family_lines: list[str] = []
     if is_v6_subnet:
-        v4_lan = infer_lan_subnet(str(host_info.get("lan_ip") or ""))
-        if v4_lan and ":" not in v4_lan:
+        raw_v4_lan = normalize_host(str(host_info.get("lan_ip") or ""))
+        v4_lan = ""
+        if raw_v4_lan and not is_loopback_or_unspecified_host(raw_v4_lan):
+            try:
+                v4_addr = ipaddress.ip_address(raw_v4_lan)
+                if isinstance(v4_addr, ipaddress.IPv4Address) and not (v4_addr.is_link_local or v4_addr.is_multicast):
+                    v4_lan = str(ipaddress.ip_network(f"{v4_addr}/24", strict=False))
+            except ValueError:
+                v4_lan = ""
+        if v4_lan:
             extra_family_lines.append(f"    # Also allow IPv4 LAN ({v4_lan}) for IPv4 SSH, workers, and UDP discovery")
             extra_family_lines.append(f"    ip saddr {v4_lan} tcp dport {{ {tcp_port_list} }} accept")
             extra_family_lines.append(f"    ip saddr {v4_lan} udp dport {{ {udp_port_list} }} accept")
@@ -341,20 +351,24 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
 
     worker_v4_ips: list[str] = []
     worker_v6_ips: list[str] = []
+    rndis_worker_v4_ips: list[str] = []
     for w in workers:
         wh = normalize_host(w.host)
         if not wh or is_loopback_or_unspecified_host(wh):
             continue
         try:
             wa = ipaddress.ip_address(wh)
-            if isinstance(wa, ipaddress.IPv4Address) and str(wa) not in worker_v4_ips:
-                worker_v4_ips.append(str(wa))
+            if isinstance(wa, ipaddress.IPv4Address):
+                if str(wa) not in worker_v4_ips:
+                    worker_v4_ips.append(str(wa))
+                if "usb-mode:rndis" in (w.tags or []) and str(wa) not in rndis_worker_v4_ips:
+                    rndis_worker_v4_ips.append(str(wa))
             elif isinstance(wa, ipaddress.IPv6Address) and str(wa) not in worker_v6_ips:
                 worker_v6_ips.append(str(wa))
         except ValueError:
             continue
     worker_blocked_tcp = sorted(
-        p for p in (set(ssh_ports) | {dash_port, master_worker_port, 3000, 3632, 50052})
+        p for p in (set(ssh_ports) | {dash_port, master_worker_port, 80, 3000, 3632, 8767, 50052})
         if 1 <= p <= 65535 and p != gw_port and p != 53
     )
     worker_restrict_lines: list[str] = []
@@ -372,6 +386,11 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
             worker_restrict_lines.append(
                 f"    ip6 saddr {{ {', '.join(worker_v6_ips)} }} tcp dport {{ {w_port_list} }} drop"
             )
+    if rndis_worker_v4_ips and 1 <= gw_port <= 65535:
+        extra_family_lines.append("    # Allow RNDIS /30 USB-hub phones to reach Master Network Guard proxy only")
+        extra_family_lines.append(
+            f"    ip saddr {{ {', '.join(rndis_worker_v4_ips)} }} tcp dport {gw_port} accept"
+        )
 
     nft_lines = [
         "#!/usr/sbin/nft -f",
@@ -448,6 +467,18 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
                 f"sudo ufw allow from {subnet} to any port 4789 proto udp comment 'Docker Swarm Overlay VXLAN (LAN)'",
             ]
         )
+    if rndis_worker_v4_ips and 1 <= gw_port <= 65535:
+        for rip in rndis_worker_v4_ips:
+            ufw_lines.append(
+                f"sudo ufw allow from {rip} to any port {gw_port} proto tcp comment 'RNDIS USB Hub Network Guard'"
+            )
+    if worker_blocked_tcp and (worker_v4_ips or worker_v6_ips):
+        ufw_lines.append("# Restrict untrusted worker phones from Master admin/compute ports (prepended ahead of LAN allows)")
+        for wip in (*worker_v4_ips, *worker_v6_ips):
+            for bp in worker_blocked_tcp:
+                ufw_lines.append(
+                    f"sudo ufw insert 1 deny from {wip} to any port {bp} proto tcp comment 'Isolate worker from Master admin'"
+                )
     ufw_lines.append("sudo ufw enable && sudo ufw status verbose")
     ufw_cmds = "\n".join(ufw_lines)
 
@@ -524,7 +555,12 @@ def audit_cluster_network(
     snapshots: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Produce a unified Master + Worker network hardening report, score, and copyable guides."""
-    config: ClusterConfig = controller.config
+    lock = getattr(controller, "config_lock", None)
+    if lock is not None:
+        with lock:
+            config: ClusterConfig = ClusterConfig.from_dict(controller.config.to_dict())
+    else:
+        config = controller.config
     snaps = snapshots if snapshots is not None else controller.poll_health()
     host_info = detect_controller_host_info(config)
 
@@ -605,8 +641,9 @@ def audit_cluster_network(
             "fix": "Toggle ON below if on shared/dorm Wi-Fi.",
         })
 
-    # 3. Worker Source-IP Master Allowlist (15 pts — verifies live enforcement on online workers!)
-    online_workers = [s for s in snaps if s.online and s.node.role != "master"]
+    # 3. Worker Source-IP Master Allowlist (15 pts — verifies live enforcement on non-quarantined online workers!)
+    quarantined_ids = set(config.gateway.quarantined_nodes)
+    online_workers = [s for s in snaps if s.online and s.node.role != "master" and s.node.id not in quarantined_ids]
     if config.network.enforce_worker_source_ip:
         unsynced = [
             s.node.id
@@ -766,6 +803,9 @@ def audit_cluster_network(
     for n in config.nodes:
         allowed_ports.add(n.worker_port)
         allowed_ports.add(n.ssh_port)
+        if n.adb is not None:
+            allowed_ports.add(n.adb.remote_worker_port)
+            allowed_ports.add(n.adb.remote_ssh_port)
 
     gw_per_node = (
         (gw_status_snap or {}).get("stats", {}).get("per_node", {})

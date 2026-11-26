@@ -186,12 +186,14 @@ def _default_route_ifaces() -> set[str]:
 def list_usb_net_interfaces(
     sys_net_dir: Path = SYS_NET_DIR,
     include_ips: bool = True,
+    exclude_default_route: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Detect USB-Ethernet / RNDIS / CDC-ECM / CDC-NCM gadget interfaces on this Linux host."""
     if not sys_net_dir.is_dir():
         return []
     found: list[dict[str, Any]] = []
-    uplink_ifaces = _default_route_ifaces() if include_ips else set()
+    should_exclude_uplink = (sys_net_dir == SYS_NET_DIR) if exclude_default_route is None else bool(exclude_default_route)
+    uplink_ifaces = _default_route_ifaces() if should_exclude_uplink else set()
     try:
         entries = sorted(sys_net_dir.iterdir(), key=lambda p: p.name)
     except OSError:
@@ -242,20 +244,37 @@ def list_usb_net_interfaces(
 
 
 def detect_subnet_collisions(interfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Identify overlapping IPv4 subnets across multiple USB gadget interfaces."""
-    by_net: dict[str, list[str]] = {}
+    """Identify identical or overlapping IPv4 subnets across multiple distinct USB gadget interfaces."""
+    iface_nets: list[tuple[str, ipaddress.IPv4Network | ipaddress.IPv6Network]] = []
+    seen_pairs: set[tuple[str, str]] = set()
     for item in interfaces:
-        iface = str(item.get("iface") or "")
+        iface = str(item.get("iface") or "").strip()
+        if not iface:
+            continue
         for cidr in item.get("ipv4_cidrs") or []:
             try:
-                net = str(ipaddress.ip_interface(cidr).network)
+                net = ipaddress.ip_interface(cidr).network
             except ValueError:
                 continue
-            by_net.setdefault(net, []).append(iface)
+            key = (iface, str(net))
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                iface_nets.append((iface, net))
+
+    grouped: dict[str, set[str]] = {}
+    for i, (if_a, net_a) in enumerate(iface_nets):
+        for if_b, net_b in iface_nets[i + 1 :]:
+            if if_a == if_b or net_a.version != net_b.version:
+                continue
+            if net_a.overlaps(net_b):
+                # Key by the broader overlapping prefix so exact duplicates and supernet overlaps merge cleanly
+                rep = str(net_a if net_a.prefixlen <= net_b.prefixlen else net_b)
+                grouped.setdefault(rep, set()).update((if_a, if_b))
+
     collisions: list[dict[str, Any]] = []
-    for net, ifaces in sorted(by_net.items()):
+    for net_str, ifaces in sorted(grouped.items()):
         if len(ifaces) > 1:
-            collisions.append({"subnet": net, "interfaces": sorted(ifaces)})
+            collisions.append({"subnet": net_str, "interfaces": sorted(ifaces)})
     return collisions
 
 
@@ -356,6 +375,8 @@ def plan_adb_usb_hub(
     registered: dict[str, tuple[NodeConfig, AdbNodeConfig]] = {}
     occupied_ids: set[str] = set()
     occupied_ports: set[int] = set()
+    if enable_gateway_reverse and not isinstance(gateway_port, bool) and 1 <= int(gateway_port) <= 65535:
+        occupied_ports.add(int(gateway_port))
     for node in existing_nodes or []:
         occupied_ids.add(node.id)
         if is_loopback_or_unspecified_host(node.host):
@@ -380,6 +401,8 @@ def plan_adb_usb_hub(
             registered[adb.serial] = (node, adb)
             occupied_ports.update(range(adb.mesh_base_port, adb.mesh_base_port + len(target_ports)))
 
+    revoked_forwards: list[dict[str, Any]] = []
+    revoked_mesh_ports: list[int] = []
     idx = 0
     seen_serials: set[str] = set()
     for dev in ready:
@@ -389,8 +412,23 @@ def plan_adb_usb_hub(
         seen_serials.add(serial)
         previous = registered.get(serial)
         if previous is not None:
-            node, adb = previous
+            node, prev_adb = previous
             node_id, local_w_port, local_s_port = node.id, node.worker_port, node.ssh_port
+            eff_w_port = prev_adb.remote_worker_port
+            raw_dw = dev.get("remote_worker_port")
+            if isinstance(raw_dw, int) and not isinstance(raw_dw, bool) and 1 <= raw_dw <= 65535:
+                eff_w_port = raw_dw
+            eff_s_port = prev_adb.remote_ssh_port
+            raw_ds = dev.get("remote_ssh_port")
+            if isinstance(raw_ds, int) and not isinstance(raw_ds, bool) and 1 <= raw_ds <= 65535:
+                eff_s_port = raw_ds
+            adb = AdbNodeConfig(
+                prev_adb.serial,
+                eff_w_port,
+                eff_s_port,
+                prev_adb.mesh_base_port,
+                prev_adb.peer_mesh,
+            )
         elif registered_only:
             continue
         else:
@@ -409,16 +447,25 @@ def plan_adb_usb_hub(
                     occupied_ports.update(slot_ports)
                     break
             dev_w_port = remote_worker_port
-            if isinstance(dev.get("remote_worker_port"), int) and 1 <= int(dev["remote_worker_port"]) <= 65535:
-                dev_w_port = int(dev["remote_worker_port"])
+            raw_dw = dev.get("remote_worker_port")
+            if isinstance(raw_dw, int) and not isinstance(raw_dw, bool) and 1 <= raw_dw <= 65535:
+                dev_w_port = raw_dw
             dev_s_port = remote_ssh_port
-            if isinstance(dev.get("remote_ssh_port"), int) and 1 <= int(dev["remote_ssh_port"]) <= 65535:
-                dev_s_port = int(dev["remote_ssh_port"])
+            raw_ds = dev.get("remote_ssh_port")
+            if isinstance(raw_ds, int) and not isinstance(raw_ds, bool) and 1 <= raw_ds <= 65535:
+                dev_s_port = raw_ds
             adb = AdbNodeConfig(serial, dev_w_port, dev_s_port, start, enable_peer_mesh)
 
         is_quarantined = node_id in quarantined
         if is_quarantined:
             quarantined_serials.append(serial)
+            for offset, sp in enumerate(target_ports):
+                hp = adb.mesh_base_port + offset
+                if 1024 <= hp <= 65535:
+                    revoked_mesh_ports.append(hp)
+                    revoked_forwards.append(
+                        {"serial": serial, "node_id": node_id, "local_port": hp, "remote_port": sp}
+                    )
         peer_mesh = (not is_quarantined) and enable_peer_mesh and (adb.peer_mesh or not registered_only)
 
         entry: dict[str, Any] = {
@@ -506,6 +553,14 @@ def plan_adb_usb_hub(
                         }
                     )
 
+    revoked_reverses: list[dict[str, Any]] = []
+    if revoked_mesh_ports:
+        for dst in nodes_plan:
+            if dst["node_id"] in quarantined:
+                continue
+            for hp in revoked_mesh_ports:
+                revoked_reverses.append({"serial": dst["serial"], "node_id": dst["node_id"], "remote_port": hp})
+
     forward_ports = [rule["local_port"] for rule in forward_rules]
     if len(forward_ports) != len(set(forward_ports)):
         raise ValueError("ADB nodes have overlapping local forward ports")
@@ -517,7 +572,35 @@ def plan_adb_usb_hub(
         "reverse_rules": reverse_rules,
         "peer_mesh_map": peer_mesh_map,
         "quarantined_serials": quarantined_serials,
+        "revoked_forwards": revoked_forwards,
+        "revoked_reverses": revoked_reverses,
     }
+
+
+def revoke_adb_device_reverses(
+    serial: str,
+    *,
+    adb_bin: str | None = None,
+    timeout_sec: float = 5.0,
+) -> tuple[bool, str]:
+    """Immediately revoke all `adb reverse` tunnels on a quarantined USB phone."""
+    cmd = adb_bin or shutil.which("adb")
+    if not cmd:
+        return False, "adb binary not found on PATH"
+    try:
+        clean_q = validate_usb_serial(str(serial))
+        res = subprocess.run(
+            [cmd, "-s", clean_q, "reverse", "--remove-all"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+        if res.returncode != 0:
+            detail = (res.stderr or res.stdout or f"adb exit {res.returncode}").strip()[:120]
+            return False, detail
+        return True, "ok"
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        return False, str(exc)[:120]
 
 
 def apply_adb_usb_hub(
@@ -543,24 +626,32 @@ def apply_adb_usb_hub(
             raise OSError(detail[:120])
         return result.stdout
 
+    def list_active(direction: str, device: str | None = None) -> dict[str, tuple[str, str]]:
+        scope = ["-s", device] if device is not None else []
+        active: dict[str, tuple[str, str]] = {}
+        for raw_line in run_adb(*scope, direction, "--list").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("*"):
+                continue
+            parts = line.split(maxsplit=2)
+            if len(parts) < 3:
+                continue
+            owner, source, destination = parts[0], parts[1], parts[2].strip()
+            if not source.startswith("tcp:"):
+                continue
+            # reverse --list is already scoped to this phone. The first field is its transport.
+            target = (device or owner, destination)
+            if source in active and active[source] != target:
+                raise ValueError(f"ambiguous ADB route for {source}")
+            active[source] = target
+        return active
+
     def reconcile(direction: str, rules: list[dict[str, Any]], device: str | None = None) -> None:
         nonlocal applied, unchanged, failed
         if not rules:
             return
-        scope = ["-s", device] if device is not None else []
-        active: dict[str, tuple[str, str]] = {}
         try:
-            for line in run_adb(*scope, direction, "--list").splitlines():
-                if not line.strip():
-                    continue
-                owner, source, destination = line.split(maxsplit=2)
-                if not source.startswith("tcp:"):
-                    continue
-                # reverse --list is already scoped to this phone. The first field is its transport.
-                target = (device or owner, destination)
-                if source in active and active[source] != target:
-                    raise ValueError(f"ambiguous ADB route for {source}")
-                active[source] = target
+            active = list_active(direction, device=device)
         except (subprocess.SubprocessError, OSError, ValueError) as exc:
             failed += len(rules)
             label = f" for {device}" if device is not None else ""
@@ -599,16 +690,50 @@ def apply_adb_usb_hub(
 
     # Actively revoke all reverse tunnels on quarantined USB devices so they cannot reach Master gateway or peer mesh
     for q_serial in plan.get("quarantined_serials") or []:
+        ok_rev, rev_err = revoke_adb_device_reverses(str(q_serial), adb_bin=cmd, timeout_sec=timeout_sec)
+        if not ok_rev:
+            failed += 1
+            errors.append(f"revoke reverse on quarantined {q_serial}: {rev_err}")
+
+    # Actively sever quarantined nodes' mesh exports (forward) and sibling mesh reverses
+    revoked_fwds = plan.get("revoked_forwards") or []
+    if revoked_fwds:
         try:
-            clean_q = validate_usb_serial(str(q_serial))
-            subprocess.run(
-                [cmd, "-s", clean_q, "reverse", "--remove-all"],
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-            )
-        except (subprocess.SubprocessError, OSError, ValueError):
-            pass
+            active_fwds = list_active("forward")
+            for rf in revoked_fwds:
+                src_spec = f"tcp:{int(rf['local_port'])}"
+                if active_fwds.get(src_spec) is not None and active_fwds[src_spec][0] == str(rf["serial"]):
+                    try:
+                        run_adb("-s", validate_usb_serial(str(rf["serial"])), "forward", "--remove", src_spec)
+                    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+                        failed += 1
+                        errors.append(f"revoke forward {rf['serial']} {src_spec}: {exc}")
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            failed += 1
+            errors.append(f"inspect forwards for quarantine revocation: {exc}")
+
+    revoked_revs = plan.get("revoked_reverses") or []
+    if revoked_revs:
+        by_ser: dict[str, list[int]] = {}
+        for rr in revoked_revs:
+            try:
+                ser = validate_usb_serial(str(rr["serial"]))
+                by_ser.setdefault(ser, []).append(int(rr["remote_port"]))
+            except (ValueError, TypeError):
+                continue
+        for ser, ports in by_ser.items():
+            try:
+                active_revs = list_active("reverse", device=ser)
+            except (subprocess.SubprocessError, OSError, ValueError):
+                continue
+            for p in ports:
+                r_spec = f"tcp:{p}"
+                if r_spec in active_revs:
+                    try:
+                        run_adb("-s", ser, "reverse", "--remove", r_spec)
+                    except (subprocess.SubprocessError, OSError) as exc:
+                        failed += 1
+                        errors.append(f"revoke peer reverse {ser} {r_spec}: {exc}")
 
     return {
         "ok": failed == 0,
@@ -627,6 +752,7 @@ def plan_rndis_usb_hub(
     ssh_port: int = 22,
     ssh_user: str = "phablet",
     node_prefix: str = "usb",
+    existing_nodes: list[NodeConfig] | None = None,
 ) -> dict[str, Any]:
     """Deterministically plan non-colliding `/30` subnets (`10.77.<k>.0/30`) for Layer-3 USB hub routing."""
     clean_prefix = validate_subnet_prefix(subnet_prefix)
@@ -638,17 +764,51 @@ def plan_rndis_usb_hub(
     if len(sorted_ifaces) > 62:
         raise ValueError(f"Too many USB interfaces ({len(sorted_ifaces)}; maximum supported per /16 plan is 62)")
 
+    occupied_ids: set[str] = set()
+    occupied_indices: set[int] = set()
+    existing_by_iface: dict[str, NodeConfig] = {}
+    prefix_dot = f"{clean_prefix}."
+    for node in existing_nodes or []:
+        occupied_ids.add(node.id)
+        if node.adb is None and "usb-mode:rndis" in (node.tags or []):
+            for t in node.tags:
+                if t.startswith("usb-iface:"):
+                    existing_by_iface[t.split(":", 1)[1]] = node
+            if node.host.startswith(prefix_dot):
+                parts = node.host.split(".")
+                if len(parts) == 4 and parts[2].isdigit() and parts[3] == "2":
+                    occupied_indices.add(int(parts[2]))
+
+    next_idx = 1
     nodes_plan: list[dict[str, Any]] = []
-    for idx, item in enumerate(sorted_ifaces, start=1):
+    for item in sorted_ifaces:
         iface = validate_iface_name(str(item.get("iface") or ""))
         mac = str(item.get("mac") or "").strip().lower()
+        prev = existing_by_iface.get(iface)
+        idx: int | None = None
+        node_id = ""
+        if prev is not None and prev.host.startswith(prefix_dot):
+            parts = prev.host.split(".")
+            if len(parts) == 4 and parts[2].isdigit() and parts[3] == "2" and 1 <= int(parts[2]) <= 254:
+                idx = int(parts[2])
+                node_id = prev.id
+        if idx is None:
+            while next_idx <= 254 and (next_idx in occupied_indices or f"{clean_node_prefix}{next_idx}" in occupied_ids):
+                next_idx += 1
+            if next_idx > 254:
+                raise ValueError("Ran out of /30 USB subnets in /16 prefix")
+            idx = next_idx
+            node_id = f"{clean_node_prefix}{idx}"
+            occupied_indices.add(idx)
+            occupied_ids.add(node_id)
+            next_idx += 1
         subnet = f"{clean_prefix}.{idx}.0/30"
         host_ip = f"{clean_prefix}.{idx}.1"
         phone_ip = f"{clean_prefix}.{idx}.2"
         nodes_plan.append(
             {
                 "index": idx,
-                "node_id": f"{clean_node_prefix}{idx}",
+                "node_id": node_id,
                 "iface": iface,
                 "mac": mac,
                 "driver": str(item.get("driver") or "usb"),
@@ -656,9 +816,9 @@ def plan_rndis_usb_hub(
                 "host_ip": host_ip,
                 "phone_ip": phone_ip,
                 "host": phone_ip,
-                "worker_port": int(worker_port),
-                "ssh_port": int(ssh_port),
-                "ssh_user": ssh_user,
+                "worker_port": int(prev.worker_port) if prev is not None else int(worker_port),
+                "ssh_port": int(prev.ssh_port) if prev is not None else int(ssh_port),
+                "ssh_user": prev.ssh_user if (prev is not None and prev.ssh_user) else ssh_user,
             }
         )
     return {
@@ -717,25 +877,34 @@ def build_rndis_router_commands(
             f"sudo iptables -I FORWARD 1 -s {cluster_cidr} -d {cluster_cidr} -j ACCEPT",
         ]
     )
-    if nat_wan:
-        clean_wan = validate_iface_name(wan_iface) if wan_iface else ""
-        if clean_wan:
+    clean_wan = validate_iface_name(wan_iface) if (nat_wan and wan_iface) else ""
+    if nat_wan and clean_wan:
+        host_cmds.append(
+            f"sudo iptables -t nat -C POSTROUTING -s {cluster_cidr} -o {clean_wan} -j MASQUERADE 2>/dev/null || "
+            f"sudo iptables -t nat -A POSTROUTING -s {cluster_cidr} -o {clean_wan} -j MASQUERADE"
+        )
+        # Block RFC1918 / CGNAT / link-local home LAN pivots on clean_wan before allowing WAN egress
+        pos = 2
+        for priv_net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10"):
             host_cmds.append(
-                f"sudo iptables -t nat -C POSTROUTING -s {cluster_cidr} -o {clean_wan} -j MASQUERADE 2>/dev/null || "
-                f"sudo iptables -t nat -A POSTROUTING -s {cluster_cidr} -o {clean_wan} -j MASQUERADE"
+                f"sudo iptables -C FORWARD -s {cluster_cidr} -d {priv_net} -o {clean_wan} -j DROP 2>/dev/null || "
+                f"sudo iptables -I FORWARD {pos} -s {cluster_cidr} -d {priv_net} -o {clean_wan} -j DROP"
             )
-            host_cmds.append(
-                f"sudo iptables -C FORWARD -s {cluster_cidr} -o {clean_wan} -j ACCEPT 2>/dev/null || "
-                f"sudo iptables -I FORWARD 2 -s {cluster_cidr} -o {clean_wan} -j ACCEPT"
-            )
-            host_cmds.append(
-                f"sudo iptables -C FORWARD -i {clean_wan} -d {cluster_cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || "
-                f"sudo iptables -I FORWARD 3 -i {clean_wan} -d {cluster_cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
-            )
-            host_cmds.append(
-                f"sudo iptables -C FORWARD -s {cluster_cidr} ! -d {cluster_cidr} ! -o {clean_wan} -j DROP 2>/dev/null || "
-                f"sudo iptables -I FORWARD 4 -s {cluster_cidr} ! -d {cluster_cidr} ! -o {clean_wan} -j DROP"
-            )
+            pos += 1
+        host_cmds.append(
+            f"sudo iptables -C FORWARD -s {cluster_cidr} -o {clean_wan} -j ACCEPT 2>/dev/null || "
+            f"sudo iptables -I FORWARD {pos} -s {cluster_cidr} -o {clean_wan} -j ACCEPT"
+        )
+        pos += 1
+        host_cmds.append(
+            f"sudo iptables -C FORWARD -i {clean_wan} -d {cluster_cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || "
+            f"sudo iptables -I FORWARD {pos} -i {clean_wan} -d {cluster_cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+        )
+        pos += 1
+        host_cmds.append(
+            f"sudo iptables -C FORWARD -s {cluster_cidr} ! -d {cluster_cidr} ! -o {clean_wan} -j DROP 2>/dev/null || "
+            f"sudo iptables -I FORWARD {pos} -s {cluster_cidr} ! -d {cluster_cidr} ! -o {clean_wan} -j DROP"
+        )
     else:
         host_cmds.append(
             f"sudo iptables -C FORWARD -s {cluster_cidr} ! -d {cluster_cidr} -j DROP 2>/dev/null || "
@@ -792,6 +961,8 @@ def sync_usb_hub_into_config(
 
         existing = by_id.get(nid)
         if existing is not None:
+            if existing.role == "master":
+                raise ValueError(f"USB plan cannot overwrite master node '{nid}'")
             if existing.adb is not None and (adb is None or existing.adb.serial != adb.serial):
                 raise ValueError(f"USB plan would reassign {nid} to another device")
             existing.host = host
@@ -800,6 +971,11 @@ def sync_usb_hub_into_config(
             existing.adb = adb
             if s_user and not existing.ssh_user:
                 existing.ssh_user = s_user
+            # Remove stale transport-specific tags before adding current mode/iface/serial tags
+            existing.tags = [
+                t for t in existing.tags
+                if not t.startswith(("usb-mode:", "usb-iface:", "usb-serial:"))
+            ]
             for t in tags:
                 if t not in existing.tags:
                     existing.tags.append(t)
@@ -857,6 +1033,7 @@ class UsbHubWatchdog(threading.Thread):
         enable_peer_mesh: bool = True,
         adb_bin: str | None = None,
         config_path: Path | None = None,
+        gateway_port_getter: Any | None = None,
     ) -> None:
         super().__init__(name="usb-hub-watchdog", daemon=True)
         self.interval_sec = max(1.0, float(interval_sec))
@@ -869,46 +1046,71 @@ class UsbHubWatchdog(threading.Thread):
         self.enable_peer_mesh = enable_peer_mesh
         self.adb_bin = adb_bin
         self.config_path = config_path
+        self.gateway_port_getter = gateway_port_getter
         self._discovered = ClusterConfig("ADB watchdog", "", [])
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._sync_lock = threading.Lock()
         self._last_serials: tuple[str, ...] = ()
         self._last_plan: dict[str, Any] = {"mode": "adb", "nodes": [], "forward_rules": [], "reverse_rules": [], "peer_mesh_map": {}}
         self._last_result: dict[str, Any] = {}
         self._last_sync_ts: float = 0.0
+        self._active_gateway_port: int | None = None
 
     def sync_once(self) -> dict[str, Any]:
-        devs = list_adb_devices(adb_bin=self.adb_bin)
-        ready_serials = tuple(sorted(d["serial"] for d in devs if d.get("state") == "device"))
-        cfg = load_config(self.config_path) if self.config_path is not None else self._discovered
-        plan = plan_adb_usb_hub(
-            devs,
-            worker_base_port=self.worker_base_port,
-            ssh_base_port=self.ssh_base_port,
-            remote_worker_port=self.remote_worker_port,
-            remote_ssh_port=self.remote_ssh_port,
-            gateway_port=self.gateway_port,
-            enable_gateway_reverse=self.enable_gateway_reverse,
-            enable_peer_mesh=self.enable_peer_mesh,
-            existing_nodes=cfg.nodes,
-            registered_only=self.config_path is not None,
-            quarantined_nodes=cfg.gateway.quarantined_nodes,
-        )
-        res = apply_adb_usb_hub(plan, adb_bin=self.adb_bin) if plan["nodes"] else {
-            "ok": True, "applied": 0, "unchanged": 0, "failed": 0, "errors": [],
-        }
-        if self.config_path is None:
-            # Keep allocations even if only part of the plan ran. A retry
-            # must never reuse a host port for a different attached phone.
-            sync_usb_hub_into_config(self._discovered, plan)
-        with self._lock:
-            if ready_serials != self._last_serials:
-                LOG.info("USB hub topology changed: %d ADB device(s) online (%s)", len(ready_serials), ", ".join(ready_serials) or "none")
-                self._last_serials = ready_serials
-            self._last_plan = plan
-            self._last_result = res
-            self._last_sync_ts = time.time()
-        return {"plan": plan, "apply": res}
+        with self._sync_lock:
+            devs = list_adb_devices(adb_bin=self.adb_bin)
+            ready_serials = tuple(sorted(d["serial"] for d in devs if d.get("state") == "device"))
+            cfg = load_config(self.config_path) if self.config_path is not None else self._discovered
+            eff_gw_rev = self.enable_gateway_reverse
+            eff_gw_port = int(self.gateway_port or 0)
+            if self.config_path is not None:
+                eff_gw_rev = bool(self.enable_gateway_reverse and cfg.gateway.enabled)
+                cfg_port = int(cfg.gateway.port or 0)
+                if cfg_port <= 0 and callable(self.gateway_port_getter):
+                    try:
+                        cfg_port = int(self.gateway_port_getter() or 0)
+                    except (TypeError, ValueError):
+                        cfg_port = 0
+                if cfg_port > 0:
+                    eff_gw_port = cfg_port
+            plan = plan_adb_usb_hub(
+                devs,
+                worker_base_port=self.worker_base_port,
+                ssh_base_port=self.ssh_base_port,
+                remote_worker_port=self.remote_worker_port,
+                remote_ssh_port=self.remote_ssh_port,
+                gateway_port=eff_gw_port,
+                enable_gateway_reverse=eff_gw_rev,
+                enable_peer_mesh=self.enable_peer_mesh,
+                existing_nodes=cfg.nodes,
+                registered_only=self.config_path is not None,
+                quarantined_nodes=cfg.gateway.quarantined_nodes,
+            )
+            # If gateway was previously reversed on an old port and is now disabled or moved, prune the old reverse
+            prev_gw_port = self._active_gateway_port
+            new_gw_port = eff_gw_port if (eff_gw_rev and 1 <= eff_gw_port <= 65535) else None
+            if prev_gw_port is not None and prev_gw_port != new_gw_port:
+                rev_list = list(plan.get("revoked_reverses") or [])
+                for n_item in plan.get("nodes") or []:
+                    rev_list.append({"serial": n_item["serial"], "node_id": n_item["node_id"], "remote_port": prev_gw_port})
+                plan["revoked_reverses"] = rev_list
+            res = apply_adb_usb_hub(plan, adb_bin=self.adb_bin) if plan["nodes"] else {
+                "ok": True, "applied": 0, "unchanged": 0, "failed": 0, "errors": [],
+            }
+            self._active_gateway_port = new_gw_port
+            if self.config_path is None:
+                # Keep allocations even if only part of the plan ran. A retry
+                # must never reuse a host port for a different attached phone.
+                sync_usb_hub_into_config(self._discovered, plan)
+            with self._lock:
+                if ready_serials != self._last_serials:
+                    LOG.info("USB hub topology changed: %d ADB device(s) online (%s)", len(ready_serials), ", ".join(ready_serials) or "none")
+                    self._last_serials = ready_serials
+                self._last_plan = plan
+                self._last_result = res
+                self._last_sync_ts = time.time()
+            return {"plan": plan, "apply": res}
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -954,11 +1156,17 @@ def probe_adb_device_profile(
     if not cmd:
         return base
     probe_sh = (
-        "if [ -f /etc/system-image/channel.ini ] || [ -d /etc/ubuntu-touch ]; then "
+        "if [ -f /etc/system-image/channel.ini ] || [ -f /etc/ubuntu-build ] || [ -d /etc/ubuntu-touch ] "
+        "|| command -v repowerd-cli >/dev/null 2>&1 || command -v powerd-cli >/dev/null 2>&1 "
+        "|| grep -qiE 'ubuntu.?touch|ubports' /etc/os-release 2>/dev/null; then "
         "  echo OS=ubuntu-touch; echo SSH_PORT=22; echo SSH_USER=phablet; "
-        "elif [ -d /data/data/com.termux/files/usr ]; then "
+        "elif [ -d /data/data/com.termux/files/usr ] || pm path com.termux >/dev/null 2>&1; then "
         "  echo OS=termux; echo SSH_PORT=8022; "
-        "  TU=$(stat -c '%U' /data/data/com.termux/files/home 2>/dev/null || ls -ld /data/data/com.termux/files/home 2>/dev/null | awk '{print $3}'); "
+        "  TU=$(stat -c '%U' /data/data/com.termux/files/home 2>/dev/null || true); "
+        "  if [ -z \"$TU\" ]; then "
+        "    UID_RAW=$(dumpsys package com.termux 2>/dev/null | grep -m1 -oE '(userId|appId)=[0-9]+' | cut -d= -f2 || true); "
+        "    if [ -n \"$UID_RAW\" ] && [ \"$UID_RAW\" -ge 10000 ] 2>/dev/null; then TU=\"u0_a$((UID_RAW - 10000))\"; fi; "
+        "  fi; "
         "  echo SSH_USER=$TU; "
         "else "
         "  echo OS=android; echo SSH_PORT=8022; echo SSH_USER=; "
@@ -968,7 +1176,7 @@ def probe_adb_device_profile(
         "done; "
         "for f in /sys/class/power_supply/battery/status /sys/class/power_supply/*/status; do "
         "  [ -r \"$f\" ] && { echo BAT_STATUS=$(cat \"$f\" 2>/dev/null); break; }; "
-        "done"
+        "done; true"
     )
     try:
         res = subprocess.run(
@@ -979,7 +1187,7 @@ def probe_adb_device_profile(
         )
     except (subprocess.SubprocessError, OSError):
         return base
-    if res.returncode != 0:
+    if res.returncode != 0 and "OS=" not in (res.stdout or ""):
         return base
     for line in res.stdout.splitlines():
         if "=" not in line:
@@ -1058,9 +1266,9 @@ def verify_usb_hub_connectivity(
         mode = "adb" if (n.adb is not None or "usb-mode:adb" in (n.tags or [])) else "rndis"
         online = bool(snap and snap.online)
         h = snap.health if (snap and snap.online and isinstance(snap.health, dict)) else {}
-        bat_status = str(h.get("battery_status") or "").upper()
+        bat_status = str(h.get("battery_status") or "").strip().upper()
         bat_pct = h.get("battery_pct")
-        power_warn = online and bat_status in {"DISCHARGING", "NOT_CHARGING"}
+        power_warn = online and bat_status in {"DISCHARGING", "NOT_CHARGING", "NOT CHARGING"}
         if power_warn:
             warnings.append(
                 f"{n.id} is discharging on USB ({bat_pct if bat_pct is not None else '?'}%) — check powered USB 3.0 hub PSU (12V/3A-5A)."
@@ -1083,15 +1291,16 @@ def verify_usb_hub_connectivity(
                 "error": "" if online else (snap.error if snap else "unreachable"),
             }
         )
-        if online and n.id not in quarantined:
-            if mode == "rndis":
+        if n.id not in quarantined:
+            if mode == "rndis" and online:
                 online_rndis.append(n)
-            else:
+            elif mode == "adb":
+                # Inspect ADB tunnels even for offline phones so dropped forwards are diagnosed
                 adb_nodes.append(n)
 
-    # Check host IPv4 forwarding if RNDIS nodes exist
-    has_rndis = any(r["mode"] == "rndis" for r in node_rows)
-    if has_rndis and not read_ipv4_forwarding_enabled():
+    # Check host IPv4 forwarding when >=2 RNDIS nodes exist (required for Phone <-> Phone routing)
+    rndis_count = sum(1 for r in node_rows if r["mode"] == "rndis")
+    if rndis_count >= 2 and not read_ipv4_forwarding_enabled():
         warnings.append("Master host net.ipv4.ip_forward=0 — RNDIS phones cannot route packets to each other. Run setup-rndis.")
 
     # Live Phone <-> Phone peer checks for RNDIS /30 nodes
@@ -1135,69 +1344,97 @@ def verify_usb_hub_connectivity(
                 for dst_id, dst_host, dst_port in peers:
                     peer_links.append({"from": src.id, "to": dst_id, "mode": "rndis", "host": dst_host, "port": dst_port, "ok": False, "latency_ms": None, "error": err})
 
-    # Live ADB tunnel verification for ADB USB-hub nodes
+    # Live ADB tunnel verification for ADB USB-hub nodes (including offline nodes to spot dropped forwards)
     adb_tunnels: list[dict[str, Any]] = []
     adb_cmd = adb_bin or shutil.which("adb")
+    if adb_nodes and not adb_cmd:
+        warnings.append("ADB USB hub node(s) configured, but `adb` binary was not found on PATH.")
     if adb_nodes and adb_cmd:
         fwd_map: dict[str, tuple[str, str]] = {}
         try:
             fwd_res = subprocess.run([adb_cmd, "forward", "--list"], capture_output=True, text=True, timeout=timeout_sec)
             if fwd_res.returncode == 0:
-                for line in fwd_res.stdout.splitlines():
-                    parts = line.split()
+                for raw_line in fwd_res.stdout.splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("*"):
+                        continue
+                    parts = line.split(maxsplit=2)
                     if len(parts) >= 3:
-                        fwd_map[parts[1]] = (parts[0], parts[2])
+                        fwd_map[parts[1]] = (parts[0], parts[2].strip())
         except (subprocess.SubprocessError, OSError):
             pass
+        rev_by_node: dict[str, dict[str, str]] = {}
         for n in adb_nodes:
             serial = n.adb.serial if n.adb is not None else ""
             w_bind = fwd_map.get(f"tcp:{n.worker_port}")
             s_bind = fwd_map.get(f"tcp:{n.ssh_port}")
-            rev_ports: set[str] = set()
+            rev_map: dict[str, str] = {}
             if serial:
                 try:
                     rev_res = subprocess.run([adb_cmd, "-s", serial, "reverse", "--list"], capture_output=True, text=True, timeout=timeout_sec)
                     if rev_res.returncode == 0:
-                        for line in rev_res.stdout.splitlines():
-                            parts = line.split()
+                        for raw_line in rev_res.stdout.splitlines():
+                            line = raw_line.strip()
+                            if not line or line.startswith("*"):
+                                continue
+                            parts = line.split(maxsplit=2)
                             if len(parts) >= 3:
-                                rev_ports.add(parts[1])
+                                rev_map[parts[1]] = parts[2].strip()
                 except (subprocess.SubprocessError, OSError):
                     pass
-            worker_fwd_ok = bool(w_bind and (not serial or w_bind[0] == serial))
-            ssh_fwd_ok = bool(s_bind and (not serial or s_bind[0] == serial))
+            rev_by_node[n.id] = rev_map
+            exp_w_dst = f"tcp:{n.adb.remote_worker_port}" if n.adb is not None else ""
+            exp_s_dst = f"tcp:{n.adb.remote_ssh_port}" if n.adb is not None else ""
+            worker_fwd_ok = bool(
+                w_bind
+                and (not serial or w_bind[0] == serial)
+                and (not exp_w_dst or w_bind[1] == exp_w_dst)
+            )
+            ssh_fwd_ok = bool(
+                s_bind
+                and (not serial or s_bind[0] == serial)
+                and (not exp_s_dst or s_bind[1] == exp_s_dst)
+            )
             adb_tunnels.append(
                 {
                     "node_id": n.id,
                     "serial": serial,
                     "worker_forward_ok": worker_fwd_ok,
                     "ssh_forward_ok": ssh_fwd_ok,
-                    "reverse_count": len(rev_ports),
+                    "reverse_count": len(rev_map),
                 }
             )
             if not worker_fwd_ok:
                 warnings.append(f"ADB worker forward missing for {n.id} (127.0.0.1:{n.worker_port}) — click 'Apply ADB Hub' or enable Auto-Heal Watchdog.")
-        # Check peer mesh reachability between sibling ADB phones
-        if len(adb_nodes) >= 2:
-            for src in adb_nodes:
+        # Check BOTH halves of peer mesh reachability (dst forward + src reverse) between sibling ADB phones
+        online_adb = [n for n in adb_nodes if snap_by_id.get(n.id) and snap_by_id[n.id].online]
+        if len(online_adb) >= 2:
+            for src in online_adb:
                 if src.adb is None or not src.adb.peer_mesh:
                     continue
-                for dst in adb_nodes:
+                src_revs = rev_by_node.get(src.id, {})
+                for dst in online_adb:
                     if dst.id == src.id or dst.adb is None or not dst.adb.peer_mesh:
                         continue
-                    mesh_port = dst.adb.mesh_base_port
-                    bind = fwd_map.get(f"tcp:{mesh_port}")
-                    mesh_bound = bool(bind and bind[0] == dst.adb.serial)
+                    missing_parts: list[str] = []
+                    for offset, svc_port in enumerate(USB_MESH_DEFAULT_PORTS):
+                        hp = dst.adb.mesh_base_port + offset
+                        fwd_bind = fwd_map.get(f"tcp:{hp}")
+                        if not (fwd_bind and fwd_bind[0] == dst.adb.serial and fwd_bind[1] == f"tcp:{svc_port}"):
+                            missing_parts.append(f"fwd:{hp}")
+                        if src_revs.get(f"tcp:{hp}") != f"tcp:{hp}":
+                            missing_parts.append(f"rev:{hp}")
+                    link_ok = not missing_parts
                     peer_links.append(
                         {
                             "from": src.id,
                             "to": dst.id,
                             "mode": "adb-mesh",
                             "host": "127.0.0.1",
-                            "port": mesh_port,
-                            "ok": mesh_bound,
+                            "port": dst.adb.mesh_base_port,
+                            "ok": link_ok,
                             "latency_ms": None,
-                            "error": "" if mesh_bound else f"mesh forward tcp:{mesh_port} missing",
+                            "error": "" if link_ok else f"missing mesh tunnel(s): {', '.join(missing_parts[:4])}",
                         }
                     )
 
@@ -1222,6 +1459,29 @@ def verify_usb_hub_connectivity(
     }
 
 
+def _systemd_escape_exec_arg(value: str) -> str:
+    """Escape a single double-quoted argument for systemd ExecStart=/ExecStop= lines."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError("systemd unit paths cannot contain control characters or newlines")
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("%", "%%")
+        .replace("$", "$$")
+    )
+    return f'"{escaped}"'
+
+
+def _systemd_escape_workdir(value: str) -> str:
+    """Format an unquoted absolute path for systemd WorkingDirectory= (systemd does NOT strip quotes)."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in value) or value.endswith("\\") or '"' in value:
+        raise ValueError("WorkingDirectory path contains unsupported control characters, quotes, or trailing backslash")
+    p = Path(value).expanduser()
+    if not p.is_absolute():
+        p = p.resolve()
+    return str(p).replace("%", "%%")
+
+
 def generate_usb_hub_systemd_unit(
     mode: str,
     *,
@@ -1232,6 +1492,8 @@ def generate_usb_hub_systemd_unit(
     wan_iface: str = "",
     gateway_port: int = 8888,
     interval_sec: float = 5.0,
+    router_script: str | Path | None = None,
+    use_python_module: bool | None = None,
 ) -> str:
     """Generate a ready-to-install systemd service unit for persistent USB 3.0 Hub routing across Master reboots."""
     clean_mode = str(mode or "adb").strip().lower()
@@ -1246,14 +1508,21 @@ def generate_usb_hub_systemd_unit(
 
     if clean_mode == "adb":
         iv = max(1.0, min(300.0, float(interval_sec)))
+        workdir_val = _systemd_escape_workdir(repo_str)
+        cli_file = Path(repo_str) / "phonecluster_cli.py"
+        if use_python_module is True or (use_python_module is None and Path(repo_str).exists() and not cli_file.is_file()):
+            entry_part = "-m phonecluster.cli"
+        else:
+            entry_part = _systemd_escape_exec_arg(f"{repo_str.rstrip('/')}/phonecluster_cli.py")
+        cfg_arg = _systemd_escape_exec_arg(cfg_str)
         return (
             "[Unit]\n"
             "Description=PhoneCluster USB 3.0 Hub Auto-Heal Watchdog (ADB Peer Mesh)\n"
             "After=network.target\n\n"
             "[Service]\n"
             "Type=simple\n"
-            f'WorkingDirectory="{repo_str}"\n'
-            f'ExecStart=/usr/bin/env python3 "{repo_str}/phonecluster_cli.py" --config "{cfg_str}" usb-hub serve --interval {iv:.1f} --gateway-port {gw_port}\n'
+            f"WorkingDirectory={workdir_val}\n"
+            f"ExecStart=/usr/bin/env python3 {entry_part} --config {cfg_arg} usb-hub serve --interval {iv:.1f} --gateway-port {gw_port}\n"
             "Restart=always\n"
             "RestartSec=5\n\n"
             "[Install]\n"
@@ -1265,6 +1534,8 @@ def generate_usb_hub_systemd_unit(
         nat_args = " --nat-wan"
         if wan_iface:
             nat_args += f" --wan-iface {validate_iface_name(wan_iface)}"
+    script_path = str(router_script) if router_script is not None else f"{repo_str.rstrip('/')}/scripts/07_usb_hub_router.sh"
+    script_arg = _systemd_escape_exec_arg(script_path)
     return (
         "[Unit]\n"
         "Description=PhoneCluster USB 3.0 Hub Layer-3 /30 Router (RNDIS Air-Gap)\n"
@@ -1272,8 +1543,8 @@ def generate_usb_hub_systemd_unit(
         "[Service]\n"
         "Type=oneshot\n"
         "RemainAfterExit=yes\n"
-        f'ExecStart=/usr/bin/env bash "{repo_str}/scripts/07_usb_hub_router.sh" setup-rndis --prefix {clean_prefix} --gateway-port {gw_port}{nat_args}\n'
-        f'ExecStop=/usr/bin/env bash "{repo_str}/scripts/07_usb_hub_router.sh" teardown --prefix {clean_prefix}\n\n'
+        f"ExecStart=/usr/bin/env bash {script_arg} setup-rndis --prefix {clean_prefix} --gateway-port {gw_port}{nat_args}\n"
+        f"ExecStop=/usr/bin/env bash {script_arg} teardown --prefix {clean_prefix}\n\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n"
     )

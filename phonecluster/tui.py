@@ -212,26 +212,34 @@ def render_top_frame(
     paused: bool = False,
     last_command_banner: str = "",
     width: int | None = None,
+    height: int | None = None,
     use_color: bool = True,
     pool_filter: str = "all",
 ) -> str:
     """Render one complete multi-device btop frame as a string."""
     pal = Palette(enabled=use_color)
-    cols = width or max(78, min(140, shutil.get_terminal_size((100, 32)).columns))
+    term_sz = shutil.get_terminal_size((100, 32))
+    cols = max(36, min(140, int(width))) if width is not None else max(36, min(140, term_sz.columns))
+    rows_avail = max(14, int(height)) if height is not None else max(14, term_sz.lines)
 
     # 1. Unified Cluster Overview Header ("One Computer" btop summary)
-    cluster_hist = history.get("cluster", [])
-    cpu_series = [float(p.get("cpu_pct", 0.0)) for p in cluster_hist]
-    cpu_pct = float(summary.get("cluster_cpu_pct", 0.0))
-    ram_pct = float(summary.get("cluster_ram_pct", 0.0))
-    mem_tot_mb = max(0, int(summary.get("mem_total_mb", 0) or 0))
-    mem_avail_mb = max(0, int(summary.get("mem_available_mb", 0) or 0))
+    cluster_hist = history.get("cluster", []) if isinstance(history, dict) else []
+    cpu_series = [_safe_num(p.get("cpu_pct", 0.0), 0.0) for p in cluster_hist if isinstance(p, dict)]
+    cpu_pct = _safe_num(summary.get("cluster_cpu_pct", 0.0), 0.0)
+    ram_pct = _safe_num(summary.get("cluster_ram_pct", 0.0), 0.0)
+    mem_tot_mb = max(0, _safe_int(summary.get("mem_total_mb", 0), 0))
+    mem_avail_mb = max(0, _safe_int(summary.get("mem_available_mb", 0), 0))
     mem_used_gb = max(0, mem_tot_mb - mem_avail_mb) / 1024.0
     mem_tot_gb = mem_tot_mb / 1024.0
-    max_temp = summary.get("max_temp_c")
-    safety = summary.get("safety", {})
-    max_temp_limit = float(safety.get("max_temp_c", 40.0))
-    bat_high = int(safety.get("battery_high_pct", 60))
+    raw_max_temp = summary.get("max_temp_c")
+    max_temp: float | None = None
+    if raw_max_temp is not None:
+        mt_v = _safe_num(raw_max_temp, -999.0)
+        if mt_v > -500.0:
+            max_temp = mt_v
+    safety = summary.get("safety") if isinstance(summary.get("safety"), dict) else {}
+    max_temp_limit = _safe_num(safety.get("max_temp_c", 40.0), 40.0)
+    bat_high = _safe_int(safety.get("battery_high_pct", 60), 60)
 
     temp_str = f"{max_temp:.1f}°C" if max_temp is not None else "N/A"
     if max_temp is not None and max_temp >= max_temp_limit:
@@ -242,12 +250,13 @@ def render_top_frame(
         temp_styled = pal.ok(temp_str)
 
     live_tag = pal.warn("⏸ PAUSED") if paused else pal.ok(f"● LIVE {refresh_sec:g}s")
-    spark_cluster = pal.cyan(make_sparkline(cpu_series, width=12 if cols < 100 else 16, max_val=100.0))
+    spark_w = 8 if cols < 64 else (12 if cols < 100 else 16)
+    spark_cluster = pal.cyan(make_sparkline(cpu_series, width=spark_w, max_val=100.0))
 
-    net_rx_tot = float(summary.get("total_net_rx_kbps", 0.0))
-    net_tx_tot = float(summary.get("total_net_tx_kbps", 0.0))
-    cpu_bar_w = 12 if cols < 100 else 16
-    mem_bar_w = 12 if cols < 100 else 16
+    net_rx_tot = _safe_num(summary.get("total_net_rx_kbps", 0.0), 0.0)
+    net_tx_tot = _safe_num(summary.get("total_net_tx_kbps", 0.0), 0.0)
+    cpu_bar_w = 8 if cols < 64 else (12 if cols < 100 else 16)
+    mem_bar_w = 8 if cols < 64 else (12 if cols < 100 else 16)
 
     top_row = (
         f"{pal.purple(_clean_term_text(summary.get('cluster_name', 'phonecluster'), 36))}  "
@@ -297,28 +306,46 @@ def render_top_frame(
     frames: list[str] = []
     frames.extend(_box_lines("PHONECLUSTER · UNIFIED MULTI-DEVICE BTOP", header_lines, cols, pal))
 
-    # 2. Per-Device Shared btop Panel
+    # 2. Per-Device Shared btop Panel (height-aware viewport anchored around selected_idx)
     all_nodes = summary.get("nodes", [])
     if pool_filter and pool_filter != "all":
         nodes = [n for n in all_nodes if str(n.get("pool", "")) == pool_filter]
     else:
         nodes = all_nodes
-    node_hist_map = history.get("nodes", {})
+    node_hist_map = history.get("nodes", {}) if isinstance(history, dict) else {}
+    est_bottom_rows = (5 if last_command_banner else 0) + 10
+    dev_row_budget = max(4, rows_avail - len(frames) - est_bottom_rows)
+    # Estimate ~4 lines per online phone; always display at least 1 phone
+    max_visible_nodes = max(1, dev_row_budget // 4)
+    if len(nodes) > max_visible_nodes and width is None:
+        clamped_sel = max(0, min(selected_idx, len(nodes) - 1))
+        win_start = max(0, min(clamped_sel - max_visible_nodes // 2, len(nodes) - max_visible_nodes))
+        win_end = min(len(nodes), win_start + max_visible_nodes)
+        visible_pairs = [(i, nodes[i]) for i in range(win_start, win_end)]
+        scroll_note = f" [{win_start + 1}-{win_end}/{len(nodes)}]"
+    else:
+        visible_pairs = list(enumerate(nodes))
+        scroll_note = ""
+
     device_lines: list[str] = []
-    for idx, n in enumerate(nodes):
+    for pos, (idx, n) in enumerate(visible_pairs):
         is_sel = idx == selected_idx
         pointer = pal.sel_bg("▶") if is_sel else " "
         h = n.get("health") or {}
         role_badge = pal.purple("MASTER") if n.get("role") == "master" else pal.dim("WORKER")
-        tier_num = int(n.get("tier", 1) or 1)
+        tier_num = _safe_int(n.get("tier", 1), 1) or 1
         pool_name = str(n.get("pool", "compute") or "compute")
         t_badge = _tier_badge(tier_num, pool_name, pal)
         nid_styled = pal.sel_bg(f"{n['id']:<6s}") if is_sel else pal.bold(f"{n['id']:<6s}")
+        n_tags = n.get("tags") if isinstance(n.get("tags"), list) else []
+        host_disp = str(n.get("host", ""))
+        if host_disp == "127.0.0.1" and ("usb-mode:adb" in n_tags or "usb-hub" in n_tags):
+            host_disp = f"usb:{n.get('worker_port', '')}"
 
         if not n.get("online"):
             err = _clean_term_text(n.get("error", "unreachable"), 42)
             device_lines.append(
-                f"{pointer} {nid_styled} [{role_badge} {t_badge}] {n['host']:<15s}  {pal.bad('✕ OFFLINE')}  {pal.dim(err)}"
+                f"{pointer} {nid_styled} [{role_badge} {t_badge}] {host_disp:<15s}  {pal.bad('✕ OFFLINE')}  {pal.dim(err)}"
             )
             continue
 
@@ -339,7 +366,7 @@ def render_top_frame(
         os_s = _clean_term_text(h.get("os_env", "linux"), 10)
         lat_txt = f"{_safe_num(n.get('latency_ms', 0), 0.0):.1f}ms"
         device_lines.append(
-            f"{pointer} {nid_styled} [{role_badge} {t_badge}] {n['host']:<15s} {pal.dim(f'{os_s:<10s}')} "
+            f"{pointer} {nid_styled} [{role_badge} {t_badge}] {host_disp:<15s} {pal.dim(f'{os_s:<10s}')} "
             f"up {up_s:<6s} {st_badge}  {pal.dim(lat_txt)}"
         )
 
@@ -401,7 +428,7 @@ def render_top_frame(
             )
             device_lines.append(f"    {pal.accent('RUN')} {running_txt}")
 
-        if idx < len(nodes) - 1:
+        if pos < len(visible_pairs) - 1:
             device_lines.append(pal.border("  " + "·" * max(10, cols - 8)))
 
     if not device_lines:
@@ -411,9 +438,9 @@ def render_top_frame(
             device_lines.append(pal.dim("No nodes configured in cluster.json."))
 
     dev_title = (
-        "DEVICES · SHARED CLUSTER VIEW"
+        f"DEVICES · SHARED CLUSTER VIEW{scroll_note}"
         if not pool_filter or pool_filter == "all"
-        else f"DEVICES · POOL FILTER: {pool_filter.upper()} (press 'p' for all)"
+        else f"DEVICES · POOL FILTER: {pool_filter.upper()}{scroll_note} (press 'p' for all)"
     )
     frames.extend(_box_lines(dev_title, device_lines, cols, pal))
 
@@ -588,7 +615,21 @@ def run_top_tui(
         return 0
 
     fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    try:
+        old_settings = termios.tcgetattr(fd)
+    except (OSError, termios.error):
+        summary = controller.cluster_summary()
+        all_jobs = controller.get_all_jobs()
+        print(
+            render_top_frame(
+                summary=summary,
+                history=controller.metrics_history.snapshot(),
+                all_jobs=all_jobs,
+                refresh_sec=refresh_sec,
+                use_color=sys.stdout.isatty(),
+            )
+        )
+        return 0
     selected_idx = 0
     view_mode = "tasks"
     pool_filter = "all"
@@ -658,6 +699,8 @@ def run_top_tui(
 
             if key in {"q", "Q", "\x03", "EOF"}:
                 break
+            elif key == "ESC":
+                last_banner = ""
             elif key in {"UP", "k"}:
                 if nodes:
                     selected_idx = (selected_idx - 1) % len(nodes)
@@ -735,7 +778,9 @@ def run_top_tui(
                 sys.stdout.write("\033[?25h\033[?1049l")
                 sys.stdout.flush()
                 try:
-                    subprocess.call(["ssh", "-p", str(sel_node.ssh_port), "--", target_ssh])
+                    ssh_rc = subprocess.call(["ssh", "-p", str(sel_node.ssh_port), "--", target_ssh])
+                    if ssh_rc != 0:
+                        last_banner = f"SSH to {sel_node.id} ({target_ssh}:{sel_node.ssh_port}) exited with code {ssh_rc}"
                 except OSError as exc:
                     last_banner = f"SSH failed: {exc}"
                 finally:

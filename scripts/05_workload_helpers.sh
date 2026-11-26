@@ -132,9 +132,14 @@ def owned_session(file, port):
     return None
 
 
-def listening(port):
+def listening(port, bind_host="0.0.0.0"):
+    probe_host = "127.0.0.1"
+    if bind_host in ("::", "[::]"):
+        probe_host = "::1"
+    elif bind_host not in ("", "0.0.0.0"):
+        probe_host = bind_host.strip("[]")
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+        with socket.create_connection((probe_host, port), timeout=0.2):
             return True
     except OSError:
         return False
@@ -144,7 +149,7 @@ def start_rpc(directory, port, bind_host="0.0.0.0"):
     session = LOG_DIR / f"llama-rpc-{port}.pid"
     owned = owned_session(session, port)
     if owned:
-        if not listening(port):
+        if not listening(port, bind_host):
             raise RuntimeError(f"Managed RPC process exists on port {port}, but its listener is unavailable.")
         print(f"Managed RPC server already running on port {port}.")
         return
@@ -157,7 +162,7 @@ def start_rpc(directory, port, bind_host="0.0.0.0"):
     else:
         raise RuntimeError(f"Neither ggml-rpc-server nor rpc-server was found under {directory} or on PATH.")
 
-    if listening(port):
+    if listening(port, bind_host):
         raise RuntimeError(f"Port {port} is already in use.")
     log_path = LOG_DIR / f"llama-rpc-{port}.log"
     with log_path.open("ab") as log:
@@ -180,7 +185,7 @@ def start_rpc(directory, port, bind_host="0.0.0.0"):
                 finally:
                     temp.unlink(missing_ok=True)
                 written = True
-            if written and started and listening(port):
+            if written and started and listening(port, bind_host):
                 print(f"Started {Path(binary).name} on port {port}.")
                 return
             time.sleep(0.1)

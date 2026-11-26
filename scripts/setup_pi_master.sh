@@ -17,6 +17,7 @@ WITH_ADGUARD=0
 WITH_FIREWALL=0
 ENABLE_GATEWAY=0
 LAN_SUBNET=""
+LAN_SUBNET_EXPLICIT=0
 RUN_USER="${SUDO_USER:-$(whoami)}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -27,7 +28,7 @@ while [[ $# -gt 0 ]]; do
     --enable-gateway) ENABLE_GATEWAY=1; shift ;;
     --lan-subnet)
       [[ $# -ge 2 ]] || { echo "Error: --lan-subnet requires a CIDR value (e.g. 192.168.1.0/24)" >&2; exit 2; }
-      LAN_SUBNET="$2"; shift 2 ;;
+      LAN_SUBNET="$2"; LAN_SUBNET_EXPLICIT=1; shift 2 ;;
     --user)
       [[ $# -ge 2 ]] || { echo "Error: --user requires a username" >&2; exit 2; }
       RUN_USER="$2"; shift 2 ;;
@@ -130,6 +131,7 @@ fi
 
 # 3. Ensure cluster.json exists (owned by RUN_USER, 0600, with Linux SSH port 22!)
 CFG_PATH="${REPO_DIR}/config/cluster.json"
+CONFIG_CREATED=0
 if [[ ! -f "${CFG_PATH}" ]]; then
   run_as_user python3 "${REPO_DIR}/phonecluster_cli.py" init-config \
     --name "pi-phonecluster" \
@@ -138,11 +140,14 @@ if [[ ! -f "${CFG_PATH}" ]]; then
     --ssh-user "${RUN_USER}" \
     --ssh-port 22 \
     --output "${CFG_PATH}"
+  CONFIG_CREATED=1
 fi
 
-# Persist chosen LAN subnet so firewall & distcc guides match this exact network
-run_as_user python3 "${REPO_DIR}/phonecluster_cli.py" \
-  --config "${CFG_PATH}" net-audit --lan-subnet "${LAN_SUBNET}" --json >/dev/null
+# Persist chosen LAN subnet on first creation or when explicitly passed via --lan-subnet
+if [[ "${CONFIG_CREATED}" -eq 1 || "${LAN_SUBNET_EXPLICIT}" -eq 1 ]]; then
+  run_as_user python3 "${REPO_DIR}/phonecluster_cli.py" \
+    --config "${CFG_PATH}" net-audit --lan-subnet "${LAN_SUBNET}" --json >/dev/null
+fi
 
 if [[ "${ENABLE_GATEWAY}" -eq 1 ]]; then
   run_as_user python3 "${REPO_DIR}/phonecluster_cli.py" \
@@ -197,8 +202,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now phonecluster-worker.service phonecluster-master.service
-echo "[OK] Installed & started phonecluster-worker.service + phonecluster-master.service (http://${MASTER_IP}:8080)"
+systemctl enable phonecluster-worker.service phonecluster-master.service
+systemctl restart phonecluster-worker.service phonecluster-master.service
+echo "[OK] Installed & restarted phonecluster-worker.service + phonecluster-master.service (http://${MASTER_IP}:8080)"
 
 # 5. Optional: Native AdGuard Home (NO Docker required — single ~12 MB Go binary!)
 if [[ "${WITH_ADGUARD}" -eq 1 ]]; then

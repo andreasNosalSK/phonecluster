@@ -717,13 +717,14 @@ def config_revision(path: Path) -> str:
 def load_config(path: str | Path | None = None) -> ClusterConfig:
     """Load and validate a ClusterConfig from JSON."""
     cfg_path = resolve_config_path(path)
-    if not cfg_path.exists():
-        raise FileNotFoundError(
-            f"Cluster config not found at '{cfg_path}'. "
-            f"Run `python3 phonecluster_cli.py init-config --output {cfg_path}` first."
-        )
     target = _canonical_config_path(cfg_path)
-    raw = target.read_bytes()
+    try:
+        raw = target.read_bytes()
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Cluster config not found at '{target}'. "
+            f"Run `python3 phonecluster_cli.py init-config --output {target}` first."
+        ) from None
     config = ClusterConfig.from_dict(json.loads(raw.decode("utf-8")))
     config._source = (target, hashlib.sha256(raw).hexdigest())
     return config

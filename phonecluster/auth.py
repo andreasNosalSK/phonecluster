@@ -662,7 +662,8 @@ def read_json_object_bounded(
                     sock.settimeout(max(0.05, rem))
                 except OSError:
                     pass
-            chunk = resp.read(min(16384, max_bytes + 1 - len(buf)))
+            need = min(16384, max_bytes + 1 - len(buf))
+            chunk = resp.read1(need) if hasattr(resp, "read1") else resp.read(need)
             if not chunk:
                 break
             buf.extend(chunk)
@@ -801,13 +802,19 @@ def verify_hmac_request(
     if parsed is None:
         return False, "malformed HMAC authorization header"
     ts, nonce, provided_sig = parsed
-    now = time.time()
-    if abs(now - ts) > max_skew_sec:
-        return False, "expired or future-dated request timestamp"
     msg = _canonical_signing_input(method, path, str(ts), nonce, body)
     expected_sig = hmac.new(expected_token.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(provided_sig, expected_sig):
         return False, "invalid HMAC request signature"
+    now = time.time()
+    skew = ts - now
+    if abs(skew) > max_skew_sec:
+        sign = "+" if skew >= 0 else "-"
+        return (
+            False,
+            f"clock skew {sign}{int(abs(skew))}s exceeds {int(max_skew_sec)}s window "
+            "(expired or future-dated request timestamp — sync clock via NTP or USB/SSH)",
+        )
     if replay_cache is not None and not replay_cache.check_and_record(nonce):
         return False, "replayed request nonce rejected"
     return True, "ok"

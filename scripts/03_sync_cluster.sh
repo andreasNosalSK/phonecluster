@@ -267,10 +267,19 @@ mkdir -p "${LOG_DIR}"
 
 # Prefer systemd --user unit on Ubuntu Touch / systemd nodes if already enabled so systemd never fights nohup
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-if [[ -f "${HOME}/.config/systemd/user/phonecluster-worker.service" ]] && command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
-  systemctl --user restart phonecluster-worker.service
-  echo "Restarted systemd --user phonecluster-worker.service for '${NODE_ID}'"
-  exit 0
+UT_UNIT="${HOME}/.config/systemd/user/phonecluster-worker.service"
+if [[ -f "${UT_UNIT}" ]] && command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  if ! grep -Fq -- "--node-id ${NODE_ID}" "${UT_UNIT}" 2>/dev/null; then
+    if [[ -f "${REMOTE_DIR}/scripts/06_ubuntu_touch_node_setup.sh" ]]; then
+      bash "${REMOTE_DIR}/scripts/06_ubuntu_touch_node_setup.sh" --boot-only --node-id "${NODE_ID}" --repo-dir "${REMOTE_DIR}" >/dev/null 2>&1 || true
+    fi
+  fi
+  if grep -Fq -- "--node-id ${NODE_ID}" "${UT_UNIT}" 2>/dev/null; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user restart phonecluster-worker.service
+    echo "Restarted systemd --user phonecluster-worker.service for '${NODE_ID}'"
+    exit 0
+  fi
 fi
 
 if [[ -f "${PID_FILE}" ]]; then

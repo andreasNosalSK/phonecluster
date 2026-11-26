@@ -88,7 +88,7 @@ def _configure_logging(verbose: bool, is_daemon: bool = False) -> None:
 
 
 def _cmd_init_config(args: argparse.Namespace) -> int:
-    out_path = Path(args.output)
+    out_path = Path(args.output) if args.output else resolve_config_path(args.config)
     previous_revision = config_revision(out_path)
     if previous_revision and not args.force:
         print(
@@ -755,6 +755,7 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
             prefix = validate_subnet_prefix(args.subnet_prefix)
             cfg_path = resolve_config_path(args.config)
             unit_mode = "adb" if args.mode == "auto" else args.mode
+            router_sh = bundled_script("07_usb_hub_router.sh")
             unit = generate_usb_hub_systemd_unit(
                 unit_mode,
                 config_path=cfg_path.resolve(),
@@ -764,6 +765,8 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
                 wan_iface=args.wan_iface,
                 gateway_port=args.gateway_port,
                 interval_sec=args.interval,
+                router_script=router_sh,
+                use_python_module=not (REPO_ROOT / "phonecluster_cli.py").is_file(),
             )
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
@@ -790,18 +793,25 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
             if not ready:
                 print("No authorized ADB phones found on USB hub. Run `adb devices` and approve USB debugging.", file=sys.stderr)
                 return 1
-            if getattr(args, "auto_detect", False):
+            eff_remote_ssh = args.remote_ssh_port if args.remote_ssh_port is not None else 8022
+            do_auto_detect = bool(getattr(args, "auto_detect", False)) or (
+                not bool(getattr(args, "no_auto_detect", False)) and bool(topo.get("adb_installed"))
+            )
+            if do_auto_detect:
                 enriched_ready = []
                 for dev in ready:
                     prof = probe_adb_device_profile(dev["serial"])
                     item = dict(dev)
                     if prof.get("os_env") != "unknown":
                         item["os_env"] = prof["os_env"]
-                        item["remote_ssh_port"] = prof["remote_ssh_port"]
+                        if args.remote_ssh_port is None:
+                            item["remote_ssh_port"] = prof["remote_ssh_port"]
                     if prof.get("ssh_user"):
                         item["ssh_user"] = prof["ssh_user"]
                     enriched_ready.append(item)
                 ready = enriched_ready
+            elif args.remote_ssh_port is not None:
+                ready = [{**dev, "remote_ssh_port": eff_remote_ssh} for dev in ready]
             cfg_path = resolve_config_path(args.config)
             cfg = load_config(cfg_path) if cfg_path.exists() or (args.write_config and not args.dry_run) else None
             eff_gw_port = args.gateway_port
@@ -816,7 +826,7 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
                 worker_base_port=args.worker_base_port,
                 ssh_base_port=args.ssh_base_port,
                 remote_worker_port=args.remote_worker_port,
-                remote_ssh_port=args.remote_ssh_port,
+                remote_ssh_port=eff_remote_ssh,
                 gateway_port=eff_gw_port,
                 enable_gateway_reverse=eff_gw_rev,
                 enable_peer_mesh=not args.no_peer_mesh,
@@ -838,7 +848,7 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
                 return 0 if apply_res.get("ok") else 1
             print(f"ADB USB Hub Plan ({len(plan['nodes'])} phone(s), {len(plan['forward_rules'])} forwards, {len(plan['reverse_rules'])} reverses):")
             for n in plan["nodes"]:
-                print(f"  - {n['node_id']} ({n['serial']}) -> 127.0.0.1:{n['worker_port']} (worker), 127.0.0.1:{n['ssh_port']} (ssh)")
+                print(f"  - {n['node_id']} ({n['serial']}) -> 127.0.0.1:{n['worker_port']} (worker), 127.0.0.1:{n['ssh_port']} (ssh->{n['remote_ssh_port']})")
             if args.dry_run:
                 print("(dry-run: tunnel changes previewed)")
             else:
@@ -856,12 +866,26 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
             if not ifaces:
                 print("No USB-Ethernet / RNDIS gadget interfaces detected on this host.", file=sys.stderr)
                 return 1
-            plan = plan_rndis_usb_hub(ifaces, subnet_prefix=prefix, ssh_port=args.remote_ssh_port)
-            cmds = build_rndis_router_commands(plan, nat_wan=args.nat_wan, wan_iface=args.wan_iface)
+            cfg_path = resolve_config_path(args.config)
+            cfg = load_config(cfg_path) if cfg_path.exists() or (args.write_config and not args.dry_run) else None
+            eff_remote_ssh = args.remote_ssh_port if args.remote_ssh_port is not None else 22
+            eff_gw_port = args.gateway_port
+            if cfg is not None and eff_gw_port == 8888 and cfg.gateway.port > 0:
+                eff_gw_port = cfg.gateway.port
+            plan = plan_rndis_usb_hub(
+                ifaces,
+                subnet_prefix=prefix,
+                ssh_port=eff_remote_ssh,
+                existing_nodes=cfg.nodes if cfg is not None else None,
+            )
+            cmds = build_rndis_router_commands(
+                plan,
+                nat_wan=args.nat_wan,
+                wan_iface=args.wan_iface,
+                gateway_port=eff_gw_port,
+            )
             updated = []
-            if args.write_config and not args.dry_run:
-                cfg_path = resolve_config_path(args.config)
-                cfg = load_config(cfg_path)
+            if args.write_config and not args.dry_run and cfg is not None:
                 updated = sync_usb_hub_into_config(cfg, plan)
                 save_config(cfg, cfg_path)
             out = {"plan": plan, "commands": cmds, "updated_nodes": updated}
@@ -889,13 +913,22 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
             print(f"Error: --interval must be between 1 and 3600 seconds (got {args.interval})", file=sys.stderr)
             return 2
         cfg_path = resolve_config_path(args.config)
+        eff_remote_ssh = args.remote_ssh_port if args.remote_ssh_port is not None else 8022
+        eff_gw_port = args.gateway_port
+        if cfg_path.exists():
+            try:
+                serve_cfg = load_config(cfg_path)
+                if eff_gw_port == 8888 and serve_cfg.gateway.port > 0:
+                    eff_gw_port = serve_cfg.gateway.port
+            except Exception:
+                pass
         wd = UsbHubWatchdog(
             interval_sec=args.interval,
             worker_base_port=args.worker_base_port,
             ssh_base_port=args.ssh_base_port,
             remote_worker_port=args.remote_worker_port,
-            remote_ssh_port=args.remote_ssh_port,
-            gateway_port=args.gateway_port,
+            remote_ssh_port=eff_remote_ssh,
+            gateway_port=eff_gw_port,
             enable_gateway_reverse=not args.no_gateway_reverse,
             enable_peer_mesh=not args.no_peer_mesh,
             config_path=cfg_path if cfg_path.exists() else None,
@@ -1278,18 +1311,28 @@ def _cmd_join(args: argparse.Namespace) -> int:
         print("  Master SSH Key   : Added to ~/.ssh/authorized_keys")
 
     # Configure OS auto-start automatically (Termux:Boot on Android, systemd --user on Ubuntu Touch — offline-safe!)
+    started_by_systemd = False
     if "com.termux" in os.environ.get("PREFIX", ""):
-        setup_sh = REPO_ROOT / "scripts" / "02_termux_node_setup.sh"
-        if setup_sh.exists():
+        setup_sh = bundled_script("02_termux_node_setup.sh")
+        if setup_sh is not None:
             print("  Updating Termux:Boot startup script for your new node ID...")
             subprocess.call(["bash", str(setup_sh), "--boot-only", "--node-id", res["node_id"], "--repo-dir", str(REPO_ROOT)])
     elif is_ubuntu_touch_os(detect_os_environment()):
-        ut_setup_sh = REPO_ROOT / "scripts" / "06_ubuntu_touch_node_setup.sh"
-        if ut_setup_sh.exists():
+        ut_setup_sh = bundled_script("06_ubuntu_touch_node_setup.sh")
+        if ut_setup_sh is not None:
             print("  Updating Ubuntu Touch systemd --user service for your new node ID...")
             subprocess.call(["bash", str(ut_setup_sh), "--boot-only", "--node-id", res["node_id"], "--repo-dir", str(REPO_ROOT)])
+            if shutil.which("systemctl"):
+                chk = subprocess.run(
+                    ["systemctl", "--user", "is-active", "--quiet", "phonecluster-worker.service"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if chk.returncode == 0:
+                    started_by_systemd = True
+                    print("  Worker Daemon    : Active via systemd --user (phonecluster-worker.service)")
 
-    if not args.no_start:
+    if not args.no_start and not started_by_systemd:
         log_dir = REPO_ROOT / "logs"
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -1795,7 +1838,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.add_argument("--ssh-user", default="", help="Default Termux/Debian SSH username (from `whoami`)")
     p_init.add_argument("--ssh-port", type=int, default=DEFAULT_SSH_PORT, help=f"Default SSH port (default: {DEFAULT_SSH_PORT}; use 22 for Raspberry Pi/Debian)")
-    p_init.add_argument("-o", "--output", default=str(DEFAULT_CONFIG_PATH), help="Output JSON path")
+    p_init.add_argument("-o", "--output", default=None, help="Output JSON path (defaults to --config or $PHONECLUSTER_CONFIG)")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing config file")
     p_init.set_defaults(func=_cmd_init_config)
 
@@ -1998,13 +2041,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_usb = sub.add_parser("usb-hub", help="Discover, configure, and verify zero-Wi-Fi USB 3.0 hub routing (ADB mesh or RNDIS /30 router)")
     p_usb.add_argument("action", nargs="?", default="scan", choices=["scan", "setup", "serve", "verify", "systemd-unit"], help="USB hub action")
     p_usb.add_argument("--mode", default="auto", choices=["auto", "adb", "rndis"], help="Routing mode: auto, adb (zero-root), or rndis (L3 /30)")
-    p_usb.add_argument("--auto-detect", action="store_true", help="Probe each ADB phone for OS (Ubuntu Touch vs Termux), SSH port (22 vs 8022), and SSH user")
+    p_usb.add_argument("--auto-detect", action="store_true", help="Probe each ADB phone for OS (Ubuntu Touch vs Termux), SSH port (22 vs 8022), and SSH user (default ON when adb is present)")
+    p_usb.add_argument("--no-auto-detect", action="store_true", help="Skip ADB OS/SSH probing during setup")
     p_usb.add_argument("--probe-devices", action="store_true", help="During `scan`, probe attached ADB phones for OS, SSH port, and USB charging power")
     p_usb.add_argument("--subnet-prefix", default=DEFAULT_USB_SUBNET_PREFIX, help="Private /16 prefix for rndis /30 subnets (default: 10.77)")
     p_usb.add_argument("--worker-base-port", type=int, default=DEFAULT_ADB_WORKER_BASE_PORT, help="Base local port for ADB worker forwards (default: 18760)")
     p_usb.add_argument("--ssh-base-port", type=int, default=DEFAULT_ADB_SSH_BASE_PORT, help="Base local port for ADB SSH forwards (default: 18020)")
     p_usb.add_argument("--remote-worker-port", type=int, default=8765, help="New ADB phones' worker listener port (default: 8765)")
-    p_usb.add_argument("--remote-ssh-port", type=int, default=22, help="Phone SSH port (22 for Ubuntu Touch/Debian, 8022 for Termux)")
+    p_usb.add_argument("--remote-ssh-port", type=int, default=None, help="Phone SSH port override (default: auto-detect/8022 for ADB, 22 for RNDIS)")
     p_usb.add_argument("--gateway-port", type=int, default=8888, help="Master Network Guard port for ADB reverse (default: 8888)")
     p_usb.add_argument("--no-gateway-reverse", action="store_true", help="Disable ADB reverse tunnel to Master Network Guard")
     p_usb.add_argument("--no-peer-mesh", action="store_true", help="Disable phone-to-phone ADB peer mesh forwarding")

@@ -25,6 +25,7 @@ from .telemetry import (
     is_ubuntu_touch_os,
     read_battery_via_termux,
 )
+from .usbhub import detect_usb_hub_topology
 
 
 @dataclass
@@ -73,7 +74,14 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
         if probe_cfg_path.exists():
             try:
                 probe_cfg = load_config(probe_cfg_path)
-                cand_ports = sorted({n.ssh_port for n in probe_cfg.nodes if n.ssh_port not in {22, 8022}})
+                # Exclude ADB-forwarded worker ports so local `adb forward` tunnels don't masquerade as a local sshd
+                cand_ports = sorted({
+                    n.ssh_port
+                    for n in probe_cfg.nodes
+                    if n.ssh_port not in {22, 8022}
+                    and n.adb is None
+                    and "usb-mode:adb" not in (n.tags or [])
+                })
                 for cp in cand_ports:
                     if (lmap_ssh is not None and cp in lmap_ssh) or (lmap_ssh is None and is_local_port_open(cp)):
                         custom_ssh_port = cp
@@ -165,15 +173,27 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
     if is_ubuntu_touch_os(os_env):
         try:
             ut_unit = Path.home() / ".config" / "systemd" / "user" / "phonecluster-worker.service"
+            ut_enabled = Path.home() / ".config" / "systemd" / "user" / "default.target.wants" / "phonecluster-worker.service"
             has_ut_unit = ut_unit.exists()
+            has_ut_enabled = ut_enabled.exists() or ut_enabled.is_symlink()
         except (OSError, RuntimeError):
             has_ut_unit = False
-        if has_ut_unit:
+            has_ut_enabled = False
+        if has_ut_unit and has_ut_enabled:
             checks.append(
                 CheckResult(
                     "Ubuntu Touch Auto-Start",
                     "ok",
-                    "Found systemd --user service (~/.config/systemd/user/phonecluster-worker.service)",
+                    "Found & enabled systemd --user service (~/.config/systemd/user/phonecluster-worker.service)",
+                )
+            )
+        elif has_ut_unit:
+            checks.append(
+                CheckResult(
+                    "Ubuntu Touch Auto-Start",
+                    "warn",
+                    "Found systemd --user unit, but it is not enabled under default.target.wants",
+                    "Enable with: `systemctl --user daemon-reload && systemctl --user enable --now phonecluster-worker.service`.",
                 )
             )
         else:
@@ -381,8 +401,10 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                     )
                 else:
                     lmap = _read_listening_tcp_map()
+                    gw_exposed: bool | None = None
                     if lmap is not None:
                         gw_live = gw_port in lmap
+                        gw_exposed = lmap.get(gw_port)
                     else:
                         bind_h = normalize_host(cfg.gateway.bind_host)
                         gw_live = False
@@ -390,25 +412,48 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                             try:
                                 with socket.create_connection((bind_h, gw_port), timeout=0.25):
                                     gw_live = True
+                                    gw_exposed = True
                             except OSError:
                                 gw_live = False
-                        if not gw_live:
+                        else:
                             gw_live = is_local_port_open(gw_port)
-                    if gw_live:
-                        checks.append(
-                            CheckResult(
-                                "Master Network Guard",
-                                "ok",
-                                f"Enabled & listening (mode={cfg.gateway.mode}, port={gw_port}, SSRF guard={'ON' if cfg.gateway.block_private_ips else 'OFF'})",
-                            )
-                        )
-                    else:
+                    has_non_loopback_workers = any(
+                        n.role != "master" and not is_loopback_or_unspecified_host(n.host)
+                        for n in cfg.nodes
+                    )
+                    if not gw_live:
                         checks.append(
                             CheckResult(
                                 "Master Network Guard",
                                 "warn",
                                 f"Enabled in config (mode={cfg.gateway.mode}, port={gw_port}) but proxy is NOT currently listening on port {gw_port}",
                                 "Start Master Dashboard (`pc dashboard`) or standalone proxy (`pc gateway`) so worker jobs can reach allowlisted sites.",
+                            )
+                        )
+                    elif gw_exposed is False and has_non_loopback_workers:
+                        checks.append(
+                            CheckResult(
+                                "Master Network Guard",
+                                "warn",
+                                f"Listening on port {gw_port}, but bound to loopback only while remote LAN/RNDIS workers exist",
+                                "Set `gateway.bind_host` to `0.0.0.0` (or Master's LAN IP) so non-ADB workers can reach the proxy.",
+                            )
+                        )
+                    elif not cfg.gateway.block_private_ips or cfg.gateway.mode == "monitor":
+                        checks.append(
+                            CheckResult(
+                                "Master Network Guard",
+                                "warn",
+                                f"Listening (mode={cfg.gateway.mode}, port={gw_port}, SSRF guard={'ON' if cfg.gateway.block_private_ips else 'OFF'})",
+                                "Use `allowlist` or `block_all` mode and keep `block_private_ips=true` (SSRF guard) enabled.",
+                            )
+                        )
+                    else:
+                        checks.append(
+                            CheckResult(
+                                "Master Network Guard",
+                                "ok",
+                                f"Enabled & listening (mode={cfg.gateway.mode}, port={gw_port}, SSRF guard=ON)",
                             )
                         )
             else:
@@ -419,6 +464,43 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                         "Disabled (default direct LAN mode). Optional: enable in Web UI Tab 5 or `pc gateway --enable` to proxy & filter old worker WAN traffic.",
                     )
                 )
+
+            # 5b. USB 3.0 Hub diagnostics when USB nodes are configured
+            usb_nodes_cfg = [
+                n for n in cfg.nodes
+                if n.adb is not None or "usb-hub" in (n.tags or []) or "usb-mode:adb" in (n.tags or []) or "usb-mode:rndis" in (n.tags or [])
+            ]
+            if usb_nodes_cfg:
+                adb_cfg_nodes = [n for n in usb_nodes_cfg if n.adb is not None or "usb-mode:adb" in (n.tags or [])]
+                rndis_cfg_nodes = [n for n in usb_nodes_cfg if n not in adb_cfg_nodes]
+                topo = detect_usb_hub_topology()
+                usb_issues: list[str] = []
+                if adb_cfg_nodes and not topo.get("adb_installed"):
+                    usb_issues.append("`adb` binary not found on PATH")
+                unauth_adb = [d for d in (topo.get("adb_devices") or []) if d.get("state") != "device"]
+                if unauth_adb:
+                    usb_issues.append(f"{len(unauth_adb)} unauthorized/offline ADB phone(s)")
+                if len(rndis_cfg_nodes) >= 2 and not topo.get("ipv4_forwarding_enabled"):
+                    usb_issues.append("net.ipv4.ip_forward=0 (blocks RNDIS phone-to-phone routing)")
+                if topo.get("subnet_collisions"):
+                    usb_issues.append("USB tethering subnet collision detected")
+                if usb_issues:
+                    checks.append(
+                        CheckResult(
+                            "USB 3.0 Hub",
+                            "warn",
+                            f"{len(usb_nodes_cfg)} USB node(s) configured — {'; '.join(usb_issues)}",
+                            "Run `pc usb-hub verify` (ADB) or `sudo bash scripts/07_usb_hub_router.sh setup-rndis` (RNDIS).",
+                        )
+                    )
+                else:
+                    checks.append(
+                        CheckResult(
+                            "USB 3.0 Hub",
+                            "ok",
+                            f"{len(usb_nodes_cfg)} USB node(s) configured (ADB ready={topo.get('adb_ready_count', 0)}, USB-Net={topo.get('usb_net_count', 0)})",
+                        )
+                    )
         except Exception as exc:
             checks.append(
                 CheckResult(
@@ -439,22 +521,44 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
         q_online = [s.node.id for s in online if s.node.id in quarantined]
         q_suffix = f"; quarantined: {', '.join(q_online)}" if q_online else ""
         if not online:
+            has_usb_any = any(n.adb is not None or "usb-hub" in (n.tags or []) for n in cfg.nodes)
+            hint = (
+                "Check USB cables/powered hub, run `pc usb-hub verify`, and ensure worker daemons are running (`pc sync`)."
+                if has_usb_any
+                else "Ensure worker daemons are started (`./scripts/03_sync_cluster.sh`) and IPs in cluster.json match your phones."
+            )
             checks.append(
                 CheckResult(
                     "Cluster Nodes",
                     "fail",
                     f"0/{len(snaps)} nodes reachable",
-                    "Ensure worker daemons are started (`./scripts/03_sync_cluster.sh`) and IPs in cluster.json match your phones.",
+                    hint,
                 )
             )
         elif len(online) < len(snaps):
-            offline_ids = [s.node.id for s in snaps if not s.online]
+            offline_snaps = [s for s in snaps if not s.online]
+            offline_ids = [s.node.id for s in offline_snaps]
+            offline_usb = [s.node.id for s in offline_snaps if s.node.adb is not None or "usb-hub" in (s.node.tags or [])]
+            hint = (
+                "Check USB hub cable/ADB tunnels (`pc usb-hub verify`) and start worker on offline phone(s)."
+                if offline_usb and len(offline_usb) == len(offline_snaps)
+                else "Check Wi-Fi/USB connection and start worker on offline phone(s)."
+            )
             checks.append(
                 CheckResult(
                     "Cluster Nodes",
                     "warn",
                     f"{len(online)}/{len(snaps)} online ({len(ready)} ready{q_suffix}); offline: {', '.join(offline_ids)}",
-                    "Check Wi-Fi connection and start worker on offline phone(s).",
+                    hint,
+                )
+            )
+        elif len(ready) == 0:
+            checks.append(
+                CheckResult(
+                    "Cluster Nodes",
+                    "warn",
+                    f"All {len(snaps)}/{len(snaps)} nodes online, but 0 ready for jobs{q_suffix}",
+                    "Inspect thermal/RAM/quarantine status (`pc status` or Dashboard Tab 6).",
                 )
             )
         else:
@@ -466,8 +570,10 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                 )
             )
 
-        # Battery swelling, PMIC hazard, and thermal safety check across online phones
+        # Battery swelling, PMIC hazard, low RAM, discharging power, and thermal safety check across online phones
         high_bat_nodes: list[str] = []
+        low_bat_nodes: list[str] = []
+        low_ram_nodes: list[str] = []
         hazard_bat_nodes: list[str] = []
         hot_nodes: list[str] = []
         for s in online:
@@ -496,8 +602,33 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                 hazard_bat_nodes.append(f"{s.node.id} ({b_health})")
             if pct_val is not None and pct_val >= cfg.safety.battery_high_pct and st in {"CHARGING", "FULL"}:
                 high_bat_nodes.append(f"{s.node.id} ({int(pct_val)}% {st})")
+            if pct_val is not None and pct_val <= cfg.safety.battery_low_pct and st in {"DISCHARGING", "NOT_CHARGING"}:
+                low_bat_nodes.append(f"{s.node.id} ({int(pct_val)}% {st})")
+            if h.get("low_ram"):
+                avail_mb = h.get("mem_available_mb")
+                low_ram_nodes.append(f"{s.node.id} ({avail_mb}MB free)")
             if h.get("overheated") or (temp_val is not None and temp_val >= cfg.safety.max_temp_c):
                 hot_nodes.append(f"{s.node.id} ({temp_val if temp_val is not None else temp_raw}C)")
+
+        if low_ram_nodes:
+            checks.append(
+                CheckResult(
+                    "Cluster Memory Headroom",
+                    "warn",
+                    f"Low free RAM (< {cfg.safety.min_free_ram_mb}MB) blocking jobs on: {', '.join(low_ram_nodes)}",
+                    "Stop heavy background apps/containers or adjust `safety.min_free_ram_mb`.",
+                )
+            )
+
+        if low_bat_nodes:
+            checks.append(
+                CheckResult(
+                    "Low Battery / USB Power",
+                    "warn",
+                    f"Discharging at or below {cfg.safety.battery_low_pct}%: {', '.join(low_bat_nodes)}",
+                    "Check charger cables or ensure your USB 3.0 hub uses an external 12V/3A-5A power adapter.",
+                )
+            )
 
         if hazard_bat_nodes:
             checks.append(

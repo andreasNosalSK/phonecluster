@@ -125,7 +125,8 @@ elif [[ ! -f "${INSTALL_DIR}/phonecluster_cli.py" ]]; then
   if ! command -v git >/dev/null 2>&1; then
     if [[ "${IS_TERMUX}" -eq 1 ]]; then
       echo "Installing git in Termux..."
-      pkg update -y && pkg install -y git
+      DEBIAN_FRONTEND=noninteractive pkg update -y -o Dpkg::Options::="--force-confold" && \
+        DEBIAN_FRONTEND=noninteractive pkg install -y -o Dpkg::Options::="--force-confold" git
     else
       echo "Error: 'git' is required to download PhoneCluster from ${REPO_URL}." >&2
       exit 1
@@ -148,11 +149,11 @@ echo
 # 1. Install OS packages cleanly
 if [[ "${IS_TERMUX}" -eq 1 ]]; then
   echo "[1/4] Installing Termux packages (openssh, termux-api, python, jq, tmux, git)..."
-  pkg update -y
-  pkg install -y openssh termux-api python jq tmux git
+  DEBIAN_FRONTEND=noninteractive pkg update -y -o Dpkg::Options::="--force-confold"
+  DEBIAN_FRONTEND=noninteractive pkg install -y -o Dpkg::Options::="--force-confold" openssh termux-api python jq tmux git
   if [[ "${WITH_COMPUTE}" -eq 1 ]]; then
     echo "[1b/4] Installing native ARM64 compute & compiler tools..."
-    pkg install -y clang cmake make distcc openmpi htop
+    DEBIAN_FRONTEND=noninteractive pkg install -y -o Dpkg::Options::="--force-confold" clang cmake make distcc openmpi htop
   fi
 else
   echo "[1/4] Checking Python 3..."

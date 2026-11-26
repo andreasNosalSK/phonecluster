@@ -392,7 +392,8 @@ def build_service_registry(
                 if for_node is None or for_node.id != snap.node.id:
                     if not adb.peer_mesh or port not in USB_MESH_DEFAULT_PORTS:
                         continue
-                    if for_node is not None and (for_node.adb is None or not for_node.adb.peer_mesh):
+                    for_local_master = for_node is not None and for_node.role == "master" and is_loopback_or_unspecified_host(for_node.host)
+                    if for_node is not None and not for_local_master and (for_node.adb is None or not for_node.adb.peer_mesh):
                         continue
                     port = adb.mesh_base_port + USB_MESH_DEFAULT_PORTS.index(port)
                     transport = "adb"
@@ -404,7 +405,13 @@ def build_service_registry(
                 elif loopback_only and not node_is_local:
                     continue
                 elif node_is_local and (for_node.adb is not None or not is_loopback_or_unspecified_host(for_node.host)):
-                    if snap.node.role != "master" or not master_lan_host or lp_exposed.get(port) is not True:
+                    if (
+                        snap.node.role != "master"
+                        or for_node.adb is not None
+                        or not master_lan_host
+                        or is_loopback_or_unspecified_host(master_lan_host)
+                        or lp_exposed.get(port) is not True
+                    ):
                         continue
                     host = master_lan_host
             seen_on_node.add(name)
@@ -512,7 +519,11 @@ def _pick_primary_service(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_cross_tier_env(
-    snapshots: list[Any], config: ClusterConfig, *, for_node: NodeConfig | None = None
+    snapshots: list[Any],
+    config: ClusterConfig,
+    *,
+    for_node: NodeConfig | None = None,
+    master_lan_host: str | None = None,
 ) -> dict[str, str]:
     """Generate `PHONECLUSTER_*` service-discovery env vars injected into every job.
 
@@ -526,7 +537,7 @@ def build_cross_tier_env(
         m_host = normalize_host(master_node.host)
         has_remote_nodes = any(not is_loopback_or_unspecified_host(n.host) for n in config.nodes)
         if is_loopback_or_unspecified_host(m_host) and has_remote_nodes:
-            lan_ip = normalize_host(detect_local_ip())
+            lan_ip = normalize_host(master_lan_host if master_lan_host is not None else detect_local_ip())
             if lan_ip and not is_loopback_or_unspecified_host(lan_ip):
                 m_host = lan_ip
         env["PHONECLUSTER_MASTER_HOST"] = m_host or master_node.host
@@ -592,13 +603,26 @@ def build_cross_tier_env(
         (s for s in snapshots if s.online and s.node.id not in quarantined),
         key=lambda s: (0 if s.ready_for_jobs else 1, s.node.id),
     )
+    for_remote = for_node is not None and (for_node.adb is not None or not is_loopback_or_unspecified_host(for_node.host))
     for snap in ordered_snaps:
         if snap.node.adb is not None:
             continue
+        node_host = snap.node.host
+        if for_remote and is_loopback_or_unspecified_host(node_host):
+            if (
+                snap.node.role == "master"
+                and for_node is not None
+                and for_node.adb is None
+                and m_host
+                and not is_loopback_or_unspecified_host(m_host)
+            ):
+                node_host = m_host
+            else:
+                continue
         _t, pool = resolve_node_tier_and_pool(snap.node, snap.health)
         hosts = pool_hosts.setdefault(pool, [])
-        if snap.node.host not in hosts:
-            hosts.append(snap.node.host)
+        if node_host not in hosts:
+            hosts.append(node_host)
     for pool_name, hosts in sorted(pool_hosts.items()):
         key = re.sub(r"[^A-Z0-9]+", "_", pool_name.upper()).strip("_")
         if key:

@@ -230,12 +230,13 @@ def build_worker_proxy_env(
         return {}
 
     m_host = normalize_host(master_host) if master_host else ""
-    if "usb-hub" in node.tags and is_loopback_or_unspecified_host(node.host):
+    if (node.adb is not None or "usb-hub" in node.tags) and is_loopback_or_unspecified_host(node.host):
         # ADB USB-hub workers reach Master's gateway over `adb reverse` on 127.0.0.1 even with Wi-Fi OFF
         m_host = "127.0.0.1"
-    elif not m_host:
+    else:
         rndis_gw = _rndis_master_host_for_node(node)
         if rndis_gw:
+            # RNDIS /30 USB-hub workers are air-gapped from Wi-Fi and must reach Master via their /30 .1 IP
             m_host = rndis_gw
     if not m_host and config.nodes:
         master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
@@ -344,6 +345,8 @@ def evaluate_policy(host: str, port: int, gw: GatewayConfig) -> tuple[bool, str]
 _NAT64_WELL_KNOWN_NET = ipaddress.IPv6Network("64:ff9b::/96")
 _NAT64_LOCAL_NET = ipaddress.IPv6Network("64:ff9b:1::/48")
 _SIIT_TRANSLATED_NET = ipaddress.IPv6Network("::ffff:0:0:0/96")
+_CGNAT_NET = ipaddress.IPv4Network("100.64.0.0/10")
+_IETF_PROTO_NET = ipaddress.IPv4Network("192.0.0.0/24")
 
 
 def _is_disallowed_addr(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -355,9 +358,14 @@ def _is_disallowed_addr(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> 
             return True  # Block deprecated 6to4 tunneling (RFC 7526) to prevent SSRF bypass
         if addr.teredo is not None:
             return True  # Block Teredo tunneling to prevent SSRF bypass
-        if addr in _NAT64_WELL_KNOWN_NET or addr in _NAT64_LOCAL_NET or addr in _SIIT_TRANSLATED_NET:
+        if addr in _NAT64_LOCAL_NET:
+            return True  # RFC 8215 local-use NAT64 prefix is private/non-global (may embed IPv4 in upper bits)
+        if addr in _NAT64_WELL_KNOWN_NET or addr in _SIIT_TRANSLATED_NET:
             embedded_v4 = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
             return _is_disallowed_addr(embedded_v4)
+    elif isinstance(addr, ipaddress.IPv4Address):
+        if addr in _CGNAT_NET or addr in _IETF_PROTO_NET:
+            return True
     return bool(
         (not addr.is_global)
         or addr.is_private
@@ -416,6 +424,7 @@ class GatewayAuditLog:
     def __init__(self, maxlen: int = 200) -> None:
         self._lock = threading.Lock()
         self._events: collections.deque[dict[str, Any]] = collections.deque(maxlen=maxlen)
+        self._per_node: dict[str, dict[str, int]] = {}
         self.total_allowed = 0
         self.total_blocked = 0
         self.auth_failures = 0
@@ -434,9 +443,10 @@ class GatewayAuditLog:
         bytes_in: int = 0,
         bytes_out: int = 0,
     ) -> None:
+        clean_nid = _sanitize_log_text(node_id, 64)
         entry = {
             "ts": int(time.time()),
-            "node_id": _sanitize_log_text(node_id, 64),
+            "node_id": clean_nid,
             "client_ip": _sanitize_log_text(client_ip, 64),
             "method": _sanitize_log_text(method, 24),
             "host": _sanitize_log_text(host, 160),
@@ -455,11 +465,21 @@ class GatewayAuditLog:
                 self.total_blocked += 1
             else:
                 self.total_blocked += 1
-            self.bytes_total += bytes_in + bytes_out
+            self.bytes_total += int(bytes_in) + int(bytes_out)
+            # Track lifetime per-node totals (bounded key cardinality) so stats survive >200 ring-buffer events
+            stat_key = clean_nid if (clean_nid in self._per_node or len(self._per_node) < 256) else "other"
+            bucket = self._per_node.setdefault(stat_key, {"allowed": 0, "blocked": 0, "bytes_in": 0, "bytes_out": 0})
+            if action == "allow":
+                bucket["allowed"] += 1
+            else:
+                bucket["blocked"] += 1
+            bucket["bytes_in"] += int(bytes_in)
+            bucket["bytes_out"] += int(bytes_out)
 
     def clear(self) -> None:
         with self._lock:
             self._events.clear()
+            self._per_node.clear()
             self.total_allowed = 0
             self.total_blocked = 0
             self.auth_failures = 0
@@ -468,14 +488,7 @@ class GatewayAuditLog:
     def snapshot(self, limit: int = 60) -> dict[str, Any]:
         with self._lock:
             events = list(self._events)[:limit]
-            per_node: dict[str, dict[str, int]] = {}
-            for ev in self._events:
-                nid = ev["node_id"]
-                bucket = per_node.setdefault(nid, {"allowed": 0, "blocked": 0})
-                if ev["action"] == "allow":
-                    bucket["allowed"] += 1
-                else:
-                    bucket["blocked"] += 1
+            per_node = {nid: dict(stats) for nid, stats in self._per_node.items()}
             return {
                 "total_allowed": self.total_allowed,
                 "total_blocked": self.total_blocked,
@@ -1068,6 +1081,7 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
         self._node_req_times: dict[str, collections.deque[float]] = {}
         self._active_conns_lock = threading.Lock()
         self._active_node_sockets: dict[str, set[socket.socket]] = {}
+        self._active_ip_sockets: dict[str, set[socket.socket]] = {}
         self._active_node_conns: dict[str, int] = {}
         bind_host = normalize_host(str(addr[0])) or "0.0.0.0"
         if ":" in bind_host:
@@ -1090,26 +1104,59 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
         finally:
             self._thread_sem.release()
 
-    def register_node_sockets(self, node_id: str, *socks: socket.socket) -> None:
+    @staticmethod
+    def _canonical_ip_key(ip_str: str) -> str:
+        norm = normalize_host(ip_str)
+        if not norm:
+            return ""
+        try:
+            addr = ipaddress.ip_address(norm)
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+                addr = addr.ipv4_mapped
+            return str(addr)
+        except ValueError:
+            return norm
+
+    def register_node_sockets(self, node_id: str, *socks: socket.socket, client_ip: str = "") -> None:
+        ip_key = self._canonical_ip_key(client_ip) if client_ip else ""
         with self._active_conns_lock:
             bucket = self._active_node_sockets.setdefault(node_id, set())
             for s in socks:
                 bucket.add(s)
+            if ip_key and not is_loopback_or_unspecified_host(ip_key):
+                ip_bucket = self._active_ip_sockets.setdefault(ip_key, set())
+                for s in socks:
+                    ip_bucket.add(s)
 
-    def unregister_node_sockets(self, node_id: str, *socks: socket.socket) -> None:
+    def unregister_node_sockets(self, node_id: str, *socks: socket.socket, client_ip: str = "") -> None:
+        ip_key = self._canonical_ip_key(client_ip) if client_ip else ""
         with self._active_conns_lock:
             bucket = self._active_node_sockets.get(node_id)
-            if not bucket:
-                return
-            for s in socks:
-                bucket.discard(s)
-            if not bucket:
-                self._active_node_sockets.pop(node_id, None)
+            if bucket:
+                for s in socks:
+                    bucket.discard(s)
+                if not bucket:
+                    self._active_node_sockets.pop(node_id, None)
+            if ip_key:
+                ip_bucket = self._active_ip_sockets.get(ip_key)
+                if ip_bucket:
+                    for s in socks:
+                        ip_bucket.discard(s)
+                    if not ip_bucket:
+                        self._active_ip_sockets.pop(ip_key, None)
 
     def disconnect_node(self, node_id: str) -> int:
-        """Immediately sever all active proxy/CONNECT tunnels belonging to `node_id` without cross-thread close FD races."""
+        """Immediately sever all active proxy/CONNECT tunnels belonging to `node_id` or its non-loopback IP."""
+        target_ips: set[str] = set()
+        for node in list(self.cluster_config.nodes):
+            if node.id == node_id and node.role != "master":
+                ip_k = self._canonical_ip_key(node.host)
+                if ip_k and not is_loopback_or_unspecified_host(ip_k):
+                    target_ips.add(ip_k)
         with self._active_conns_lock:
-            socks = list(self._active_node_sockets.pop(node_id, set()))
+            socks: set[socket.socket] = set(self._active_node_sockets.pop(node_id, set()))
+            for ip_k in target_ips:
+                socks.update(self._active_ip_sockets.pop(ip_k, set()))
         closed = 0
         for s in socks:
             try:
@@ -1185,29 +1232,32 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
     def authenticate_worker(self, headers: dict[str, str], client_ip: str) -> tuple[str | None, str]:
         creds = _parse_basic_proxy_auth(headers)
         is_lb = is_loopback_or_unspecified_host(client_ip)
-        # On loopback (ADB USB-hub reverse tunnels), bucket per (client_ip, node_id) so one phone cannot lock out siblings
-        rl_key = client_ip
-        if is_lb and creds is not None and creds[0]:
-            rl_key = f"{client_ip}#{creds[0][:64]}"
+        nodes_snapshot = list(self.cluster_config.nodes)
+        node: NodeConfig | None = None
+        password = ""
+        if creds is not None:
+            raw_user, password = creds
+            canon_user = urllib.parse.unquote(raw_user) if "%" in raw_user else raw_user
+            node = next((n for n in nodes_snapshot if n.id == raw_user or n.id == canon_user), None)
+        # On loopback (ADB USB-hub reverse tunnels), bucket per canonical known node.id so one phone
+        # cannot lock out siblings, while routing unknown/URL-encoded probes into one shared bucket.
+        if is_lb:
+            rl_key = f"{client_ip}#{node.id}" if node is not None else f"{client_ip}#__unknown__"
+        else:
+            rl_key = client_ip
         blocked, retry = self.rate_limiter.is_blocked(rl_key)
         if blocked:
             return None, f"rate limited ({retry}s)"
         if creds is None:
             self.rate_limiter.record_failure(rl_key)
             return None, "missing Proxy-Authorization"
-        node_id, password = creds
-        nodes_snapshot = list(self.cluster_config.nodes)
-        node = next((n for n in nodes_snapshot if n.id == node_id), None)
-        if node is None and "%" in node_id:
-            unquoted_id = urllib.parse.unquote(node_id)
-            node = next((n for n in nodes_snapshot if n.id == unquoted_id), None)
         if node is None:
             self.rate_limiter.record_failure(rl_key)
-            return None, f"unknown node '{node_id}'"
+            return None, "invalid proxy credentials"
         expected = derive_proxy_password(self.cluster_config.token_for_node(node), node.id)
         if not hmac.compare_digest(password, expected):
             self.rate_limiter.record_failure(rl_key)
-            return None, "invalid proxy secret"
+            return None, "invalid proxy credentials"
         self.rate_limiter.record_success(rl_key)
         return node.id, "ok"
 
@@ -1216,6 +1266,7 @@ class NetworkGuardServer(socketserver.ThreadingTCPServer):
         with self._active_conns_lock:
             all_socks = [s for bucket in self._active_node_sockets.values() for s in bucket]
             self._active_node_sockets.clear()
+            self._active_ip_sockets.clear()
         for s in all_socks:
             try:
                 s.shutdown(socket.SHUT_RDWR)
@@ -1558,17 +1609,33 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             )
             return
 
+        def _is_quarantined_now() -> bool:
+            return (
+                node_id in self.server.cluster_config.gateway.quarantined_nodes
+                or self.server.is_quarantined_source_ip(client_ip) is not None
+            )
+
         upstream: socket.socket | None = None
         bytes_in = 0
         bytes_out = 0
         response_started = False
         try:
             last_conn_err: OSError | None = None
+            connect_budget = min(15.0, max(2.0, float(gw.idle_timeout_sec)))
+            connect_deadline = time.monotonic() + connect_budget
             for family, sockaddr in candidates:
+                if self.server.stop_event.is_set():
+                    raise OSError("gateway shutting down")
+                if _is_quarantined_now():
+                    raise OSError("node quarantined during connect")
+                rem_conn = connect_deadline - time.monotonic()
+                if rem_conn <= 0:
+                    last_conn_err = TimeoutError("upstream connect budget exceeded")
+                    break
                 sock_try: socket.socket | None = None
                 try:
                     sock_try = socket.socket(family, socket.SOCK_STREAM)
-                    sock_try.settimeout(min(15.0, gw.idle_timeout_sec))
+                    sock_try.settimeout(min(5.0, max(0.25, rem_conn)))
                     sock_try.connect(sockaddr)
                     upstream = sock_try
                     break
@@ -1582,8 +1649,8 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
             if upstream is None:
                 raise last_conn_err or OSError("unable to connect to upstream")
 
-            self.server.register_node_sockets(node_id, conn, upstream)
-            if node_id in self.server.cluster_config.gateway.quarantined_nodes:
+            self.server.register_node_sockets(node_id, conn, upstream, client_ip=client_ip)
+            if _is_quarantined_now():
                 self.server.audit_log.record(
                     node_id=node_id,
                     client_ip=client_ip,
@@ -1608,7 +1675,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     upstream,
                     idle_timeout=gw.idle_timeout_sec,
                     stop_event=self.server.stop_event,
-                    abort_check=lambda: node_id in self.server.cluster_config.gateway.quarantined_nodes,
+                    abort_check=_is_quarantined_now,
                 )
                 bytes_in += r_in
                 bytes_out += r_out
@@ -1667,7 +1734,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                             leftover,
                             idle_timeout=gw.idle_timeout_sec,
                             stop_event=self.server.stop_event,
-                            abort_check=lambda: node_id in self.server.cluster_config.gateway.quarantined_nodes,
+                            abort_check=_is_quarantined_now,
                             sent_counter=chunk_sent,
                         )
                         bytes_out += chunk_sent[0]
@@ -1695,7 +1762,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     remaining = max(0, content_len - len(initial_body))
                     conn.settimeout(gw.idle_timeout_sec)
                     while remaining > 0 and not self.server.stop_event.is_set():
-                        if node_id in self.server.cluster_config.gateway.quarantined_nodes:
+                        if _is_quarantined_now():
                             raise OSError("node quarantined during upload")
                         chunk = conn.recv(min(RELAY_CHUNK_BYTES, remaining))
                         if not chunk:
@@ -1712,7 +1779,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
                     req_version=version,
                     idle_timeout=gw.idle_timeout_sec,
                     stop_event=self.server.stop_event,
-                    abort_check=lambda: node_id in self.server.cluster_config.gateway.quarantined_nodes,
+                    abort_check=_is_quarantined_now,
                 )
                 bytes_in += r_in
 
@@ -1744,7 +1811,7 @@ class _NetworkGuardHandler(socketserver.BaseRequestHandler):
         finally:
             self.server.release_node_conn(node_id)
             if upstream is not None:
-                self.server.unregister_node_sockets(node_id, conn, upstream)
+                self.server.unregister_node_sockets(node_id, conn, upstream, client_ip=client_ip)
                 try:
                     upstream.close()
                 except OSError:

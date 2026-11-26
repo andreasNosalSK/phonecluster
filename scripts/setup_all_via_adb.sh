@@ -71,9 +71,12 @@ TMP_TSV="$(mktemp)"
 trap 'rm -f "${TMP_TSV}"' EXIT
 
 for SER in "${SERIALS[@]}"; do
-  MODEL="$(adb -s "${SER}" shell getprop ro.product.model | tr -d '\r\n\t')"
-  DEVICE="$(adb -s "${SER}" shell getprop ro.product.device | tr -d '\r\n\t')"
-  VER="$(adb -s "${SER}" shell getprop ro.build.version.release | tr -d '\r\n\t')"
+  MODEL="$(adb -s "${SER}" shell getprop ro.product.model 2>/dev/null | tr -d '\r\n\t' || true)"
+  DEVICE="$(adb -s "${SER}" shell getprop ro.product.device 2>/dev/null | tr -d '\r\n\t' || true)"
+  VER="$(adb -s "${SER}" shell getprop ro.build.version.release 2>/dev/null | tr -d '\r\n\t' || true)"
+  MODEL="${MODEL:-Linux/Unknown}"
+  DEVICE="${DEVICE:-usb}"
+  VER="${VER:-n/a}"
   MEM_KB="$(adb -s "${SER}" shell cat /proc/meminfo 2>/dev/null | awk '/MemTotal/{print $2; exit}' | tr -d '\r\n\t ' || true)"
   [[ "${MEM_KB}" =~ ^[0-9]+$ ]] || MEM_KB=0
   MEM_MB="$(( MEM_KB / 1024 ))"

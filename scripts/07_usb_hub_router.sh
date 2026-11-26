@@ -105,7 +105,7 @@ case "${CMD}" in
         *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
       esac
     done
-    ARGS=(--config "${CONFIG_PATH}" usb-hub setup --mode adb --gateway-port "${GW_PORT}" --write-config)
+    ARGS=(--config "${CONFIG_PATH}" usb-hub setup --mode adb --auto-detect --gateway-port "${GW_PORT}" --write-config)
     [[ "${PEER_MESH}" -eq 0 ]] && ARGS+=(--no-peer-mesh)
     exec python3 "${REPO_ROOT}/phonecluster_cli.py" "${ARGS[@]}"
     ;;
@@ -218,15 +218,21 @@ PY
       fi
       if [[ -n "${WAN_IFACE}" ]]; then
         validate_iface "${WAN_IFACE}"
-        echo "  Enabling optional WAN NAT via ${WAN_IFACE} for ${CLUSTER_CIDR} (LAN still blocked)..."
+        echo "  Enabling optional WAN NAT via ${WAN_IFACE} for ${CLUSTER_CIDR} (private RFC1918/LAN targets still blocked)..."
         if [[ "${DRY_RUN}" -eq 1 ]]; then
           echo "[dry-run] iptables -t nat -A POSTROUTING -s ${CLUSTER_CIDR} -o ${WAN_IFACE} -j MASQUERADE"
+          for PRIV_NET in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+            echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -s ${CLUSTER_CIDR} -d ${PRIV_NET} -o ${WAN_IFACE} -j DROP"
+          done
           echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -s ${CLUSTER_CIDR} -o ${WAN_IFACE} -j ACCEPT"
           echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -i ${WAN_IFACE} -d ${CLUSTER_CIDR} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
           echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -s ${CLUSTER_CIDR} ! -d ${CLUSTER_CIDR} -j DROP"
         else
           iptables -t nat -C POSTROUTING -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j MASQUERADE 2>/dev/null \
             || iptables -t nat -A POSTROUTING -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j MASQUERADE
+          for PRIV_NET in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+            iptables -A PHONECLUSTER_USB_FWD -s "${CLUSTER_CIDR}" -d "${PRIV_NET}" -o "${WAN_IFACE}" -j DROP
+          done
           iptables -A PHONECLUSTER_USB_FWD -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j ACCEPT
           iptables -A PHONECLUSTER_USB_FWD -i "${WAN_IFACE}" -d "${CLUSTER_CIDR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
           iptables -A PHONECLUSTER_USB_FWD -s "${CLUSTER_CIDR}" ! -d "${CLUSTER_CIDR}" -j DROP

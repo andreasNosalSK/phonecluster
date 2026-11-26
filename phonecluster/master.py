@@ -47,6 +47,7 @@ from .routing import (
     select_snapshots_for_target,
     summarize_pools,
 )
+from .usbhub import USB_MESH_DEFAULT_PORTS
 
 LOG = logging.getLogger("phonecluster.master")
 
@@ -521,14 +522,38 @@ class MasterController:
         except (http.client.HTTPException, OSError, ValueError, OverflowError) as exc:
             return unknown_result(str(exc))
 
+    def _resolve_master_lan_host_unlocked(self) -> str:
+        """Resolve local LAN IP outside `config_lock` if Master is bound to loopback with remote workers."""
+        with self.config_lock:
+            nodes = list(self.config.nodes)
+        if not nodes:
+            return ""
+        master_node = next((n for n in nodes if n.role == "master"), nodes[0])
+        m_host = normalize_host(master_node.host)
+        if is_loopback_or_unspecified_host(m_host) and any(
+            not is_loopback_or_unspecified_host(n.host) for n in nodes
+        ):
+            lan_ip = normalize_host(detect_local_ip())
+            if lan_ip and not is_loopback_or_unspecified_host(lan_ip):
+                return lan_ip
+        return m_host
+
     def _with_node_env(
-        self, spec: JobSpec, node: NodeConfig, cross_env: dict[str, str]
+        self,
+        spec: JobSpec,
+        node: NodeConfig,
+        cross_env: dict[str, str],
+        master_lan_host: str | None = None,
     ) -> JobSpec:
         """Return a copy of `spec` enriched with cross-tier mesh + optional per-worker gateway proxy env."""
         merged = dict(cross_env)
+        eff_master = master_lan_host if master_lan_host is not None else self._resolve_master_lan_host_unlocked()
         with self.config_lock:
             proxy_env = build_worker_proxy_env(
-                self.config, node, port_override=self.gateway_port_override
+                self.config,
+                node,
+                master_host=eff_master or None,
+                port_override=self.gateway_port_override,
             )
         if spec.env:
             for k, v in spec.env.items():
@@ -563,9 +588,12 @@ class MasterController:
             snapshots = [s for s in all_snapshots if want_tags.issubset(set(s.node.tags))]
         else:
             snapshots = all_snapshots
+        master_lan = self._resolve_master_lan_host_unlocked()
         with self.config_lock:
             cross_envs = {
-                snap.node.id: build_cross_tier_env(all_snapshots, self.config, for_node=snap.node)
+                snap.node.id: build_cross_tier_env(
+                    all_snapshots, self.config, for_node=snap.node, master_lan_host=master_lan
+                )
                 for snap in snapshots if snap.online
             }
             quarantined = set(self.config.gateway.quarantined_nodes)
@@ -753,7 +781,15 @@ class MasterController:
         tier, pool_name = resolve_node_tier_and_pool(
             node, snap.health if snap and snap.online else None
         )
-        kind, data = self.exec_on_node(node, self._with_node_env(spec, node, cross_envs.get(node.id, {})))
+        node_cross_env = cross_envs.get(node.id)
+        if node_cross_env is None:
+            with self.config_lock:
+                node_cross_env = build_cross_tier_env(
+                    all_snapshots, self.config, for_node=node, master_lan_host=master_lan
+                )
+        kind, data = self.exec_on_node(
+            node, self._with_node_env(spec, node, node_cross_env, master_lan_host=master_lan)
+        )
         return [
             self._to_outcome(
                 spec,
@@ -878,9 +914,12 @@ class MasterController:
                 snapshots = [s for s in all_snaps if want_tags.issubset(set(s.node.tags))]
             else:
                 snapshots = all_snaps
+            m_lan = self._resolve_master_lan_host_unlocked()
             with self.config_lock:
                 cross_envs = {
-                    snap.node.id: build_cross_tier_env(all_snaps, self.config, for_node=snap.node)
+                    snap.node.id: build_cross_tier_env(
+                        all_snaps, self.config, for_node=snap.node, master_lan_host=m_lan
+                    )
                     for snap in snapshots if snap.online
                 }
             last_poll = time.monotonic()
@@ -923,14 +962,33 @@ class MasterController:
                         for s in snapshots
                         if (external_active[s.node.id] + in_flight_per_node[s.node.id]) >= s.max_concurrency
                     }
-                    eligible, reason = select_snapshots_for_target(
-                        snapshots,
-                        target=target,
-                        route=route,
-                        force=spec.force,
-                        busy_node_ids=busy_ids,
-                        excluded_node_ids=quarantined,
-                    )
+                    if failed_nodes:
+                        eligible, reason = select_snapshots_for_target(
+                            snapshots,
+                            target=target,
+                            route=route,
+                            force=spec.force,
+                            busy_node_ids=busy_ids,
+                            excluded_node_ids=quarantined | failed_nodes,
+                        )
+                        if not eligible:
+                            eligible, reason = select_snapshots_for_target(
+                                snapshots,
+                                target=target,
+                                route=route,
+                                force=spec.force,
+                                busy_node_ids=busy_ids,
+                                excluded_node_ids=quarantined,
+                            )
+                    else:
+                        eligible, reason = select_snapshots_for_target(
+                            snapshots,
+                            target=target,
+                            route=route,
+                            force=spec.force,
+                            busy_node_ids=busy_ids,
+                            excluded_node_ids=quarantined,
+                        )
                     last_reason_by_slot[slot_idx] = reason
                     if not eligible:
                         # Continue inspecting remaining jobs so busy Tier X does not block Tier Y
@@ -1389,6 +1447,13 @@ class MasterController:
             if running and self._is_remote_port_loopback_only(snap, 3632):
                 continue
             cores = max(1, min(_MAX_WORKER_CPU_CORES, _safe_int(snap.health.get("cpu_cores", 4), 4)))
+            if snap.node.adb is not None:
+                if snap.node.adb.peer_mesh and 3632 in USB_MESH_DEFAULT_PORTS:
+                    mesh_port = snap.node.adb.mesh_base_port + USB_MESH_DEFAULT_PORTS.index(3632)
+                    entries.append(f"127.0.0.1:{mesh_port}/{cores},lzo")
+                continue
+            if "usb-mode:adb" in (snap.node.tags or []):
+                continue
             if snap.node.role == "master" or is_loopback_or_unspecified_host(snap.node.host):
                 slots = max(1, cores - 2)
                 entries.append(f"localhost/{slots}")
@@ -1408,11 +1473,16 @@ class MasterController:
                 index=spec.index, job_id=spec.job_id, label=spec.label, node_id="none",
                 returncode=-1, duration_sec=0.0, error="No ready worker phones for llama.cpp RPC. Master skipped.",
             )]
+        master_lan = self._resolve_master_lan_host_unlocked()
         with self.config_lock:
-            work = [
-                (s, self._with_node_env(spec, s.node, build_cross_tier_env(snapshots, self.config, for_node=s.node)))
+            cross_by_id = {
+                s.node.id: build_cross_tier_env(snapshots, self.config, for_node=s.node, master_lan_host=master_lan)
                 for s in workers
-            ]
+            }
+        work = [
+            (s, self._with_node_env(spec, s.node, cross_by_id[s.node.id], master_lan_host=master_lan))
+            for s in workers
+        ]
 
         def start(item: tuple[NodeSnapshot, JobSpec]) -> JobOutcome:
             snapshot, enriched = item
@@ -1443,7 +1513,7 @@ class MasterController:
             failed = {"node_id": node.id, "ok": False}
             try:
                 with _DIRECT_OPENER.open(request, timeout=14.0) as response:
-                    result = read_json_object_bounded(response, _MAX_CTRL_RESP_BYTES)
+                    result = read_json_object_bounded(response, _MAX_CTRL_RESP_BYTES, deadline_sec=14.0)
                 if result.get("node_id") != node.id or type(result.get("ok")) is not bool:
                     raise ValueError("unexpected worker stop response")
                 return result
@@ -1500,7 +1570,14 @@ class MasterController:
         """Generate an OpenMPI hostfile containing healthy, non-quarantined nodes (prefers mpirun-capable)."""
         snaps = snapshots if snapshots is not None else self.poll_health()
         quarantined = self._quarantined_ids()
-        ready_snaps = [s for s in snaps if s.ready_for_jobs and s.node.id not in quarantined]
+        ready_snaps = [
+            s
+            for s in snaps
+            if s.ready_for_jobs
+            and s.node.id not in quarantined
+            and s.node.adb is None
+            and "usb-mode:adb" not in (s.node.tags or [])
+        ]
         mpi_snaps = [
             s for s in ready_snaps
             if isinstance(s.health.get("tools"), dict) and s.health["tools"].get("mpirun")
@@ -1640,10 +1717,11 @@ class MasterController:
     ) -> dict[str, Any]:
         """Return live cross-tier service registry, `.env` vars, and DNS hosts block."""
         snaps = snapshots if snapshots is not None else self.poll_health()
+        master_lan = self._resolve_master_lan_host_unlocked()
         with self.config_lock:
             quarantined = set(self.config.gateway.quarantined_nodes)
-            services = build_service_registry(snaps, self.config)
-            env = build_cross_tier_env(snaps, self.config)
+            services = build_service_registry(snaps, self.config, master_lan_host=master_lan)
+            env = build_cross_tier_env(snaps, self.config, master_lan_host=master_lan)
             dns_hosts = build_cluster_dns_hosts(snaps, self.config)
         return {
             "pools": summarize_pools(snaps, quarantined_nodes=quarantined),
@@ -1711,7 +1789,11 @@ class MasterController:
             "if not dk:\n"
             "    out['error'] = 'docker binary not found'\n"
             "    print(json.dumps(out)); raise SystemExit(0)\n"
-            "p = subprocess.run([dk, 'info', '--format', '{{json .}}'], capture_output=True, text=True, timeout=8)\n"
+            "try:\n"
+            "    p = subprocess.run([dk, 'info', '--format', '{{json .}}'], capture_output=True, text=True, timeout=8)\n"
+            "except (OSError, subprocess.TimeoutExpired) as exc:\n"
+            "    out['error'] = f'docker info failed: {exc}'[:260]\n"
+            "    print(json.dumps(out)); raise SystemExit(0)\n"
             "if p.returncode != 0:\n"
             "    out['error'] = (p.stderr or p.stdout or 'docker info failed').strip()[:260]\n"
             "    print(json.dumps(out)); raise SystemExit(0)\n"
@@ -1739,7 +1821,7 @@ class MasterController:
             "    items = [json.loads(row) for row in rows[:25]]\n"
             "    out['containers'] = [{'id': row['ID'], 'name': row['Names'], 'image': row['Image'], "
             "'status': row['Status'], 'ports': row.get('Ports', '')} for row in items]\n"
-            "    out['inventory_truncated'] = len(rows) > 25\n"
+            "    out['containers_truncated'] = len(rows) > 25\n"
             "    out['inventory_ok'] = out['ok'] = True\n"
             "except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as exc:\n"
             "    out['error'] = f'Docker inventory unavailable: {exc}'[:300]\n"
@@ -1801,7 +1883,7 @@ class MasterController:
                         "containers": clean_ct,
                         "volume_root": str(parsed.get("volume_root") or "")[:200],
                     }
-                    if parsed.get("containers_truncated"):
+                    if parsed.get("containers_truncated") or parsed.get("inventory_truncated"):
                         out_row["containers_truncated"] = True
                     return out_row
             except (json.JSONDecodeError, RecursionError, ValueError):
@@ -1901,8 +1983,11 @@ class MasterController:
             "adv = os.environ.get('PHONECLUSTER_SWARM_ADV', '').strip()\n"
             "if not dk:\n"
             "    print(json.dumps({'ok': False, 'error': 'docker binary not found'})); raise SystemExit(0)\n"
-            "st = subprocess.run([dk, 'info', '--format', '{{.Swarm.LocalNodeState}}|{{.Swarm.ControlAvailable}}'], "
+            "try:\n"
+            "    st = subprocess.run([dk, 'info', '--format', '{{.Swarm.LocalNodeState}}|{{.Swarm.ControlAvailable}}'], "
             "capture_output=True, text=True, timeout=10)\n"
+            "except (OSError, subprocess.TimeoutExpired) as exc:\n"
+            "    print(json.dumps({'ok': False, 'error': f'docker info failed: {exc}'[:260]})); raise SystemExit(0)\n"
             "if st.returncode != 0:\n"
             "    print(json.dumps({'ok': False, 'error': (st.stderr or st.stdout).strip()[:260]})); raise SystemExit(0)\n"
             "parts = st.stdout.strip().split('|')\n"
@@ -1981,14 +2066,18 @@ class MasterController:
             "capture_output=True, text=True, timeout=8, check=True)\n"
             "    state, _, node_id = status.stdout.strip().partition('|')\n"
             "    return state, node_id\n"
-            "state, node_id = swarm_info()\n"
-            "already_active = state.lower() == 'active'\n"
-            "if not already_active:\n"
-            "    r = subprocess.run([dk, 'swarm', 'join', '--token', tok, mgr], capture_output=True, text=True, timeout=20)\n"
-            "    if r.returncode:\n"
-            "        detail = (r.stderr or 'docker swarm join failed').replace(tok, '[redacted]').strip()[:280]\n"
-            "        print(json.dumps({'ok': False, 'error': detail})); raise SystemExit(0)\n"
+            "try:\n"
             "    state, node_id = swarm_info()\n"
+            "    already_active = state.lower() == 'active'\n"
+            "    if not already_active:\n"
+            "        r = subprocess.run([dk, 'swarm', 'join', '--token', tok, mgr], capture_output=True, text=True, timeout=20)\n"
+            "        if r.returncode:\n"
+            "            detail = (r.stderr or 'docker swarm join failed').replace(tok, '[redacted]').strip()[:280]\n"
+            "            print(json.dumps({'ok': False, 'error': detail})); raise SystemExit(0)\n"
+            "        state, node_id = swarm_info()\n"
+            "except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:\n"
+            "    detail = str(exc).replace(tok, '[redacted]')[:280]\n"
+            "    print(json.dumps({'ok': False, 'error': f'docker swarm join failed: {detail}'})); raise SystemExit(0)\n"
             "if state.lower() != 'active' or not node_id:\n"
             "    print(json.dumps({'ok': False, 'error': 'Swarm node ID could not be confirmed'})); raise SystemExit(0)\n"
             "print(json.dumps({'ok': True, 'already_active': already_active, 'swarm_node_id': node_id}))\n"
@@ -2278,11 +2367,13 @@ class MasterController:
                 (n for n in self.config.nodes if n.role == "master"),
                 self.config.nodes[0] if self.config.nodes else None,
             )
+            enforce_ip = net.enforce_worker_source_ip
+            req_signed = net.require_signed_requests
             allowed_ips = list(net.allowed_master_ips)
             need_lan_ip = False
-            if master_node is not None and master_node.host:
+            if enforce_ip and master_node is not None and master_node.host:
                 m_host = normalize_host(master_node.host)
-                if m_host and m_host not in allowed_ips:
+                if m_host and m_host not in {"0.0.0.0", "::"} and m_host not in allowed_ips:
                     allowed_ips.append(m_host)
                 if is_loopback_or_unspecified_host(m_host) and not is_loopback_or_unspecified_host(node.host):
                     need_lan_ip = True
@@ -2296,8 +2387,6 @@ class MasterController:
                 "webhook_cooldown_sec": s.webhook_cooldown_sec,
                 "battery_webhook_url": s.battery_webhook_url,
             }
-            enforce_ip = net.enforce_worker_source_ip
-            req_signed = net.require_signed_requests
         if need_lan_ip:
             # Resolve local LAN IP OUTSIDE `config_lock` so slow air-gapped DNS never stalls Master
             lan_ip = normalize_host(detect_local_ip())
@@ -2367,7 +2456,7 @@ class MasterController:
         )
         try:
             with _DIRECT_OPENER.open(req, timeout=5.0) as resp:
-                return read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES)
+                return read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES, deadline_sec=5.0)
         except urllib.error.HTTPError as exc:
             raw = _read_http_error_body(exc, 4096)
             try:

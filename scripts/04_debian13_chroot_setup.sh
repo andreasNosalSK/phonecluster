@@ -114,8 +114,10 @@ fi
 # Basic DNS & Android group compatibility inside Debian chroot (unlink symlinked resolv.conf first!)
 rm -f "${CHROOT_DIR}/etc/resolv.conf"
 printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > "${CHROOT_DIR}/etc/resolv.conf"
-grep -q "^aid_inet:" "${CHROOT_DIR}/etc/group" || echo "aid_inet:x:3003:root" >> "${CHROOT_DIR}/etc/group"
-grep -q "^aid_net_raw:" "${CHROOT_DIR}/etc/group" || echo "aid_net_raw:x:3004:root" >> "${CHROOT_DIR}/etc/group"
+grep -q "^aid_inet:" "${CHROOT_DIR}/etc/group" || echo "aid_inet:x:3003:root,_apt" >> "${CHROOT_DIR}/etc/group"
+grep -q "^aid_net_raw:" "${CHROOT_DIR}/etc/group" || echo "aid_net_raw:x:3004:root,_apt" >> "${CHROOT_DIR}/etc/group"
+mkdir -p "${CHROOT_DIR}/etc/apt/apt.conf.d"
+printf 'APT::Sandbox::User "root";\n' > "${CHROOT_DIR}/etc/apt/apt.conf.d/99-android-net"
 
 # Create mount + enter helper scripts (create dev/pts & dev/shm AFTER bind-mounting /dev since Android /dev lacks /dev/shm!)
 cat > /data/local/linux/mount_debian13.sh <<EOF

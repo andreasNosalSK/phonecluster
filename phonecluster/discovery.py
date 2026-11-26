@@ -65,10 +65,16 @@ def _detect_ipv4_via_sys_net() -> str | None:
             if name == "lo" or name.startswith("dummy"):
                 continue
             try:
+                oper = (net_dir / name / "operstate").read_text(encoding="utf-8", errors="ignore").strip().lower()
+                if oper == "down":
+                    continue
+            except OSError:
+                pass
+            try:
                 req = struct.pack("256s", name[:15].encode("utf-8"))
                 res = fcntl.ioctl(sock.fileno(), _SIOCGIFADDR, req)
                 ip = socket.inet_ntoa(res[20:24])
-                if ip and not ip.startswith(("127.", "169.254.")):
+                if ip and not ip.startswith(("127.", "169.254.", "0.")):
                     return ip
             except OSError:
                 continue
@@ -102,14 +108,60 @@ def detect_local_ip() -> str:
     return "127.0.0.1"
 
 
+_SIOCGIFBRDADDR = 0x8919
+
+
+def _detect_interface_broadcasts() -> list[str]:
+    """Enumerate exact IPv4 broadcast addresses across all UP non-container NICs (handles /16-/23 & multi-NIC)."""
+    try:
+        import fcntl
+    except ImportError:
+        return []
+    net_dir = Path("/sys/class/net")
+    if not net_dir.is_dir():
+        return []
+    try:
+        ifaces = sorted(p.name for p in net_dir.iterdir())
+    except OSError:
+        return []
+    out: list[str] = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for name in ifaces:
+            if name == "lo" or name.startswith(("dummy", "docker", "br-", "veth", "virbr", "cni", "flannel")):
+                continue
+            try:
+                oper = (net_dir / name / "operstate").read_text(encoding="utf-8", errors="ignore").strip().lower()
+                if oper == "down":
+                    continue
+            except OSError:
+                pass
+            try:
+                req = struct.pack("256s", name[:15].encode("utf-8"))
+                res = fcntl.ioctl(sock.fileno(), _SIOCGIFBRDADDR, req)
+                bcast = socket.inet_ntoa(res[20:24])
+                if bcast and not bcast.startswith(("0.", "127.")) and bcast not in out:
+                    out.append(bcast)
+            except OSError:
+                continue
+    finally:
+        sock.close()
+    return out
+
+
 def _candidate_broadcast_addresses(local_ip: str) -> list[str]:
-    """Return broadcast targets including subnet /24 broadcast and 255.255.255.255."""
-    targets = ["255.255.255.255"]
+    """Return broadcast targets across all UP NICs, /24 fallback, and 255.255.255.255."""
+    targets: list[str] = []
+    for bcast in _detect_interface_broadcasts():
+        if bcast not in targets:
+            targets.append(bcast)
     parts = local_ip.split(".")
-    if len(parts) == 4 and not local_ip.startswith("127."):
+    if len(parts) == 4 and not local_ip.startswith(("127.", "0.")):
         subnet_bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
         if subnet_bcast not in targets:
-            targets.insert(0, subnet_bcast)
+            targets.append(subnet_bcast)
+    if "255.255.255.255" not in targets:
+        targets.append("255.255.255.255")
     return targets
 
 
@@ -270,6 +322,9 @@ def discover_lan_nodes(
     targets: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Broadcast a discovery probe on Wi-Fi/LAN and return discovered phones."""
+    if isinstance(discovery_port, bool) or not (1 <= int(discovery_port) <= 65535):
+        raise ValueError(f"discovery_port must be between 1 and 65535 (got {discovery_port})")
+    discovery_port = int(discovery_port)
     probe = json.dumps({"type": PROBE_TYPE, "ts": int(time.time())}).encode("utf-8")
     local_ip = detect_local_ip()
     dests = targets if targets is not None else _candidate_broadcast_addresses(local_ip)
@@ -296,7 +351,7 @@ def discover_lan_nodes(
             for dest in dests:
                 try:
                     s.sendto(probe, (dest, discovery_port))
-                except OSError as exc:
+                except (OSError, OverflowError) as exc:
                     LOG.debug("Broadcast to %s:%d failed: %s", dest, discovery_port, exc)
 
         # Probe across multiple ephemeral source ports to defeat SO_REUSEPORT pinning
@@ -381,7 +436,16 @@ def discover_lan_nodes(
 
 
 def _current_user() -> str:
+    env_u = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if env_u:
+        return env_u
     try:
-        return os.environ.get("USER") or os.getlogin()
+        return os.getlogin()
     except OSError:
-        return os.environ.get("USER", "")
+        pass
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, AttributeError, OSError):
+        return ""
