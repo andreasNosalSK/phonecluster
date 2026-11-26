@@ -18,6 +18,18 @@ case "${CMD}" in
       echo "Error: Invalid allow CIDR '${ALLOW_CIDR}'." >&2
       exit 2
     fi
+    ALLOW_CIDR="$(python3 - "${ALLOW_CIDR}" <<'PY_CIDR'
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+except ValueError:
+    raise SystemExit(f"Error: Invalid allow CIDR {sys.argv[1]!r}.")
+min_prefix = 8 if isinstance(net, ipaddress.IPv4Network) else 48
+if net.prefixlen < min_prefix:
+    raise SystemExit(f"Error: CIDR {sys.argv[1]!r} is too broad for unauthenticated distccd (prefix must be >= /{min_prefix}).")
+print(str(net))
+PY_CIDR
+)" || exit 2
     if [[ ! "${JOBS}" =~ ^[0-9]+$ ]] || (( JOBS < 1 || JOBS > 128 )); then
       echo "Error: Invalid jobs count '${JOBS}' (expected 1..128)." >&2
       exit 2
@@ -49,11 +61,13 @@ case "${CMD}" in
   llama-rpc-start|llama-rpc-stop)
     exec python3 - "$CMD" "$@" <<'PY_RPC'
 import fcntl
+import ipaddress
 import os
 from pathlib import Path
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -69,6 +83,14 @@ def parse_port(value):
     return int(value)
 
 
+def parse_bind_host(value):
+    clean = str(value or "0.0.0.0").strip().strip("[]")
+    try:
+        return str(ipaddress.ip_address(clean))
+    except ValueError as exc:
+        raise ValueError(f"Invalid RPC bind host IP {value!r}.") from exc
+
+
 def process_start(pid, port):
     if pid <= 1:
         return None
@@ -79,18 +101,30 @@ def process_start(pid, port):
         fields = (proc / "stat").read_text(encoding="utf-8", errors="replace").rsplit(") ", 1)[1].split()
         if executable.name in BINARIES and args[-2:] == [b"-p", str(port).encode()] and fields[0] != "Z":
             return fields[19]
-    except (FileNotFoundError, ProcessLookupError, IndexError):
+    except (OSError, IndexError):
         pass
     return None
 
 
 def owned_session(file, port):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        if file.is_symlink() or file.stat().st_uid != os.getuid():
+        fd = os.open(file, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
             return None
-        fields = file.read_text(encoding="ascii").split()
+        raw = os.read(fd, 128).decode("ascii", errors="strict")
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(fd)
+    try:
+        fields = raw.split()
         pid = int(fields[0])
-    except (FileNotFoundError, IndexError, ValueError):
+    except (IndexError, ValueError):
         return None
     started = process_start(pid, port)
     if started and (len(fields) == 1 or fields == [str(pid), started]):
@@ -106,7 +140,7 @@ def listening(port):
         return False
 
 
-def start_rpc(directory, port):
+def start_rpc(directory, port, bind_host="0.0.0.0"):
     session = LOG_DIR / f"llama-rpc-{port}.pid"
     owned = owned_session(session, port)
     if owned:
@@ -128,7 +162,7 @@ def start_rpc(directory, port):
     log_path = LOG_DIR / f"llama-rpc-{port}.log"
     with log_path.open("ab") as log:
         process = subprocess.Popen(
-            [str(Path(binary).resolve()), "-H", "0.0.0.0", "-p", str(port)],
+            [str(Path(binary).resolve()), "-H", bind_host, "-p", str(port)],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
         )
     written = False
@@ -192,6 +226,14 @@ def stop_rpc():
         while process_start(pid, port) == started and time.monotonic() < deadline:
             time.sleep(0.05)
         if process_start(pid, port) == started:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            kill_deadline = time.monotonic() + 1.0
+            while process_start(pid, port) == started and time.monotonic() < kill_deadline:
+                time.sleep(0.05)
+        if process_start(pid, port) == started:
             errors.append(str(port))
         else:
             file.unlink(missing_ok=True)
@@ -205,11 +247,16 @@ try:
     if command == "llama-rpc-start":
         directory = Path(args[0]).expanduser() if args else Path.home() / "llama.cpp"
         port = parse_port(args[1] if len(args) > 1 else "50052")
+        bind_host = parse_bind_host(args[2] if len(args) > 2 else "0.0.0.0")
     LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(LOG_DIR, 0o700)
+    except OSError:
+        pass
     with (LOG_DIR / "llama-rpc.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if command == "llama-rpc-start":
-            start_rpc(directory, port)
+            start_rpc(directory, port, bind_host=bind_host)
         else:
             stop_rpc()
 except (OSError, RuntimeError, ValueError) as exc:
@@ -277,7 +324,11 @@ PY_RPC
     if [[ "${SW_STATE}" == "active" ]]; then
       echo "Already part of an active Docker Swarm."
     else
-      "${DK_BIN}" swarm join --token "${PHONECLUSTER_SWARM_TOKEN}" "${MGR_ADDR}"
+      if ! JOIN_OUT="$("${DK_BIN}" swarm join --token "${PHONECLUSTER_SWARM_TOKEN}" "${MGR_ADDR}" 2>&1)"; then
+        echo "${JOIN_OUT//"${PHONECLUSTER_SWARM_TOKEN}"/[redacted]}" >&2
+        exit 1
+      fi
+      echo "${JOIN_OUT//"${PHONECLUSTER_SWARM_TOKEN}"/[redacted]}"
     fi
     ;;
 

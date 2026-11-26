@@ -8,6 +8,7 @@ import http.client
 import json
 import logging
 import math
+import re
 import socket
 import threading
 import time
@@ -231,6 +232,32 @@ def _safe_float(val: Any, default: float) -> float:
         return default
 
 
+_MAX_WORKER_CPU_CORES = 128
+_MAX_WORKER_RAM_MB = 1048576
+_SWARM_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{4,256}$")
+_PROXY_OVERRIDE_EXACT = frozenset({
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "ftp_proxy",
+    "no_proxy",
+    "pip_proxy",
+    "curl_home",
+    "phonecluster_gateway_enabled",
+})
+
+
+def _is_gateway_reserved_env_key(key: str) -> bool:
+    kl = str(key or "").replace("\x00", "").strip().lower()
+    if not kl:
+        return True
+    if kl in _PROXY_OVERRIDE_EXACT or kl.endswith("_proxy"):
+        return True
+    if kl.startswith("git_config_") or kl.startswith("phonecluster_gateway_"):
+        return True
+    return (kl.startswith("npm_config_") or kl.startswith("yarn_")) and "proxy" in kl
+
+
 def score_node(
     snapshot: NodeSnapshot, in_flight_local: int | None = None, max_temp_c: float = 40.0
 ) -> float:
@@ -245,19 +272,20 @@ def score_node(
         return -1e6
 
     health = snapshot.health
-    cores = max(1, _safe_int(health.get("cpu_cores", 1), 1))
+    cores = max(1, min(_MAX_WORKER_CPU_CORES, _safe_int(health.get("cpu_cores", 1), 1)))
     load_1m = max(0.0, _safe_float(health.get("load_1m", 0.0), 0.0))
     load_ratio = min(load_1m / cores, 2.0)
 
     temp_raw = health.get("temp_c")
     temp_val = _safe_float(temp_raw, -999.0) if temp_raw is not None else None
     temp_bonus = (
-        max(0.0, (max_temp_c - temp_val) / 10.0)
-        if temp_val is not None and temp_val > -500.0
+        max(0.0, min(4.0, (max_temp_c - temp_val) / 10.0))
+        if temp_val is not None and 0.0 <= temp_val <= 120.0
         else 0.5
     )
 
-    avail_ram_gb = max(0.0, _safe_float(health.get("mem_available_mb", 512), 512.0)) / 1024.0
+    avail_ram_mb = max(0.0, min(float(_MAX_WORKER_RAM_MB), _safe_float(health.get("mem_available_mb", 512), 512.0)))
+    avail_ram_gb = avail_ram_mb / 1024.0
     slot_ratio = free_slots / max(1, snapshot.max_concurrency)
 
     return (
@@ -400,8 +428,9 @@ class MasterController:
         )
         t0 = time.monotonic()
         try:
-            with _DIRECT_OPENER.open(req, timeout=self.config.health_timeout_sec) as resp:
-                data = read_json_object_bounded(resp, _MAX_HEALTH_RESP_BYTES)
+            health_to = max(0.5, float(self.config.health_timeout_sec))
+            with _DIRECT_OPENER.open(req, timeout=health_to) as resp:
+                data = read_json_object_bounded(resp, _MAX_HEALTH_RESP_BYTES, deadline_sec=health_to)
                 latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
                 return NodeSnapshot(node=node, online=True, latency_ms=latency_ms, health=data)
         except urllib.error.HTTPError as exc:
@@ -460,7 +489,7 @@ class MasterController:
 
         try:
             with _DIRECT_OPENER.open(req, timeout=http_timeout) as resp:
-                data = read_json_object_bounded(resp, MAX_EXEC_RESPONSE_BYTES)
+                data = read_json_object_bounded(resp, MAX_EXEC_RESPONSE_BYTES, deadline_sec=http_timeout)
                 expected_id = spec.job_id.strip() if isinstance(spec.job_id, str) else ""
                 returned_id = data.get("job_id")
                 if not isinstance(returned_id, str) or not returned_id or (expected_id and expected_id != returned_id):
@@ -501,10 +530,16 @@ class MasterController:
             proxy_env = build_worker_proxy_env(
                 self.config, node, port_override=self.gateway_port_override
             )
-        if proxy_env:
-            merged.update(proxy_env)
         if spec.env:
-            merged.update(spec.env)
+            for k, v in spec.env.items():
+                if not isinstance(k, str):
+                    continue
+                if proxy_env and _is_gateway_reserved_env_key(k):
+                    continue
+                merged[k] = str(v)
+        if proxy_env:
+            # Apply Gateway proxy enforcement LAST so job-supplied env vars can NEVER bypass Master Network Guard
+            merged.update(proxy_env)
         return replace(spec, env=merged)
 
     def run_single(
@@ -1353,7 +1388,7 @@ class MasterController:
                 continue
             if running and self._is_remote_port_loopback_only(snap, 3632):
                 continue
-            cores = max(1, _safe_int(snap.health.get("cpu_cores", 4), 4))
+            cores = max(1, min(_MAX_WORKER_CPU_CORES, _safe_int(snap.health.get("cpu_cores", 4), 4)))
             if snap.node.role == "master" or is_loopback_or_unspecified_host(snap.node.host):
                 slots = max(1, cores - 2)
                 entries.append(f"localhost/{slots}")
@@ -1473,7 +1508,7 @@ class MasterController:
         chosen = mpi_snaps if mpi_snaps else ready_snaps
         lines: list[str] = []
         for snap in chosen:
-            cores = max(1, _safe_int(snap.health.get("cpu_cores", 4), 4))
+            cores = max(1, min(_MAX_WORKER_CPU_CORES, _safe_int(snap.health.get("cpu_cores", 4), 4)))
             lines.append(f"{snap.node.host} slots={cores}")
         return "\n".join(lines) + ("\n" if lines else "")
 
@@ -1499,11 +1534,11 @@ class MasterController:
             is_q = snap.node.id in quarantined
             if snap.online:
                 online_count += 1
-                cores = max(0, _safe_int(snap.health.get("cpu_cores", 0), 0))
+                cores = max(0, min(_MAX_WORKER_CPU_CORES, _safe_int(snap.health.get("cpu_cores", 0), 0)))
                 total_cores += cores
-                total_ram_mb += max(0, _safe_int(snap.health.get("mem_total_mb", 0), 0))
-                avail_ram_mb += max(0, _safe_int(snap.health.get("mem_available_mb", 0), 0))
-                total_active_jobs += max(0, _safe_int(snap.health.get("active_jobs", 0), 0))
+                total_ram_mb += max(0, min(_MAX_WORKER_RAM_MB, _safe_int(snap.health.get("mem_total_mb", 0), 0)))
+                avail_ram_mb += max(0, min(_MAX_WORKER_RAM_MB, _safe_int(snap.health.get("mem_available_mb", 0), 0)))
+                total_active_jobs += max(0, min(256, _safe_int(snap.health.get("active_jobs", 0), 0)))
                 latencies.append(max(0.0, _safe_float(snap.latency_ms, 0.0)))
                 if snap.ready_for_jobs and not is_q:
                     ready_count += 1
@@ -1522,7 +1557,7 @@ class MasterController:
                 t_raw = snap.health.get("temp_c")
                 if t_raw is not None:
                     t_val = _safe_float(t_raw, -999.0)
-                    if t_val > -500.0:
+                    if 0.0 <= t_val <= 120.0:
                         temps.append(t_val)
             eff_tier, eff_pool = resolve_node_tier_and_pool(snap.node, snap.health if snap.online else None)
             node_dicts.append(
@@ -1736,10 +1771,40 @@ class MasterController:
                 return {**base, "ok": False, "error": str(data.get("error", kind))}
             stdout = str(data.get("stdout") or "").strip()
             try:
-                parsed = json.loads(stdout)
+                parsed = json.loads(stdout, parse_constant=lambda _c: None)
                 if isinstance(parsed, dict):
-                    return {**base, **parsed, "node_id": snap.node.id, "host": snap.node.host}
-            except json.JSONDecodeError:
+                    raw_ct = parsed.get("containers")
+                    clean_ct = [
+                        {
+                            "name": str(c.get("name", ""))[:120],
+                            "image": str(c.get("image", ""))[:160],
+                            "status": str(c.get("status", ""))[:120],
+                            "ports": str(c.get("ports", ""))[:160],
+                        }
+                        for c in (raw_ct if isinstance(raw_ct, list) else [])[:50]
+                        if isinstance(c, dict)
+                    ]
+                    out_row = {
+                        **base,
+                        "docker_bin": str(parsed.get("docker_bin") or "")[:160],
+                        "is_snap": bool(parsed.get("is_snap", base["docker_snap"])),
+                        "ok": bool(parsed.get("ok")),
+                        "engine_ok": bool(parsed.get("engine_ok")),
+                        "inventory_ok": bool(parsed.get("inventory_ok")),
+                        "error": str(parsed.get("error") or "")[:240],
+                        "server_version": str(parsed.get("server_version") or "")[:64],
+                        "swarm_state": str(parsed.get("swarm_state") or "inactive")[:32],
+                        "swarm_manager": bool(parsed.get("swarm_manager")),
+                        "swarm_nodes": max(0, min(10000, _safe_int(parsed.get("swarm_nodes", 0), 0))),
+                        "containers_running": max(0, min(10000, _safe_int(parsed.get("containers_running", 0), 0))),
+                        "containers_total": max(0, min(10000, _safe_int(parsed.get("containers_total", 0), 0))),
+                        "containers": clean_ct,
+                        "volume_root": str(parsed.get("volume_root") or "")[:200],
+                    }
+                    if parsed.get("containers_truncated"):
+                        out_row["containers_truncated"] = True
+                    return out_row
+            except (json.JSONDecodeError, RecursionError, ValueError):
                 pass
             return {**base, "ok": False, "error": (str(data.get("stderr") or stdout) or "unexpected output")[:240]}
 
@@ -1754,7 +1819,9 @@ class MasterController:
             "engine_ready_nodes": sum(1 for r in rows if r.get("engine_ok")),
             "swarm_active": any(r.get("swarm_state") == "active" for r in rows),
             "swarm_managers": [r["node_id"] for r in rows if r.get("swarm_manager")],
-            "total_running_containers": sum(int(r.get("containers_running") or 0) for r in rows if r.get("engine_ok")),
+            "total_running_containers": sum(
+                max(0, _safe_int(r.get("containers_running", 0), 0)) for r in rows if r.get("engine_ok")
+            ),
         }
 
     def docker_swarm_setup(
@@ -1890,7 +1957,16 @@ class MasterController:
                 "note": "If your Ubuntu Touch Halium kernel lacks VXLAN/overlay modules, use direct PhoneCluster Tier 3 container jobs (`pc run --target tier:3` / `pc map`) instead of Swarm overlay networks.",
             }
 
-        join_token = str(m_parsed["token"])
+        join_token = str(m_parsed["token"]).strip()
+        if join_token.startswith("-") or not _SWARM_TOKEN_RE.fullmatch(join_token):
+            return {
+                "ok": False,
+                "manager_node_id": mgr_snap.node.id,
+                "manager_addr": format_host_port(adv, 2377),
+                "error": "Swarm manager returned a malformed join token.",
+                "workers": [],
+                "joined_count": 0,
+            }
         manager_addr = format_host_port(adv, 2377)
 
         join_script = (
@@ -2018,27 +2094,49 @@ class MasterController:
         if not math.isfinite(timeout_f) or not (0.1 <= timeout_f <= 30.0):
             raise ValueError("timeout_sec must be a finite number between 0.1 and 30.0")
         with self.config_lock:
+            quarantined = set(self.config.gateway.quarantined_nodes)
             workers = [n for n in self.config.nodes if n.role != "master"]
         if not workers:
             return []
+        check_extra_leaks = (clean_probe_host == "1.1.1.1" and probe_port_i == 443)
+        probe_targets: list[tuple[str, str, int]] = [("ipv4_https", clean_probe_host, probe_port_i)]
+        if check_extra_leaks:
+            probe_targets.append(("ipv6_https", "2606:4700:4700::1111", 443))
+            probe_targets.append(("direct_dns_tcp", "1.1.1.1", 53))
         probe_code = (
-            "import socket, sys\n"
-            f"try:\n"
-            f"    s = socket.create_connection(({clean_probe_host!r}, {probe_port_i}), timeout={timeout_f})\n"
-            "    s.close()\n"
-            "    print('DIRECT_WAN_OPEN')\n"
-            "except OSError as e:\n"
-            "    print(f'WAN_BLOCKED:{type(e).__name__}')\n"
+            "import socket\n"
+            f"targets = {probe_targets!r}\n"
+            "open_list = []\n"
+            "last_err = 'OSError'\n"
+            "for label, host, port in targets:\n"
+            "    try:\n"
+            f"        s = socket.create_connection((host, port), timeout={timeout_f})\n"
+            "        s.close()\n"
+            "        open_list.append(label)\n"
+            "    except OSError as e:\n"
+            "        last_err = type(e).__name__\n"
+            "if open_list:\n"
+            "    print('DIRECT_WAN_OPEN:' + ','.join(open_list))\n"
+            "else:\n"
+            "    print('WAN_BLOCKED:' + last_err)\n"
         )
 
         def _probe_one(node: NodeConfig) -> dict[str, Any]:
+            if node.id in quarantined:
+                return {
+                    "node_id": node.id,
+                    "host": node.host,
+                    "online": False,
+                    "wan_blocked": None,
+                    "detail": "Skipped — node is quarantined by Master.",
+                }
             spec = JobSpec(
                 index=0,
                 job_id=f"wancheck-{node.id}-{uuid.uuid4().hex[:6]}",
                 script_content=probe_code,
                 script_name="wan_check.py",
                 interpreter="python3",
-                timeout_sec=timeout_f + 4.0,
+                timeout_sec=timeout_f * len(probe_targets) + 4.0,
                 force=True,
             )
             kind, data = self.exec_on_node(node, spec)
@@ -2060,12 +2158,13 @@ class MasterController:
                     "detail": f"Direct WAN blocked ({out.split(':', 1)[-1]}) — isolated on LAN!",
                 }
             if "DIRECT_WAN_OPEN" in out:
+                leaks = out.split(":", 1)[1] if ":" in out else "ipv4"
                 return {
                     "node_id": node.id,
                     "host": node.host,
                     "online": True,
                     "wan_blocked": False,
-                    "detail": "Direct internet reachable — block this phone's MAC/IP on your router for air-gap isolation.",
+                    "detail": f"Direct internet reachable ({leaks}) — block this phone's IPv4/IPv6 WAN & external DNS on your router.",
                 }
             return {
                 "node_id": node.id,
@@ -2143,13 +2242,14 @@ class MasterController:
             url, headers=self._headers_for(node, "GET", "/jobs"), method="GET"
         )
         try:
-            with _DIRECT_OPENER.open(req, timeout=self.config.health_timeout_sec) as resp:
-                data = read_json_object_bounded(resp, _MAX_JOBS_RESP_BYTES)
+            jobs_to = max(0.5, float(self.config.health_timeout_sec))
+            with _DIRECT_OPENER.open(req, timeout=jobs_to) as resp:
+                data = read_json_object_bounded(resp, _MAX_JOBS_RESP_BYTES, deadline_sec=jobs_to)
                 raw_active = data.get("active")
                 raw_recent = data.get("recent")
-                active = [j for j in raw_active if isinstance(j, dict)] if isinstance(raw_active, list) else []
-                recent = [j for j in raw_recent if isinstance(j, dict)] if isinstance(raw_recent, list) else []
-                return {**data, "node_id": node.id, "online": True, "active": active, "recent": recent}
+                active = [j for j in raw_active if isinstance(j, dict)][:64] if isinstance(raw_active, list) else []
+                recent = [j for j in raw_recent if isinstance(j, dict)][:50] if isinstance(raw_recent, list) else []
+                return {"node_id": node.id, "online": True, "active": active, "recent": recent}
         except urllib.error.HTTPError as exc:
             err = _read_http_error_body(exc, 4096)[:200]
             return {"node_id": node.id, "online": False, "error": f"HTTP {exc.code}: {err}", "active": [], "recent": []}
@@ -2223,7 +2323,7 @@ class MasterController:
         )
         try:
             with _DIRECT_OPENER.open(req, timeout=timeout_sec) as resp:
-                data = read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES)
+                data = read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES, deadline_sec=max(1.0, float(timeout_sec)))
                 if data.get("node_id") != node.id or data.get("updated") is not True:
                     return {"node_id": node.id, "ok": False, "error": "Worker did not confirm this policy update."}
                 return {**data, "persisted": data.get("persisted") is True, "ok": True}
@@ -2236,13 +2336,14 @@ class MasterController:
     def push_config_to_all(
         self, node_ids: list[str] | None = None, timeout_sec: float = 3.0
     ) -> dict[str, Any]:
-        """Push live Master policy (safety, concurrency, source-IP lock) to online workers in parallel."""
+        """Push live Master policy (safety, concurrency, source-IP lock) to non-quarantined online workers in parallel."""
         with self.config_lock:
             if node_ids is not None:
                 want = set(node_ids)
                 nodes = [n for n in self.config.nodes if n.id in want]
             else:
-                nodes = list(self.config.nodes)
+                quarantined = set(self.config.gateway.quarantined_nodes)
+                nodes = [n for n in self.config.nodes if n.id not in quarantined]
         if not nodes:
             return {"ok_count": 0, "persisted_count": 0, "total": 0, "results": []}
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes))) as pool:

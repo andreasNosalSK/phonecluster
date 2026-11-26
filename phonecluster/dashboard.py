@@ -4102,6 +4102,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 except (ValueError, TypeError, OverflowError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
+                master_ids = {n.id for n in ctrl.config.nodes if n.role == "master"}
+                if any(nid in master_ids for nid in updated_gw.quarantined_nodes):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cannot quarantine the Master node"})
+                    return
+                newly_quarantined = set(updated_gw.quarantined_nodes) - set(prev_gw.quarantined_nodes)
                 ctrl.config.gateway = updated_gw
                 ok, msg = self.server.gateway_manager.sync_with_config()
                 if not ok:
@@ -4118,6 +4123,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         ctrl.gateway_port_override = None
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": msg})
                     return
+                for q_nid in newly_quarantined:
+                    self.server.gateway_manager.disconnect_node(q_nid)
                 prev_port_override = ctrl.gateway_port_override
                 ctrl.gateway_port_override = (
                     self.server.gateway_manager.bound_port if updated_gw.enabled else None
@@ -4407,10 +4414,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 cidr = infer_lan_subnet(seed_host, cfg_subnet)
             elif action == "distcc-start":
                 try:
-                    cidr = str(ipaddress.ip_network(cidr, strict=False))
+                    net_c = ipaddress.ip_network(cidr, strict=False)
                 except ValueError:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid CIDR subnet '{cidr}'"})
                     return
+                min_prefix = 8 if isinstance(net_c, ipaddress.IPv4Network) else 48
+                if net_c.prefixlen < min_prefix:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": f"CIDR '{cidr}' is too broad for unauthenticated distccd (prefix must be >= /{min_prefix})"},
+                    )
+                    return
+                cidr = str(net_c)
             action_args_map = {
                 "distcc-start": ["distcc-start", cidr],
                 "distcc-stop": ["distcc-stop"],

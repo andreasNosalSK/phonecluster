@@ -52,7 +52,8 @@ USB_MESH_DEFAULT_PORTS: tuple[int, ...] = (3632, 50052, 8081, 1883, 8123)
 _SAFE_SERIAL_RE = re.compile(r"^[A-Za-z0-9._:@-]{1,128}$")
 _SAFE_IFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,32}$")
 _SAFE_PREFIX_RE = re.compile(r"^(?:10\.(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])|172\.(?:1[6-9]|2[0-9]|3[0-1])|192\.168)$")
-_USB_NET_DRIVERS = frozenset({"rndis_host", "cdc_ether", "cdc_ncm", "cdc_eem", "ipheth", "usbnet", "asix", "ax88179_178a", "r8152"})
+# Restrict to phone USB gadget drivers (exclude host USB-Ethernet LAN/WAN dongles like r8152/asix/ax88179/smsc95xx)
+_USB_NET_DRIVERS = frozenset({"rndis_host", "cdc_ether", "cdc_ncm", "cdc_eem", "ipheth"})
 
 
 def validate_usb_serial(serial: str) -> str:
@@ -149,6 +150,29 @@ def _read_iface_ipv4s(iface: str) -> list[str]:
     return cidrs
 
 
+def _default_route_ifaces() -> set[str]:
+    """Return interface names currently holding a default route so USB setup never hijacks host uplink."""
+    ip_bin = shutil.which("ip")
+    if not ip_bin:
+        return set()
+    ifaces: set[str] = set()
+    for family in ("-4", "-6"):
+        try:
+            out = subprocess.check_output(
+                [ip_bin, family, "route", "show", "default"],
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            ).decode("utf-8", errors="replace")
+        except (subprocess.SubprocessError, OSError):
+            continue
+        for line in out.splitlines():
+            parts = line.split()
+            for i, tok in enumerate(parts):
+                if tok == "dev" and i + 1 < len(parts):
+                    ifaces.add(parts[i + 1])
+    return ifaces
+
+
 def list_usb_net_interfaces(
     sys_net_dir: Path = SYS_NET_DIR,
     include_ips: bool = True,
@@ -157,6 +181,7 @@ def list_usb_net_interfaces(
     if not sys_net_dir.is_dir():
         return []
     found: list[dict[str, Any]] = []
+    uplink_ifaces = _default_route_ifaces() if include_ips else set()
     try:
         entries = sorted(sys_net_dir.iterdir(), key=lambda p: p.name)
     except OSError:
@@ -164,16 +189,13 @@ def list_usb_net_interfaces(
 
     for entry in entries:
         name = entry.name
-        if name == "lo" or not _SAFE_IFACE_RE.fullmatch(name):
+        if name == "lo" or name in uplink_ifaces or not _SAFE_IFACE_RE.fullmatch(name):
             continue
         is_usb = name.startswith(("usb", "rndis"))
         driver_name = ""
         dev_link = entry / "device"
         if dev_link.exists():
             try:
-                resolved = str(dev_link.resolve())
-                if "/usb" in resolved:
-                    is_usb = True
                 drv_link = dev_link / "driver"
                 if drv_link.exists():
                     driver_name = drv_link.resolve().name
@@ -299,6 +321,7 @@ def plan_adb_usb_hub(
     node_prefix: str = "usb",
     existing_nodes: list[NodeConfig] | None = None,
     registered_only: bool = False,
+    quarantined_nodes: set[str] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Deterministically plan ADB USB-hub forwards, gateway reverses, and phone-to-phone mesh tunnels."""
     ready = [d for d in devices if str(d.get("state") or "device") == "device"]
@@ -306,9 +329,11 @@ def plan_adb_usb_hub(
     if len(ready) > 32:
         raise ValueError(f"Too many USB devices ({len(ready)}; maximum supported per hub plan is 32)")
 
+    quarantined = set(quarantined_nodes or ())
     nodes_plan: list[dict[str, Any]] = []
     forward_rules: list[dict[str, Any]] = []
     reverse_rules: list[dict[str, Any]] = []
+    quarantined_serials: list[str] = []
     peer_mesh_ports: dict[str, dict[int, int]] = {}  # owner_node_id -> {service_port: hub_local_port}
 
     clean_prefix = re.sub(r"[^A-Za-z0-9_-]+", "", node_prefix) or "usb"
@@ -375,7 +400,10 @@ def plan_adb_usb_hub(
                     break
             adb = AdbNodeConfig(serial, remote_worker_port, remote_ssh_port, start, enable_peer_mesh)
 
-        peer_mesh = enable_peer_mesh and (adb.peer_mesh or not registered_only)
+        is_quarantined = node_id in quarantined
+        if is_quarantined:
+            quarantined_serials.append(serial)
+        peer_mesh = (not is_quarantined) and enable_peer_mesh and (adb.peer_mesh or not registered_only)
 
         nodes_plan.append(
             {
@@ -397,7 +425,7 @@ def plan_adb_usb_hub(
         forward_rules.append(
             {"serial": serial, "node_id": node_id, "local_port": local_s_port, "remote_port": adb.remote_ssh_port, "label": "ssh"}
         )
-        if enable_gateway_reverse and 1 <= int(gateway_port) <= 65535:
+        if not is_quarantined and enable_gateway_reverse and 1 <= int(gateway_port) <= 65535:
             reverse_rules.append(
                 {
                     "serial": serial,
@@ -463,6 +491,7 @@ def plan_adb_usb_hub(
         "forward_rules": forward_rules,
         "reverse_rules": reverse_rules,
         "peer_mesh_map": peer_mesh_map,
+        "quarantined_serials": quarantined_serials,
     }
 
 
@@ -543,6 +572,19 @@ def apply_adb_usb_hub(
     for serial, rules in reverses.items():
         reconcile("reverse", rules, device=serial)
 
+    # Actively revoke all reverse tunnels on quarantined USB devices so they cannot reach Master gateway or peer mesh
+    for q_serial in plan.get("quarantined_serials") or []:
+        try:
+            clean_q = validate_usb_serial(str(q_serial))
+            subprocess.run(
+                [cmd, "-s", clean_q, "reverse", "--remove-all"],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+
     return {
         "ok": failed == 0,
         "applied": applied,
@@ -607,9 +649,11 @@ def build_rndis_router_commands(
     *,
     nat_wan: bool = False,
     wan_iface: str = "",
+    gateway_port: int = 8888,
 ) -> dict[str, Any]:
     """Build explicit, idempotent Linux host & phone commands for Layer-3 USB hub phone-to-phone routing."""
     cluster_cidr = str(plan.get("cluster_cidr") or f"{DEFAULT_USB_SUBNET_PREFIX}.0.0/16")
+    gw_port = int(gateway_port) if 1 <= int(gateway_port) <= 65535 else 8888
     nodes = list(plan.get("nodes") or [])
     host_cmds: list[str] = [
         "# 1. Enable kernel IPv4 forwarding so USB phones talk to each other through Master Host",
@@ -626,6 +670,7 @@ def build_rndis_router_commands(
             [
                 f"# Phone {idx} ({n['node_id']}, mac={n.get('mac') or 'unknown'}) on {iface}",
                 f"sudo nmcli dev set {iface} managed no 2>/dev/null || true",
+                f"sudo sysctl -w net.ipv6.conf.{iface}.disable_ipv6=1 net.ipv6.conf.{iface}.accept_ra=0 net.ipv4.conf.{iface}.rp_filter=1",
                 f"sudo ip addr flush dev {iface}",
                 f"sudo ip addr add {host_ip}/30 dev {iface}",
                 f"sudo ip link set {iface} up",
@@ -642,7 +687,7 @@ def build_rndis_router_commands(
 
     host_cmds.extend(
         [
-            "# 2. Allow phone-to-phone forwarding STRICTLY inside the USB hub subnet (air-gapped from WAN)",
+            "# 2. Enforce strict USB hub FORWARD & INPUT air-gap (phone-to-phone only; block LAN/WAN/host admin pivot)",
             f"sudo iptables -C FORWARD -s {cluster_cidr} -d {cluster_cidr} -j ACCEPT 2>/dev/null || "
             f"sudo iptables -I FORWARD 1 -s {cluster_cidr} -d {cluster_cidr} -j ACCEPT",
         ]
@@ -662,6 +707,28 @@ def build_rndis_router_commands(
                 f"sudo iptables -C FORWARD -i {clean_wan} -d {cluster_cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || "
                 f"sudo iptables -I FORWARD 3 -i {clean_wan} -d {cluster_cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
             )
+            host_cmds.append(
+                f"sudo iptables -C FORWARD -s {cluster_cidr} ! -d {cluster_cidr} ! -o {clean_wan} -j DROP 2>/dev/null || "
+                f"sudo iptables -I FORWARD 4 -s {cluster_cidr} ! -d {cluster_cidr} ! -o {clean_wan} -j DROP"
+            )
+    else:
+        host_cmds.append(
+            f"sudo iptables -C FORWARD -s {cluster_cidr} ! -d {cluster_cidr} -j DROP 2>/dev/null || "
+            f"sudo iptables -I FORWARD 2 -s {cluster_cidr} ! -d {cluster_cidr} -j DROP"
+        )
+    for n in nodes:
+        iface = validate_iface_name(str(n["iface"]))
+        host_ip = str(n["host_ip"])
+        phone_ip = str(n["phone_ip"])
+        host_cmds.extend(
+            [
+                f"sudo iptables -C FORWARD -i {iface} ! -s {phone_ip}/32 -j DROP 2>/dev/null || sudo iptables -I FORWARD 1 -i {iface} ! -s {phone_ip}/32 -j DROP",
+                f"sudo iptables -C INPUT -i {iface} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || sudo iptables -I INPUT 1 -i {iface} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                f"sudo iptables -C INPUT -i {iface} -s {phone_ip}/32 -d {host_ip}/32 -p tcp --dport {gw_port} -j ACCEPT 2>/dev/null || sudo iptables -I INPUT 2 -i {iface} -s {phone_ip}/32 -d {host_ip}/32 -p tcp --dport {gw_port} -j ACCEPT",
+                f"sudo iptables -C INPUT -i {iface} -s {phone_ip}/32 -d {host_ip}/32 -p icmp -j ACCEPT 2>/dev/null || sudo iptables -I INPUT 3 -i {iface} -s {phone_ip}/32 -d {host_ip}/32 -p icmp -j ACCEPT",
+                f"sudo iptables -C INPUT -i {iface} -j DROP 2>/dev/null || sudo iptables -I INPUT 4 -i {iface} -j DROP",
+            ]
+        )
     return {
         "cluster_cidr": cluster_cidr,
         "host_commands": host_cmds,
@@ -734,11 +801,12 @@ def sync_usb_hub_into_config(
             by_id[nid] = node
         updated_ids.append(nid)
 
-    # Ensure Master allows USB subnet or loopback automatically when enforce_worker_source_ip is ON
+    # Allow ONLY Master's /30 host IPs (NEVER the whole /16 phone subnet!) when enforce_worker_source_ip is ON
     if mode == "rndis":
-        cidr = str(plan.get("cluster_cidr") or "")
-        if cidr and cidr not in config.network.allowed_master_ips:
-            config.network.allowed_master_ips.append(cidr)
+        for item in plan.get("nodes") or []:
+            h_ip = str(item.get("host_ip") or "").strip()
+            if h_ip and h_ip not in config.network.allowed_master_ips:
+                config.network.allowed_master_ips.append(h_ip)
     elif mode == "adb":
         for item in plan.get("nodes") or []:
             h = str(item.get("host") or "")
@@ -798,6 +866,7 @@ class UsbHubWatchdog(threading.Thread):
             enable_peer_mesh=self.enable_peer_mesh,
             existing_nodes=cfg.nodes,
             registered_only=self.config_path is not None,
+            quarantined_nodes=cfg.gateway.quarantined_nodes,
         )
         res = apply_adb_usb_hub(plan, adb_bin=self.adb_bin) if plan["nodes"] else {
             "ok": True, "applied": 0, "unchanged": 0, "failed": 0, "errors": [],

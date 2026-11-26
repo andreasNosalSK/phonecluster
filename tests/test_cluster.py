@@ -7981,7 +7981,11 @@ class TestUsbHubRouting(unittest.TestCase):
         sync_usb_hub_into_config(cfg, plan)
         self.assertEqual(cfg.get_node("usb1").host, "10.77.1.2")
         self.assertEqual(cfg.get_node("usb2").host, "10.77.2.2")
-        self.assertIn("10.77.0.0/16", cfg.network.allowed_master_ips)
+        self.assertIn("10.77.1.1", cfg.network.allowed_master_ips)
+        self.assertIn("10.77.2.1", cfg.network.allowed_master_ips)
+        self.assertNotIn("10.77.0.0/16", cfg.network.allowed_master_ips)
+        self.assertNotIn("10.77.1.2", cfg.network.allowed_master_ips)
+        self.assertNotIn("10.77.2.2", cfg.network.allowed_master_ips)
 
         # 3. Dashboard /api/usb-hub endpoint (with auth lock check) + HTML markers
         fake_topo = {

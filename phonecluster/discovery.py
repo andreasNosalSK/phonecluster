@@ -210,6 +210,7 @@ class DiscoveryResponder(threading.Thread):
         LOG.info("LAN discovery responder listening on UDP %s:%d", self.listen_host, self.bound_port)
         win_start = time.monotonic()
         replies = 0
+        per_ip_replies: dict[str, int] = {}
         try:
             while not self._stop_event.is_set():
                 try:
@@ -226,16 +227,20 @@ class DiscoveryResponder(threading.Thread):
                 if now_m - win_start >= 1.0:
                     win_start = now_m
                     replies = 0
-                if replies >= 20:
+                    per_ip_replies.clear()
+                src_ip = str(addr[0])
+                if replies >= 40 or per_ip_replies.get(src_ip, 0) >= 6:
                     continue
                 try:
-                    msg = json.loads(data.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                    msg = json.loads(data.decode("utf-8"), parse_constant=lambda _c: None)
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
                     continue
                 if isinstance(msg, dict) and msg.get("type") == PROBE_TYPE:
                     try:
                         sock.sendto(self._build_reply(), addr)
                         replies += 1
+                        if len(per_ip_replies) < 256 or src_ip in per_ip_replies:
+                            per_ip_replies[src_ip] = per_ip_replies.get(src_ip, 0) + 1
                     except OSError:
                         pass
         finally:
@@ -326,8 +331,8 @@ def discover_lan_nodes(
                 except OSError:
                     continue
                 try:
-                    msg = json.loads(data.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                    msg = json.loads(data.decode("utf-8"), parse_constant=lambda _c: None)
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
                     continue
                 if not isinstance(msg, dict) or msg.get("type") != REPLY_TYPE:
                     continue

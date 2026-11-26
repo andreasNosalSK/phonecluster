@@ -105,14 +105,15 @@ print(digest.hexdigest())'
 if [[ "${DRY_RUN}" -eq 0 ]]; then
   SYNC_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/phonecluster-sync.XXXXXX")"
   trap 'rm -f -- "${SYNC_ARCHIVE}"' EXIT
-  tar -cf "${SYNC_ARCHIVE}" -C "${MODULE_ROOT}" phonecluster \
+  tar --exclude='__pycache__' --exclude='*.pyc' -cf "${SYNC_ARCHIVE}" -C "${MODULE_ROOT}" phonecluster \
     -C "${REPO_ROOT}" phonecluster_cli.py scripts examples
   ARCHIVE_SHA="$(python3 -c "${ARCHIVE_HASH_CODE}" "${SYNC_ARCHIVE}")"
 fi
 
 if [[ "${DRY_RUN}" -eq 0 && "${SETUP_KEYS}" -eq 1 && ! -f "${HOME}/.ssh/id_ed25519" ]]; then
   echo "Generating SSH key (~/.ssh/id_ed25519)..."
-  mkdir -p "${HOME}/.ssh"
+  mkdir -p -m 700 "${HOME}/.ssh"
+  chmod 700 "${HOME}/.ssh"
   ssh-keygen -t ed25519 -N "" -f "${HOME}/.ssh/id_ed25519"
 fi
 
@@ -138,6 +139,22 @@ while IFS='|' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE <&3; do
 
   # Use POSIX shell syntax for the remote command, including Termux and Ubuntu Touch shells.
   REMOTE_PATH="set -eu; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#??}\" ;; esac"
+ARCHIVE_SAFE_CHECK='import os, pathlib, sys, tarfile
+archive, dest = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).resolve()
+if dest.is_symlink():
+    raise SystemExit("Sync destination cannot be a symlink.")
+with tarfile.open(archive, "r") as tf:
+    for m in tf.getmembers():
+        if m.issym() or m.islnk() or not (m.isfile() or m.isdir()):
+            raise SystemExit(f"Unsafe tar member type rejected: {m.name}")
+        p = pathlib.PurePosixPath(m.name)
+        if p.is_absolute() or ".." in p.parts:
+            raise SystemExit(f"Unsafe tar member path rejected: {m.name}")
+        cur = dest
+        for part in p.parts:
+            cur = cur / part
+            if cur.is_symlink():
+                raise SystemExit(f"Refusing to extract through symlink: {cur}")'
   REMOTE_UNPACK="${REMOTE_PATH}
 mkdir -p \"\$RDIR/config\" \"\$RDIR/logs\"
 ARCHIVE=\$(mktemp \"\$RDIR/.phonecluster-sync.XXXXXX\")
@@ -148,6 +165,7 @@ if [ \"\$CHECKSUM\" != '${ARCHIVE_SHA}' ]; then
     echo 'Sync archive checksum mismatch. Code was not extracted.' >&2
     exit 1
 fi
+python3 -c '${ARCHIVE_SAFE_CHECK}' \"\$ARCHIVE\" \"\$RDIR\"
 tar -xf \"\$ARCHIVE\" -C \"\$RDIR\"
 cd \"\$RDIR\"
 python3 -m phonecluster.config_transfer config/cluster.json"

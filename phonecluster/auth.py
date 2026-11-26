@@ -333,7 +333,20 @@ def is_webhook_target_unsafe(url: str) -> bool:
     return False
 
 
-def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
+def _is_loopback_webhook_addr(a: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(a, ipaddress.IPv6Address):
+        for v4 in _embedded_ipv4s(a):
+            if v4.is_loopback or v4.is_unspecified or v4 in _IPV4_THIS_NET:
+                return True
+    return bool(a.is_loopback or a.is_unspecified or (isinstance(a, ipaddress.IPv4Address) and a in _IPV4_THIS_NET))
+
+
+def _is_webhook_redirect_target_unsafe(
+    orig_url: str,
+    new_url: str,
+    *,
+    orig_peer_ip: str | None = None,
+) -> bool:
     """Block webhook redirects to non-HTTP(S), link-local/metadata, public->private/LAN, or remote->loopback SSRF."""
     try:
         parsed_new = urllib.parse.urlsplit(new_url)
@@ -355,21 +368,20 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
     except ValueError:
         return True
 
-    def _is_loopback_addr(a: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-        if isinstance(a, ipaddress.IPv6Address):
-            for v4 in _embedded_ipv4s(a):
-                if v4.is_loopback or v4.is_unspecified or v4 in _IPV4_THIS_NET:
-                    return True
-        return bool(a.is_loopback or a.is_unspecified or (isinstance(a, ipaddress.IPv4Address) and a in _IPV4_THIS_NET))
-
     def _classify_origin(h: str, p: int) -> tuple[bool, bool]:
         """Return `(orig_is_loopback, orig_is_private_or_local)`."""
+        if orig_peer_ip:
+            try:
+                peer_a = ipaddress.ip_address(str(orig_peer_ip).strip().strip("[]").split("%", 1)[0])
+                return _is_loopback_webhook_addr(peer_a), _is_non_public_ip(peer_a)
+            except ValueError:
+                return False, False
         nodot = h.rstrip(".")
         if nodot == "localhost":
             return True, True
         try:
             a = ipaddress.ip_address(nodot)
-            return _is_loopback_addr(a), _is_non_public_ip(a)
+            return _is_loopback_webhook_addr(a), _is_non_public_ip(a)
         except ValueError:
             pass
         if nodot.endswith(_LOCAL_HOST_SUFFIXES) or "." not in nodot:
@@ -378,7 +390,7 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
             orig_infos = socket.getaddrinfo(h, p, type=socket.SOCK_STREAM)
             orig_addrs = [ipaddress.ip_address(str(sa[0])) for *_r, sa in orig_infos if "%" not in str(sa[0])]
             if orig_addrs and all(_is_non_public_ip(a) for a in orig_addrs):
-                return all(_is_loopback_addr(a) for a in orig_addrs), True
+                return all(_is_loopback_webhook_addr(a) for a in orig_addrs), True
         except (OSError, ValueError):
             pass
         return False, False
@@ -391,7 +403,7 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
         lit_new = ipaddress.ip_address(new_nodot)
         if _is_webhook_ip_disallowed(lit_new):
             return True
-        if _is_loopback_addr(lit_new) and not orig_is_loopback:
+        if _is_loopback_webhook_addr(lit_new) and not orig_is_loopback:
             return True
         if _is_non_public_ip(lit_new) and not orig_is_private:
             return True
@@ -414,7 +426,7 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
             return True
         if _is_webhook_ip_disallowed(addr):
             return True
-        if _is_loopback_addr(addr) and not orig_is_loopback:
+        if _is_loopback_webhook_addr(addr) and not orig_is_loopback:
             return True
         if _is_non_public_ip(addr) and not orig_is_private:
             return True
@@ -422,9 +434,16 @@ def _is_webhook_redirect_target_unsafe(orig_url: str, new_url: str) -> bool:
 
 
 def _connect_validated_webhook_socket(
-    host: str, port: int, timeout: Any, source_address: Any = None
+    host: str,
+    port: int,
+    timeout: Any,
+    source_address: Any = None,
+    *,
+    allow_private: bool = True,
+    allow_loopback: bool = True,
+    peer_out: list[str] | None = None,
 ) -> socket.socket:
-    """Resolve DNS ONCE, validate every IP against webhook SSRF rules, and connect directly (blocks DNS-rebinding TOCTOU)."""
+    """Resolve DNS ONCE, validate every IP against webhook SSRF & redirect-origin policy, and connect directly."""
     clean_host = str(host or "").strip().strip("[]").lower()
     if not clean_host or "%" in clean_host or not (1 <= int(port) <= 65535):
         raise OSError(f"Refused unsafe webhook target {host!r}:{port}")
@@ -444,6 +463,10 @@ def _connect_validated_webhook_socket(
             raise OSError(f"Invalid resolved webhook IP {ip_raw!r}") from exc
         if _is_webhook_ip_disallowed(addr):
             raise OSError(f"Blocked unsafe webhook destination IP {ip_raw}")
+        if not allow_loopback and _is_loopback_webhook_addr(addr):
+            raise OSError(f"Blocked webhook redirect to loopback IP {ip_raw}")
+        if not allow_private and _is_non_public_ip(addr):
+            raise OSError(f"Blocked webhook redirect to private/non-public IP {ip_raw}")
     last_exc: OSError | None = None
     for fam, socktype, proto, _cn, sa in infos:
         s: socket.socket | None = None
@@ -454,6 +477,8 @@ def _connect_validated_webhook_socket(
             if source_address:
                 s.bind(source_address)
             s.connect(sa)
+            if peer_out is not None:
+                peer_out.append(str(sa[0]))
             return s
         except OSError as exc:
             last_exc = exc
@@ -468,9 +493,28 @@ def _connect_validated_webhook_socket(
 class _SafeWebhookHTTPConnection(http.client.HTTPConnection):
     """HTTPConnection subclass that connects only to DNS-validated, SSRF-safe IPs (single-resolve)."""
 
+    def __init__(
+        self,
+        *args: Any,
+        _pc_allow_private: bool = True,
+        _pc_allow_loopback: bool = True,
+        _pc_peer_out: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._pc_allow_private = _pc_allow_private
+        self._pc_allow_loopback = _pc_allow_loopback
+        self._pc_peer_out = _pc_peer_out
+        super().__init__(*args, **kwargs)
+
     def connect(self) -> None:
         self.sock = _connect_validated_webhook_socket(
-            self.host, self.port, self.timeout, self.source_address
+            self.host,
+            self.port,
+            self.timeout,
+            self.source_address,
+            allow_private=self._pc_allow_private,
+            allow_loopback=self._pc_allow_loopback,
+            peer_out=self._pc_peer_out,
         )
         if self._tunnel_host:
             self._tunnel()
@@ -479,9 +523,28 @@ class _SafeWebhookHTTPConnection(http.client.HTTPConnection):
 class _SafeWebhookHTTPSConnection(http.client.HTTPSConnection):
     """HTTPSConnection subclass that connects only to DNS-validated IPs while preserving TLS SNI."""
 
+    def __init__(
+        self,
+        *args: Any,
+        _pc_allow_private: bool = True,
+        _pc_allow_loopback: bool = True,
+        _pc_peer_out: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._pc_allow_private = _pc_allow_private
+        self._pc_allow_loopback = _pc_allow_loopback
+        self._pc_peer_out = _pc_peer_out
+        super().__init__(*args, **kwargs)
+
     def connect(self) -> None:
         raw_sock = _connect_validated_webhook_socket(
-            self.host, self.port, self.timeout, self.source_address
+            self.host,
+            self.port,
+            self.timeout,
+            self.source_address,
+            allow_private=self._pc_allow_private,
+            allow_loopback=self._pc_allow_loopback,
+            peer_out=self._pc_peer_out,
         )
         try:
             if self._tunnel_host:
@@ -502,12 +565,42 @@ class _SafeWebhookHTTPSConnection(http.client.HTTPSConnection):
 
 class _SafeWebhookHTTPHandler(urllib.request.HTTPHandler):
     def http_open(self, req: Any) -> Any:
-        return self.do_open(_SafeWebhookHTTPConnection, req)
+        allow_priv, allow_lb = getattr(req, "_pc_webhook_policy", (True, True))
+        peer_out: list[str] = []
+
+        def _make_conn(host: Any, **kw: Any) -> _SafeWebhookHTTPConnection:
+            return _SafeWebhookHTTPConnection(
+                host,
+                _pc_allow_private=allow_priv,
+                _pc_allow_loopback=allow_lb,
+                _pc_peer_out=peer_out,
+                **kw,
+            )
+
+        resp = self.do_open(_make_conn, req)
+        if peer_out and not hasattr(req, "_pc_origin_peer"):
+            req._pc_origin_peer = peer_out[0]
+        return resp
 
 
 class _SafeWebhookHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req: Any) -> Any:
-        return self.do_open(_SafeWebhookHTTPSConnection, req, context=self._context)
+        allow_priv, allow_lb = getattr(req, "_pc_webhook_policy", (True, True))
+        peer_out: list[str] = []
+
+        def _make_conn(host: Any, **kw: Any) -> _SafeWebhookHTTPSConnection:
+            return _SafeWebhookHTTPSConnection(
+                host,
+                _pc_allow_private=allow_priv,
+                _pc_allow_loopback=allow_lb,
+                _pc_peer_out=peer_out,
+                **kw,
+            )
+
+        resp = self.do_open(_make_conn, req, context=self._context)
+        if peer_out and not hasattr(req, "_pc_origin_peer"):
+            req._pc_origin_peer = peer_out[0]
+        return resp
 
 
 class _HttpOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -516,9 +609,21 @@ class _HttpOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
     max_redirections = 5
 
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
-        if _is_webhook_redirect_target_unsafe(req.full_url, newurl):
+        orig_peer = getattr(req, "_pc_origin_peer", None)
+        if _is_webhook_redirect_target_unsafe(req.full_url, newurl, orig_peer_ip=orig_peer):
             return None
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None:
+            if orig_peer:
+                new_req._pc_origin_peer = orig_peer
+                try:
+                    peer_a = ipaddress.ip_address(str(orig_peer).strip().strip("[]").split("%", 1)[0])
+                    new_req._pc_webhook_policy = (_is_non_public_ip(peer_a), _is_loopback_webhook_addr(peer_a))
+                except ValueError:
+                    new_req._pc_webhook_policy = (False, False)
+            elif hasattr(req, "_pc_webhook_policy"):
+                new_req._pc_webhook_policy = req._pc_webhook_policy
+        return new_req
 
 
 def build_direct_opener() -> urllib.request.OpenerDirector:
@@ -527,17 +632,41 @@ def build_direct_opener() -> urllib.request.OpenerDirector:
 
 
 def build_webhook_opener() -> urllib.request.OpenerDirector:
-    """Return an opener for user webhooks with single-resolve SSRF blocking and strict redirect guards."""
+    """Return an opener for user webhooks with direct connection (no ambient proxy bypass), single-resolve SSRF blocking, and strict redirect guards."""
     return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
         _SafeWebhookHTTPHandler(),
         _SafeWebhookHTTPSHandler(),
         _HttpOnlyRedirectHandler(),
     )
 
 
-def read_json_object_bounded(resp: Any, max_bytes: int) -> dict[str, Any]:
-    """Read an HTTP JSON response with a strict RAM cap and verify it is a JSON object (`dict`)."""
-    raw = resp.read(max_bytes + 1)
+def read_json_object_bounded(
+    resp: Any,
+    max_bytes: int,
+    deadline_sec: float | None = None,
+) -> dict[str, Any]:
+    """Read an HTTP JSON response with a strict RAM cap and optional total wall-clock deadline."""
+    if deadline_sec is None:
+        raw = resp.read(max_bytes + 1)
+    else:
+        deadline = time.monotonic() + max(0.05, float(deadline_sec))
+        buf = bytearray()
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+        while len(buf) <= max_bytes:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError(f"HTTP response read exceeded {deadline_sec:.1f}s wall-clock deadline")
+            if sock is not None:
+                try:
+                    sock.settimeout(max(0.05, rem))
+                except OSError:
+                    pass
+            chunk = resp.read(min(16384, max_bytes + 1 - len(buf)))
+            if not chunk:
+                break
+            buf.extend(chunk)
+        raw = bytes(buf)
     if len(raw) > max_bytes:
         raise ValueError(f"response exceeds {max_bytes} byte safety limit")
     try:
@@ -726,8 +855,11 @@ class AuthRateLimiter:
             raw = raw.split("%", 1)[0]
         try:
             a = ipaddress.ip_address(raw)
-            if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped is not None:
-                return str(a.ipv4_mapped)
+            if isinstance(a, ipaddress.IPv6Address):
+                if a.ipv4_mapped is not None:
+                    return str(a.ipv4_mapped)
+                if not a.is_loopback and not a.is_unspecified:
+                    return str(ipaddress.IPv6Network((a, 64), strict=False))
             return str(a)
         except ValueError:
             return raw.lower()

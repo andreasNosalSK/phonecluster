@@ -101,6 +101,9 @@ case "${CMD}" in
         --wan-iface)
           [[ $# -ge 2 ]] || { echo "Error: --wan-iface requires an interface name" >&2; exit 2; }
           WAN_IFACE="$2"; shift 2 ;;
+        --gateway-port)
+          [[ $# -ge 2 ]] || { echo "Error: --gateway-port requires a port" >&2; exit 2; }
+          GW_PORT="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
@@ -131,8 +134,28 @@ PY
     fi
 
     CLUSTER_CIDR="${PREFIX}.0.0/16"
+    if [[ ! "${GW_PORT}" =~ ^[0-9]+$ ]] || (( GW_PORT < 1 || GW_PORT > 65535 )); then
+      echo "Error: Invalid --gateway-port '${GW_PORT}' (expected 1..65535)." >&2
+      exit 2
+    fi
+    if [[ "${DRY_RUN}" -eq 0 ]] && ! command -v iptables >/dev/null 2>&1; then
+      echo "Error: iptables is required to enforce USB hub air-gap isolation before enabling net.ipv4.ip_forward=1." >&2
+      exit 1
+    fi
     echo "=== Configuring Layer-3 USB 3.0 Hub Router (${CLUSTER_CIDR}) ==="
     run_cmd sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    # Create/flush dedicated firewall chains BEFORE bringing USB phone interfaces up
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "[dry-run] iptables -N PHONECLUSTER_USB_FWD / PHONECLUSTER_USB_IN (flush + jump from FORWARD & INPUT)"
+    else
+      iptables -N PHONECLUSTER_USB_FWD 2>/dev/null || true
+      iptables -F PHONECLUSTER_USB_FWD
+      iptables -C FORWARD -j PHONECLUSTER_USB_FWD 2>/dev/null || iptables -I FORWARD 1 -j PHONECLUSTER_USB_FWD
+      iptables -N PHONECLUSTER_USB_IN 2>/dev/null || true
+      iptables -F PHONECLUSTER_USB_IN
+      iptables -C INPUT -j PHONECLUSTER_USB_IN 2>/dev/null || iptables -I INPUT 1 -j PHONECLUSTER_USB_IN
+    fi
 
     while IFS='|' read -r IDX IFACE MAC DRV; do
       [[ -z "${IFACE}" ]] && continue
@@ -143,43 +166,65 @@ PY
       if command -v nmcli >/dev/null 2>&1; then
         run_cmd nmcli dev set "${IFACE}" managed no 2>/dev/null || true
       fi
+      # Disable IPv6 + Router Advertisements (blocks rogue RAs & fe80:: SSH) and enforce strict rp_filter anti-spoofing
+      run_cmd sysctl -w "net.ipv6.conf.${IFACE}.disable_ipv6=1" "net.ipv6.conf.${IFACE}.accept_ra=0" "net.ipv4.conf.${IFACE}.rp_filter=1" >/dev/null 2>&1 || true
       run_cmd ip addr flush dev "${IFACE}"
       run_cmd ip addr add "${HOST_IP}/30" dev "${IFACE}"
       run_cmd ip link set "${IFACE}" up
+
+      # Per-interface anti-spoofing + host INPUT isolation (allow ESTABLISHED, ICMP, and Network Guard port only)
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -i ${IFACE} ! -s ${PHONE_IP}/32 -j DROP"
+        echo "[dry-run] iptables -A PHONECLUSTER_USB_IN -i ${IFACE} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+        echo "[dry-run] iptables -A PHONECLUSTER_USB_IN -i ${IFACE} -s ${PHONE_IP}/32 -d ${HOST_IP}/32 -p tcp --dport ${GW_PORT} -j ACCEPT"
+        echo "[dry-run] iptables -A PHONECLUSTER_USB_IN -i ${IFACE} -s ${PHONE_IP}/32 -d ${HOST_IP}/32 -p icmp -j ACCEPT"
+        echo "[dry-run] iptables -A PHONECLUSTER_USB_IN -i ${IFACE} -j DROP"
+      else
+        iptables -A PHONECLUSTER_USB_FWD -i "${IFACE}" ! -s "${PHONE_IP}/32" -j DROP
+        iptables -A PHONECLUSTER_USB_IN -i "${IFACE}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -A PHONECLUSTER_USB_IN -i "${IFACE}" -s "${PHONE_IP}/32" -d "${HOST_IP}/32" -p tcp --dport "${GW_PORT}" -j ACCEPT
+        iptables -A PHONECLUSTER_USB_IN -i "${IFACE}" -s "${PHONE_IP}/32" -d "${HOST_IP}/32" -p icmp -j ACCEPT
+        iptables -A PHONECLUSTER_USB_IN -i "${IFACE}" -j DROP
+      fi
     done <<< "${IFACE_ROWS}"
 
-    if command -v iptables >/dev/null 2>&1; then
-      if [[ "${DRY_RUN}" -eq 1 ]]; then
-        echo "[dry-run] iptables -I FORWARD 1 -s ${CLUSTER_CIDR} -d ${CLUSTER_CIDR} -j ACCEPT"
-      else
-        iptables -C FORWARD -s "${CLUSTER_CIDR}" -d "${CLUSTER_CIDR}" -j ACCEPT 2>/dev/null \
-          || iptables -I FORWARD 1 -s "${CLUSTER_CIDR}" -d "${CLUSTER_CIDR}" -j ACCEPT
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -s ${CLUSTER_CIDR} -d ${CLUSTER_CIDR} -j ACCEPT"
+    else
+      iptables -A PHONECLUSTER_USB_FWD -s "${CLUSTER_CIDR}" -d "${CLUSTER_CIDR}" -j ACCEPT
+    fi
+    if [[ "${NAT_WAN}" -eq 1 ]]; then
+      if [[ -z "${WAN_IFACE}" ]]; then
+        WAN_IFACE="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
       fi
-      if [[ "${NAT_WAN}" -eq 1 ]]; then
-        if [[ -z "${WAN_IFACE}" ]]; then
-          WAN_IFACE="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
-        fi
-        if [[ -n "${WAN_IFACE}" ]]; then
-          validate_iface "${WAN_IFACE}"
-          echo "  Enabling optional WAN NAT via ${WAN_IFACE} for ${CLUSTER_CIDR}..."
-          if [[ "${DRY_RUN}" -eq 1 ]]; then
-            echo "[dry-run] iptables -t nat -A POSTROUTING -s ${CLUSTER_CIDR} -o ${WAN_IFACE} -j MASQUERADE"
-            echo "[dry-run] iptables -I FORWARD 2 -s ${CLUSTER_CIDR} -o ${WAN_IFACE} -j ACCEPT"
-            echo "[dry-run] iptables -I FORWARD 3 -i ${WAN_IFACE} -d ${CLUSTER_CIDR} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
-          else
-            iptables -t nat -C POSTROUTING -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j MASQUERADE 2>/dev/null \
-              || iptables -t nat -A POSTROUTING -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j MASQUERADE
-            iptables -C FORWARD -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j ACCEPT 2>/dev/null \
-              || iptables -I FORWARD 2 -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j ACCEPT
-            iptables -C FORWARD -i "${WAN_IFACE}" -d "${CLUSTER_CIDR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
-              || iptables -I FORWARD 3 -i "${WAN_IFACE}" -d "${CLUSTER_CIDR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-          fi
+      if [[ -n "${WAN_IFACE}" ]]; then
+        validate_iface "${WAN_IFACE}"
+        echo "  Enabling optional WAN NAT via ${WAN_IFACE} for ${CLUSTER_CIDR} (LAN still blocked)..."
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+          echo "[dry-run] iptables -t nat -A POSTROUTING -s ${CLUSTER_CIDR} -o ${WAN_IFACE} -j MASQUERADE"
+          echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -s ${CLUSTER_CIDR} -o ${WAN_IFACE} -j ACCEPT"
+          echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -i ${WAN_IFACE} -d ${CLUSTER_CIDR} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+          echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -s ${CLUSTER_CIDR} ! -d ${CLUSTER_CIDR} -j DROP"
         else
-          echo "Warning: Could not detect default WAN interface; pass --wan-iface <if>." >&2
+          iptables -t nat -C POSTROUTING -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j MASQUERADE 2>/dev/null \
+            || iptables -t nat -A POSTROUTING -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j MASQUERADE
+          iptables -A PHONECLUSTER_USB_FWD -s "${CLUSTER_CIDR}" -o "${WAN_IFACE}" -j ACCEPT
+          iptables -A PHONECLUSTER_USB_FWD -i "${WAN_IFACE}" -d "${CLUSTER_CIDR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          iptables -A PHONECLUSTER_USB_FWD -s "${CLUSTER_CIDR}" ! -d "${CLUSTER_CIDR}" -j DROP
         fi
       else
-        echo "  WAN isolation: Phones can talk to Master & each other (${CLUSTER_CIDR}), air-gapped from WAN."
+        echo "Warning: Could not detect default WAN interface; keeping strict air-gap (pass --wan-iface <if>)." >&2
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          iptables -A PHONECLUSTER_USB_FWD -s "${CLUSTER_CIDR}" ! -d "${CLUSTER_CIDR}" -j DROP
+        fi
       fi
+    else
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] iptables -A PHONECLUSTER_USB_FWD -s ${CLUSTER_CIDR} ! -d ${CLUSTER_CIDR} -j DROP"
+      else
+        iptables -A PHONECLUSTER_USB_FWD -s "${CLUSTER_CIDR}" ! -d "${CLUSTER_CIDR}" -j DROP
+      fi
+      echo "  WAN & LAN isolation enforced: Phones can talk to each other (${CLUSTER_CIDR}) and Master Gateway (:${GW_PORT}) ONLY."
     fi
 
     echo
@@ -267,12 +312,27 @@ PY
     CLUSTER_CIDR="${PREFIX}.0.0/16"
     if command -v iptables >/dev/null 2>&1; then
       if [[ "${DRY_RUN}" -eq 1 ]]; then
-        echo "[dry-run] iptables -D FORWARD -s ${CLUSTER_CIDR} -d ${CLUSTER_CIDR} -j ACCEPT"
+        echo "[dry-run] iptables -D FORWARD -j PHONECLUSTER_USB_FWD; iptables -F/X PHONECLUSTER_USB_FWD"
+        echo "[dry-run] iptables -D INPUT -j PHONECLUSTER_USB_IN; iptables -F/X PHONECLUSTER_USB_IN"
+        echo "[dry-run] iptables -t nat -D POSTROUTING -s ${CLUSTER_CIDR} -j MASQUERADE (all matching)"
       else
+        iptables -D FORWARD -j PHONECLUSTER_USB_FWD 2>/dev/null || true
+        iptables -F PHONECLUSTER_USB_FWD 2>/dev/null || true
+        iptables -X PHONECLUSTER_USB_FWD 2>/dev/null || true
+        iptables -D INPUT -j PHONECLUSTER_USB_IN 2>/dev/null || true
+        iptables -F PHONECLUSTER_USB_IN 2>/dev/null || true
+        iptables -X PHONECLUSTER_USB_IN 2>/dev/null || true
         iptables -D FORWARD -s "${CLUSTER_CIDR}" -d "${CLUSTER_CIDR}" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -s "${CLUSTER_CIDR}" ! -d "${CLUSTER_CIDR}" -j DROP 2>/dev/null || true
+        while iptables -t nat -S POSTROUTING 2>/dev/null | grep -Fq -- "-s ${CLUSTER_CIDR} "; do
+          RULE="$(iptables -t nat -S POSTROUTING | grep -Fm 1 -- "-s ${CLUSTER_CIDR} " | sed 's/^-A /-D /')"
+          [[ -n "${RULE}" ]] || break
+          # shellcheck disable=SC2086
+          iptables -t nat ${RULE} 2>/dev/null || break
+        done
       fi
     fi
-    echo "Removed USB hub forwarding rules for ${CLUSTER_CIDR}."
+    echo "Removed USB hub forwarding, input, and NAT rules for ${CLUSTER_CIDR}."
     ;;
 
   help|-h|--help)

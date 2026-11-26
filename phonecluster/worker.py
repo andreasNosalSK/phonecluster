@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import hmac
 import http.client
 import ipaddress
 import json
@@ -14,6 +15,7 @@ import selectors
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -117,6 +119,7 @@ class WorkerState:
         self.replay_cache = ReplayCache(ttl_sec=150.0, max_entries=4096)
         self.lock = threading.Lock()
         self._config_update_lock = threading.Lock()
+        self._rpc_stop_lock = threading.Lock()
         self._shutting_down = False
         self.active_jobs: dict[str, ActiveJob] = {}
         self.recent_jobs: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
@@ -202,6 +205,8 @@ class WorkerState:
         if self.health_provider is not None:
             return
         with self.lock:
+            if self._sample_health_in_background:
+                return
             self._sample_health_in_background = True
 
         def sample_loop() -> None:
@@ -572,7 +577,9 @@ class WorkerState:
             try:
                 disk_cfg = load_config(cfg_path)
                 disk_node = disk_cfg.get_node(self.node_id)
-                if disk_node.role != self.role or disk_cfg.token_for_node(disk_node) != self.auth_token:
+                if disk_node.role != self.role or not hmac.compare_digest(
+                    disk_cfg.token_for_node(disk_node), self.auth_token
+                ):
                     raise ValueError("Worker identity or credential on disk changed. Restart the worker.")
                 if new_safety is not None:
                     disk_cfg.safety = new_safety
@@ -1004,6 +1011,60 @@ def _stop_ubuntu_touch_wakelock(proc: subprocess.Popen[bytes] | None) -> None:
         pass
 
 
+_VALID_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_GATEWAY_SCRUB_PREFIXES = (
+    "npm_config_",
+    "yarn_",
+    "git_config_",
+)
+_GATEWAY_SCRUB_EXACT = frozenset({
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "ftp_proxy",
+    "no_proxy",
+    "pip_proxy",
+    "curl_home",
+})
+
+
+def _is_proxy_override_env_key(key: str) -> bool:
+    kl = key.lower()
+    if kl in _GATEWAY_SCRUB_EXACT or kl.endswith("_proxy"):
+        return True
+    if kl.startswith("git_config_"):
+        return True
+    return any(kl.startswith(p) and "proxy" in kl for p in _GATEWAY_SCRUB_PREFIXES)
+
+
+def _private_script_stage_dir(cwd: Path) -> Path | None:
+    """Return a private 0700 staging directory if `cwd` is world-writable (e.g. /tmp or /sdcard)."""
+    try:
+        st = cwd.stat()
+        is_world_writable = os.name != "nt" and bool(st.st_mode & 0o002)
+    except OSError:
+        is_world_writable = True
+    if not is_world_writable:
+        return None
+    base = Path(os.environ.get("PREFIX") or Path.home() / ".cache") / "phonecluster-jobs"
+    try:
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if base.is_symlink():
+            return None
+        bst = base.lstat()
+        if not stat.S_ISDIR(bst.st_mode):
+            return None
+        if hasattr(os, "getuid") and bst.st_uid != os.getuid():
+            return None
+        try:
+            os.chmod(base, 0o700)
+        except OSError:
+            pass
+        return base
+    except OSError:
+        return None
+
+
 def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """Run a shell command or staged inline script with timeout and cancellation."""
     raw_job_id = payload.get("job_id")
@@ -1115,10 +1176,15 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
 
     try:
         env = os.environ.copy()
+        gateway_enforced = str(extra_env.get("PHONECLUSTER_GATEWAY_ENABLED") or "").strip() == "1"
+        if gateway_enforced:
+            for existing_k in list(env.keys()):
+                if _is_proxy_override_env_key(existing_k):
+                    env.pop(existing_k, None)
         for k, v in extra_env.items():
-            clean_k = str(k).replace("\x00", "").strip()
-            if clean_k and "=" not in clean_k:
-                env[clean_k] = str(v).replace("\x00", "")
+            if not isinstance(k, str) or not _VALID_ENV_KEY_RE.fullmatch(k):
+                continue
+            env[k] = str(v).replace("\x00", "")
         _augment_job_env(env, state.node_id, job_id)
 
         if state.is_cancelled(job_id) or state._shutting_down:
@@ -1131,22 +1197,25 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
             args = list(parsed_script_args)
 
             safe_job_prefix = re.sub(r"[^A-Za-z0-9._-]+", "_", job_id).strip("._")[:40] or "job"
+            stage_dir = _private_script_stage_dir(cwd) or cwd
             try:
                 fd, tmp_name = tempfile.mkstemp(
-                    prefix=f"pc_{safe_job_prefix}_", suffix=suffix, dir=str(cwd)
+                    prefix=f"pc_{safe_job_prefix}_", suffix=suffix, dir=str(stage_dir)
                 )
             except OSError:
                 # Fall back to system temp dir when `cwd` is read-only (e.g. `/` or `/etc`)
                 fd, tmp_name = tempfile.mkstemp(
                     prefix=f"pc_{safe_job_prefix}_", suffix=suffix
                 )
-            temp_script_path = Path(tmp_name).resolve()
+            temp_script_path = Path(tmp_name)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                if hasattr(os, "fchmod"):
+                    try:
+                        os.fchmod(fh.fileno(), 0o700)
+                    except OSError:
+                        pass  # Android /sdcard FUSE/exFAT rejects chmod even though interpreter doesn't need +x
                 fh.write(str(script_content))
-            try:
-                os.chmod(temp_script_path, 0o700)
-            except OSError:
-                pass  # Android /sdcard FUSE/exFAT rejects chmod even though interpreter doesn't need +x
+            temp_script_path = temp_script_path.resolve()
 
             cmd_list = interp_parts + [str(temp_script_path)] + args
             proc = subprocess.Popen(
@@ -1327,26 +1396,57 @@ class WorkerHTTPServer(ThreadingHTTPServer):
     ) -> None:
         self.state = state
         self._conn_sem = threading.BoundedSemaphore(64)
+        self._ip_conns_lock = threading.Lock()
+        self._ip_conns: dict[str, int] = {}
+        self._max_conns_per_ip = 16
+        self._max_conns_loopback = 48
         clean_host = normalize_host(str(server_address[0])) or "0.0.0.0"
         if ":" in clean_host:
             self.address_family = socket.AF_INET6
         super().__init__((clean_host, server_address[1]), WorkerRequestHandler)
 
+    def _acquire_ip_slot(self, client_ip: str) -> str | None:
+        key = AuthRateLimiter._norm_ip(client_ip)
+        is_lb = key in {"127.0.0.1", "::1"} or key.startswith("127.")
+        cap = self._max_conns_loopback if is_lb else self._max_conns_per_ip
+        with self._ip_conns_lock:
+            cur = self._ip_conns.get(key, 0)
+            if cur >= cap:
+                return None
+            self._ip_conns[key] = cur + 1
+            return key
+
+    def _release_ip_slot(self, key: str) -> None:
+        with self._ip_conns_lock:
+            cur = self._ip_conns.get(key, 0)
+            if cur <= 1:
+                self._ip_conns.pop(key, None)
+            else:
+                self._ip_conns[key] = cur - 1
+
     def process_request(self, request: Any, client_address: Any) -> None:
+        ip_key = self._acquire_ip_slot(str(client_address[0]))
+        if ip_key is None:
+            self.shutdown_request(request)
+            return
         if not self._conn_sem.acquire(blocking=False):
+            self._release_ip_slot(ip_key)
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except Exception:
             self._conn_sem.release()
+            self._release_ip_slot(ip_key)
             raise
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
+        ip_key = AuthRateLimiter._norm_ip(str(client_address[0]))
         try:
             super().process_request_thread(request, client_address)
         finally:
             self._conn_sem.release()
+            self._release_ip_slot(ip_key)
 
 
 class WorkerRequestHandler(BaseHTTPRequestHandler):
@@ -1377,22 +1477,41 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
-    def _read_raw_body(self) -> bytes | None:
+    def _read_raw_body(self, deadline_sec: float = 10.0) -> bytes | None:
         length, err_status, err_msg = parse_strict_content_length(self.headers, MAX_REQUEST_BYTES)
         if length is None:
             self._send_json(err_status, {"error": err_msg})
             return None
         if length == 0:
             return b""
+        deadline = time.monotonic() + max(1.0, float(deadline_sec))
+        buf = bytearray()
         try:
-            raw = self.rfile.read(length)
+            while len(buf) < length:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError("request body read timed out")
+                try:
+                    self.connection.settimeout(min(self.timeout, max(0.05, rem)))
+                except OSError:
+                    pass
+                need = min(16384, length - len(buf))
+                chunk = self.rfile.read1(need) if hasattr(self.rfile, "read1") else self.rfile.read(need)
+                if not chunk:
+                    break
+                buf.extend(chunk)
         except OSError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"failed reading request body: {exc}"})
             return None
-        if len(raw) != length:
+        finally:
+            try:
+                self.connection.settimeout(self.timeout)
+            except OSError:
+                pass
+        if len(buf) != length:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "truncated request body"})
             return None
-        return raw
+        return bytes(buf)
 
     def _authenticate(self, method: str, path: str, read_body: bool) -> tuple[bool, bytes]:
         # Workers are strictly machine-to-machine (Master -> Worker); reject browser CSRF & DNS-rebinding calls.
@@ -1454,6 +1573,7 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
                 return False, b""
             raw_body = self._read_raw_body() if read_body else b""
             if raw_body is None:
+                self.server.state.rate_limiter.record_failure(norm_ip)
                 return False, b""
             ok, reason = verify_hmac_request(
                 self.headers,
@@ -1525,24 +1645,33 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
             if payload:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "RPC stop takes no arguments"})
                 return
+            if self.server.state._shutting_down:
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "node_shutting_down"})
+                return
             outcome = {"node_id": self.server.state.node_id, "ok": False}
             script = bundled_script("05_workload_helpers.sh")
             if script is None:
                 outcome["error"] = "Workload helper missing. Reinstall PhoneCluster."
             else:
-                try:
-                    process = subprocess.run(
-                        ["bash", str(script), "llama-rpc-stop"], capture_output=True,
-                        text=True, errors="replace", timeout=12.0,
-                    )
-                    if process.returncode == 0:
-                        outcome.update(ok=True, detail=process.stdout.strip()[:400])
-                    else:
-                        outcome["error"] = (process.stderr.strip() or "RPC stop failed.")[:400]
-                except subprocess.TimeoutExpired:
-                    outcome.update(error="RPC stop unconfirmed. Worker stop timed out.", outcome_unknown=True)
-                except OSError as exc:
-                    outcome["error"] = f"Cannot run RPC stop: {exc}"
+                with self.server.state._rpc_stop_lock:
+                    try:
+                        process = subprocess.run(
+                            ["bash", str(script), "llama-rpc-stop"],
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            errors="replace",
+                            timeout=12.0,
+                            start_new_session=True,
+                        )
+                        if process.returncode == 0:
+                            outcome.update(ok=True, detail=process.stdout.strip()[:400])
+                        else:
+                            outcome["error"] = (process.stderr.strip() or "RPC stop failed.")[:400]
+                    except subprocess.TimeoutExpired:
+                        outcome.update(error="RPC stop unconfirmed. Worker stop timed out.", outcome_unknown=True)
+                    except OSError as exc:
+                        outcome["error"] = f"Cannot run RPC stop: {exc}"
             self._send_json(HTTPStatus.OK, outcome)
         elif path == "/config":
             status, body = self.server.state.apply_live_config(

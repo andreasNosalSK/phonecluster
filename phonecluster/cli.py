@@ -713,16 +713,24 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
                 return 1
             cfg_path = resolve_config_path(args.config)
             cfg = load_config(cfg_path) if cfg_path.exists() or (args.write_config and not args.dry_run) else None
+            eff_gw_port = args.gateway_port
+            eff_gw_rev = not args.no_gateway_reverse
+            if cfg is not None:
+                if eff_gw_port == 8888 and cfg.gateway.port > 0:
+                    eff_gw_port = cfg.gateway.port
+                if not cfg.gateway.enabled:
+                    eff_gw_rev = False
             plan = plan_adb_usb_hub(
                 ready,
                 worker_base_port=args.worker_base_port,
                 ssh_base_port=args.ssh_base_port,
                 remote_worker_port=args.remote_worker_port,
                 remote_ssh_port=args.remote_ssh_port,
-                gateway_port=args.gateway_port,
-                enable_gateway_reverse=not args.no_gateway_reverse,
+                gateway_port=eff_gw_port,
+                enable_gateway_reverse=eff_gw_rev,
                 enable_peer_mesh=not args.no_peer_mesh,
                 existing_nodes=cfg.nodes if cfg is not None else None,
+                quarantined_nodes=cfg.gateway.quarantined_nodes if cfg is not None else None,
             )
             apply_res = (
                 {"ok": True, "dry_run": True, "applied": 0, "unchanged": 0, "failed": 0, "errors": []}

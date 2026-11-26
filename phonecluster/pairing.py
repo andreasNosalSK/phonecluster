@@ -31,6 +31,7 @@ import re
 import secrets
 import selectors
 import socket
+import stat
 import threading
 import time
 import urllib.error
@@ -203,6 +204,8 @@ def decrypt_bundle(k_enc: bytes, k_mac: bytes, envelope: dict[str, str], aad: st
         tag = str(envelope["tag"])
     except (KeyError, ValueError, TypeError) as exc:
         raise ValueError(f"Malformed encrypted envelope: {exc}") from exc
+    if len(nonce) != 16:
+        raise ValueError("Malformed encrypted envelope: nonce must be 16 bytes.")
 
     expected_tag = hmac.new(
         k_mac, aad.encode("utf-8") + b"|" + nonce + ciphertext, hashlib.sha256
@@ -297,6 +300,7 @@ class PairingBeaconResponder(threading.Thread):
         LOG.info("Temporary pairing beacon active on UDP %s:%d", self.listen_host, self.bound_port)
         reply_window_start = time.monotonic()
         replies_in_window = 0
+        per_ip_replies: dict[str, int] = {}
         try:
             while not self._stop_event.is_set() and time.monotonic() < self.expires_at:
                 try:
@@ -313,11 +317,13 @@ class PairingBeaconResponder(threading.Thread):
                 if now_m - reply_window_start >= 1.0:
                     reply_window_start = now_m
                     replies_in_window = 0
-                if replies_in_window >= 20:
+                    per_ip_replies.clear()
+                src_ip = str(addr[0])
+                if replies_in_window >= 40 or per_ip_replies.get(src_ip, 0) >= 6:
                     continue
                 try:
-                    msg = json.loads(data.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                    msg = json.loads(data.decode("utf-8"), parse_constant=lambda _c: None)
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
                     continue
                 if isinstance(msg, dict) and msg.get("type") == PAIR_SEARCH_TYPE:
                     rem = max(0, int(self.expires_at - time.monotonic()))
@@ -334,6 +340,8 @@ class PairingBeaconResponder(threading.Thread):
                     try:
                         sock.sendto(json.dumps(reply).encode("utf-8"), addr)
                         replies_in_window += 1
+                        if len(per_ip_replies) < 256 or src_ip in per_ip_replies:
+                            per_ip_replies[src_ip] = per_ip_replies.get(src_ip, 0) + 1
                     except OSError:
                         pass
         finally:
@@ -426,8 +434,8 @@ def discover_pairing_masters(
                 except OSError:
                     continue
                 try:
-                    msg = json.loads(data.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                    msg = json.loads(data.decode("utf-8"), parse_constant=lambda _c: None)
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
                     continue
                 if not isinstance(msg, dict) or msg.get("type") != PAIR_BEACON_TYPE:
                     continue
@@ -1187,10 +1195,10 @@ def _http_json(url: str, method: str = "GET", body: dict[str, Any] | None = None
             except OSError:
                 pass
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(raw, parse_constant=lambda _c: None)
             if not isinstance(parsed, dict):
                 parsed = {"error": raw[:200]}
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
             parsed = {"error": raw[:200]}
         return exc.code, parsed
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
@@ -1209,18 +1217,29 @@ def _install_ssh_pubkey(pubkey: str) -> bool:
     except OSError:
         pass
     auth_keys = ssh_dir / "authorized_keys"
+    if auth_keys.is_symlink():
+        raise ValueError(f"Refusing to follow symlink authorized_keys path: {auth_keys}")
     existing = auth_keys.read_text(encoding="utf-8", errors="ignore") if auth_keys.exists() else ""
     if clean in existing.splitlines():
         return True
-    fd = os.open(auth_keys, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(auth_keys, open_flags, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Refusing non-regular authorized_keys file: {auth_keys}")
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+    except BaseException:
+        os.close(fd)
+        raise
     with os.fdopen(fd, "a", encoding="utf-8") as fh:
         if existing and not existing.endswith("\n"):
             fh.write("\n")
         fh.write(clean + "\n")
-    try:
-        os.chmod(auth_keys, 0o600)
-    except OSError:
-        pass
     return True
 
 
@@ -1253,12 +1272,16 @@ def join_cluster_via_pairing(
         not session_id
         or len(session_id) > 64
         or not pub_a_hex
-        or len(pub_a_hex) > 600
+        or len(pub_a_hex) > 512
         or not re.fullmatch(r"[0-9a-f]+", pub_a_hex)
         or not re.fullmatch(r"(?:[0-9a-f]{2}){8,64}", salt_hex)
     ):
         raise RuntimeError("Malformed pairing hello from Master (invalid session_id, dh_pub, or salt).")
     pub_a = int(pub_a_hex, 16)
+    try:
+        validate_dh_public(pub_a)
+    except ValueError as exc:
+        raise RuntimeError(f"Master sent invalid DH public key: {exc}") from exc
     actual_fp = fingerprint_public_key(pub_a)
     hello_fp = str(hello.get("fingerprint") or "").strip().upper()
     if hello_fp and not hmac.compare_digest(hello_fp, actual_fp):

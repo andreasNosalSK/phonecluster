@@ -422,7 +422,7 @@ def build_service_registry(
                     "pool": pool,
                     "ready": snap.ready_for_jobs,
                     "loopback_only": loopback_only,
-                    "cpu_cores": max(1, _safe_nonneg_int(h.get("cpu_cores", 4), 4)),
+                    "cpu_cores": max(1, min(128, _safe_nonneg_int(h.get("cpu_cores", 4), 4))),
                     "role": snap.node.role,
                     "source": "auto",
                     "transport": transport,
@@ -565,7 +565,7 @@ def build_cross_tier_env(
             host_e = str(e.get("host") or "").strip()
             if not host_e:
                 continue
-            cores = max(1, int(e.get("cpu_cores", 4)))
+            cores = max(1, min(128, int(e.get("cpu_cores", 4))))
             if e.get("transport") == "adb":
                 distcc_entries.append(f"{format_host_port(host_e, e['port'])}/{cores},lzo")
             elif is_loopback_or_unspecified_host(host_e):

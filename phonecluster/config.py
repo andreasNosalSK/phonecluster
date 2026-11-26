@@ -9,6 +9,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import tempfile
 import urllib.parse
 from collections import Counter
@@ -221,9 +222,12 @@ def validate_allowed_master_entry(raw: str) -> str:
         raise ValueError(f"Invalid allowed_master_ips entry {raw!r}")
     if "/" in entry:
         try:
-            return str(ipaddress.ip_network(entry, strict=False))
+            net = ipaddress.ip_network(entry, strict=False)
         except ValueError as exc:
             raise ValueError(f"Invalid allowed_master_ips CIDR {raw!r}") from exc
+        if net.prefixlen == 0:
+            raise ValueError(f"Wildcard /0 CIDR is not allowed in allowed_master_ips: {raw!r}")
+        return str(net)
     return validate_host(entry)
 
 
@@ -396,6 +400,10 @@ class SafetyConfig:
                 or (wb_port is not None and not (1 <= wb_port <= 65535))
             ):
                 raise ValueError("safety.battery_webhook_url must be empty or a valid http:// / https:// URL")
+            try:
+                validate_host(p_wb.hostname)
+            except ValueError as exc:
+                raise ValueError("safety.battery_webhook_url must be empty or a valid http:// / https:// URL") from exc
         cfg.battery_webhook_url = wb
         return cfg
 
@@ -553,6 +561,10 @@ class NetworkHardeningConfig:
                 or (ag_port is not None and not (1 <= ag_port <= 65535))
             ):
                 raise ValueError("network.adguard_url must be empty or a valid http:// / https:// URL")
+            try:
+                validate_host(p_ag.hostname)
+            except ValueError as exc:
+                raise ValueError("network.adguard_url must be empty or a valid http:// / https:// URL") from exc
         raw_sub = data.get("lan_subnet")
         if raw_sub is not None and not isinstance(raw_sub, str):
             raise ValueError("network.lan_subnet must be a string CIDR")
@@ -681,10 +693,23 @@ class ConfigConflictError(OSError):
     """Another writer changed the config after the caller read it."""
 
 
+def _canonical_config_path(path: Path) -> Path:
+    """Resolve parent directory without following a symlink on the target config filename itself."""
+    expanded = path.expanduser()
+    if not expanded.name or expanded.name in {".", ".."}:
+        raise ValueError(f"Invalid config file path: {path}")
+    parent = expanded.parent.resolve()
+    candidate = parent / expanded.name
+    if candidate.is_symlink():
+        raise ValueError(f"Refusing to read or overwrite symlink config path: {candidate}")
+    return candidate
+
+
 def config_revision(path: Path) -> str:
     """Read the revision for an intentional replacement, including an absent file."""
+    target = _canonical_config_path(path)
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        return hashlib.sha256(target.read_bytes()).hexdigest()
     except FileNotFoundError:
         return ""
 
@@ -697,9 +722,10 @@ def load_config(path: str | Path | None = None) -> ClusterConfig:
             f"Cluster config not found at '{cfg_path}'. "
             f"Run `python3 phonecluster_cli.py init-config --output {cfg_path}` first."
         )
-    raw = cfg_path.read_bytes()
+    target = _canonical_config_path(cfg_path)
+    raw = target.read_bytes()
     config = ClusterConfig.from_dict(json.loads(raw.decode("utf-8")))
-    config._source = (cfg_path.resolve(), hashlib.sha256(raw).hexdigest())
+    config._source = (target, hashlib.sha256(raw).hexdigest())
     return config
 
 
@@ -771,7 +797,7 @@ def generate_auth_token() -> str:
 
 def save_config(config: ClusterConfig, path: str | Path, *, expected_revision: str | None = None) -> Path:
     """Save if the file still matches the version read, or is absent for a new config."""
-    out = Path(path).resolve()
+    out = _canonical_config_path(Path(path))
     if expected_revision is None:
         expected_revision = config._source[1] if config._source and config._source[0] == out else ""
     payload = (json.dumps(config.to_dict(), indent=2, allow_nan=False) + "\n").encode("utf-8")
@@ -782,17 +808,35 @@ def save_config(config: ClusterConfig, path: str | Path, *, expected_revision: s
 
 def replace_config_file(out: Path, payload: bytes, expected_revision: str) -> str:
     """Compare and atomically replace validated JSON, retaining the bytes sent by a sync."""
-    out = out.resolve()
+    out = _canonical_config_path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    # Lock a stable sibling. Locking the config inode itself would lose the lock on replace.
+    # Lock a stable sibling without following symlinks. Locking the config inode itself loses the lock on replace.
     lock_path = out.with_name(f".{out.name}.lock")
-    with os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "r+b") as lock:
+    lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    lock_fd = os.open(lock_path, lock_flags, 0o600)
+    try:
+        st = os.fstat(lock_fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Refusing non-regular config lockfile: {lock_path}")
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            raise PermissionError(f"Config lockfile owned by unexpected UID: {lock_path}")
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(lock_fd, 0o600)
+            except OSError:
+                pass
+    except BaseException:
+        os.close(lock_fd)
+        raise
+    with os.fdopen(lock_fd, "r+b") as lock:
         if os.name == "nt":
             import msvcrt
             msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if out.is_symlink():
+            raise ValueError(f"Refusing to overwrite symlink config path: {out}")
         if config_revision(out) != expected_revision:
             raise ConfigConflictError(f"Config '{out}' changed on disk. Reload the config and retry.")
         _write_config(out, payload)
@@ -803,11 +847,12 @@ def _write_config(out: Path, payload: bytes) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=str(out.parent))
     tmp_path = Path(tmp_name)
     try:
-        try:
-            os.chmod(tmp_path, 0o600)
-        except OSError:
-            pass
         with os.fdopen(fd, "wb") as fh:
+            if hasattr(os, "fchmod"):
+                try:
+                    os.fchmod(fh.fileno(), 0o600)
+                except OSError:
+                    pass
             fh.write(payload)
             fh.flush()
             try:

@@ -339,6 +339,40 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
         extra_family_lines.append("    # Keep link-local IPv6 SSH reachable (prevents mDNS/.local SSH lockout)")
         extra_family_lines.append(f"    ip6 saddr fe80::/10 tcp dport {{ {ssh_port_list} }} accept")
 
+    worker_v4_ips: list[str] = []
+    worker_v6_ips: list[str] = []
+    for w in workers:
+        wh = normalize_host(w.host)
+        if not wh or is_loopback_or_unspecified_host(wh):
+            continue
+        try:
+            wa = ipaddress.ip_address(wh)
+            if isinstance(wa, ipaddress.IPv4Address) and str(wa) not in worker_v4_ips:
+                worker_v4_ips.append(str(wa))
+            elif isinstance(wa, ipaddress.IPv6Address) and str(wa) not in worker_v6_ips:
+                worker_v6_ips.append(str(wa))
+        except ValueError:
+            continue
+    worker_blocked_tcp = sorted(
+        p for p in (set(ssh_ports) | {dash_port, master_worker_port, 3000, 3632, 50052})
+        if 1 <= p <= 65535 and p != gw_port and p != 53
+    )
+    worker_restrict_lines: list[str] = []
+    if worker_blocked_tcp and (worker_v4_ips or worker_v6_ips):
+        w_port_list = ", ".join(str(p) for p in worker_blocked_tcp)
+        worker_restrict_lines.append("")
+        worker_restrict_lines.append(
+            "    # Restrict untrusted worker phones from Master admin/compute ports (allow Network Guard & DNS only)"
+        )
+        if worker_v4_ips:
+            worker_restrict_lines.append(
+                f"    ip saddr {{ {', '.join(worker_v4_ips)} }} tcp dport {{ {w_port_list} }} drop"
+            )
+        if worker_v6_ips:
+            worker_restrict_lines.append(
+                f"    ip6 saddr {{ {', '.join(worker_v6_ips)} }} tcp dport {{ {w_port_list} }} drop"
+            )
+
     nft_lines = [
         "#!/usr/sbin/nft -f",
         "# Hardened PhoneCluster Master Firewall (Raspberry Pi / Debian 13 / Ubuntu Touch)",
@@ -357,11 +391,16 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
         "",
         "    # Allow Tailscale / WireGuard overlay if used",
         '    iifname { "tailscale0", "wg0" } accept',
-        "",
-        f"    # Allow LAN ({subnet}) access to SSH, Dashboard, Worker, Pairing, Network Guard, AdGuard & Shared Services",
-        f"    {addr_match} tcp dport {{ {tcp_port_list} }} accept",
-        f"    {addr_match} udp dport {{ {udp_port_list} }} accept",
     ]
+    nft_lines.extend(worker_restrict_lines)
+    nft_lines.extend(
+        [
+            "",
+            f"    # Allow LAN ({subnet}) access to SSH, Dashboard, Worker, Pairing, Network Guard, AdGuard & Shared Services",
+            f"    {addr_match} tcp dport {{ {tcp_port_list} }} accept",
+            f"    {addr_match} udp dport {{ {udp_port_list} }} accept",
+        ]
+    )
     nft_lines.extend(extra_family_lines)
     nft_lines.extend(
         [
