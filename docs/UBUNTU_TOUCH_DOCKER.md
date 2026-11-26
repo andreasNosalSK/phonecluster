@@ -46,13 +46,11 @@ What this does automatically (safe on read-only rootfs):
 
 > **Important:** After being added to the `docker` group for the first time, log out & back in (or reboot / restart `systemctl --user restart phonecluster-worker.service`) so the worker process inherits the `docker` group!
 
-Run the guided wizard (or copy the 2-phone template):
+The installer can run the wizard before enabling the boot services. If you used the setup script directly, create the config with the same Master node ID and start both services.
 
 ```bash
-pc wizard
-# or:
-cp examples/ubuntu_touch_docker_cluster.example.json config/cluster.json
-# edit IPs & generate a strong token, then verify:
+pc wizard --master-id ut-master
+systemctl --user start phonecluster-worker.service phonecluster-dashboard.service
 pc doctor
 ```
 
@@ -99,7 +97,7 @@ You can also manage containers from the **Web Control Center** (`pc dashboard` â
 
 ### 2. Optional: Unite Both Phones in a Docker Swarm
 
-If your Ubuntu Touch phones' kernels support VXLAN / netfilter modules, you can initialize a 2-phone Docker Swarm with one command (join tokens are exchanged securely over PhoneCluster's authenticated HTTP channel via `PHONECLUSTER_SWARM_TOKEN`, never exposed on the command line):
+If your Ubuntu Touch phones' kernels support VXLAN and netfilter modules, you can initialize a two-phone Docker Swarm. The workers need the manager's reachable Docker address. The result counts worker IDs confirmed by the selected manager and flags memberships it cannot verify.
 
 ```bash
 pc docker swarm-init

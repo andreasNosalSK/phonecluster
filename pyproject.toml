@@ -17,3 +17,8 @@ pc = "phonecluster.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["phonecluster*"]
+
+[tool.setuptools.data-files]
+"share/phonecluster" = ["phonecluster_cli.py"]
+"share/phonecluster/scripts" = ["scripts/*.sh"]
+"share/phonecluster/examples" = ["examples/*.py", "examples/*.txt", "examples/*.json"]

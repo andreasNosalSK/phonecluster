@@ -5,12 +5,12 @@ from __future__ import annotations
 import ipaddress
 import math
 import os
-import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import uuid
+from itertools import count
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,12 +22,15 @@ from .config import (
     ClusterConfig,
     NodeConfig,
     SafetyConfig,
+    config_revision,
     format_host_port,
+    generate_auth_token,
     is_loopback_or_unspecified_host,
     load_config,
     resolve_config_path,
     save_config,
     validate_host,
+    validate_node_id,
     validate_ssh_user,
 )
 from .discovery import detect_local_ip, discover_lan_nodes
@@ -65,8 +68,11 @@ def _prompt_yes_no(
 def run_setup_wizard(
     config_path: str | Path | None = None,
     input_fn: Callable[[str], str] = input,
+    *,
+    master_id: str = "node0",
 ) -> int:
     """Walk the user step-by-step through creating a working cluster config."""
+    master_id = validate_node_id(master_id)
     out_path = resolve_config_path(config_path)
     local_ip = detect_local_ip()
     os_env = detect_os_environment()
@@ -86,13 +92,14 @@ def run_setup_wizard(
     print(f"Config target   : {out_path}")
     print()
 
-    if out_path.exists():
+    previous_revision = config_revision(out_path)
+    if previous_revision:
         if not _prompt_yes_no(f"Config already exists at '{out_path}'. Overwrite it?", default=False, input_fn=input_fn):
             print("Keeping existing config.")
             return 0
 
     cluster_name = _prompt("1. Name your cluster", "phone-cluster", input_fn=input_fn)
-    raw_master = _prompt("2. Static LAN IP of your Master phone (node0)", local_ip, input_fn=input_fn)
+    raw_master = _prompt(f"2. Static LAN IP of your Master phone ({master_id})", local_ip, input_fn=input_fn)
     try:
         master_host = validate_host(raw_master)
     except ValueError:
@@ -113,7 +120,7 @@ def run_setup_wizard(
 
     nodes: list[NodeConfig] = [
         NodeConfig(
-            id="node0",
+            id=master_id,
             host=master_host,
             role="master",
             worker_port=DEFAULT_WORKER_PORT,
@@ -126,6 +133,7 @@ def run_setup_wizard(
         )
     ]
 
+    worker_ids = (f"node{i}" for i in count(1) if f"node{i}" != master_id)
     print("\n5. Finding Worker phones...")
     discovered = []
     if _prompt_yes_no("Scan your Wi-Fi now for phones already running PhoneCluster?", default=True, input_fn=input_fn):
@@ -148,12 +156,13 @@ def run_setup_wizard(
                         disc_user = validate_ssh_user(str(item.get("ssh_user") or "")) or ssh_user
                     except ValueError:
                         disc_user = ssh_user
-                    nid = f"node{len(nodes)}"
+                    nid = next(worker_ids)
                     nodes.append(
                         NodeConfig(
                             id=nid,
                             host=disc_host,
                             role="worker",
+                            auth_token=generate_auth_token(),
                             worker_port=item["worker_port"],
                             ssh_port=item["ssh_port"],
                             ssh_user=disc_user,
@@ -182,12 +191,13 @@ def run_setup_wizard(
             print(f"  Skipping invalid worker host/IP '{cand}'.")
             continue
         if ip not in existing_hosts:
-            nid = f"node{len(nodes)}"
+            nid = next(worker_ids)
             nodes.append(
                 NodeConfig(
                     id=nid,
                     host=ip,
                     role="worker",
+                    auth_token=generate_auth_token(),
                     worker_port=DEFAULT_WORKER_PORT,
                     ssh_port=ssh_port,
                     ssh_user=ssh_user,
@@ -230,11 +240,11 @@ def run_setup_wizard(
 
     cfg = ClusterConfig(
         cluster_name=cluster_name,
-        auth_token=secrets.token_urlsafe(32),
+        auth_token=generate_auth_token(),
         nodes=nodes,
         safety=safety_cfg,
     )
-    saved = save_config(cfg, out_path)
+    saved = save_config(cfg, out_path, expected_revision=previous_revision)
 
     print("\n" + "=" * 60)
     print(f"  Setup Saved: {saved}")

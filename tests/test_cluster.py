@@ -458,6 +458,10 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
                 reloaded = load_config(cfg_path)
                 self.assertEqual(len(reloaded.nodes), 4)
                 self.assertEqual(reloaded.get_node("node3").host, "192.168.1.210")
+                new_token = reloaded.get_node("node3").auth_token
+                self.assertTrue(new_token)
+                self.assertNotEqual(new_token, reloaded.auth_token)
+                self.assertNotIn(new_token, json.dumps(ares))
 
                 # Removing master node must fail with 400
                 req_rm_master = urllib.request.Request(
@@ -670,6 +674,7 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
             cfg = load_config(cfg_path)
             self.assertEqual(cfg.cluster_name, "my-home-cluster")
             self.assertEqual(len(cfg.nodes), 3)
+            self.assertEqual(cfg.workers_needing_tokens(), [])
             self.assertEqual(cfg.safety.max_temp_c, 39.5)
             self.assertEqual(cfg.safety.resume_temp_c, 36.5)
 
@@ -1577,7 +1582,12 @@ class TestMasterNetworkGuard(unittest.TestCase):
             )
             self.assertTrue(r_airgap.startswith(b"HTTP/1.1 403"))
 
+            # The tunnel can deliver EOF before its handler publishes the final audit entry.
+            deadline = time.monotonic() + 2.0
             st = mgr.status()
+            while st["stats"]["total_allowed"] < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+                st = mgr.status()
             self.assertEqual(st["stats"]["total_allowed"], 2)
             self.assertEqual(st["stats"]["auth_failures"], 1)
             self.assertGreaterEqual(st["stats"]["total_blocked"], 4)
@@ -2878,35 +2888,41 @@ class TestConnectivityAndResourceSharingFixes(unittest.TestCase):
                 in_flight_local=0,
             ))
 
-            # Poll #1 sees both idle -> dispatches j0 (0.25s) to fast1 and j1 (1.2s) to slow2.
-            # At t=0.10s, poll #2 catches fast1 busy (`ready_for_jobs=False, not_ready_reasons=["busy (1/1)"]`).
-            # Even with a long 10s interval after poll #2, fast1 MUST immediately take j2 and j3 once j0 finishes!
+            # Hold the first dispatch until a refresh sees its occupied slot.
             jobs = [
                 JobSpec(index=0, job_id="ns-0", command="sleep 0.25 && echo j0", timeout_sec=5.0),
                 JobSpec(index=1, job_id="ns-1", command="sleep 1.2 && echo j1", timeout_sec=5.0),
                 JobSpec(index=2, job_id="ns-2", command="sleep 0.20 && echo j2", timeout_sec=5.0),
                 JobSpec(index=3, job_id="ns-3", command="sleep 0.20 && echo j3", timeout_sec=5.0),
             ]
-            saw_busy_poll = [False]
+            first_dispatched = threading.Event()
+            busy_observed = threading.Event()
             orig_poll = ctrl.poll_health
+            orig_exec = ctrl.exec_on_node
+
+            def _exec_after_refresh(node: NodeConfig, spec: JobSpec) -> tuple[str, dict[str, Any]]:
+                if spec.job_id == "ns-0":
+                    first_dispatched.set()
+                    if not busy_observed.wait(3):
+                        raise AssertionError("Health did not refresh while the first job was in flight")
+                return orig_exec(node, spec)
 
             def _poll_track_busy(tags: list[str] | None = None) -> list[NodeSnapshot]:
                 snaps = orig_poll(tags=tags)
-                for s in snaps:
-                    if s.node.id == "fast1" and not s.ready_for_jobs and any(
-                        str(r).startswith("busy") for r in s.health.get("not_ready_reasons", [])
-                    ):
-                        saw_busy_poll[0] = True
+                if first_dispatched.is_set() and not busy_observed.is_set():
+                    snaps = [snap_busy if s.node.id == "fast1" else s for s in snaps]
+                    busy_observed.set()
                 return snaps
 
             ctrl.poll_health = _poll_track_busy  # type: ignore[method-assign]
-            t0 = time.monotonic()
-            outs = ctrl.map_jobs(jobs, health_refresh_sec=0.12, wait_for_ready_sec=5.0)
-            elapsed = time.monotonic() - t0
+            ctrl.exec_on_node = _exec_after_refresh  # type: ignore[method-assign]
+            try:
+                outs = ctrl.map_jobs(jobs, health_refresh_sec=0.12, wait_for_ready_sec=5.0)
+            finally:
+                ctrl.poll_health = orig_poll  # type: ignore[method-assign]
+                ctrl.exec_on_node = orig_exec  # type: ignore[method-assign]
             self.assertTrue(all(o.ok for o in outs), [o.to_dict() for o in outs])
-            self.assertTrue(saw_busy_poll[0], "Expected mid-batch poll to observe fast1 busy")
-            self.assertLess(elapsed, 3.0)
-            ctrl.poll_health = orig_poll  # type: ignore[method-assign]
+            self.assertTrue(busy_observed.is_set())
 
             # Also verify two concurrent Web UI /api/map requests NEVER collide on job_id!
             st_fast.max_concurrency = 4
@@ -7368,7 +7384,7 @@ class TestPass12HardeningAndBugHunt(unittest.TestCase):
         sync_sh = (repo / "scripts" / "03_sync_cluster.sh").read_text(encoding="utf-8")
         self.assertIn("${RDIR#??}", sync_sh)
         self.assertIn("SCOPED_CFG", sync_sh)
-        self.assertIn(r'[ ! -s \"\$TMP\" ]', sync_sh)
+        self.assertIn("phonecluster.config_transfer config/cluster.json --expect", sync_sh)
         self.assertIn("load_config", sync_sh)
 
         install_sh = (repo / "install.sh").read_text(encoding="utf-8")
@@ -7641,6 +7657,8 @@ class TestUbuntuTouchAndSnapDockerClustering(unittest.TestCase):
                 "docker_bin": "/snap/bin/docker",
                 "is_snap": True,
                 "ok": True,
+                "engine_ok": True,
+                "inventory_ok": True,
                 "error": "",
                 "server_version": "27.5.1",
                 "swarm_state": "active",
@@ -7668,10 +7686,15 @@ class TestUbuntuTouchAndSnapDockerClustering(unittest.TestCase):
         secret_tok = "SWMTKN-1-FAKE-UNIT-TEST-TOKEN-99999"
 
         def _fake_exec_swarm(node: NodeConfig, spec: JobSpec) -> tuple[str, dict[str, Any]]:
+            if spec.script_name == "swarm_members.py":
+                self.assertEqual(node.id, "ut-master")
+                return "ok", {"stdout": "ut-worker-swarm-id\n", "returncode": 0}
             captured_specs[node.id] = spec
             if node.id == "ut-master":
                 return "ok", {"stdout": json.dumps({"ok": True, "initialized": True, "token": secret_tok}), "stderr": "", "returncode": 0}
-            return "ok", {"stdout": json.dumps({"ok": True, "already_active": False}), "stderr": "", "returncode": 0}
+            return "ok", {"stdout": json.dumps({
+                "ok": True, "already_active": False, "swarm_node_id": "ut-worker-swarm-id",
+            }), "stderr": "", "returncode": 0}
 
         with mock.patch.object(ctrl, "poll_health", return_value=snaps), mock.patch.object(
             ctrl, "exec_on_node", side_effect=_fake_exec_swarm

@@ -104,7 +104,7 @@ if [[ ! -d "${CHROOT_DIR}/etc" ]]; then
   echo "Downloading ${ROOTFS_URL}..."
   TMP_TAR="/data/local/linux/debian13-rootfs.tar.xz.tmp.$$"
   trap 'rm -f "${TMP_TAR}"' EXIT
-  curl -fsSL -- "${ROOTFS_URL}" -o "${TMP_TAR}"
+  curl -fsSL -o "${TMP_TAR}" -- "${ROOTFS_URL}"
   echo "Extracting Debian 13 rootfs into ${CHROOT_DIR}..."
   tar --numeric-owner -xJf "${TMP_TAR}" -C "${CHROOT_DIR}"
   rm -f "${TMP_TAR}"

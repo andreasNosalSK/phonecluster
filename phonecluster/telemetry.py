@@ -846,6 +846,11 @@ def detect_capabilities(listening_map: dict[int, bool] | None = None) -> dict[st
         or Path("/opt/AdGuardHome/AdGuardHome").exists()
         or find_executable("pihole")
     )
+    llama_dir = Path.home() / "llama.cpp"
+    local_rpc_binaries = (
+        directory / name for directory in (llama_dir / "build" / "bin", llama_dir)
+        for name in ("ggml-rpc-server", "rpc-server")
+    )
     tools = {
         "python3": bool(find_executable("python3")),
         "clang": bool(find_executable("clang")),
@@ -853,8 +858,8 @@ def detect_capabilities(listening_map: dict[int, bool] | None = None) -> dict[st
         "distccd": bool(find_executable("distccd")),
         "mpirun": bool(find_executable("mpirun")),
         "llama_rpc": bool(
-            find_executable("rpc-server")
-            or Path.home().joinpath("llama.cpp/build/bin/rpc-server").exists()
+            find_executable("ggml-rpc-server") or find_executable("rpc-server")
+            or any(path.is_file() and os.access(path, os.X_OK) for path in local_rpc_binaries)
         ),
         "llama_cli": bool(
             find_executable("llama-cli")
@@ -866,6 +871,10 @@ def detect_capabilities(listening_map: dict[int, bool] | None = None) -> dict[st
         "docker_compose": bool(docker_rt["compose_available"]),
         "snap": bool(find_executable("snap")),
         "k3s": bool(find_executable("k3s") or find_executable("kubectl")),
+        "podman": bool(find_executable("podman")),
+        "crictl": bool(find_executable("crictl")),
+        "nerdctl": bool(find_executable("nerdctl")),
+        "ctr": bool(find_executable("ctr")),
         "homeassistant": bool(find_executable("hass")),
         "mosquitto": bool(find_executable("mosquitto") or find_executable("mosquitto_pub")),
         "adguard": adguard_installed,

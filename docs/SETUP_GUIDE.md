@@ -64,11 +64,12 @@ The installer:
 
 ## 4. Sync & Verify Your Cluster
 
-Copy your generated `config/cluster.json` to your Master phone (or run `pc wizard` on the Master phone to auto-discover workers over Wi-Fi), then run from the Master phone:
+Copy your generated `config/cluster.json` to the Master phone or run `pc wizard` there to discover workers. Preview the first worker, then deploy to that worker from the Master.
 
 ```bash
-# Push SSH keys + sync PhoneCluster code & config to all phones + start workers
-pc sync --setup-keys
+# Use the worker ID shown by pc status
+pc sync --node-id node1 --dry-run
+pc sync --node-id node1 --setup-keys
 
 # Run automated diagnostics
 pc doctor
@@ -82,6 +83,8 @@ pc token
 # Start the accessible Web Control Center
 pc dashboard
 ```
+
+The preview lists the selected endpoints and planned restart. Sync stages and verifies the received code archive before extracting it. Verify the canary's health and run a small job before syncing more workers. Repeat `--node-id` to select several nodes or use `--skip-node` with the local controller ID for a fleet sync.
 
 Open `http://<master-phone-ip>:8080` in any browser on your Wi-Fi! Paste your token from `pc token` into the top bar and click **Unlock** (check **Remember** if you're on your own personal device).
 
@@ -112,5 +115,5 @@ PhoneCluster stays **completely silent on Wi-Fi** by default so strangers cannot
 | Background jobs die with `[Process completed (signal 9)]` | Android 12+ Phantom Process Killer | Re-run `./scripts/01_adb_prep.sh` and **reboot** the phone. |
 | `termux-battery-status` hangs or times out | Termux and Termux:API installed from different stores, or Battery Optimization enabled | Uninstall both and reinstall all 3 apps from F-Droid; set Battery Optimization to Unrestricted. |
 | `pc discover` finds 0 phones | Router AP/Client Isolation enabled, or worker daemons not running | Disable AP Isolation in router Wi-Fi settings, or enter static phone IPs manually in `pc wizard`. |
-| Phone shows `PAUSED (overheated)` | Battery reached `40.0 °C` | Stand phones vertically with air gaps (never stacked flat). Jobs auto-resume once temp drops to `37.0 °C`. |
-| `HTTP 401 unauthorized` | Worker has a different `auth_token` than Master | Re-run `./scripts/03_sync_cluster.sh` so all nodes share the exact same `config/cluster.json`. |
+| Phone shows `PAUSED (overheated)` | Temperature reached `40.0 °C` | Stand phones vertically with air gaps. Running jobs continue. The worker accepts new jobs again at `37.0 °C`. |
+| `HTTP 401 unauthorized` | The worker's local credential differs from its entry on the Master. | Run `pc sync` on the Master. If it reports shared or missing credentials, follow the [credential migration steps](SECURITY.md#migrating-a-cluster-that-used-shared-credentials). |

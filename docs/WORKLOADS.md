@@ -17,6 +17,9 @@ Dispatch across the entire cluster with automatic thermal throttling & failover:
 ```bash
 pc map --jobs-file jobs.txt --retries 2 --output-jsonl results.jsonl
 ```
+Choose a new `--output-jsonl` path for every batch. PhoneCluster refuses to replace an existing file and appends completed results to the new file as they arrive.
+
+The worker caps captured output and clips it further when JSON encoding would exceed the response limit. The resulting text includes a truncation marker. Write full logs or binary results to files when you need to retain the complete output.
 
 ### Ship & run a local Python or Bash script (zero manual `scp`!)
 Edit your script once on the Master phone (or paste it in the Web Control Center → **2. Run & Parallel Jobs**):
@@ -95,22 +98,25 @@ Because LLM decode speed is memory-bandwidth bound (~7–9.5 GB/s effective CPU 
 Use `pc map` to process batches of prompts across all 3 phones concurrently!
 
 ### Pooling RAM Across Phones (`llama.cpp` RPC)
-When a 7B–8B model won't fit on one 4 GB phone:
+Use RPC on a trusted, isolated network. Build compatible versions on the inference host and each worker.
+
 1. Compile `llama.cpp` with `-DGGML_RPC=ON` on each phone:
    ```bash
    git clone https://github.com/ggml-org/llama.cpp ~/llama.cpp
    cmake -S ~/llama.cpp -B ~/llama.cpp/build -DGGML_RPC=ON
    cmake --build ~/llama.cpp/build -j
    ```
-2. Start RPC workers across all ready phones:
+2. Use **Start RPC Workers** in the dashboard, or explicitly select a worker. The helper accepts `ggml-rpc-server` and older builds named `rpc-server`.
    ```bash
-   pc run --target all "bash ~/phonecluster/scripts/05_workload_helpers.sh llama-rpc-start ~/llama.cpp 50052"
+   pc run --target node1 'bash ~/phonecluster/scripts/05_workload_helpers.sh llama-rpc-start ~/llama.cpp 50052'
    ```
-3. Run inference from the Master using only healthy RPC workers:
+3. Verify that the inference host can reach the workers. The generated flag lists direct addresses and excludes ADB control forwards.
    ```bash
-   RPC_FLAG="$(pc llama-rpc)"
-   ~/llama.cpp/build/bin/llama-cli -m model-q4_k_m.gguf ${RPC_FLAG} -p "Summarize distributed computing."
+   if RPC_FLAG="$(pc llama-rpc)"; then
+     ~/llama.cpp/build/bin/llama-cli -m model-q4_k_m.gguf ${RPC_FLAG} -p "Summarize distributed computing."
+   fi
    ```
+4. Use **Stop All** to stop services started by the helper. Upgrade the workers before using this action so it can reach phones during a job or thermal block.
 
 ---
 
@@ -137,7 +143,9 @@ For unrooted Termux phones running 24/7, set `safety.battery_webhook_url` in `co
 }
 ```
 
-PhoneCluster posts a JSON payload whenever a phone crosses `60%` while charging (`event: "charge_off"`), drops below `45%` while discharging (`event: "charge_on"`), or hits thermal throttling (`event: "thermal_throttle"`):
+The guard requests `charge_off` at or above 60% while charging and `charge_on` at or below 45% while discharging. An overheated phone or a hazardous battery reading takes priority at any charge level. The guard requests `charge_off` and reports `thermal_throttle` or `battery_hazard`. After a battery hazard, it continues to request power off as needed until a fresh `GOOD` reading. Automatic restoration requires that health reading, a valid temperature below the high threshold, and an open thermal gate. Verify that your phone reports both health and temperature before relying on automatic restoration. The thermal gate blocks new jobs. Jobs already running continue.
+
+When webhook delivery fails, the guard retries on the first check at least 30 seconds later if the reading still calls for the same event. After successful delivery it observes `webhook_cooldown_sec` for repeated events. A change in requested charger direction is sent immediately on the next check.
 
 ```json
 {
@@ -152,22 +160,32 @@ PhoneCluster posts a JSON payload whenever a phone crosses `60%` while charging 
 ```
 
 ### Example Home Assistant Automation (Toggle Wi-Fi Smart Plug)
+
+Each entry in `chargers` pairs a node ID with its dedicated plug. Use the node IDs and switch entities that match your wiring.
 ```yaml
 alias: PhoneCluster 24/7 Battery Guard
+mode: queued
+variables:
+  chargers:
+    node1: switch.node1_charger
+    node2: switch.node2_charger
 trigger:
   - platform: webhook
     webhook_id: phonecluster_battery
     local_only: true
+condition:
+  - condition: template
+    value_template: "{{ trigger.json.node_id in chargers }}"
 action:
   - choose:
       - conditions: "{{ trigger.json.event == 'charge_off' }}"
         sequence:
           - service: switch.turn_off
             target:
-              entity_id: switch.phonecluster_charger_plug
+              entity_id: "{{ chargers[trigger.json.node_id] }}"
       - conditions: "{{ trigger.json.event == 'charge_on' }}"
         sequence:
           - service: switch.turn_on
             target:
-              entity_id: switch.phonecluster_charger_plug
+              entity_id: "{{ chargers[trigger.json.node_id] }}"
 ```

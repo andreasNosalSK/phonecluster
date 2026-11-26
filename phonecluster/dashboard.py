@@ -31,14 +31,17 @@ from .auth import (
     safe_json_dumps,
     verify_token,
 )
+from .bundled import bundled_script
 from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
+    ConfigConflictError,
     GatewayConfig,
     NetworkHardeningConfig,
     NodeConfig,
     SafetyConfig,
     format_host_port,
+    generate_auth_token,
     is_loopback_or_unspecified_host,
     normalize_host,
     save_config,
@@ -61,7 +64,6 @@ from .usbhub import detect_usb_hub_topology, plan_adb_usb_hub, plan_rndis_usb_hu
 LOG = logging.getLogger("phonecluster.dashboard")
 
 MAX_DASHBOARD_BODY = 2 * 1024 * 1024
-WORKLOAD_HELPER_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "05_workload_helpers.sh"
 _WEBHOOK_OPENER = build_webhook_opener()
 
 DASHBOARD_HTML = r"""<!doctype html>
@@ -541,11 +543,11 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <nav class="tabs" role="tablist" aria-label="Control Center Sections">
     <button role="tab" id="tab-overview" aria-selected="true" aria-controls="panel-overview" onclick="selectTab('overview')">1. Live btop &amp; Pools</button>
-    <button role="tab" id="tab-terminal" aria-selected="false" aria-controls="panel-terminal" onclick="selectTab('terminal')">2. Terminal Control</button>
-    <button role="tab" id="tab-jobs" aria-selected="false" aria-controls="panel-jobs" onclick="selectTab('jobs')">3. Parallel Batch &amp; Pipelines</button>
-    <button role="tab" id="tab-workloads" aria-selected="false" aria-controls="panel-workloads" onclick="selectTab('workloads')">4. Workloads &amp; Service Mesh</button>
-    <button role="tab" id="tab-network" aria-selected="false" aria-controls="panel-network" onclick="selectTab('network')">5. Network &amp; Pi Guard</button>
-    <button role="tab" id="tab-setup" aria-selected="false" aria-controls="panel-setup" onclick="selectTab('setup')">6. Phones, Safety &amp; Doctor</button>
+    <button role="tab" id="tab-terminal" aria-selected="false" tabindex="-1" aria-controls="panel-terminal" onclick="selectTab('terminal')">2. Terminal Control</button>
+    <button role="tab" id="tab-jobs" aria-selected="false" tabindex="-1" aria-controls="panel-jobs" onclick="selectTab('jobs')">3. Parallel Batch &amp; Pipelines</button>
+    <button role="tab" id="tab-workloads" aria-selected="false" tabindex="-1" aria-controls="panel-workloads" onclick="selectTab('workloads')">4. Workloads &amp; Service Mesh</button>
+    <button role="tab" id="tab-network" aria-selected="false" tabindex="-1" aria-controls="panel-network" onclick="selectTab('network')">5. Network &amp; Pi Guard</button>
+    <button role="tab" id="tab-setup" aria-selected="false" tabindex="-1" aria-controls="panel-setup" onclick="selectTab('setup')">6. Phones, Safety &amp; Doctor</button>
   </nav>
 
   <main id="main-content">
@@ -623,7 +625,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <span id="term-cwd-pill" class="pill neutral mono">~</span>
           </div>
           <div class="row" style="margin:0;">
-            <button id="btn-term-cancel" class="small danger" onclick="cancelActiveTermJob()" disabled>Cancel (Ctrl+C)</button>
+            <button id="btn-term-cancel" class="small danger" onclick="cancelActiveTermJob()" title="Cancel the running command on a specifically selected phone" disabled>Cancel command</button>
             <button class="small" onclick="clearTerminal()">Clear</button>
             <button class="small" onclick="downloadTermLog()">Save Log</button>
           </div>
@@ -732,14 +734,15 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
           <h2 style="margin:0;">Visual Cross-Tier Pipeline Builder (No JSON Needed!)</h2>
           <div class="row" style="margin:0;">
             <label class="small" style="cursor:pointer; border:1px solid var(--border); border-radius:8px; padding:5px 9px;">
-              Import .json <input type="file" accept=".json" style="display:none" onchange="importPipeJsonFile(this)" />
+              Import .json <input id="pipe-import" type="file" accept=".json" style="display:none" onchange="importPipeJsonFile(this)" />
             </label>
-            <button class="small" onclick="downloadPipeJson()">Export .json</button>
-            <button class="small ghost" id="btn-toggle-pipe-json" onclick="togglePipeJsonDrawer()">Advanced JSON</button>
+            <button id="pipe-export" class="small" onclick="downloadPipeJson()">Export .json</button>
+            <button class="small ghost" id="btn-toggle-pipe-json" aria-controls="pipe-json-drawer" aria-expanded="false" onclick="togglePipeJsonDrawer()">Advanced JSON</button>
           </div>
         </div>
         <p class="hint" style="margin-top:0;">Build a multi-step workflow across <strong>Tier 1 (Termux)</strong> → <strong>Tier 2 (Debian Services)</strong> → <strong>Tier 3 (Docker)</strong>. Each step automatically gets the previous step's output (<code class="mono">$PHONECLUSTER_PREV_STDOUT</code>) and every live cluster service URL.</p>
 
+        <fieldset id="pipe-visual-controls" aria-label="Visual pipeline editor" style="border:0; padding:0; margin:0; min-width:0;">
         <div class="row">
           <label for="pipe-template">Starter Templates:</label>
           <select id="pipe-template" onchange="applyPipeTemplate(this.value)" aria-label="Cross-tier pipeline template">
@@ -755,18 +758,20 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
 
         <div id="pipe-flow" class="pipe-flow" aria-label="Visual pipeline flow preview"></div>
         <div id="pipe-steps-list"></div>
+        </fieldset>
 
         <div id="pipe-json-drawer" style="display:none; margin-top:10px; padding-top:10px; border-top:1px dashed var(--border);">
           <div class="row" style="justify-content:space-between; margin-bottom:4px;">
-            <label for="pipe-json" class="hint" style="margin:0;">Advanced Raw JSON (auto-synced with Visual Builder above):</label>
+            <label for="pipe-json" class="hint" style="margin:0;">Pipeline JSON draft. Apply edits to enable the visual controls.</label>
             <button class="small primary" onclick="applyPipeJsonFromDrawer()">Apply JSON to Visual Steps</button>
           </div>
           <textarea id="pipe-json" style="min-height:140px"></textarea>
         </div>
 
+        <h3 id="pipe-result-heading" hidden>Last submitted pipeline</h3>
         <div id="pipe-summary-chips" class="chips"></div>
         <div id="pipe-results-cards" aria-live="polite"></div>
-        <pre id="pipe-out" class="code" style="display:none"></pre>
+        <details id="pipe-details" hidden><summary>Full result JSON</summary><pre id="pipe-out" class="code"></pre></details>
       </div>
     </section>
 
@@ -1225,8 +1230,7 @@ async function saveNodeTier(nodeId) {
   const data = await authPost('/api/nodes/update', { id: nodeId, tier, pool, max_concurrency });
   if (data.error) { showToast('Update failed: ' + data.error, 'bad'); return; }
   closeNodeTierEditor();
-  const pushed = data.pushed ? (' · live-synced ' + data.pushed.ok_count + '/' + data.pushed.total) : '';
-  showToast('Updated ' + nodeId + ' -> Tier ' + (tier || 'auto') + ' / pool ' + pool + pushed, 'ok');
+  showPolicyResult('Saved tier ' + (tier || 'auto') + ' and pool ' + pool + ' for ' + nodeId + '.', data.pushed);
   refreshLive();
 }
 
@@ -1282,6 +1286,21 @@ function showToast(msg, tone) {
 }
 function hideToast() {
   document.getElementById('toast').classList.add('hidden');
+}
+
+function showPolicyResult(message, push) {
+  if (!push || !Number.isInteger(push.total)) {
+    showToast(message + ' Worker status unavailable.', 'warn');
+    return;
+  }
+  if (!push.total) {
+    showToast(message + ' No workers targeted.', 'warn');
+    return;
+  }
+  const disk = Number.isInteger(push.persisted_count)
+    ? push.persisted_count + '/' + push.total + ' saved to disk' : 'disk status unavailable';
+  const confirmed = push.ok_count === push.total && push.persisted_count === push.total;
+  showToast(message + ' ' + push.ok_count + '/' + push.total + ' applied live, ' + disk + '.', confirmed ? 'ok' : 'warn');
 }
 
 function getToken() {
@@ -1411,7 +1430,10 @@ function initPreferences() {
 
   for (const id of ['map-commands', 'map-script', 'map-args']) {
     document.getElementById(id).addEventListener('keydown', e => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') runParallelMap();
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        if (!e.repeat) runParallelMap();
+      }
     });
   }
 }
@@ -1423,9 +1445,9 @@ function selectTab(name) {
     const panel = document.getElementById('panel-' + t);
     const active = t === name;
     btn.setAttribute('aria-selected', active ? 'true' : 'false');
+    btn.tabIndex = active ? 0 : -1;
     panel.classList.toggle('active', active);
   }
-  if (name === 'terminal') document.getElementById('term-input').focus();
   if (name === 'jobs') renderPipeBuilder();
   if (name === 'workloads') loadWorkloads();
   if (name === 'network') loadNetworkCenter();
@@ -1436,8 +1458,17 @@ document.querySelector('nav.tabs').addEventListener('keydown', e => {
   const btns = Array.from(document.querySelectorAll('nav.tabs button[role="tab"]'));
   const idx = btns.indexOf(document.activeElement);
   if (idx === -1) return;
-  if (e.key === 'ArrowRight') { btns[(idx + 1) % btns.length].focus(); btns[(idx + 1) % btns.length].click(); }
-  if (e.key === 'ArrowLeft') { btns[(idx - 1 + btns.length) % btns.length].focus(); btns[(idx - 1 + btns.length) % btns.length].click(); }
+  const destinations = {
+    ArrowRight: (idx + 1) % btns.length,
+    ArrowLeft: (idx - 1 + btns.length) % btns.length,
+    Home: 0,
+    End: btns.length - 1,
+  };
+  if (!Object.prototype.hasOwnProperty.call(destinations, e.key)) return;
+  e.preventDefault();
+  const next = btns[destinations[e.key]];
+  next.focus();
+  next.click();
 });
 
 function metricBar(label, valueText, pct, tone) {
@@ -1454,14 +1485,6 @@ function setBoardView(mode) {
   document.getElementById('btn-board-tasks').className = 'small' + (mode === 'tasks' ? ' primary' : '');
   document.getElementById('btn-board-procs').className = 'small' + (mode === 'procs' ? ' primary' : '');
   if (lastLive) renderTasksBoard(lastLive);
-}
-
-let lastTaskCommands = [];
-
-function rerunTask(idx) {
-  const item = lastTaskCommands[idx];
-  if (!item) return;
-  openNodeTerminal(item.node_id, item.command);
 }
 
 function renderTasksBoard(live) {
@@ -1491,8 +1514,13 @@ function renderTasksBoard(live) {
     return;
   }
 
+  const focused = wrap.contains(document.activeElement) ? document.activeElement.dataset : null;
   const rows = [];
-  for (const node of (live.jobs || [])) {
+  const snapshots = live.jobs || [];
+  const unavailable = snapshots.filter(node => node.online === false).map(node => node.node_id);
+  const notice = unavailable.length
+    ? '<p class="hint">Job status unavailable for ' + esc(unavailable.join(', ')) + '.</p>' : '';
+  for (const node of snapshots) {
     for (const j of (node.active || [])) {
       rows.push({
         node_id: node.node_id, job_id: j.job_id, state: 'RUNNING',
@@ -1508,21 +1536,28 @@ function renderTasksBoard(live) {
     }
   }
   if (!rows.length) {
-    wrap.innerHTML = '<p class="hint">No active or recent cluster tasks yet. Try running a command in Terminal Control or Parallel Batch!</p>';
+    wrap.innerHTML = notice || '<p class="hint">No active or recent cluster tasks.</p>';
+    if (focused?.jobId) document.getElementById('btn-board-tasks').focus({ preventScroll: true });
     return;
   }
-  lastTaskCommands = rows.map(r => ({ node_id: r.node_id, command: r.command }));
-  wrap.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Phone</th><th>Job ID</th><th>Status</th><th>Duration</th><th>Command</th><th>Action</th></tr></thead><tbody>'
-    + rows.map((r, idx) => {
+  wrap.innerHTML = notice + '<div style="overflow-x:auto;"><table><thead><tr><th>Phone</th><th>Job ID</th><th>Status</th><th>Duration</th><th>Command</th><th>Action</th></tr></thead><tbody>'
+    + rows.map(r => {
       const tone = r.state === 'OK' ? 'ok' : (r.state === 'RUNNING' ? 'warn' : 'bad');
       const btn = r.active
-        ? '<button class="small danger" onclick="cancelJob(' + jsArg(r.node_id) + ',' + jsArg(r.job_id) + ')">Cancel</button>'
-        : '<button class="small" onclick="rerunTask(' + idx + ')">Re-run</button>';
+        ? '<button class="small danger" data-node-id="' + esc(r.node_id) + '" data-job-id="' + esc(r.job_id)
+          + '" aria-label="Cancel ' + esc(r.job_id) + ' on ' + esc(r.node_id)
+          + '" onclick="cancelJob(' + jsArg(r.node_id) + ',' + jsArg(r.job_id) + ')">Cancel</button>'
+        : '';
       return '<tr><td><b>' + esc(r.node_id) + '</b></td><td class="mono">' + esc(r.job_id) + '</td>'
         + '<td><span class="pill ' + tone + '">' + esc(r.state) + '</span></td>'
         + '<td class="mono">' + esc(r.duration) + '</td><td class="mono">' + esc(r.command) + '</td><td>' + btn + '</td></tr>';
     }).join('')
     + '</tbody></table></div>';
+  if (focused?.jobId) {
+    const sameJob = Array.from(wrap.querySelectorAll('button[data-job-id]')).find(button =>
+      button.dataset.nodeId === focused.nodeId && button.dataset.jobId === focused.jobId);
+    (sameJob || document.getElementById('btn-board-tasks')).focus({ preventScroll: true });
+  }
 }
 
 async function apiFetch(url) {
@@ -1565,7 +1600,7 @@ async function refreshLive() {
     const batHigh = safety.battery_high_pct ?? 60;
 
     document.getElementById('cluster-title').textContent = d.cluster_name + ' — Shared btop';
-    document.getElementById('last-updated').textContent = 'Synced ' + new Date().toLocaleTimeString() + ' · ' + d.nodes_online + '/' + d.nodes_total + ' phones connected';
+    document.getElementById('last-updated').textContent = 'Sampled ' + new Date(d.timestamp * 1000).toLocaleTimeString() + ' · ' + d.nodes_online + '/' + d.nodes_total + ' phones connected';
 
     // Hero KPIs + Sparklines
     const cHist = hist.cluster || [];
@@ -1638,12 +1673,9 @@ async function refreshLive() {
         termSel.appendChild(opt);
       }
       termSel.dataset.sig = termSig;
-      if (Array.from(termSel.options).some(o => o.value === prevTerm)) {
-        termSel.value = prevTerm;
-      } else {
-        onTermTargetChange();
-      }
+      selectTerminalTarget(prevTerm);
     }
+    onTermTargetChange();
 
     renderPoolStrip(d);
     renderNodesGrid(live);
@@ -1683,6 +1715,9 @@ function renderNodesGrid(live) {
 
     // Render Shared Multi-Device btop Cards (respecting active Tier/Pool filter)
     const grid = document.getElementById('nodes-grid');
+    const active = document.activeElement;
+    const focusedAction = grid.contains(active) ? active.dataset.action : '';
+    const focusedNode = focusedAction ? active.closest('[data-node-id]').dataset.nodeId : '';
     grid.innerHTML = '';
 
     const visibleNodes = (d.nodes || []).filter(n => {
@@ -1792,20 +1827,25 @@ function renderNodesGrid(live) {
         ? '<span class="pill purple">MASTER</span>'
         : '<span class="pill neutral">WORKER</span>';
       let actionsHtml = '<div class="node-actions">'
-        + '<button class="small primary" onclick="openNodeTerminal(' + jsArg(n.id) + ')">Terminal</button>'
-        + '<button class="small" onclick="openNodeTierEditor(' + jsArg(n.id) + ')">Tier / Pool</button>';
+        + '<button class="small primary" data-action="terminal" onclick="openNodeTerminal(' + jsArg(n.id) + ')">Terminal</button>'
+        + '<button class="small" data-action="edit" onclick="openNodeTierEditor(' + jsArg(n.id) + ')">Tier / Pool</button>';
       if (n.role !== 'master') {
-        actionsHtml += '<button class="small danger" onclick="removeNode(' + jsArg(n.id) + ')">Remove</button>';
+        actionsHtml += '<button class="small danger" data-action="remove" onclick="removeNode(' + jsArg(n.id) + ')">Remove</button>';
       }
       actionsHtml += '</div>';
 
       const card = document.createElement('article');
       card.className = cardCls;
+      card.dataset.nodeId = n.id;
       card.innerHTML = '<div><div class="node-head">'
         + '<div><div class="node-title">' + esc(n.id) + ' ' + rolePill + ' ' + tierPillHtml(n.tier, n.pool) + '</div>'
         + '<div class="node-meta mono">' + esc(n.host) + '</div></div>'
         + badge + '</div>' + bodyHtml + '</div>' + actionsHtml;
       grid.appendChild(card);
+      if (focusedNode === n.id) {
+        const button = Array.from(card.querySelectorAll('button')).find(el => el.dataset.action === focusedAction);
+        if (button) button.focus({ preventScroll: true });
+      }
     }
 }
 
@@ -1817,17 +1857,37 @@ function shortCwd(cwd) {
   return s.replace(/\/+$/, '').split('/').slice(-1)[0] || '~';
 }
 
+function terminalTargetAvailable(target) {
+  if (['auto', 'all', 'best', 'tier:1', 'tier:2', 'tier:3'].includes(target)) return true;
+  if (!lastLive) return false;
+  const summary = lastLive.summary;
+  return (summary.nodes || []).some(node => node.id === target)
+    || (summary.pools || []).some(pool => 'pool:' + pool.pool === target);
+}
+
+function selectTerminalTarget(target) {
+  const sel = document.getElementById('term-target');
+  if (!Array.from(sel.options).some(option => option.value === target)) {
+    const option = new Option(target, target);
+    if (!terminalTargetAvailable(target)) option.textContent += ' (unavailable)';
+    sel.add(option);
+  }
+  sel.value = target;
+}
+
 function onTermTargetChange() {
   const target = document.getElementById('term-target').value;
   const cwd = termCwds[target] || '~';
+  const available = terminalTargetAvailable(target);
+  document.getElementById('btn-term-run').disabled = Boolean(activeTermJob) || !available;
   document.getElementById('term-cwd-pill').textContent = cwd;
-  document.getElementById('term-prompt').textContent = target + ':' + shortCwd(cwd) + ' $';
+  document.getElementById('term-prompt').textContent = available
+    ? target + ':' + shortCwd(cwd) + ' $' : target + ' unavailable — choose a target';
 }
 
 function openNodeTerminal(nodeId, prefillCmd) {
   selectTab('terminal');
-  const sel = document.getElementById('term-target');
-  if (Array.from(sel.options).some(o => o.value === nodeId)) sel.value = nodeId;
+  selectTerminalTarget(nodeId);
   onTermTargetChange();
   const inp = document.getElementById('term-input');
   if (prefillCmd) inp.value = prefillCmd;
@@ -1835,6 +1895,10 @@ function openNodeTerminal(nodeId, prefillCmd) {
 }
 
 function runTermPreset(cmd) {
+  if (document.getElementById('btn-term-run').disabled) {
+    showToast('Choose an available target and wait for the current command to finish.', 'warn');
+    return;
+  }
   document.getElementById('term-input').value = cmd;
   submitTerminalCommand();
 }
@@ -1862,6 +1926,10 @@ async function submitTerminalCommand() {
   if (cmd === 'clear') { inp.value = ''; clearTerminal(); return; }
 
   const target = document.getElementById('term-target').value;
+  if (!terminalTargetAvailable(target)) {
+    showToast('Target ' + target + ' is unavailable. Choose another target to run this command.', 'warn');
+    return;
+  }
   const cwd = termCwds[target] || '';
   termHistory.push(cmd);
   termHistIdx = -1;
@@ -1897,7 +1965,7 @@ async function submitTerminalCommand() {
       }
       const tierStr = r.node_tier ? (' · T' + r.node_tier + ':' + (r.node_pool || 'compute')) : '';
       const whyStr = r.routing_reason ? (' — ' + r.routing_reason) : '';
-      const meta = '[' + r.node_id + tierStr + ' · ' + (r.ok ? 'OK' : 'rc=' + r.returncode) + ' · ' + r.duration_sec + 's' + whyStr + ']';
+      const meta = '[' + r.node_id + tierStr + ' · ' + (r.ok ? 'OK' : (r.outcome_unknown ? 'Outcome unknown' : 'rc=' + r.returncode)) + ' · ' + r.duration_sec + 's' + whyStr + ']';
       html += '<div class="term-meta" style="margin-left:0;">' + esc(meta) + '</div>';
       if (r.stdout) { html += '<div>' + esc(r.stdout) + '</div>'; plainOut += meta + '\n' + r.stdout + '\n'; }
       if (r.stderr) { html += '<div class="term-err">' + esc(r.stderr) + '</div>'; plainOut += '[stderr]\n' + r.stderr + '\n'; }
@@ -1909,7 +1977,7 @@ async function submitTerminalCommand() {
     refreshLive();
   } finally {
     activeTermJob = null;
-    document.getElementById('btn-term-run').disabled = false;
+    onTermTargetChange();
     document.getElementById('btn-term-cancel').disabled = true;
   }
 }
@@ -2013,6 +2081,14 @@ async function authPost(url, payload) {
   }
 }
 
+function formatJobOutput(result) {
+  const sections = [];
+  if (result.stdout) sections.push('[stdout]\n' + result.stdout);
+  if (result.stderr) sections.push('[stderr]\n' + result.stderr);
+  if (result.error) sections.push('[error]\n' + result.error);
+  return sections.join('\n') || '(no output)';
+}
+
 function toggleMapMode() {
   const mode = document.getElementById('map-mode').value;
   document.getElementById('map-commands-box').style.display = mode === 'commands' ? 'block' : 'none';
@@ -2023,9 +2099,13 @@ async function runParallelMap() {
   const mode = document.getElementById('map-mode').value;
   const target = document.getElementById('map-target').value || 'auto';
   const btn = document.getElementById('btn-run-map');
+  if (btn.disabled) return;
   const out = document.getElementById('map-out');
   const chips = document.getElementById('map-summary-chips');
+  const download = document.getElementById('btn-dl-map');
   btn.disabled = true;
+  download.disabled = true;
+  lastMapData = null;
   chips.innerHTML = '';
   out.textContent = 'Dispatching parallel batch (target: ' + target + ')...';
   try {
@@ -2042,19 +2122,23 @@ async function runParallelMap() {
     const data = await authPost('/api/map', payload);
     if (data.error) { out.textContent = 'Error: ' + data.error; showToast(data.error, 'bad'); return; }
     lastMapData = data;
-    document.getElementById('btn-dl-map').disabled = false;
+    download.disabled = false;
+    const unknown = (data.results || []).filter(result => result.outcome_unknown).length;
+    const failed = data.fail_count - unknown;
     chips.innerHTML = '<span class="pill neutral mono">' + esc(data.wall_sec) + 's</span>'
       + '<span class="pill ok">✓ OK: ' + esc(data.ok_count) + '</span>'
-      + (data.fail_count ? '<span class="pill bad">✕ FAIL: ' + esc(data.fail_count) + '</span>' : '')
+      + (failed ? '<span class="pill bad">✕ FAIL: ' + esc(failed) + '</span>' : '')
+      + (unknown ? '<span class="pill warn">Unknown: ' + esc(unknown) + '</span>' : '')
       + Object.entries(data.distribution || {}).map(([k, v]) => '<span class="pill neutral">' + esc(k) + ': ' + esc(v) + '</span>').join('');
     let txt = '';
     for (const r of (data.results || [])) {
       const tierStr = r.node_tier ? (' [T' + r.node_tier + ':' + (r.node_pool || 'compute') + ']') : '';
-      txt += '[' + (r.ok ? 'OK' : 'FAIL') + '] ' + r.node_id + tierStr + ' (' + r.duration_sec + 's) ' + r.label + '\n  '
-        + (r.stdout || r.stderr || r.error || '').trim().replace(/\n/g, '\n  ') + '\n';
+      txt += '[' + (r.ok ? 'OK' : (r.outcome_unknown ? 'UNKNOWN' : 'FAIL')) + '] ' + r.node_id + tierStr + ' (' + r.duration_sec + 's) ' + r.label + '\n  '
+        + formatJobOutput(r).replace(/\n/g, '\n  ') + '\n';
     }
     out.textContent = txt || 'Done.';
-    showToast('Batch complete: ' + data.ok_count + ' succeeded, ' + data.fail_count + ' failed', data.fail_count ? 'warn' : 'ok');
+    showToast('Batch complete: ' + data.ok_count + ' succeeded, ' + failed + ' failed'
+      + (unknown ? ', ' + unknown + ' unknown' : ''), data.fail_count ? 'warn' : 'ok');
     refreshLive();
   } finally {
     btn.disabled = false;
@@ -2076,6 +2160,7 @@ let pipeSteps = [
   }
 ];
 let lastPipeResults = [];
+let submittedPipeDefinition = '';
 
 function pipeTargetLabel(t) {
   if (t === 'auto') return '⚡ Auto';
@@ -2088,7 +2173,9 @@ function pipeTargetLabel(t) {
 
 function syncPipeJsonFromBuilder() {
   const el = document.getElementById('pipe-json');
-  if (el) el.value = JSON.stringify(pipeSteps, null, 2);
+  if (el && !document.getElementById('pipe-visual-controls').disabled) {
+    el.value = JSON.stringify(pipeSteps, null, 2);
+  }
 }
 
 function getAvailableMeshVars(stepIdx) {
@@ -2132,10 +2219,11 @@ function renderPipeFlow() {
     flow.innerHTML = '<span class="hint" style="margin:0;">No steps yet — click "+ Add Step" or choose a Starter Template.</span>';
     return;
   }
+  const matchesSubmission = lastPipeResults.length && JSON.stringify(pipeSteps) === submittedPipeDefinition;
   flow.innerHTML = pipeSteps.map((st, idx) => {
-    const res = lastPipeResults.find(r => r.step_index === idx + 1);
-    const cls = res ? (res.ok ? ' ok' : ' bad') : '';
-    const icon = res ? (res.ok ? '✓ ' : '✕ ') : '';
+    const res = matchesSubmission && lastPipeResults.find(r => r.step_index === idx + 1);
+    const cls = res ? (res.outcome_unknown ? '' : (res.ok ? ' ok' : ' bad')) : '';
+    const icon = res ? (res.outcome_unknown ? '? ' : (res.ok ? '✓ ' : '✕ ')) : '';
     const targetBadge = res && res.node_id && res.node_id !== 'none'
       ? (res.node_id + (res.node_tier ? ' · T' + res.node_tier : ''))
       : pipeTargetLabel(st.target);
@@ -2200,7 +2288,7 @@ function updatePipeStep(idx, field, val) {
   if (!pipeSteps[idx]) return;
   pipeSteps[idx][field] = val;
   syncPipeJsonFromBuilder();
-  if (field === 'name' || field === 'target') renderPipeFlow();
+  renderPipeFlow();
 }
 
 function insertPipeVar(idx, varToken) {
@@ -2212,6 +2300,7 @@ function insertPipeVar(idx, varToken) {
   ta.value = cur.slice(0, start) + varToken + cur.slice(end);
   pipeSteps[idx].command = ta.value;
   syncPipeJsonFromBuilder();
+  renderPipeFlow();
   ta.focus();
   ta.setSelectionRange(start + varToken.length, start + varToken.length);
 }
@@ -2254,12 +2343,23 @@ function removePipeStep(idx) {
   renderPipeBuilder();
 }
 
-function togglePipeJsonDrawer() {
+function setPipeJsonEditor(open) {
   const box = document.getElementById('pipe-json-drawer');
-  const open = box.style.display === 'none';
+  document.getElementById('pipe-visual-controls').disabled = open;
+  document.getElementById('pipe-import').disabled = open;
+  document.getElementById('pipe-export').disabled = open;
   box.style.display = open ? 'block' : 'none';
-  document.getElementById('btn-toggle-pipe-json').textContent = open ? 'Hide Advanced JSON' : 'Advanced JSON';
+  const toggle = document.getElementById('btn-toggle-pipe-json');
+  toggle.textContent = open ? 'Discard JSON edits and close' : 'Advanced JSON';
+  toggle.setAttribute('aria-expanded', String(open));
+  if (open) document.getElementById('pipe-json').focus();
+  else toggle.focus();
+}
+
+function togglePipeJsonDrawer() {
+  const open = !document.getElementById('pipe-visual-controls').disabled;
   if (open) syncPipeJsonFromBuilder();
+  setPipeJsonEditor(open);
 }
 
 function applyPipeJsonFromDrawer() {
@@ -2276,6 +2376,7 @@ function applyPipeJsonFromDrawer() {
       continue_on_error: Boolean(s.continue_on_error)
     }));
     lastPipeResults = [];
+    if (document.getElementById('pipe-visual-controls').disabled) setPipeJsonEditor(false);
     renderPipeBuilder();
     showToast('Applied ' + pipeSteps.length + ' step(s) to Visual Builder!', 'ok');
   } catch (e) {
@@ -2288,9 +2389,15 @@ function importPipeJsonFile(input) {
   if (!file) return;
   const reader = new FileReader();
   reader.onload = () => {
+    if (document.getElementById('pipe-visual-controls').disabled) {
+      showToast('JSON editor opened before import finished. Import the file again after closing it.', 'warn');
+      return;
+    }
+    setPipeJsonEditor(true);
     document.getElementById('pipe-json').value = String(reader.result || '');
     applyPipeJsonFromDrawer();
   };
+  reader.onerror = () => showToast('Could not read the pipeline file.', 'bad');
   reader.readAsText(file);
   input.value = '';
 }
@@ -2371,6 +2478,7 @@ function applyPipeTemplate(name) {
 
 async function runCrossTierPipeline() {
   const btn = document.getElementById('btn-run-pipe');
+  if (btn.disabled || document.getElementById('pipe-visual-controls').disabled) return;
   const cardsBox = document.getElementById('pipe-results-cards');
   const out = document.getElementById('pipe-out');
   const chips = document.getElementById('pipe-summary-chips');
@@ -2379,6 +2487,13 @@ async function runCrossTierPipeline() {
     return;
   }
   btn.disabled = true;
+  document.getElementById('pipe-result-heading').hidden = false;
+  submittedPipeDefinition = JSON.stringify(pipeSteps);
+  lastPipeResults = [];
+  renderPipeFlow();
+  const details = document.getElementById('pipe-details');
+  details.hidden = true;
+  out.textContent = '';
   chips.innerHTML = '';
   cardsBox.innerHTML = '<p class="hint">Running ' + pipeSteps.length + ' cross-tier step(s)...</p>';
   try {
@@ -2390,17 +2505,21 @@ async function runCrossTierPipeline() {
     }
     lastPipeResults = data.results || [];
     renderPipeFlow();
-    chips.innerHTML = '<span class="pill ' + (data.ok ? 'ok' : 'bad') + '">' + (data.ok ? '✓ PIPELINE OK' : '✕ FAILED') + '</span>'
+    const uncertain = lastPipeResults.some(result => result.outcome_unknown);
+    const stateLabel = uncertain ? 'Review unconfirmed outcomes' : (data.ok ? '✓ PIPELINE OK' : '✕ FAILED');
+    chips.innerHTML = '<span class="pill ' + (uncertain ? 'warn' : (data.ok ? 'ok' : 'bad')) + '">' + stateLabel + '</span>'
       + '<span class="pill neutral mono">' + esc(data.duration_sec) + 's</span>'
       + '<span class="pill neutral">' + esc(data.steps_completed) + '/' + esc(data.steps_total) + ' steps</span>';
 
     cardsBox.innerHTML = lastPipeResults.map(r => {
       const tp = r.node_tier ? tierPillHtml(r.node_tier, r.node_pool) : '<span class="pill neutral">none</span>';
-      const body = (r.stdout || r.stderr || r.error || '(no output)').trim();
-      return '<div class="pipe-res-card ' + (r.ok ? 'ok' : 'bad') + '">'
+      const body = formatJobOutput(r);
+      const tone = r.outcome_unknown ? 'warn' : (r.ok ? 'ok' : 'bad');
+      const state = r.outcome_unknown ? 'Outcome unknown' : (r.ok ? '✓ OK' : '✕ FAIL');
+      return '<div class="pipe-res-card ' + tone + '">'
         + '<div class="row" style="justify-content:space-between; margin-bottom:4px;">'
         + '<div><strong>Step ' + esc(r.step_index) + ': ' + esc(r.name) + '</strong> '
-        + '<span class="pill ' + (r.ok ? 'ok' : 'bad') + '">' + (r.ok ? '✓ OK' : '✕ FAIL') + '</span> '
+        + '<span class="pill ' + tone + '">' + state + '</span> '
         + '<span class="pill neutral mono">' + esc(r.node_id) + '</span> ' + tp + '</div>'
         + '<span class="hint mono" style="margin:0;">' + esc(r.duration_sec) + 's</span></div>'
         + (r.routing_reason ? '<div class="hint" style="margin:0 0 6px;">Route: ' + esc(r.routing_reason) + '</div>' : '')
@@ -2409,6 +2528,7 @@ async function runCrossTierPipeline() {
     }).join('');
 
     out.textContent = JSON.stringify(data, null, 2);
+    details.hidden = false;
     showToast('Pipeline finished: ' + data.steps_completed + '/' + data.steps_total + ' steps', data.ok ? 'ok' : 'warn');
     refreshLive();
   } finally {
@@ -2590,7 +2710,21 @@ async function workloadAction(action) {
   out.textContent = 'Running ' + action + ' on all ready phones...';
   const data = await authPost('/api/workloads/action', { action, cidr });
   out.textContent = JSON.stringify(data, null, 2);
-  showToast(data.error ? data.error : 'Workload command finished: ' + action, data.error ? 'bad' : 'ok');
+  const rows = data.results || data.nodes || data.workers || [];
+  const failures = rows.filter(row => row.ok !== true);
+  if (data.error) {
+    showToast(data.error, 'bad');
+  } else if (failures.length) {
+    const message = failures.length === 1 && failures[0].error
+      ? failures[0].error : failures.length + ' node actions failed or are unconfirmed.';
+    showToast(message, failures.length === rows.length ? 'bad' : 'warn');
+  } else if (data.ok === false) {
+    showToast('Workload command failed: ' + action, 'bad');
+  } else if (!rows.length && !data.manager_node_id) {
+    showToast('No matching nodes reported for ' + action, 'warn');
+  } else {
+    showToast('Workload command finished: ' + action, 'ok');
+  }
   setTimeout(loadWorkloads, 800);
 }
 
@@ -2703,7 +2837,7 @@ async function scanLan() {
 async function addDiscoveredNode(host, worker_port, ssh_port, ssh_user) {
   const data = await authPost('/api/nodes/add', { host, worker_port, ssh_port, ssh_user });
   if (data.error) { showToast('Could not add node: ' + data.error, 'bad'); return; }
-  showToast('Added ' + data.node.id + ' (' + data.node.host + ') to cluster.json!', 'ok');
+  showToast('Added ' + data.node.id + '. Run pc sync on the Master to provision its worker token.', 'ok');
   scanLan();
   refreshLive();
 }
@@ -2719,7 +2853,7 @@ async function addManualNode() {
   const data = await authPost('/api/nodes/add', { host, ssh_user, ssh_port, max_concurrency, tier, pool });
   if (data.error) { showToast('Could not add phone: ' + data.error, 'bad'); return; }
   document.getElementById('add-host').value = '';
-  showToast('Added ' + data.node.id + ' (' + data.node.host + ')!', 'ok');
+  showToast('Added ' + data.node.id + '. Run pc sync on the Master to provision its worker token.', 'ok');
   refreshLive();
 }
 
@@ -2764,8 +2898,7 @@ async function saveSafetySettings() {
   };
   const data = await authPost('/api/settings', payload);
   if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
-  const pushed = data.pushed ? (' (live-synced to ' + data.pushed.ok_count + '/' + data.pushed.total + ' phone(s))') : '';
-  showToast('Safety settings saved!' + pushed, 'ok');
+  showPolicyResult('Controller safety settings saved.', data.pushed);
   refreshLive();
 }
 
@@ -2978,8 +3111,7 @@ async function loadUsbHub() {
 async function applySecurityProfile(profile) {
   const data = await authPost('/api/network/profile', { profile });
   if (data.error) { showToast('Profile error: ' + data.error, 'bad'); return; }
-  const pushed = data.pushed ? (' · synced live to ' + data.pushed.ok_count + '/' + data.pushed.total + ' phone(s)') : '';
-  showToast('Applied profile: ' + data.description + pushed, 'ok');
+  showPolicyResult('Applied profile: ' + data.description + '.', data.pushed);
   loadNetworkCenter();
 }
 
@@ -3001,15 +3133,14 @@ async function saveHardeningSettings() {
   };
   const data = await authPost('/api/network/hardening', payload);
   if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
-  const pushed = data.pushed ? (' Synced live to ' + data.pushed.ok_count + '/' + data.pushed.total + ' phone(s)!') : '';
-  showToast('Network hardening saved!' + pushed, 'ok');
+  showPolicyResult('Controller network settings saved.', data.pushed);
   loadNetworkCenter();
 }
 
 async function pushLivePolicyToWorkers() {
   const data = await authPost('/api/network/push-config', {});
   if (data.error) { showToast('Policy push failed: ' + data.error, 'bad'); return; }
-  showToast('Pushed live policy (safety, concurrency & IP lock) to ' + data.ok_count + '/' + data.total + ' online phone(s)!', data.ok_count === data.total ? 'ok' : 'warn');
+  showPolicyResult('Policy push complete.', data);
   loadNetworkCenter();
   refreshLive();
 }
@@ -3212,6 +3343,8 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     ) -> None:
         self.controller = controller
         self.config_path = config_path
+        self.sample_live_in_background = False
+        self.latest_live: dict[str, Any] | None = None
         self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
         self._conn_sem = threading.BoundedSemaphore(64)
         if ":" in str(addr[0]):
@@ -3271,7 +3404,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         LOG.info("dashboard %s - %s", self.address_string(), msg)
 
     def _save_config_or_rollback(self, rollback_fn: Any) -> bool:
-        """Persist `controller.config` atomically; roll back in-memory state and return HTTP 500 JSON on failure."""
+        """Roll back the in-memory edit if the config changed elsewhere or the save failed."""
         if self.server.config_path is None:
             return True
         try:
@@ -3283,10 +3416,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             except Exception as rb_exc:
                 LOG.error("Rollback after failed config save also failed: %s", rb_exc)
             LOG.error("Failed to save cluster config: %s", exc)
-            self._send_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"error": f"Failed to persist cluster config: {exc}"},
-            )
+            if isinstance(exc, ConfigConflictError):
+                self._send_json(HTTPStatus.CONFLICT, {"error": f"{exc} Restart the dashboard to reload."})
+            else:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Failed to persist cluster config: {exc}"})
             return False
 
     def _send(self, status: int, content_type: str, raw: bytes) -> None:
@@ -3510,10 +3643,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/metrics":
                 self._send_json(HTTPStatus.OK, self.server.controller.metrics_history.snapshot())
             elif path == "/api/live":
-                summary = self.server.controller.cluster_summary()
-                jobs = self.server.controller.get_all_jobs()
-                history = self.server.controller.metrics_history.snapshot()
-                self._send_json(HTTPStatus.OK, {"summary": summary, "jobs": jobs, "history": history})
+                live = self.server.latest_live
+                if not self.server.sample_live_in_background:
+                    live = _collect_live(self.server.controller)
+                if live is None:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Waiting for first health sample"})
+                else:
+                    self._send_json(HTTPStatus.OK, live)
             elif path == "/api/jobs":
                 self._send_json(HTTPStatus.OK, {"nodes": self.server.controller.get_all_jobs()})
             elif path == "/api/services":
@@ -3581,7 +3717,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/usb-hub":
                 topo = detect_usb_hub_topology()
                 ready_adb = [d for d in topo["adb_devices"] if d.get("state") == "device"]
-                adb_plan = plan_adb_usb_hub(ready_adb) if ready_adb else {"mode": "adb", "nodes": [], "forward_rules": [], "reverse_rules": [], "peer_mesh_map": {}}
+                try:
+                    with self.server.controller.config_lock:
+                        adb_plan = plan_adb_usb_hub(ready_adb, existing_nodes=self.server.controller.config.nodes)
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
                 rndis_plan = plan_rndis_usb_hub(topo["usb_net_interfaces"]) if topo["usb_net_interfaces"] else {"mode": "rndis", "nodes": [], "cluster_cidr": "10.77.0.0/16"}
                 self._send_json(
                     HTTPStatus.OK,
@@ -4250,6 +4391,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         return
                 self._send_json(HTTPStatus.OK, ctrl.docker_swarm_setup(manager_node_id=mgr_id, advertise_addr=adv))
                 return
+            if action == "llama-rpc-stop":
+                self._send_json(HTTPStatus.OK, {"action": action, "results": ctrl.stop_llama_rpc()})
+                return
             cidr = str(body.get("cidr") or "").strip()
             if not cidr:
                 with ctrl.config_lock:
@@ -4271,7 +4415,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 "distcc-start": ["distcc-start", cidr],
                 "distcc-stop": ["distcc-stop"],
                 "llama-rpc-start": ["llama-rpc-start"],
-                "llama-rpc-stop": ["llama-rpc-stop"],
             }
             script_args = action_args_map.get(action)
             if not script_args:
@@ -4279,91 +4422,22 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return
             # Ship 05_workload_helpers.sh inline so it works regardless of install directory on each phone!
             wl_job_id = f"wl-{action}-{uuid.uuid4().hex[:6]}"
-            if WORKLOAD_HELPER_SCRIPT.exists():
-                spec = JobSpec(
-                    index=0,
-                    job_id=wl_job_id,
-                    script_content=WORKLOAD_HELPER_SCRIPT.read_text(encoding="utf-8"),
-                    script_name="05_workload_helpers.sh",
-                    interpreter="bash",
-                    args=script_args,
-                    timeout_sec=30.0,
-                )
+            helper = bundled_script("05_workload_helpers.sh")
+            try:
+                script = helper.read_text(encoding="utf-8") if helper else ""
+            except (OSError, UnicodeError):
+                script = ""
+            if not script:
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Workload helper missing. Reinstall PhoneCluster."})
+                return
+            spec = JobSpec(
+                index=0, job_id=wl_job_id, script_content=script, script_name=helper.name,
+                interpreter="bash", args=script_args, timeout_sec=30.0,
+            )
+            if action != "llama-rpc-start":
+                outcomes = ctrl.run_single(spec, target="all")
             else:
-                quoted_args = " ".join(shlex.quote(a) for a in script_args)
-                spec = JobSpec(
-                    index=0,
-                    job_id=wl_job_id,
-                    command=f"bash ~/phonecluster/scripts/05_workload_helpers.sh {quoted_args}",
-                    timeout_sec=30.0,
-                )
-            # For llama-rpc-start, prefer worker phones if any exist so a 512 MB Pi Master doesn't OOM
-            if action == "llama-rpc-start":
-                with ctrl.config_lock:
-                    has_workers = any(n.role != "master" for n in ctrl.config.nodes)
-                if has_workers:
-                    import concurrent.futures as _cf
-                    from .routing import build_cross_tier_env as _build_env
-
-                    snaps = ctrl.poll_health()
-                    quarantined = ctrl._quarantined_ids()
-                    ready_workers = [
-                        s
-                        for s in snaps
-                        if s.online and s.ready_for_jobs and s.node.role != "master" and s.node.id not in quarantined
-                    ]
-                    if ready_workers:
-                        with ctrl.config_lock:
-                            cross_env = _build_env(snaps, ctrl.config)
-                        outcomes = []
-                        with _cf.ThreadPoolExecutor(max_workers=min(32, len(ready_workers))) as pool:
-                            fut_map = {
-                                pool.submit(
-                                    ctrl.exec_on_node,
-                                    ws.node,
-                                    ctrl._with_node_env(spec, ws.node, cross_env),
-                                ): ws
-                                for ws in ready_workers
-                            }
-                            for fut in _cf.as_completed(fut_map):
-                                ws = fut_map[fut]
-                                kind, data = fut.result()
-                                t_num, p_name = resolve_node_tier_and_pool(ws.node, ws.health)
-                                outcomes.append(
-                                    ctrl._to_outcome(
-                                        spec,
-                                        ws.node.id,
-                                        kind,
-                                        data,
-                                        attempts=1,
-                                        node_tier=t_num,
-                                        node_pool=p_name,
-                                        routing_reason="Broadcast llama-rpc-start to ready worker phones",
-                                    )
-                                )
-                        outcomes.sort(key=lambda o: o.node_id)
-                        self._send_json(HTTPStatus.OK, {"action": action, "results": [o.to_dict() for o in outcomes]})
-                        return
-                    self._send_json(
-                        HTTPStatus.OK,
-                        {
-                            "action": action,
-                            "results": [
-                                {
-                                    "index": 0,
-                                    "job_id": wl_job_id,
-                                    "label": "llama-rpc-start",
-                                    "node_id": "none",
-                                    "ok": False,
-                                    "returncode": -1,
-                                    "duration_sec": 0.0,
-                                    "error": "No online, ready, non-quarantined worker phones available for llama-rpc-start (Master skipped to protect low-RAM controllers).",
-                                }
-                            ],
-                        },
-                    )
-                    return
-            outcomes = ctrl.run_single(spec, target="all")
+                outcomes = ctrl.start_llama_rpc(spec)
             self._send_json(HTTPStatus.OK, {"action": action, "results": [o.to_dict() for o in outcomes]})
 
         elif path == "/api/nodes/add":
@@ -4414,6 +4488,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     id=node_id,
                     host=host,
                     role="worker",
+                    auth_token=generate_auth_token(),
                     worker_port=worker_port,
                     ssh_port=ssh_port,
                     ssh_user=ssh_user,
@@ -4649,18 +4724,27 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
 
 
+def _collect_live(controller: MasterController) -> dict[str, Any]:
+    return {
+        "summary": controller.cluster_summary(),
+        "jobs": controller.get_all_jobs(),
+        "history": controller.metrics_history.snapshot(),
+    }
+
+
 def _start_background_sampler(
-    controller: MasterController,
+    server: DashboardHTTPServer,
     stop_event: threading.Event,
     interval_sec: float = 4.0,
 ) -> threading.Thread:
-    """Keep sparkline metrics warm even before a browser tab connects."""
+    """Share one fleet sample across dashboard viewers."""
+    server.sample_live_in_background = True
     def _loop() -> None:
         while not stop_event.is_set():
             try:
-                controller.cluster_summary(record_history=True)
+                server.latest_live = _collect_live(server.controller)
             except Exception:
-                pass
+                LOG.exception("Dashboard live sampling failed")
             stop_event.wait(interval_sec)
 
     t = threading.Thread(target=_loop, name="metrics-sampler", daemon=True)
@@ -4677,7 +4761,7 @@ def serve_dashboard(
     """Start the Master Phone's accessible btop Web Control Center."""
     server = DashboardHTTPServer((bind_host, port), controller, config_path=config_path)
     stop_event = threading.Event()
-    _start_background_sampler(controller, stop_event, interval_sec=4.0)
+    _start_background_sampler(server, stop_event, interval_sec=4.0)
 
     sigterm_event = threading.Event()
     watcher_stop = threading.Event()

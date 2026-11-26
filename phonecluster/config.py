@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import math
@@ -10,6 +11,7 @@ import re
 import secrets
 import tempfile
 import urllib.parse
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -225,6 +227,35 @@ def validate_allowed_master_entry(raw: str) -> str:
     return validate_host(entry)
 
 
+@dataclass(frozen=True)
+class AdbNodeConfig:
+    """The stable USB identity and the ports on the device side of its tunnels."""
+
+    serial: str
+    remote_worker_port: int
+    remote_ssh_port: int
+    mesh_base_port: int
+    peer_mesh: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "AdbNodeConfig":
+        if not isinstance(data, dict):
+            raise ValueError("Node adb metadata must be an object")
+        serial = data.get("serial")
+        if not isinstance(serial, str) or serial.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", serial):
+            raise ValueError("Node adb metadata requires a valid device serial")
+        ports = [
+            _parse_int_field(data.get(name), 0, f"adb.{name}")
+            for name in ("remote_worker_port", "remote_ssh_port", "mesh_base_port")
+        ]
+        if not all(1 <= port <= 65535 for port in ports):
+            raise ValueError("Node adb metadata ports must be between 1 and 65535")
+        peer_mesh = data.get("peer_mesh", True)
+        if not isinstance(peer_mesh, bool):
+            raise ValueError("Node adb peer_mesh must be a boolean")
+        return cls(serial, *ports, peer_mesh=peer_mesh)
+
+
 @dataclass
 class NodeConfig:
     """Configuration for a single phone or Linux node in the cluster."""
@@ -242,6 +273,7 @@ class NodeConfig:
     tags: list[str] = field(default_factory=list)
     notes: str = ""
     auth_token: str = ""  # Optional per-node least-privilege token (recommended for workers)
+    adb: AdbNodeConfig | None = None
 
     @property
     def base_url(self) -> str:
@@ -306,6 +338,7 @@ class NodeConfig:
             tags=tags,
             notes=str(data.get("notes") or ""),
             auth_token=node_tok,
+            adb=AdbNodeConfig.from_dict(data["adb"]) if data.get("adb") is not None else None,
         )
 
 
@@ -553,6 +586,7 @@ class ClusterConfig:
     dashboard_port: int = 8080
     dashboard_require_auth: bool = False
     custom_services: dict[str, str] = field(default_factory=dict)
+    _source: tuple[Path, str] | None = field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ClusterConfig":
@@ -609,7 +643,9 @@ class ClusterConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        del data["_source"]
+        return data
 
     def token_for_node(self, node: NodeConfig) -> str:
         """Return the least-privilege per-node token if set, else the cluster token."""
@@ -620,6 +656,15 @@ class ClusterConfig:
             if node.id == node_id:
                 return node
         raise KeyError(f"Unknown node id: {node_id}")
+
+    def workers_needing_tokens(self) -> list[NodeConfig]:
+        """Find workers whose credential is missing or also grants access to another node."""
+        counts = Counter(n.auth_token for n in self.nodes)
+        return [
+            n for n in self.nodes
+            if n.role == "worker"
+            and (not n.auth_token or n.auth_token == self.auth_token or counts[n.auth_token] > 1)
+        ]
 
 
 def resolve_config_path(path: str | Path | None = None) -> Path:
@@ -632,6 +677,18 @@ def resolve_config_path(path: str | Path | None = None) -> Path:
     return DEFAULT_CONFIG_PATH
 
 
+class ConfigConflictError(OSError):
+    """Another writer changed the config after the caller read it."""
+
+
+def config_revision(path: Path) -> str:
+    """Read the revision for an intentional replacement, including an absent file."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return ""
+
+
 def load_config(path: str | Path | None = None) -> ClusterConfig:
     """Load and validate a ClusterConfig from JSON."""
     cfg_path = resolve_config_path(path)
@@ -640,9 +697,10 @@ def load_config(path: str | Path | None = None) -> ClusterConfig:
             f"Cluster config not found at '{cfg_path}'. "
             f"Run `python3 phonecluster_cli.py init-config --output {cfg_path}` first."
         )
-    with cfg_path.open("r", encoding="utf-8") as fh:
-        raw = json.load(fh)
-    return ClusterConfig.from_dict(raw)
+    raw = cfg_path.read_bytes()
+    config = ClusterConfig.from_dict(json.loads(raw.decode("utf-8")))
+    config._source = (cfg_path.resolve(), hashlib.sha256(raw).hexdigest())
+    return config
 
 
 def create_default_config(
@@ -689,6 +747,7 @@ def create_default_config(
                 id=f"node{idx}",
                 host=host,
                 role="worker",
+                auth_token=generate_auth_token(),
                 ssh_port=clean_ssh_port,
                 ssh_user=clean_user,
                 max_concurrency=2,
@@ -699,7 +758,7 @@ def create_default_config(
         )
     return ClusterConfig(
         cluster_name=str(cluster_name or "phonecluster").strip() or "phonecluster",
-        auth_token=secrets.token_urlsafe(32),
+        auth_token=generate_auth_token(),
         nodes=nodes,
         safety=SafetyConfig(),
     )
@@ -710,11 +769,37 @@ def generate_auth_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def save_config(config: ClusterConfig, path: str | Path) -> Path:
-    """Atomically write a ClusterConfig to disk with restrictive permissions (0600)."""
-    out = Path(path)
+def save_config(config: ClusterConfig, path: str | Path, *, expected_revision: str | None = None) -> Path:
+    """Save if the file still matches the version read, or is absent for a new config."""
+    out = Path(path).resolve()
+    if expected_revision is None:
+        expected_revision = config._source[1] if config._source and config._source[0] == out else ""
+    payload = (json.dumps(config.to_dict(), indent=2, allow_nan=False) + "\n").encode("utf-8")
+    revision = replace_config_file(out, payload, expected_revision)
+    config._source = (out, revision)
+    return Path(path)
+
+
+def replace_config_file(out: Path, payload: bytes, expected_revision: str) -> str:
+    """Compare and atomically replace validated JSON, retaining the bytes sent by a sync."""
+    out = out.resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(config.to_dict(), indent=2, allow_nan=False) + "\n"
+    # Lock a stable sibling. Locking the config inode itself would lose the lock on replace.
+    lock_path = out.with_name(f".{out.name}.lock")
+    with os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "r+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if config_revision(out) != expected_revision:
+            raise ConfigConflictError(f"Config '{out}' changed on disk. Reload the config and retry.")
+        _write_config(out, payload)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _write_config(out: Path, payload: bytes) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=str(out.parent))
     tmp_path = Path(tmp_name)
     try:
@@ -722,7 +807,7 @@ def save_config(config: ClusterConfig, path: str | Path) -> Path:
             os.chmod(tmp_path, 0o600)
         except OSError:
             pass
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "wb") as fh:
             fh.write(payload)
             fh.flush()
             try:
@@ -736,4 +821,3 @@ def save_config(config: ClusterConfig, path: str | Path) -> Path:
         except OSError:
             pass
         raise
-    return out

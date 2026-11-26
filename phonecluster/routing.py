@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import posixpath
 import re
+import shlex
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,6 +26,7 @@ from .config import (
     normalize_host,
 )
 from .discovery import detect_local_ip
+from .usbhub import USB_MESH_DEFAULT_PORTS
 
 TIER_LABELS: dict[int, str] = {
     1: "Tier 1 · Termux Compute",
@@ -157,7 +160,27 @@ def classify_workload(
             reason="Explicit compute workload -> prefers Tier 1 (compute pool)",
         )
 
-    text = f"{command or ''}\n{(script_content or '')[:600]}"
+    # Inline scripts can be in any language. Route complex scripts through a hint
+    # and examine command positions in simple shell expressions.
+    names: list[str] = []
+    for line in (command or "").splitlines():
+        lexer = shlex.shlex(line, posix=False, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        at_command = True
+        try:
+            tokens = list(lexer)
+        except ValueError:
+            continue
+        for token in tokens:
+            if all(char in ";&|()" for char in token):
+                at_command = True
+            elif at_command:
+                name = token.strip("\"'")
+                if name in {"sudo", "env", "command", "exec"} or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", name):
+                    continue
+                names.append(posixpath.basename(name))
+                at_command = False
+    text = " ".join(names)
     m_doc = _DOCKER_RE.search(text)
     if m_doc:
         return WorkloadRoute(
@@ -165,7 +188,9 @@ def classify_workload(
             preferred_tiers=[3],
             preferred_pool="docker",
             strict=True,
-            required_tool="docker",
+            required_tool={"docker-compose": "docker_compose", "docker.compose": "docker_compose", "kubectl": "k3s"}.get(
+                m_doc.group(1).lower(), m_doc.group(1).lower()
+            ),
             reason=f"Detected '{m_doc.group(1)}' -> routed to Tier 3 (docker pool)",
         )
 
@@ -269,15 +294,17 @@ def select_snapshots_for_target(
             return True
         raw_tools = (snap.health or {}).get("tools") if isinstance(snap.health, dict) else None
         tools = raw_tools if isinstance(raw_tools, dict) else {}
-        t_num, p_name = resolve_node_tier_and_pool(snap.node, snap.health)
-        return bool(tools.get(route.required_tool)) or (
-            route.required_tool == "docker" and (t_num == 3 or p_name == "docker")
+        if not tools.get(route.required_tool):
+            return False
+        return route.required_tool not in {"docker", "docker_compose"} or (
+            (snap.health or {}).get("docker_socket_accessible") is not False
         )
 
     pool_matches = [
         s
         for s in ready
         if resolve_node_tier_and_pool(s.node, s.health)[1] == route.preferred_pool
+        and (not route.strict or resolve_node_tier_and_pool(s.node, s.health)[0] in route.preferred_tiers)
         and _has_required_tool(s)
     ]
     if pool_matches:
@@ -299,9 +326,10 @@ def select_snapshots_for_target(
         return ready, f"{route.reason} (spilled over to available cluster phones)"
 
     # 4. Strict workload (e.g. Docker or Debian service) with no compatible ready phone
+    tool_message = f" with usable {route.required_tool}" if route.required_tool else ""
     return [], (
         f"No ready compatible phone found: {route.reason}. "
-        f"Ensure a Tier {'/'.join(str(t) for t in route.preferred_tiers)} node is online and cool."
+        f"Ensure a Tier {'/'.join(str(t) for t in route.preferred_tiers)} node{tool_message} is online and cool."
     )
 
 
@@ -326,7 +354,7 @@ _SERVICE_SPEC: list[tuple[str, str, int, str]] = [
 
 
 def build_service_registry(
-    snapshots: list[Any], config: ClusterConfig
+    snapshots: list[Any], config: ClusterConfig, *, for_node: NodeConfig | None = None, master_lan_host: str = ""
 ) -> list[dict[str, Any]]:
     """Discover all live cross-tier services running across every non-quarantined online phone."""
     entries: list[dict[str, Any]] = []
@@ -355,16 +383,39 @@ def build_service_registry(
         for name, key, port, scheme in _SERVICE_SPEC:
             if not svcs.get(key) or name in seen_on_node:
                 continue
+            host = snap.node.host
+            transport = "lan"
+            loopback_only = lp_exposed.get(port) is False
+            if snap.node.adb is not None:
+                adb = snap.node.adb
+                host = "127.0.0.1"
+                if for_node is None or for_node.id != snap.node.id:
+                    if not adb.peer_mesh or port not in USB_MESH_DEFAULT_PORTS:
+                        continue
+                    if for_node is not None and (for_node.adb is None or not for_node.adb.peer_mesh):
+                        continue
+                    port = adb.mesh_base_port + USB_MESH_DEFAULT_PORTS.index(port)
+                    transport = "adb"
+                loopback_only = False
+            elif for_node is not None:
+                if loopback_only and for_node.id == snap.node.id:
+                    host = "127.0.0.1"
+                    loopback_only = False
+                elif loopback_only and not node_is_local:
+                    continue
+                elif node_is_local and (for_node.adb is not None or not is_loopback_or_unspecified_host(for_node.host)):
+                    if snap.node.role != "master" or not master_lan_host or lp_exposed.get(port) is not True:
+                        continue
+                    host = master_lan_host
             seen_on_node.add(name)
             if name == "adguard":
                 has_auto_adguard = True
-            url = f"{scheme}://{format_host_port(snap.node.host, port)}"
-            loopback_only = (not node_is_local) and (port in lp_exposed) and (not lp_exposed[port])
+            url = f"{scheme}://{format_host_port(host, port)}"
             entries.append(
                 {
                     "name": name,
                     "node_id": snap.node.id,
-                    "host": snap.node.host,
+                    "host": host,
                     "port": port,
                     "url": url,
                     "tier": tier,
@@ -374,6 +425,7 @@ def build_service_registry(
                     "cpu_cores": max(1, _safe_nonneg_int(h.get("cpu_cores", 4), 4)),
                     "role": snap.node.role,
                     "source": "auto",
+                    "transport": transport,
                 }
             )
         if tools.get("docker") or tier == 3:
@@ -460,7 +512,7 @@ def _pick_primary_service(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_cross_tier_env(
-    snapshots: list[Any], config: ClusterConfig
+    snapshots: list[Any], config: ClusterConfig, *, for_node: NodeConfig | None = None
 ) -> dict[str, str]:
     """Generate `PHONECLUSTER_*` service-discovery env vars injected into every job.
 
@@ -468,6 +520,7 @@ def build_cross_tier_env(
     to Tier 2 Mosquitto MQTT or calling Tier 3 Home Assistant without hardcoded IPs).
     """
     env: dict[str, str] = {"PHONECLUSTER_CLUSTER_NAME": config.cluster_name}
+    m_host = ""
     if config.nodes:
         master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
         m_host = normalize_host(master_node.host)
@@ -478,7 +531,7 @@ def build_cross_tier_env(
                 m_host = lan_ip
         env["PHONECLUSTER_MASTER_HOST"] = m_host or master_node.host
 
-    registry = build_service_registry(snapshots, config)
+    registry = build_service_registry(snapshots, config, for_node=for_node, master_lan_host=m_host)
     by_name: dict[str, list[dict[str, Any]]] = {}
     for item in registry:
         by_name.setdefault(item["name"], []).append(item)
@@ -513,7 +566,9 @@ def build_cross_tier_env(
             if not host_e:
                 continue
             cores = max(1, int(e.get("cpu_cores", 4)))
-            if is_loopback_or_unspecified_host(host_e):
+            if e.get("transport") == "adb":
+                distcc_entries.append(f"{format_host_port(host_e, e['port'])}/{cores},lzo")
+            elif is_loopback_or_unspecified_host(host_e):
                 distcc_entries.append(f"localhost/{max(1, cores - 2)}")
             elif e.get("role") == "master":
                 distcc_entries.append(f"{format_host_for_url(host_e)}/{max(1, cores - 2)},lzo")
@@ -538,6 +593,8 @@ def build_cross_tier_env(
         key=lambda s: (0 if s.ready_for_jobs else 1, s.node.id),
     )
     for snap in ordered_snaps:
+        if snap.node.adb is not None:
+            continue
         _t, pool = resolve_node_tier_and_pool(snap.node, snap.health)
         hosts = pool_hosts.setdefault(pool, [])
         if snap.node.host not in hosts:
@@ -574,7 +631,7 @@ def build_cluster_dns_hosts(
     quarantined = set(config.gateway.quarantined_nodes)
     lines: list[str] = [f"# PhoneCluster friendly DNS names (.{domain}) — paste into /etc/hosts or AdGuard Home"]
     for snap in snapshots:
-        if snap.node.id in quarantined:
+        if snap.node.id in quarantined or snap.node.adb is not None:
             continue
         tier, pool = resolve_node_tier_and_pool(snap.node, snap.health if snap.online else None)
         norm_h = normalize_host(snap.node.host)
@@ -604,6 +661,8 @@ def build_cluster_dns_hosts(
         "postgres": "db",
     }
     for item in ordered_registry:
+        if item.get("transport") == "adb":
+            continue
         alias = alias_map.get(item["name"])
         item_host = normalize_host(str(item.get("host") or ""))
         if alias and item_host and alias not in seen_aliases and _is_ip_address(item_host):

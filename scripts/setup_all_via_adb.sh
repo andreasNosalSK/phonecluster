@@ -38,7 +38,9 @@ if [[ "${#POSITIONAL[@]}" -ge 1 ]]; then
   CONFIG_OUT="${POSITIONAL[0]}"
 fi
 
-if [[ -f "${CONFIG_OUT}" && "${FORCE_OVERWRITE}" -eq 0 ]]; then
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_REVISION="$(PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" python3 -m phonecluster.config_transfer "${CONFIG_OUT}")"
+if [[ -n "${CONFIG_REVISION}" && "${FORCE_OVERWRITE}" -eq 0 ]]; then
   echo "Error: Config already exists at '${CONFIG_OUT}' (refusing to overwrite existing cluster tokens)." >&2
   echo "Pass --force to overwrite or specify a different output path." >&2
   exit 1
@@ -138,9 +140,12 @@ for SER in "${SERIALS[@]}"; do
 done
 
 # Generate config/cluster.json automatically using detected Wi-Fi IPs ranked by Master score
-python3 - "${TMP_TSV}" "${CONFIG_OUT}" <<'PY'
-import json, os, secrets, sys, tempfile
+python3 - "${TMP_TSV}" "${CONFIG_OUT}" "${REPO_ROOT}" "${CONFIG_REVISION}" <<'PY'
+import json, secrets, sys
 from pathlib import Path
+
+sys.path.insert(0, sys.argv[3])
+from phonecluster.config import ClusterConfig, replace_config_file
 
 rows = []
 for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
@@ -191,24 +196,9 @@ cfg = {
 }
 
 out = Path(sys.argv[2])
-out.parent.mkdir(parents=True, exist_ok=True)
-fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=str(out.parent))
-tmp_path = Path(tmp_name)
-try:
-    try:
-        os.chmod(tmp_path, 0o600)
-    except OSError:
-        pass
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(cfg, indent=2) + "\n")
-        fh.flush()
-    os.replace(tmp_path, out)
-except Exception:
-    try:
-        tmp_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-    raise
+ClusterConfig.from_dict(cfg)
+payload = (json.dumps(cfg, indent=2) + "\n").encode("utf-8")
+replace_config_file(out, payload, expected_revision=sys.argv[4])
 
 print("=== Auto-Generated Cluster Plan ===")
 for n in nodes:

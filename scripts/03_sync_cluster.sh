@@ -5,9 +5,12 @@ set -euo pipefail
 
 CONFIG_PATH="${PHONECLUSTER_CONFIG:-config/cluster.json}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MODULE_ROOT="${PHONECLUSTER_MODULE_ROOT:-${REPO_ROOT}}"
 REMOTE_DIR="~/phonecluster"
 SETUP_KEYS=0
 SKIP_LOCAL=""
+DRY_RUN=0
+SELECTED_NODES=()
 
 usage() {
   cat <<'EOF'
@@ -17,6 +20,8 @@ Options:
   -c, --config <path>   Path to cluster.json (default: config/cluster.json)
   --setup-keys          Run ssh-copy-id for each node before syncing
   --skip-node <id>      Skip syncing a specific node (e.g. node0 if running on Master)
+  --node-id <id>        Sync only this node (repeat for multiple nodes)
+  --dry-run             Preview the selected nodes without SSH or key setup
   --remote-dir <path>   Destination folder on remote nodes (default: ~/phonecluster)
 EOF
 }
@@ -27,6 +32,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "Error: $1 requires a path" >&2; exit 2; }
       CONFIG_PATH="$2"; shift 2 ;;
     --setup-keys) SETUP_KEYS=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --node-id)
+      [[ $# -ge 2 ]] || { echo "Error: --node-id requires a node id" >&2; exit 2; }
+      SELECTED_NODES+=("$2"); shift 2 ;;
     --skip-node)
       [[ $# -ge 2 ]] || { echo "Error: --skip-node requires a node id" >&2; exit 2; }
       SKIP_LOCAL="$2"; shift 2 ;;
@@ -43,20 +52,32 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
   exit 1
 fi
 
-if [[ "${SETUP_KEYS}" -eq 1 && ! -f "${HOME}/.ssh/id_ed25519" ]]; then
-  echo "Generating SSH key (~/.ssh/id_ed25519)..."
-  mkdir -p "${HOME}/.ssh"
-  ssh-keygen -t ed25519 -N "" -f "${HOME}/.ssh/id_ed25519"
-fi
-
 # Extract & strictly validate node list via phonecluster.config (blocks SSH option injection & normalizes role casing)
-NODES_PSV="$(python3 - "${CONFIG_PATH}" "${REPO_ROOT}" <<'PY'
+NODES_PSV="$(python3 - "${CONFIG_PATH}" "${MODULE_ROOT}" "${SKIP_LOCAL}" ${SELECTED_NODES[@]+"${SELECTED_NODES[@]}"} <<'PY'
 import sys
 sys.path.insert(0, sys.argv[2])
 from phonecluster.config import load_config
 
 cfg = load_config(sys.argv[1])
-for n in cfg.nodes:
+skip_id, *requested = sys.argv[3:]
+known = {n.id for n in cfg.nodes}
+missing = set(requested) - known
+if missing:
+    raise SystemExit("Unknown sync node ID(s): " + ", ".join(sorted(missing)))
+if skip_id and skip_id not in known:
+    raise SystemExit(f"Unknown --skip-node ID: {skip_id}")
+if skip_id in requested:
+    raise SystemExit(f"Node {skip_id} was both selected and skipped.")
+nodes = [n for n in cfg.nodes if n.id != skip_id and (not requested or n.id in requested)]
+selected_ids = {n.id for n in nodes}
+repairs = [n for n in cfg.workers_needing_tokens() if n.id in selected_ids]
+if repairs:
+    node_ids = ", ".join(n.id for n in repairs)
+    raise SystemExit(f"Workers need individual credentials: {node_ids}. On the Master, run pc token --rotate with this config, then retry sync.")
+legacy_adb = [n.id for n in nodes if "usb-mode:adb" in n.tags and n.adb is None]
+if legacy_adb:
+    raise SystemExit("Run pc usb-hub setup --mode adb --write-config to record the device listener ports for: " + ", ".join(legacy_adb))
+for n in nodes:
     fields = [
         n.id,
         n.host,
@@ -70,15 +91,40 @@ for n in cfg.nodes:
 PY
 )"
 
+if [[ -z "${NODES_PSV}" ]]; then
+  echo "No nodes selected for sync."
+  exit 0
+fi
+
+ARCHIVE_HASH_CODE='import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as archive:
+    for chunk in iter(lambda: archive.read(65536), b""):
+        digest.update(chunk)
+print(digest.hexdigest())'
+if [[ "${DRY_RUN}" -eq 0 ]]; then
+  SYNC_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/phonecluster-sync.XXXXXX")"
+  trap 'rm -f -- "${SYNC_ARCHIVE}"' EXIT
+  tar -cf "${SYNC_ARCHIVE}" -C "${MODULE_ROOT}" phonecluster \
+    -C "${REPO_ROOT}" phonecluster_cli.py scripts examples
+  ARCHIVE_SHA="$(python3 -c "${ARCHIVE_HASH_CODE}" "${SYNC_ARCHIVE}")"
+fi
+
+if [[ "${DRY_RUN}" -eq 0 && "${SETUP_KEYS}" -eq 1 && ! -f "${HOME}/.ssh/id_ed25519" ]]; then
+  echo "Generating SSH key (~/.ssh/id_ed25519)..."
+  mkdir -p "${HOME}/.ssh"
+  ssh-keygen -t ed25519 -N "" -f "${HOME}/.ssh/id_ed25519"
+fi
+
 while IFS='|' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE <&3; do
   [[ -z "${NODE_ID}" ]] && continue
-  if [[ "${NODE_ID}" == "${SKIP_LOCAL}" ]]; then
-    echo "--- Skipping local node '${NODE_ID}' (${HOST}) ---"
-    continue
-  fi
-
   TARGET="${HOST}"
   [[ -n "${SSH_USER}" ]] && TARGET="${SSH_USER}@${HOST}"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    echo "Would transfer code and config, then restart '${NODE_ID}' (${ROLE}) at ${TARGET}:${SSH_PORT}"
+    continue
+  fi
 
   echo "=== Syncing '${NODE_ID}' (${ROLE}) -> ${TARGET}:${SSH_PORT} ==="
 
@@ -90,29 +136,59 @@ while IFS='|' read -r NODE_ID HOST SSH_PORT SSH_USER ROLE <&3; do
   SQ_RDIR="$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "${REMOTE_DIR}")"
   SQ_NID="$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "${NODE_ID}")"
 
-  # Stream project code via tar over SSH (uses POSIX-portable ${RDIR#??} inside '~/'* case arm for dash/ash/mksh/Bash!)
-  tar -C "${REPO_ROOT}" -cf - \
-    phonecluster \
-    phonecluster_cli.py \
-    scripts \
-    examples \
-    | ssh -p "${SSH_PORT}" -- "${TARGET}" \
-      "set -eu; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#??}\" ;; esac; mkdir -p \"\$RDIR/config\" \"\$RDIR/logs\"; tar -xf - -C \"\$RDIR\""
+  # Use POSIX shell syntax for the remote command, including Termux and Ubuntu Touch shells.
+  REMOTE_PATH="set -eu; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#??}\" ;; esac"
+  REMOTE_UNPACK="${REMOTE_PATH}
+mkdir -p \"\$RDIR/config\" \"\$RDIR/logs\"
+ARCHIVE=\$(mktemp \"\$RDIR/.phonecluster-sync.XXXXXX\")
+trap 'rm -f -- \"\$ARCHIVE\"' 0
+cat > \"\$ARCHIVE\"
+CHECKSUM=\$(python3 -c '${ARCHIVE_HASH_CODE}' \"\$ARCHIVE\")
+if [ \"\$CHECKSUM\" != '${ARCHIVE_SHA}' ]; then
+    echo 'Sync archive checksum mismatch. Code was not extracted.' >&2
+    exit 1
+fi
+tar -xf \"\$ARCHIVE\" -C \"\$RDIR\"
+cd \"\$RDIR\"
+python3 -m phonecluster.config_transfer config/cluster.json"
+  REMOTE_REVISION="$(
+    ssh -p "${SSH_PORT}" -- "${TARGET}" "${REMOTE_UNPACK}" < "${SYNC_ARCHIVE}"
+  )"
+  if [[ -n "${REMOTE_REVISION}" && ! "${REMOTE_REVISION}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Error: Invalid config revision returned by '${NODE_ID}'." >&2
+    exit 1
+  fi
 
   # Build scoped config locally FIRST so a Python failure NEVER truncates remote config/cluster.json to 0 bytes
-  SCOPED_CFG="$(python3 - "${CONFIG_PATH}" "${NODE_ID}" "${ROLE}" <<'PY'
+  SCOPED_CFG="$(python3 - "${CONFIG_PATH}" "${MODULE_ROOT}" "${NODE_ID}" "${ROLE}" "${HOST}" "${SSH_PORT}" "${SSH_USER}" <<'PY'
 import json, socket, sys
-cfg_path, node_id, role = sys.argv[1], sys.argv[2], sys.argv[3].strip().lower()
+cfg_path, module_root, node_id, role, host, ssh_port, ssh_user = sys.argv[1:]
+sys.path.insert(0, module_root)
+from phonecluster.config import ClusterConfig
+
 with open(cfg_path, "r", encoding="utf-8") as fh:
     cfg = json.load(fh)
+cluster = ClusterConfig.from_dict(cfg)
+target = cluster.get_node(node_id)
+if (target.role, target.host, str(target.ssh_port), target.ssh_user) != (role, host, ssh_port, ssh_user):
+    raise SystemExit(f"Destination for {node_id} changed during sync. Retry with the updated config.")
 if role == "master":
     out = cfg
 else:
-    node = next(n for n in cfg["nodes"] if n["id"] == node_id)
+    if target in cluster.workers_needing_tokens():
+        raise SystemExit(f"Worker {node_id} needs an individual token. On the Master, run pc token --rotate with this config, then retry sync.")
+    node = next(n for n in cfg["nodes"] if n["id"].strip() == node_id)
     master = next((n for n in cfg["nodes"] if str(n.get("role") or "").strip().lower() == "master"), cfg["nodes"][0])
-    tok = node.get("auth_token") or cfg["auth_token"]
+    tok = target.auth_token
     scoped_node = dict(node)
     scoped_node["auth_token"] = tok
+    if target.adb is not None:
+        scoped_node["worker_port"] = target.adb.remote_worker_port
+        scoped_node["ssh_port"] = target.adb.remote_ssh_port
+        scoped_node.pop("adb", None)
+        scoped_node["tags"] = [
+            tag for tag in target.tags if tag != "usb-mode:adb" and not tag.startswith("usb-serial:")
+        ]
     net_cfg = dict(cfg.get("network") or {})
     allowed_masters = [str(x).strip() for x in (net_cfg.get("allowed_master_ips") or []) if str(x).strip()]
     m_host = str(master.get("host") or "").strip()
@@ -153,7 +229,7 @@ PY
   fi
   printf '%s\n' "${SCOPED_CFG}" \
     | ssh -p "${SSH_PORT}" -- "${TARGET}" \
-      "set -eu; umask 077; RDIR=${SQ_RDIR}; case \"\$RDIR\" in '~') RDIR=\"\$HOME\" ;; '~/'*) RDIR=\"\$HOME/\${RDIR#??}\" ;; esac; TMP=\"\$RDIR/config/.cluster.json.tmp.\$\$\"; cat > \"\$TMP\"; if [ ! -s \"\$TMP\" ]; then rm -f \"\$TMP\"; exit 1; fi; chmod 600 \"\$TMP\"; mv -f \"\$TMP\" \"\$RDIR/config/cluster.json\""
+      "${REMOTE_PATH}; cd \"\$RDIR\"; python3 -m phonecluster.config_transfer config/cluster.json --expect '${REMOTE_REVISION}'"
 
   # Restart worker daemon cleanly on remote node (arguments pre-quoted via shlex.quote so spaces/metachars stay literal)
   ssh -p "${SSH_PORT}" -- "${TARGET}" "bash -s -- ${SQ_NID} ${SQ_RDIR}" <<'REMOTE'
@@ -228,6 +304,10 @@ fi
 echo "Started worker '${NODE_ID}' (PID ${NEW_PID})"
 REMOTE
 done 3<<< "${NODES_PSV}"
+
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  exit 0
+fi
 
 echo
 echo "Sync complete! Verify the whole cluster with:"

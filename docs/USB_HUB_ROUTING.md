@@ -56,6 +56,12 @@ pc usb-hub setup --mode adb --write-config
 pc usb-hub serve
 ```
 
+Use `--remote-ssh-port 8022` when enrolling new Termux phones and `--remote-ssh-port 22` for Ubuntu Touch. Use `--dry-run` on the setup command to preview the assignments. Setup writes the inventory after all ADB tunnel commands succeed. The watchdog reads it on each pass and restores tunnels for enrolled phones. A disconnected phone keeps its node ID and ports. Run setup again to enroll another phone.
+
+Setup and the watchdog keep matching routes and report ports occupied by a different route. Inspect `adb forward --list` and `adb -s SERIAL reverse --list` if a conflict appears. Free the specific obsolete mapping or choose unused ports for the new assignment, then retry setup.
+
+For an existing ADB inventory, connect the previously enrolled phones once and rerun setup with the correct device listener ports. This records the device-side ports separately from the ports on the controller. Then use `pc sync` to send worker configs over the SSH forwards and run `pc status` to verify the workers before disabling Wi-Fi. If setup reports multiple serials for an old entry, verify the physical phone and correct its `usb-serial:` tag before rerunning setup.
+
 Now turn **Airplane Mode / Wi-Fi OFF** on all worker phones!
 - Master controls every phone over USB (`127.0.0.1:18761..18766`).
 - Phones reach each other's `distcc`, `llama-rpc`, `llama-api`, `mqtt`, and `ha` ports over USB via the reversed mesh ports (`25000+`).

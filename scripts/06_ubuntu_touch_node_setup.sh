@@ -11,7 +11,7 @@
 #   bash scripts/06_ubuntu_touch_node_setup.sh --node-id node1
 set -euo pipefail
 
-NODE_ID="node1"
+NODE_ID=""
 REPO_DIR="${HOME}/phonecluster"
 IS_MASTER=0
 BOOT_ONLY=0
@@ -22,7 +22,7 @@ usage() {
 Usage: bash scripts/06_ubuntu_touch_node_setup.sh [options]
 
 Options:
-  --node-id <id>     Node ID in config/cluster.json (default: node1)
+  --node-id <id>     Node ID in config/cluster.json (default: node0 for Master, node1 for Worker)
   --repo-dir <path>  Path to PhoneCluster checkout (default: ~/phonecluster)
   --master           Also install systemd --user service for Master Web Dashboard (:8080)
   --boot-only        Only update wrappers & systemd --user unit (offline-safe, used by `pc join`)
@@ -46,6 +46,10 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ -z "${NODE_ID}" ]]; then
+  if [[ "${IS_MASTER}" -eq 1 ]]; then NODE_ID="node0"; else NODE_ID="node1"; fi
+fi
 
 if [[ ! "${NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
   echo "Error: Invalid --node-id '${NODE_ID}' (must start with alphanumeric and contain only A-Za-z0-9._-, max 40 chars)." >&2
@@ -159,7 +163,7 @@ Type=simple
 WorkingDirectory=${REPO_DIR}
 Environment="PATH=/snap/bin:${HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="PHONECLUSTER_CONFIG=${REPO_DIR}/config/cluster.json"
-ExecStart=/usr/bin/env python3 ${REPO_DIR}/phonecluster_cli.py --config ${REPO_DIR}/config/cluster.json worker --node-id ${NODE_ID}
+ExecStart=/usr/bin/env python3 "${REPO_DIR}/phonecluster_cli.py" --config "${REPO_DIR}/config/cluster.json" worker --node-id ${NODE_ID}
 Restart=always
 RestartSec=5
 
@@ -178,7 +182,7 @@ Type=simple
 WorkingDirectory=${REPO_DIR}
 Environment="PATH=/snap/bin:${HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="PHONECLUSTER_CONFIG=${REPO_DIR}/config/cluster.json"
-ExecStart=/usr/bin/env python3 ${REPO_DIR}/phonecluster_cli.py --config ${REPO_DIR}/config/cluster.json dashboard --host 0.0.0.0
+ExecStart=/usr/bin/env python3 "${REPO_DIR}/phonecluster_cli.py" --config "${REPO_DIR}/config/cluster.json" dashboard --bind 0.0.0.0
 Restart=always
 RestartSec=5
 
@@ -191,14 +195,15 @@ fi
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
   systemctl --user daemon-reload
-  systemctl --user enable phonecluster-worker.service >/dev/null 2>&1 || true
+  units=(phonecluster-worker.service)
+  if [[ "${IS_MASTER}" -eq 1 ]]; then
+    units+=(phonecluster-dashboard.service)
+  fi
+  systemctl --user enable "${units[@]}"
   if [[ -f "${REPO_DIR}/config/cluster.json" ]]; then
-    systemctl --user restart phonecluster-worker.service || true
-    if [[ "${IS_MASTER}" -eq 1 ]]; then
-      systemctl --user enable --now phonecluster-dashboard.service || true
-    fi
+    systemctl --user restart "${units[@]}"
   else
-    echo "  (Worker unit enabled — it will start automatically once ${REPO_DIR}/config/cluster.json exists.)"
+    echo "  After creating config/cluster.json, run: systemctl --user start ${units[*]}"
   fi
 else
   echo "  Note: systemd --user bus not active in this shell; unit written to ${UNIT_DIR}/phonecluster-worker.service."
@@ -217,7 +222,7 @@ echo "  Systemd Unit : ${UNIT_DIR}/phonecluster-worker.service"
 echo
 if [[ "${IS_MASTER}" -eq 1 ]]; then
   echo "Next steps on this Ubuntu Touch MASTER phone:"
-  echo "  1. Create config:  pc wizard   (or copy examples/ubuntu_touch_docker_cluster.example.json)"
+  echo "  1. Create config:  pc wizard --master-id ${NODE_ID}   (if you have not configured the cluster yet)"
   echo "  2. Pair phone #2:  pc pair     (then run 'pc join' on your second Ubuntu Touch phone)"
   echo "  3. Check Docker :  pc docker status"
   echo "  4. Optional Swarm: pc docker swarm-init"

@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 config/cluster.json
+config/.cluster.json.lock
 logs/
 *.jsonl
 .venv/

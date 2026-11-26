@@ -53,9 +53,11 @@ from .config import (
     DEFAULT_SSH_PORT,
     DEFAULT_WORKER_PORT,
     ClusterConfig,
+    ConfigConflictError,
     NetworkHardeningConfig,
     NodeConfig,
     SafetyConfig,
+    config_revision,
     format_host_port,
     generate_auth_token,
     is_loopback_or_unspecified_host,
@@ -851,6 +853,8 @@ class PairingManager:
                     elif appended_new:
                         self.config.nodes.pop()
                     LOG.error("Failed to save cluster config during pairing: %s", exc)
+                    if isinstance(exc, ConfigConflictError):
+                        return HTTPStatus.CONFLICT, {"error": f"{exc} Restart pairing on the Master."}
                     return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Failed to persist cluster config: {exc}"}
 
             self._session.used_peer_pubs.add(peer_pub)
@@ -1235,6 +1239,7 @@ def join_cluster_via_pairing(
     expected_fingerprint: str = "",
 ) -> dict[str, Any]:
     """Perform authenticated DH pairing with Master and save a scoped worker config."""
+    previous_revision = config_revision(config_out)
     clean_master = normalize_host(master_host)
     base_url = f"http://{format_host_port(clean_master, pair_port)}"
     status, hello = _http_json(f"{base_url}/api/pair/hello", method="GET")
@@ -1364,7 +1369,7 @@ def join_cluster_via_pairing(
             )
         ],
     )
-    save_config(worker_cfg, config_out)
+    save_config(worker_cfg, config_out, expected_revision=previous_revision)
 
     ssh_trusted = False
     if trust_ssh_key and bundle.get("master_ssh_pubkey"):

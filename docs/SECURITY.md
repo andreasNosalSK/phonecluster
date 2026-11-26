@@ -37,9 +37,18 @@ Every pairing handshake uses pure Python 3 standard-library cryptography (zero p
 - Every newly paired worker receives its **own unique 256-bit `node_token`** (`NodeConfig.auth_token`).
 - Worker phones **never** receive the Master's admin `auth_token` or any other worker's token!
 - Both `pc join` and `pc sync` write a **worker-scoped `config/cluster.json`** (`0600` permissions, atomic `os.replace()`) containing only that worker's own token.
+- `pc init-config`, `pc wizard`, and the dashboard's **Add** control generate a separate credential for each new worker. Run `pc sync` on the Master to deliver those credentials over SSH.
 - If a worker phone is ever lost, stolen, or retired:
   - It **cannot** control the Master dashboard, Terminal Control, or other workers.
   - Clicking **Remove** in the Web UI immediately cuts it off with zero impact on the rest of your cluster.
+
+### Migrating a cluster that used shared credentials
+
+If sync reports that workers need individual credentials, stop the Master dashboard and any running gateway. On the Master, run `pc token --rotate` once. This rotates the previously shared administrator token and replaces missing or shared worker tokens. Existing unique worker credentials are preserved.
+
+From the Master, run `pc sync --skip-node <master-id>` with the actual local master ID. It delivers the saved credentials and restarts the remote workers. If a phone is offline, retry sync when it returns. After active jobs finish, restart the local worker if enabled, the dashboard, and any separate gateway. Unlock the dashboard with the new token and confirm the local worker appears in `pc status`. For a non-default config path, pass `--config PATH` before each subcommand.
+
+Use `pc push-config --node-id node1 --require-persisted --json` when a rollout requires a saved safety policy on a specific worker. The controller checks the worker's acknowledgment. The worker checks that its config on disk still matches its ID, role, and credential before saving. A credential change on disk calls for a worker restart. Check the saved settings after restarting the canary.
 
 ---
 

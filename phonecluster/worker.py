@@ -30,6 +30,7 @@ from typing import Any, Callable
 
 from .auth import (
     HMAC_AUTH_SCHEME,
+    MAX_EXEC_RESPONSE_BYTES,
     AuthRateLimiter,
     ReplayCache,
     build_webhook_opener,
@@ -42,6 +43,7 @@ from .auth import (
     verify_hmac_request,
     verify_token,
 )
+from .bundled import bundled_script
 from .config import (
     NetworkHardeningConfig,
     SafetyConfig,
@@ -69,6 +71,9 @@ _CTRL_LOG_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 MAX_OUTPUT_BYTES = 512 * 1024  # 512 KiB per stream to protect 4 GB phones from OOM
 MAX_REQUEST_BYTES = 2 * 1024 * 1024  # 2 MiB max JSON payload (allows inline scripts)
+WEBHOOK_RETRY_SEC = 30
+HEALTH_SAMPLE_INTERVAL_SEC = 3.0
+HEALTH_SAMPLE_MAX_AGE_SEC = 20.0
 
 
 @dataclass
@@ -115,8 +120,11 @@ class WorkerState:
         self._shutting_down = False
         self.active_jobs: dict[str, ActiveJob] = {}
         self.recent_jobs: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
+        self._sample_health_in_background = False
+        self._health_sample: tuple[float, dict[str, Any]] | None = None
         self.recent_alerts: collections.deque[dict[str, Any]] = collections.deque(maxlen=25)
         self._last_alert_ts: dict[str, float] = {}
+        self._next_webhook_ts: dict[str, float] = {}
         self._allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
         self._allowed_exact_ips: set[str] = set()
         exact, nets = self._build_allowed_clients(self.allowed_client_ips)
@@ -189,8 +197,39 @@ class WorkerState:
             pass
         return False
 
+    def start_health_sampler(self, stop_event: threading.Event) -> None:
+        """Sample slow platform telemetry independently of HTTP requests."""
+        if self.health_provider is not None:
+            return
+        with self.lock:
+            self._sample_health_in_background = True
+
+        def sample_loop() -> None:
+            while not stop_event.is_set():
+                started_at = time.monotonic()
+                try:
+                    health = self._collect_health()
+                    with self.lock:
+                        self._health_sample = started_at, health
+                except Exception:
+                    LOG.exception("Worker health sampling failed")
+                stop_event.wait(HEALTH_SAMPLE_INTERVAL_SEC)
+
+        threading.Thread(target=sample_loop, name="worker-health", daemon=True).start()
+
+    def _collect_health(self) -> dict[str, Any]:
+        return collect_node_health(
+            node_id=self.node_id,
+            role=self.role,
+            safety=self.safety,
+            thermal_gate=self.thermal_gate,
+            workdir=self.workdir,
+            cpu_sampler=self.cpu_sampler,
+            net_sampler=self.net_sampler,
+        )
+
     def get_health(self) -> dict[str, Any]:
-        """Collect current node health and active job details."""
+        """Return telemetry with current job slots and sample age."""
         with self.lock:
             now = time.time()
             active_list = [
@@ -201,37 +240,41 @@ class WorkerState:
                 }
                 for j in self.active_jobs.values()
             ]
-            active_count = len(active_list)
+            sample_enabled = self._sample_health_in_background
+            sample = self._health_sample
+            max_concurrency = self.max_concurrency
+            enforce_source_ip = bool(self.allowed_client_ips)
+            require_signed_requests = bool(self.require_signed_requests)
+        active_count = len(active_list)
         if self.health_provider is not None:
             health = dict(self.health_provider())
-            health.setdefault("node_id", self.node_id)
-            health.setdefault("role", self.role)
-            health["active_jobs"] = active_count
-            health["active_job_list"] = active_list
-            health["max_concurrency"] = self.max_concurrency
-            health["source_ip_allowlist_active"] = bool(self.allowed_client_ips)
-            health["require_signed_requests"] = bool(self.require_signed_requests)
-            if active_count >= self.max_concurrency:
-                health["ready_for_jobs"] = False
-                raw_reasons = health.get("not_ready_reasons")
-                reasons = list(raw_reasons) if isinstance(raw_reasons, list) else []
-                reasons.append(f"busy ({active_count}/{self.max_concurrency})")
-                health["not_ready_reasons"] = reasons
-            return health
-        health = collect_node_health(
-            node_id=self.node_id,
-            role=self.role,
-            safety=self.safety,
-            thermal_gate=self.thermal_gate,
+        elif sample_enabled and sample is None:
+            health = {"telemetry_age_sec": None, "telemetry_stale": True}
+        elif sample_enabled and sample is not None:
+            sampled_at, readings = sample
+            age = time.monotonic() - sampled_at
+            health = {**readings, "telemetry_age_sec": round(age, 1)}
+            health["telemetry_stale"] = age > HEALTH_SAMPLE_MAX_AGE_SEC
+        else:
+            health = self._collect_health()
+        health.setdefault("node_id", self.node_id)
+        health.setdefault("role", self.role)
+        health.update(
             active_jobs=active_count,
-            max_concurrency=self.max_concurrency,
-            workdir=self.workdir,
-            cpu_sampler=self.cpu_sampler,
-            net_sampler=self.net_sampler,
             active_job_list=active_list,
+            max_concurrency=max_concurrency,
+            source_ip_allowlist_active=enforce_source_ip,
+            require_signed_requests=require_signed_requests,
         )
-        health["source_ip_allowlist_active"] = bool(self.allowed_client_ips)
-        health["require_signed_requests"] = bool(self.require_signed_requests)
+        raw_reasons = health.get("not_ready_reasons")
+        reasons = list(raw_reasons) if isinstance(raw_reasons, list) else []
+        if health.get("telemetry_stale"):
+            reasons.append("telemetry unavailable" if sample is None else "telemetry stale")
+            health["ready_for_jobs"] = False
+        if active_count >= max_concurrency:
+            reasons.append(f"busy ({active_count}/{max_concurrency})")
+            health["ready_for_jobs"] = False
+        health["not_ready_reasons"] = reasons
         return health
 
     def try_reserve_slot(
@@ -528,12 +571,13 @@ class WorkerState:
         if cfg_path is not None and cfg_path.exists():
             try:
                 disk_cfg = load_config(cfg_path)
+                disk_node = disk_cfg.get_node(self.node_id)
+                if disk_node.role != self.role or disk_cfg.token_for_node(disk_node) != self.auth_token:
+                    raise ValueError("Worker identity or credential on disk changed. Restart the worker.")
                 if new_safety is not None:
                     disk_cfg.safety = new_safety
                 if new_max_conc is not None:
-                    for n in disk_cfg.nodes:
-                        if n.id == self.node_id:
-                            n.max_concurrency = new_max_conc
+                    disk_node.max_concurrency = new_max_conc
                 if new_net_cfg is not None:
                     disk_cfg.network.enforce_worker_source_ip = new_net_cfg.enforce_worker_source_ip
                     disk_cfg.network.require_signed_requests = new_net_cfg.require_signed_requests
@@ -583,15 +627,21 @@ class WorkerState:
         return {"active": active, "recent": recent}
 
     def record_safety_event(self, event: str, message: str, health: dict[str, Any]) -> bool:
-        """Record a battery/thermal safety event respecting monotonic cooldown, and fire webhook."""
+        """Record alerts and retry delivery while the guard still observes the condition."""
         now_mono = time.monotonic()
-        now_wall = time.time()
         with self.lock:
+            # A changed power decision must take effect even inside the previous cooldown.
+            if event in {"charge_on", "charge_off"}:
+                opposite = "charge_off" if event == "charge_on" else "charge_on"
+                self._last_alert_ts.pop(opposite, None)
+                self._next_webhook_ts.pop(opposite, None)
             last = self._last_alert_ts.get(event)
-            if last is not None and (now_mono - last) < self.safety.webhook_cooldown_sec:
-                return False
-            self._last_alert_ts[event] = now_mono
+            cooldown = self.safety.webhook_cooldown_sec
+            record_alert = last is None or now_mono - last >= cooldown
             webhook_url = self.safety.battery_webhook_url
+            send_webhook = webhook_url and now_mono >= self._next_webhook_ts.get(event, 0.0)
+            if not record_alert and not send_webhook:
+                return False
             payload = {
                 "event": event,
                 "node_id": self.node_id,
@@ -600,14 +650,20 @@ class WorkerState:
                 "battery_status": health.get("battery_status"),
                 "battery_health": health.get("battery_health"),
                 "temp_c": health.get("temp_c"),
-                "timestamp": int(now_wall),
+                "timestamp": int(time.time()),
             }
-            self.recent_alerts.appendleft(payload)
+            if record_alert:
+                self._last_alert_ts[event] = now_mono
+                self.recent_alerts.appendleft(payload)
+            if send_webhook:
+                self._next_webhook_ts[event] = now_mono + WEBHOOK_RETRY_SEC
 
-        LOG.warning("[%s] %s: %s", self.node_id, event, message)
-        if webhook_url:
-            _post_webhook(webhook_url, payload)
-        return True
+        if record_alert:
+            LOG.warning("[%s] %s: %s", self.node_id, event, message)
+        if send_webhook and _post_webhook(webhook_url, payload):
+            with self.lock:
+                self._next_webhook_ts[event] = time.monotonic() + cooldown
+        return record_alert
 
 
 def _terminate_process_group(
@@ -689,7 +745,7 @@ def _terminate_process_group(
 _WEBHOOK_OPENER = build_webhook_opener()
 
 
-def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> None:
+def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> bool:
     """Send a best-effort JSON webhook (e.g., Home Assistant, ntfy, smart plug bridge)."""
     clean_url = str(url or "").strip()
     try:
@@ -697,7 +753,7 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> No
         _ = parsed_wb.port
     except ValueError:
         LOG.warning("Skipped invalid safety webhook URL (malformed URL)")
-        return
+        return False
     if (
         not clean_url
         or any(c.isspace() or ord(c) < 32 for c in clean_url)
@@ -705,10 +761,10 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> No
         or not parsed_wb.hostname
     ):
         LOG.warning("Skipped invalid safety webhook URL (must be http:// or https:// with hostname)")
-        return
+        return False
     if is_webhook_target_unsafe(clean_url):
         LOG.warning("Blocked safety webhook URL %s by SSRF guard (link-local/metadata/unspecified)", clean_url)
-        return
+        return False
     try:
         body = safe_json_dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -717,10 +773,11 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> No
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with _WEBHOOK_OPENER.open(req, timeout=timeout):
-            pass
+        with _WEBHOOK_OPENER.open(req, timeout=timeout) as response:
+            return 200 <= response.status < 300
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
         LOG.warning("Safety webhook POST to %s failed: %s", clean_url, exc)
+        return False
 
 
 def _decode_capped(data: bytes | None, limit: int = MAX_OUTPUT_BYTES, overflow_bytes: int = 0) -> str:
@@ -735,6 +792,39 @@ def _decode_capped(data: bytes | None, limit: int = MAX_OUTPUT_BYTES, overflow_b
     if extra > 0:
         return f"{text}\n...[truncated {extra} bytes]"
     return text
+
+
+def _clip_encoded_output(text: str, limit: int) -> str:
+    marker = "\n...[truncated to fit job response]"
+    remaining = limit - len(safe_json_dumps(marker))
+    end = 0
+    while end < len(text):
+        chunk = text[end:end + 4096]
+        # The response encoder emits ASCII JSON. Subtract the two string quotes.
+        remaining -= len(safe_json_dumps(chunk)) - 2
+        if remaining < 0:
+            break
+        end += len(chunk)
+    return text[:end] + marker
+
+
+def _bound_exec_outputs(stdout: str, stderr: str) -> tuple[str, str]:
+    # Reserve space for the fixed result fields and the validated job and node IDs.
+    stream_budget = MAX_EXEC_RESPONSE_BYTES - 4096
+    if 12 * (len(stdout) + len(stderr)) + 4 <= stream_budget:
+        return stdout, stderr
+    out_size = len(safe_json_dumps(stdout))
+    err_size = len(safe_json_dumps(stderr))
+    if out_size + err_size <= stream_budget:
+        return stdout, stderr
+    half = stream_budget // 2
+    out_limit = stream_budget - min(err_size, half)
+    err_limit = stream_budget - min(out_size, half)
+    if out_size > out_limit:
+        stdout = _clip_encoded_output(stdout, out_limit)
+    if err_size > err_limit:
+        stderr = _clip_encoded_output(stderr, err_limit)
+    return stdout, stderr
 
 
 def _run_process_bounded(
@@ -1119,6 +1209,7 @@ def _execute_job_payload(state: WorkerState, payload: dict[str, Any]) -> tuple[i
         }
         state.finish_job(job_id, summary)
 
+    stdout_text, stderr_text = _bound_exec_outputs(stdout_text, stderr_text)
     result = {
         "job_id": job_id,
         "node_id": state.node_id,
@@ -1139,6 +1230,7 @@ class BatteryGuardLoop(threading.Thread):
         super().__init__(name="battery-guard", daemon=True)
         self.state = state
         self.stop_event = stop_event
+        self._battery_hazard_pending = False
 
     def check_once(self) -> None:
         if self.state.health_provider is not None:
@@ -1158,21 +1250,34 @@ class BatteryGuardLoop(threading.Thread):
         bat_health = str(health.get("battery_health", "UNKNOWN")).strip().upper().replace(" ", "_")
         temp_c = health.get("temp_c")
 
-        if is_battery_health_hazardous(bat_health):
+        hazardous = is_battery_health_hazardous(bat_health)
+        healthy_reading = bat_health == "GOOD" and not health.get("telemetry_stale")
+        if hazardous:
+            self._battery_hazard_pending = True
+        elif healthy_reading:
+            self._battery_hazard_pending = False
+        overheated = health.get("overheated", False)
+        if self._battery_hazard_pending or overheated:
+            self.state.record_safety_event(
+                "charge_off",
+                f"Cut charger power while a thermal or battery hazard is unresolved (health={bat_health}, temp={temp_c}C).",
+                health,
+            )
+        if hazardous:
             self.state.record_safety_event(
                 "battery_hazard",
-                f"Hardware PMIC reported battery health '{bat_health}' (temp={temp_c}C, pct={pct}%); pausing jobs & cut charger power immediately!",
+                f"Battery health '{bat_health}' (temp={temp_c}C, pct={pct}%) blocks new jobs.",
                 health,
             )
 
-        if health.get("overheated"):
+        if overheated:
             self.state.record_safety_event(
                 "thermal_throttle",
-                f"Temperature {temp_c}C reached limit {safety.max_temp_c}C; pausing new jobs.",
+                f"Thermal gate blocks new jobs at {temp_c}C until the phone cools to {safety.resume_temp_c}C.",
                 health,
             )
 
-        if pct is not None:
+        if not (self._battery_hazard_pending or overheated) and pct is not None:
             if pct >= safety.battery_high_pct and status in {"CHARGING", "FULL"}:
                 self.state.record_safety_event(
                     "charge_off",
@@ -1182,7 +1287,14 @@ class BatteryGuardLoop(threading.Thread):
                     ),
                     health,
                 )
-            elif pct <= safety.battery_low_pct and status in {"DISCHARGING", "NOT_CHARGING"}:
+            elif (
+                pct <= safety.battery_low_pct
+                and status in {"DISCHARGING", "NOT_CHARGING"}
+                and healthy_reading
+                and type(temp_c) in (int, float)
+                and math.isfinite(temp_c)
+                and temp_c < safety.max_temp_c
+            ):
                 self.state.record_safety_event(
                     "charge_on",
                     (
@@ -1409,6 +1521,29 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {"job_id": job_id, "cancelled": True})
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": f"job '{job_id}' not active"})
+        elif path == "/workloads/llama-rpc-stop":
+            if payload:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "RPC stop takes no arguments"})
+                return
+            outcome = {"node_id": self.server.state.node_id, "ok": False}
+            script = bundled_script("05_workload_helpers.sh")
+            if script is None:
+                outcome["error"] = "Workload helper missing. Reinstall PhoneCluster."
+            else:
+                try:
+                    process = subprocess.run(
+                        ["bash", str(script), "llama-rpc-stop"], capture_output=True,
+                        text=True, errors="replace", timeout=12.0,
+                    )
+                    if process.returncode == 0:
+                        outcome.update(ok=True, detail=process.stdout.strip()[:400])
+                    else:
+                        outcome["error"] = (process.stderr.strip() or "RPC stop failed.")[:400]
+                except subprocess.TimeoutExpired:
+                    outcome.update(error="RPC stop unconfirmed. Worker stop timed out.", outcome_unknown=True)
+                except OSError as exc:
+                    outcome["error"] = f"Cannot run RPC stop: {exc}"
+            self._send_json(HTTPStatus.OK, outcome)
         elif path == "/config":
             status, body = self.server.state.apply_live_config(
                 payload, requester_ip=str(self.client_address[0])
@@ -1441,6 +1576,7 @@ def serve_worker(
 ) -> None:
     """Run the worker HTTP daemon (stealth on UDP by default) until interrupted."""
     server, guard, stop_event = create_worker_server(bind_host, port, state)
+    state.start_health_sampler(stop_event)
     guard.start()
     wakelock_proc = _start_ubuntu_touch_wakelock()
 

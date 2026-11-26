@@ -21,6 +21,7 @@ from http import HTTPStatus
 from typing import Any, Mapping
 
 HMAC_AUTH_SCHEME = "PC-HMAC-SHA256"
+MAX_EXEC_RESPONSE_BYTES = 4 * 1024 * 1024
 _NONCE_RE = re.compile(r"^[A-Fa-f0-9]{16,64}$")
 _SIG_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
 _ASCII_UINT_RE = re.compile(r"^[0-9]{1,10}$")

@@ -32,7 +32,7 @@ PhoneCluster gives you **one entry point** (Web UI + interactive terminal menu +
   - Routes approved worker traffic through Master's (or a ~€15 **Raspberry Pi Zero 2 W** Master's via [`scripts/setup_pi_master.sh`](scripts/setup_pi_master.sh)) authenticated allowlist proxy with per-worker derived credentials, **per-worker quarantine**, **rate quotas**, **SSRF guard**, **Worker Master-IP allowlist**, **listening-port attack-surface audit**, and **Native AdGuard Home setup (NO Docker required!)**.
 - **Smart Parallel Scheduling & Hardware Safety**:
   - Dynamically ships & runs local Python/Bash scripts across all cool, ready phones (`pc map --script ...`) with automatic retry/failover if a phone throttles or disconnects.
-  - **Thermal Gate with hysteresis** pauses jobs at `40 °C` and resumes at `37 °C`.
+  - **Thermal Gate with hysteresis** blocks new jobs at `40 °C` and admits them again at `37 °C`. Jobs already running continue.
   - **24/7 Battery Guard** fires alerts or a smart-plug / Home Assistant webhook to keep unrooted Li-Po batteries in the safer `45–60%` range.
 - **Heterogeneous Multi-Tier Orchestration (One Seamless System!)**:
   - Freely mix **Tier 1 (Unrooted Termux — compute/LLMs)** + **Tier 2 (Native Debian 13 ARM64 chroot — Mosquitto MQTT, AdGuard Home, glibc services)** + **Tier 3 (Ubuntu Touch + Snap Docker or Custom Kernel + Droidspaces — Docker containers, Swarm, Home Assistant)** inside the **same cluster**!
@@ -158,7 +158,7 @@ Never leave aging smartphone lithium-polymer batteries plugged in at **100% char
 
 ```bash
 python3 -m unittest discover -s tests -v
-bash -n install.sh scripts/*.sh
+for script in install.sh scripts/*.sh; do bash -n "$script" || exit 1; done
 ```
 
 ## License

@@ -202,8 +202,27 @@ if [[ -z "${ROLE}" && "${NON_INTERACTIVE}" -eq 0 ]]; then
   esac
 fi
 
-if [[ "${ROLE}" == "master" && -z "${NODE_ID}" ]]; then
-  NODE_ID="node0"
+if [[ "${ROLE}" == "master" ]]; then
+  if [[ -f "${INSTALL_DIR}/config/cluster.json" ]]; then
+    CONFIGURED_ID="$(python3 - "${INSTALL_DIR}" <<'PYCONFIG'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from phonecluster.config import load_config
+cfg = load_config(Path(sys.argv[1]) / "config" / "cluster.json")
+masters = [node for node in cfg.nodes if node.role == "master"]
+if len(masters) != 1:
+    raise SystemExit("Expected exactly one master in the existing config.")
+print(masters[0].id)
+PYCONFIG
+)"
+    if [[ -n "${NODE_ID}" && "${NODE_ID}" != "${CONFIGURED_ID}" ]]; then
+      echo "Error: --node-id '${NODE_ID}' differs from the configured master '${CONFIGURED_ID}'." >&2
+      exit 2
+    fi
+    NODE_ID="${CONFIGURED_ID}"
+  fi
+  NODE_ID="${NODE_ID:-node0}"
 elif [[ "${ROLE}" == "worker" && -z "${NODE_ID}" ]]; then
   if [[ "${NON_INTERACTIVE}" -eq 0 ]]; then
     NODE_ID="$(ask "Enter Worker node ID [node1]: " "node1")"
@@ -214,6 +233,18 @@ fi
 if [[ -n "${NODE_ID}" && ! "${NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]]; then
   echo "Error: Invalid node ID '${NODE_ID}' (must start with alphanumeric and contain only A-Za-z0-9._-, max 40 chars)." >&2
   exit 2
+fi
+
+if [[ "${ROLE}" == "master" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR}/config/cluster.json" ]]; then
+  RUN_WIZ="$(ask "Launch the Guided Setup Wizard right now? [Y/n]: " "y")"
+  RUN_WIZ_LC="$(printf '%s' "${RUN_WIZ}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${RUN_WIZ_LC}" == "y" || "${RUN_WIZ_LC}" == "yes" ]]; then
+    if has_tty; then
+      "${BIN_DIR}/phonecluster" wizard --master-id "${NODE_ID}" < /dev/tty
+    else
+      "${BIN_DIR}/phonecluster" wizard --master-id "${NODE_ID}"
+    fi
+  fi
 fi
 
 # 4. OS boot & persistence setup (Termux:Boot on Android, systemd --user + Snap Docker on Ubuntu Touch)
@@ -255,17 +286,7 @@ echo "  pc token            -> Print unlock token for the Web UI"
 echo "  pc sync             -> Push code & scoped configs to all worker phones"
 echo
 
-if [[ "${ROLE}" == "master" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR}/config/cluster.json" ]]; then
-  RUN_WIZ="$(ask "Launch the Guided Setup Wizard right now? [Y/n]: " "y")"
-  RUN_WIZ_LC="$(printf '%s' "${RUN_WIZ}" | tr '[:upper:]' '[:lower:]')"
-  if [[ "${RUN_WIZ_LC}" == "y" || "${RUN_WIZ_LC}" == "yes" ]]; then
-    if has_tty; then
-      "${BIN_DIR}/phonecluster" wizard < /dev/tty
-    else
-      "${BIN_DIR}/phonecluster" wizard
-    fi
-  fi
-elif [[ "${ROLE}" == "worker" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR}/config/cluster.json" ]]; then
+if [[ "${ROLE}" == "worker" && "${NON_INTERACTIVE}" -eq 0 && ! -f "${INSTALL_DIR}/config/cluster.json" ]]; then
   echo "Ready to join your cluster securely!"
   echo "  -> On your Master phone, open Pairing first (Web UI Tab 6 or run: pc pair)"
   RUN_JOIN="$(ask "Auto-search Wi-Fi for your Master phone and pair now? [Y/n]: " "y")"

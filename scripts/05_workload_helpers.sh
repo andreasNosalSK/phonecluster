@@ -46,91 +46,176 @@ case "${CMD}" in
     pkill -x distccd 2>/dev/null && echo "Stopped distccd" || echo "distccd was not running"
     ;;
 
-  llama-rpc-start)
-    LLAMA_DIR="${1:-${HOME}/llama.cpp}"
-    PORT="${2:-50052}"
-    if [[ ! "${PORT}" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
-      echo "Error: Invalid port '${PORT}' (expected 1..65535)." >&2
-      exit 2
-    fi
-    BIN=""
-    for CAND in "${LLAMA_DIR}/build/bin/rpc-server" "${LLAMA_DIR}/rpc-server" "$(command -v rpc-server 2>/dev/null || true)"; do
-      if [[ -n "${CAND}" && -x "${CAND}" ]]; then
-        BIN="${CAND}"
-        break
-      fi
-    done
-    if [[ -z "${BIN}" ]]; then
-      echo "Error: rpc-server binary not found (checked '${LLAMA_DIR}/build/bin/rpc-server' and PATH)." >&2
-      echo "Build llama.cpp with:" >&2
-      echo "  git clone https://github.com/ggml-org/llama.cpp ${LLAMA_DIR}" >&2
-      echo "  cmake -S ${LLAMA_DIR} -B ${LLAMA_DIR}/build -DGGML_RPC=ON && cmake --build ${LLAMA_DIR}/build -j" >&2
-      exit 1
-    fi
-    LOG_DIR="${HOME}/phonecluster/logs"
-    mkdir -p "${LOG_DIR}" 2>/dev/null || LOG_DIR="${TMPDIR:-/tmp}"
-    PID_FILE="${LOG_DIR}/llama-rpc-${PORT}.pid"
-    if [[ -f "${PID_FILE}" ]]; then
-      OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
-      if [[ "${OLD_PID}" =~ ^[0-9]+$ ]] && (( OLD_PID > 1 )) && kill -0 "${OLD_PID}" 2>/dev/null; then
-        SHOULD_KILL=1
-        if [[ -d /proc ]]; then
-          if [[ -r "/proc/${OLD_PID}/cmdline" ]]; then
-            OLD_CMDLINE="$(tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null || true)"
-            [[ "${OLD_CMDLINE}" == *"rpc-server"* ]] || SHOULD_KILL=0
-          else
-            SHOULD_KILL=0
-          fi
-        fi
-        if [[ "${SHOULD_KILL}" -eq 1 ]]; then
-          kill "${OLD_PID}" 2>/dev/null || true
-        fi
-      fi
-    fi
-    pkill -x rpc-server 2>/dev/null || true
-    sleep 0.2
-    nohup "${BIN}" -H 0.0.0.0 -p "${PORT}" >> "${LOG_DIR}/llama-rpc.log" 2>&1 < /dev/null &
-    NEW_PID=$!
-    echo "${NEW_PID}" > "${PID_FILE}"
-    sleep 0.3
-    if ! kill -0 "${NEW_PID}" 2>/dev/null; then
-      echo "Error: llama.cpp rpc-server exited immediately. Log:" >&2
-      tail -n 10 "${LOG_DIR}/llama-rpc.log" >&2 || true
-      exit 1
-    fi
-    echo "Started llama.cpp rpc-server on 0.0.0.0:${PORT} (PID ${NEW_PID}, bin=${BIN})"
-    ;;
+  llama-rpc-start|llama-rpc-stop)
+    exec python3 - "$CMD" "$@" <<'PY_RPC'
+import fcntl
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
 
-  llama-rpc-stop)
-    STOPPED=0
-    for PF in "${HOME}/phonecluster/logs"/llama-rpc-*.pid "${TMPDIR:-/tmp}"/llama-rpc-*.pid; do
-      if [[ -f "${PF}" ]]; then
-        OLD_PID="$(cat "${PF}" 2>/dev/null || true)"
-        if [[ "${OLD_PID}" =~ ^[0-9]+$ ]] && (( OLD_PID > 1 )) && kill -0 "${OLD_PID}" 2>/dev/null; then
-          SHOULD_KILL=1
-          if [[ -d /proc ]]; then
-            if [[ -r "/proc/${OLD_PID}/cmdline" ]]; then
-              OLD_CMDLINE="$(tr '\0' ' ' < "/proc/${OLD_PID}/cmdline" 2>/dev/null || true)"
-              [[ "${OLD_CMDLINE}" == *"rpc-server"* ]] || SHOULD_KILL=0
-            else
-              SHOULD_KILL=0
-            fi
-          fi
-          if [[ "${SHOULD_KILL}" -eq 1 ]]; then
-            kill "${OLD_PID}" 2>/dev/null && STOPPED=1 || true
-          fi
-        fi
-        rm -f "${PF}"
-      fi
-    done
-    if pkill -x rpc-server 2>/dev/null; then
-      STOPPED=1
-    fi
-    if [[ "${STOPPED}" -eq 1 ]]; then
-      echo "Stopped llama.cpp rpc-server"
-    else
-      echo "rpc-server was not running"
-    fi
+BINARIES = ("ggml-rpc-server", "rpc-server")
+LOG_DIR = Path.home() / "phonecluster" / "logs"
+
+
+def parse_port(value):
+    if not value.isascii() or not value.isdecimal() or len(value) > 5 or not 1 <= int(value) <= 65535:
+        raise ValueError(f"Invalid port {value!r} (expected 1..65535).")
+    return int(value)
+
+
+def process_start(pid, port):
+    if pid <= 1:
+        return None
+    proc = Path("/proc") / str(pid)
+    try:
+        executable = Path(os.readlink(proc / "exe").removesuffix(" (deleted)"))
+        args = (proc / "cmdline").read_bytes().rstrip(b"\x00").split(b"\x00")
+        fields = (proc / "stat").read_text(encoding="utf-8", errors="replace").rsplit(") ", 1)[1].split()
+        if executable.name in BINARIES and args[-2:] == [b"-p", str(port).encode()] and fields[0] != "Z":
+            return fields[19]
+    except (FileNotFoundError, ProcessLookupError, IndexError):
+        pass
+    return None
+
+
+def owned_session(file, port):
+    try:
+        if file.is_symlink() or file.stat().st_uid != os.getuid():
+            return None
+        fields = file.read_text(encoding="ascii").split()
+        pid = int(fields[0])
+    except (FileNotFoundError, IndexError, ValueError):
+        return None
+    started = process_start(pid, port)
+    if started and (len(fields) == 1 or fields == [str(pid), started]):
+        return pid, started
+    return None
+
+
+def listening(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def start_rpc(directory, port):
+    session = LOG_DIR / f"llama-rpc-{port}.pid"
+    owned = owned_session(session, port)
+    if owned:
+        if not listening(port):
+            raise RuntimeError(f"Managed RPC process exists on port {port}, but its listener is unavailable.")
+        print(f"Managed RPC server already running on port {port}.")
+        return
+
+    for name in BINARIES:
+        candidates = [directory / "build" / "bin" / name, directory / name, shutil.which(name)]
+        binary = next((path for path in candidates if path and Path(path).is_file() and os.access(path, os.X_OK)), None)
+        if binary is not None:
+            break
+    else:
+        raise RuntimeError(f"Neither ggml-rpc-server nor rpc-server was found under {directory} or on PATH.")
+
+    if listening(port):
+        raise RuntimeError(f"Port {port} is already in use.")
+    log_path = LOG_DIR / f"llama-rpc-{port}.log"
+    with log_path.open("ab") as log:
+        process = subprocess.Popen(
+            [str(Path(binary).resolve()), "-H", "0.0.0.0", "-p", str(port)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
+    written = False
+    try:
+        for _ in range(50):
+            if process.poll() is not None:
+                break
+            started = process_start(process.pid, port)
+            if started and not written:
+                with tempfile.NamedTemporaryFile(mode="w", dir=LOG_DIR, delete=False, encoding="ascii") as stream:
+                    temp = Path(stream.name)
+                    stream.write(f"{process.pid} {started}\n")
+                try:
+                    temp.replace(session)
+                finally:
+                    temp.unlink(missing_ok=True)
+                written = True
+            if written and started and listening(port):
+                print(f"Started {Path(binary).name} on port {port}.")
+                return
+            time.sleep(0.1)
+        raise RuntimeError(f"RPC listener on port {port} did not become ready. See {log_path}.")
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if written:
+            session.unlink(missing_ok=True)
+        raise
+
+
+def stop_rpc():
+    stopped = []
+    errors = []
+    directories = dict.fromkeys((LOG_DIR, Path(tempfile.gettempdir())))
+    for directory in directories:
+        for file in directory.glob("llama-rpc-*.pid"):
+            if file.is_symlink() or not file.is_file() or file.stat().st_uid != os.getuid():
+                continue
+            try:
+                port = parse_port(file.stem.removeprefix("llama-rpc-"))
+            except ValueError:
+                continue
+            identity = owned_session(file, port)
+            if identity:
+                pid, started = identity
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                stopped.append((file, pid, port, started))
+            else:
+                file.unlink(missing_ok=True)
+
+    deadline = time.monotonic() + 3
+    for file, pid, port, started in stopped:
+        while process_start(pid, port) == started and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if process_start(pid, port) == started:
+            errors.append(str(port))
+        else:
+            file.unlink(missing_ok=True)
+    if errors:
+        raise RuntimeError("RPC shutdown unconfirmed on ports " + ", ".join(errors) + ".")
+    print(f"Stopped {len(stopped)} managed RPC server(s)." if stopped else "No managed RPC servers were running.")
+
+
+try:
+    command, *args = sys.argv[1:]
+    if command == "llama-rpc-start":
+        directory = Path(args[0]).expanduser() if args else Path.home() / "llama.cpp"
+        port = parse_port(args[1] if len(args) > 1 else "50052")
+    LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (LOG_DIR / "llama-rpc.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if command == "llama-rpc-start":
+            start_rpc(directory, port)
+        else:
+            stop_rpc()
+except (OSError, RuntimeError, ValueError) as exc:
+    print(f"Error: {exc}", file=sys.stderr)
+    sys.exit(2 if isinstance(exc, ValueError) else 1)
+PY_RPC
     ;;
 
   docker-status)
@@ -213,8 +298,8 @@ Usage: bash scripts/05_workload_helpers.sh <subcommand> [args]
 Subcommands:
   distcc-start [cidr] [jobs]       Start distccd compiler worker (default: 192.168.1.0/24)
   distcc-stop                      Stop distccd
-  llama-rpc-start [dir] [port]     Start llama.cpp rpc-server (default: ~/llama.cpp, port 50052)
-  llama-rpc-stop                   Stop llama.cpp rpc-server
+  llama-rpc-start [dir] [port]     Start ggml-rpc-server or rpc-server (default: ~/llama.cpp, port 50052)
+  llama-rpc-stop                   Stop PhoneCluster-managed llama.cpp RPC processes
   docker-status                    Show Docker / Snap Docker version, Swarm state, and running containers
   docker-swarm-init [adv_ip]       Initialize Docker Swarm manager on this phone
   docker-swarm-join <mgr:2377>     Join Docker Swarm (reads token from PHONECLUSTER_SWARM_TOKEN env var)

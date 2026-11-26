@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import ClusterConfig, NodeConfig, is_loopback_or_unspecified_host
+from .config import AdbNodeConfig, ClusterConfig, NodeConfig, is_loopback_or_unspecified_host, load_config
 
 LOG = logging.getLogger("phonecluster.usbhub")
 
@@ -297,6 +297,8 @@ def plan_adb_usb_hub(
     mesh_ports: tuple[int, ...] = USB_MESH_DEFAULT_PORTS,
     mesh_base_port: int = DEFAULT_ADB_MESH_BASE_PORT,
     node_prefix: str = "usb",
+    existing_nodes: list[NodeConfig] | None = None,
+    registered_only: bool = False,
 ) -> dict[str, Any]:
     """Deterministically plan ADB USB-hub forwards, gateway reverses, and phone-to-phone mesh tunnels."""
     ready = [d for d in devices if str(d.get("state") or "device") == "device"]
@@ -310,15 +312,70 @@ def plan_adb_usb_hub(
     peer_mesh_ports: dict[str, dict[int, int]] = {}  # owner_node_id -> {service_port: hub_local_port}
 
     clean_prefix = re.sub(r"[^A-Za-z0-9_-]+", "", node_prefix) or "usb"
-    next_mesh_port = int(mesh_base_port)
+    target_ports = tuple(dict.fromkeys(int(port) for port in mesh_ports if 1 <= int(port) <= 65535))
+    if not (1 <= remote_worker_port <= 65535 and 1 <= remote_ssh_port <= 65535):
+        raise ValueError("ADB device listener ports must be between 1 and 65535")
+    if worker_base_port == ssh_base_port:
+        raise ValueError("ADB worker and SSH forward port ranges need different bases")
 
-    for idx, dev in enumerate(ready, start=1):
+    registered: dict[str, tuple[NodeConfig, AdbNodeConfig]] = {}
+    occupied_ids: set[str] = set()
+    occupied_ports: set[int] = set()
+    for node in existing_nodes or []:
+        occupied_ids.add(node.id)
+        if is_loopback_or_unspecified_host(node.host):
+            occupied_ports.update((node.worker_port, node.ssh_port))
+        adb = node.adb
+        if adb is None and "usb-mode:adb" in node.tags:
+            # Older versions recorded the serial as a tag. Preserve that
+            # assignment when the legacy inventory has one unambiguous serial.
+            legacy_serials = {tag.split(":", 1)[1] for tag in node.tags if tag.startswith("usb-serial:")}
+            slot = re.fullmatch(re.escape(clean_prefix) + r"([1-9][0-9]*)", node.id)
+            if len(legacy_serials) != 1 or slot is None:
+                raise ValueError(f"Ambiguous legacy ADB mapping for {node.id}; check its USB serial before setup")
+            adb = AdbNodeConfig(
+                validate_usb_serial(legacy_serials.pop()), remote_worker_port, remote_ssh_port,
+                mesh_base_port + (int(slot[1]) - 1) * len(target_ports),
+            )
+        if adb is not None:
+            if node.role != "worker" or not is_loopback_or_unspecified_host(node.host):
+                raise ValueError(f"ADB transport requires a loopback worker endpoint for {node.id}")
+            if adb.serial in registered:
+                raise ValueError(f"ADB serial {adb.serial} belongs to multiple nodes")
+            registered[adb.serial] = (node, adb)
+            occupied_ports.update(range(adb.mesh_base_port, adb.mesh_base_port + len(target_ports)))
+
+    idx = 0
+    seen_serials: set[str] = set()
+    for dev in ready:
         serial = validate_usb_serial(dev["serial"])
-        node_id = f"{clean_prefix}{idx}"
-        local_w_port = int(worker_base_port) + idx
-        local_s_port = int(ssh_base_port) + idx
-        if not (1024 <= local_w_port <= 65535 and 1024 <= local_s_port <= 65535):
-            raise ValueError("Computed ADB local forward port out of valid 1024..65535 range")
+        if serial in seen_serials:
+            continue
+        seen_serials.add(serial)
+        previous = registered.get(serial)
+        if previous is not None:
+            node, adb = previous
+            node_id, local_w_port, local_s_port = node.id, node.worker_port, node.ssh_port
+        elif registered_only:
+            continue
+        else:
+            while True:
+                idx += 1
+                node_id = f"{clean_prefix}{idx}"
+                local_w_port, local_s_port = worker_base_port + idx, ssh_base_port + idx
+                start = mesh_base_port + (idx - 1) * max(1, len(target_ports))
+                if not (1024 <= min(local_w_port, local_s_port, start)
+                        and max(local_w_port, local_s_port, start + max(0, len(target_ports) - 1)) <= 65535):
+                    raise ValueError("Ran out of valid ADB forward ports")
+                slot_ports = {local_w_port, local_s_port, *range(start, start + len(target_ports))}
+                if len(slot_ports) != len(target_ports) + 2:
+                    raise ValueError("ADB worker, SSH, and service ports overlap")
+                if node_id not in occupied_ids and not (slot_ports & occupied_ports):
+                    occupied_ports.update(slot_ports)
+                    break
+            adb = AdbNodeConfig(serial, remote_worker_port, remote_ssh_port, start, enable_peer_mesh)
+
+        peer_mesh = enable_peer_mesh and (adb.peer_mesh or not registered_only)
 
         nodes_plan.append(
             {
@@ -328,15 +385,17 @@ def plan_adb_usb_hub(
                 "host": "127.0.0.1",
                 "worker_port": local_w_port,
                 "ssh_port": local_s_port,
-                "remote_worker_port": int(remote_worker_port),
-                "remote_ssh_port": int(remote_ssh_port),
+                "remote_worker_port": adb.remote_worker_port,
+                "remote_ssh_port": adb.remote_ssh_port,
+                "mesh_base_port": adb.mesh_base_port,
+                "peer_mesh": peer_mesh,
             }
         )
         forward_rules.append(
-            {"serial": serial, "node_id": node_id, "local_port": local_w_port, "remote_port": int(remote_worker_port), "label": "worker"}
+            {"serial": serial, "node_id": node_id, "local_port": local_w_port, "remote_port": adb.remote_worker_port, "label": "worker"}
         )
         forward_rules.append(
-            {"serial": serial, "node_id": node_id, "local_port": local_s_port, "remote_port": int(remote_ssh_port), "label": "ssh"}
+            {"serial": serial, "node_id": node_id, "local_port": local_s_port, "remote_port": adb.remote_ssh_port, "label": "ssh"}
         )
         if enable_gateway_reverse and 1 <= int(gateway_port) <= 65535:
             reverse_rules.append(
@@ -348,24 +407,22 @@ def plan_adb_usb_hub(
                     "label": "network-guard-gateway",
                 }
             )
-        if enable_peer_mesh and len(ready) >= 2:
+        if peer_mesh:
             svc_map: dict[int, int] = {}
-            for sp in mesh_ports:
-                sp_i = int(sp)
-                if not (1 <= sp_i <= 65535):
-                    continue
-                if next_mesh_port > 65535:
+            for offset, sp in enumerate(target_ports):
+                hub_port = adb.mesh_base_port + offset
+                if not 1024 <= hub_port <= 65535:
                     raise ValueError("Ran out of TCP ports while planning USB peer mesh")
-                hub_port = next_mesh_port
-                next_mesh_port += 1
-                svc_map[sp_i] = hub_port
+                if enable_gateway_reverse and hub_port == gateway_port:
+                    raise ValueError("ADB peer mesh conflicts with the Network Guard reverse port")
+                svc_map[sp] = hub_port
                 forward_rules.append(
                     {
                         "serial": serial,
                         "node_id": node_id,
                         "local_port": hub_port,
-                        "remote_port": sp_i,
-                        "label": f"mesh-export:{sp_i}",
+                        "remote_port": sp,
+                        "label": f"mesh-export:{sp}",
                     }
                 )
             peer_mesh_ports[node_id] = svc_map
@@ -374,12 +431,14 @@ def plan_adb_usb_hub(
     peer_mesh_map: dict[str, dict[str, dict[str, int]]] = {}
     if enable_peer_mesh and len(nodes_plan) >= 2:
         for dst in nodes_plan:
+            if not dst["peer_mesh"]:
+                continue
             dst_id = dst["node_id"]
             dst_serial = dst["serial"]
             peer_mesh_map[dst_id] = {}
             for src in nodes_plan:
                 src_id = src["node_id"]
-                if src_id == dst_id:
+                if src_id == dst_id or not src["peer_mesh"]:
                     continue
                 src_ports = peer_mesh_ports.get(src_id) or {}
                 peer_mesh_map[dst_id][src_id] = {str(sp): hp for sp, hp in src_ports.items()}
@@ -393,6 +452,10 @@ def plan_adb_usb_hub(
                             "label": f"mesh-peer:{src_id}:{sp}",
                         }
                     )
+
+    forward_ports = [rule["local_port"] for rule in forward_rules]
+    if len(forward_ports) != len(set(forward_ports)):
+        raise ValueError("ADB nodes have overlapping local forward ports")
 
     return {
         "mode": "adb",
@@ -409,58 +472,81 @@ def apply_adb_usb_hub(
     adb_bin: str | None = None,
     timeout_sec: float = 5.0,
 ) -> dict[str, Any]:
-    """Execute a planned ADB USB-hub tunnel set (`adb forward` and `adb reverse`)."""
+    """Create missing ADB routes and preserve existing routes with other destinations."""
     cmd = adb_bin or shutil.which("adb")
     if not cmd:
-        return {"ok": False, "error": "adb binary not found on PATH", "applied": 0, "failed": 0, "errors": []}
+        return {"ok": False, "error": "adb binary not found on PATH", "applied": 0, "unchanged": 0, "failed": 0, "errors": []}
 
     applied = 0
+    unchanged = 0
     failed = 0
     errors: list[str] = []
 
-    for rule in plan.get("forward_rules") or []:
-        serial = validate_usb_serial(rule["serial"])
-        lp = int(rule["local_port"])
-        rp = int(rule["remote_port"])
-        try:
-            res = subprocess.run(
-                [cmd, "-s", serial, "forward", f"tcp:{lp}", f"tcp:{rp}"],
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-            )
-            if res.returncode == 0:
-                applied += 1
-            else:
-                failed += 1
-                errors.append(f"forward {serial} {lp}->{rp}: {(res.stderr or res.stdout).strip()[:120]}")
-        except (subprocess.SubprocessError, OSError) as exc:
-            failed += 1
-            errors.append(f"forward {serial} {lp}->{rp}: {exc}")
+    def run_adb(*args: str) -> str:
+        result = subprocess.run([cmd, *args], capture_output=True, text=True, timeout=timeout_sec)
+        if result.returncode:
+            detail = (result.stderr or result.stdout or f"adb exit {result.returncode}").strip()
+            raise OSError(detail[:120])
+        return result.stdout
 
+    def reconcile(direction: str, rules: list[dict[str, Any]], device: str | None = None) -> None:
+        nonlocal applied, unchanged, failed
+        if not rules:
+            return
+        scope = ["-s", device] if device is not None else []
+        active: dict[str, tuple[str, str]] = {}
+        try:
+            for line in run_adb(*scope, direction, "--list").splitlines():
+                if not line.strip():
+                    continue
+                owner, source, destination = line.split(maxsplit=2)
+                if not source.startswith("tcp:"):
+                    continue
+                # reverse --list is already scoped to this phone. The first field is its transport.
+                target = (device or owner, destination)
+                if source in active and active[source] != target:
+                    raise ValueError(f"ambiguous ADB route for {source}")
+                active[source] = target
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            failed += len(rules)
+            label = f" for {device}" if device is not None else ""
+            errors.append(f"Cannot inspect adb {direction} rules{label}: {exc}")
+            return
+
+        source_field, dest_field = ("local_port", "remote_port") if direction == "forward" else ("remote_port", "local_port")
+        for rule in rules:
+            serial = validate_usb_serial(rule["serial"])
+            source = f"tcp:{int(rule[source_field])}"
+            destination = f"tcp:{int(rule[dest_field])}"
+            existing = active.get(source)
+            if existing == (serial, destination):
+                unchanged += 1
+                continue
+            if existing is not None:
+                failed += 1
+                errors.append(f"{direction} {serial} {source}->{destination}: occupied by {existing[0]} -> {existing[1]}")
+                continue
+            try:
+                run_adb("-s", serial, direction, "--no-rebind", source, destination)
+            except (subprocess.SubprocessError, OSError) as exc:
+                failed += 1
+                errors.append(f"{direction} {serial} {source}->{destination}: {exc}")
+            else:
+                applied += 1
+                active[source] = (serial, destination)
+
+    reconcile("forward", plan.get("forward_rules") or [])
+    reverses: dict[str, list[dict[str, Any]]] = {}
     for rule in plan.get("reverse_rules") or []:
         serial = validate_usb_serial(rule["serial"])
-        rp = int(rule["remote_port"])
-        lp = int(rule["local_port"])
-        try:
-            res = subprocess.run(
-                [cmd, "-s", serial, "reverse", f"tcp:{rp}", f"tcp:{lp}"],
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-            )
-            if res.returncode == 0:
-                applied += 1
-            else:
-                failed += 1
-                errors.append(f"reverse {serial} {rp}->{lp}: {(res.stderr or res.stdout).strip()[:120]}")
-        except (subprocess.SubprocessError, OSError) as exc:
-            failed += 1
-            errors.append(f"reverse {serial} {rp}->{lp}: {exc}")
+        reverses.setdefault(serial, []).append(rule)
+    for serial, rules in reverses.items():
+        reconcile("reverse", rules, device=serial)
 
     return {
         "ok": failed == 0,
         "applied": applied,
+        "unchanged": unchanged,
         "failed": failed,
         "errors": errors[:32],
     }
@@ -606,12 +692,20 @@ def sync_usb_hub_into_config(
             tags.append(f"usb-serial:{item['serial']}")
         if item.get("iface"):
             tags.append(f"usb-iface:{item['iface']}")
+        adb = (
+            AdbNodeConfig.from_dict(item)
+            if mode == "adb" and item.get("serial")
+            else None
+        )
 
         existing = by_id.get(nid)
         if existing is not None:
+            if existing.adb is not None and (adb is None or existing.adb.serial != adb.serial):
+                raise ValueError(f"USB plan would reassign {nid} to another device")
             existing.host = host
             existing.worker_port = w_port
             existing.ssh_port = s_port
+            existing.adb = adb
             if s_user and not existing.ssh_user:
                 existing.ssh_user = s_user
             for t in tags:
@@ -634,6 +728,7 @@ def sync_usb_hub_into_config(
                 tags=tags,
                 notes=f"USB 3.0 Hub worker ({mode})",
                 auth_token=secrets.token_urlsafe(32),
+                adb=adb,
             )
             config.nodes.append(node)
             by_id[nid] = node
@@ -668,6 +763,7 @@ class UsbHubWatchdog(threading.Thread):
         enable_gateway_reverse: bool = True,
         enable_peer_mesh: bool = True,
         adb_bin: str | None = None,
+        config_path: Path | None = None,
     ) -> None:
         super().__init__(name="usb-hub-watchdog", daemon=True)
         self.interval_sec = max(1.0, float(interval_sec))
@@ -679,6 +775,8 @@ class UsbHubWatchdog(threading.Thread):
         self.enable_gateway_reverse = enable_gateway_reverse
         self.enable_peer_mesh = enable_peer_mesh
         self.adb_bin = adb_bin
+        self.config_path = config_path
+        self._discovered = ClusterConfig("ADB watchdog", "", [])
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._last_serials: tuple[str, ...] = ()
@@ -688,6 +786,7 @@ class UsbHubWatchdog(threading.Thread):
     def sync_once(self) -> dict[str, Any]:
         devs = list_adb_devices(adb_bin=self.adb_bin)
         ready_serials = tuple(sorted(d["serial"] for d in devs if d.get("state") == "device"))
+        cfg = load_config(self.config_path) if self.config_path is not None else self._discovered
         plan = plan_adb_usb_hub(
             devs,
             worker_base_port=self.worker_base_port,
@@ -697,8 +796,16 @@ class UsbHubWatchdog(threading.Thread):
             gateway_port=self.gateway_port,
             enable_gateway_reverse=self.enable_gateway_reverse,
             enable_peer_mesh=self.enable_peer_mesh,
+            existing_nodes=cfg.nodes,
+            registered_only=self.config_path is not None,
         )
-        res = apply_adb_usb_hub(plan, adb_bin=self.adb_bin) if plan["nodes"] else {"ok": True, "applied": 0, "failed": 0, "errors": []}
+        res = apply_adb_usb_hub(plan, adb_bin=self.adb_bin) if plan["nodes"] else {
+            "ok": True, "applied": 0, "unchanged": 0, "failed": 0, "errors": [],
+        }
+        if self.config_path is None:
+            # Keep allocations even if only part of the plan ran. A retry
+            # must never reuse a host port for a different attached phone.
+            sync_usb_hub_into_config(self._discovered, plan)
         with self._lock:
             if ready_serials != self._last_serials:
                 LOG.info("USB hub topology changed: %d ADB device(s) online (%s)", len(ready_serials), ", ".join(ready_serials) or "none")

@@ -19,6 +19,7 @@ from http import HTTPStatus
 from typing import Any, Callable
 
 from .auth import (
+    MAX_EXEC_RESPONSE_BYTES,
     build_auth_headers,
     build_direct_opener,
     build_signed_auth_headers,
@@ -53,7 +54,6 @@ _DIRECT_OPENER = build_direct_opener()
 _MAX_HEALTH_RESP_BYTES = 256 * 1024
 _MAX_JOBS_RESP_BYTES = 512 * 1024
 _MAX_CTRL_RESP_BYTES = 64 * 1024
-_MAX_EXEC_RESP_BYTES = 4 * 1024 * 1024  # Plenty for 512 KiB stdout + 512 KiB stderr + JSON overhead
 _MAX_JOB_TIMEOUT_SEC = 86400.0
 
 
@@ -177,6 +177,12 @@ class JobOutcome:
     routing_reason: str = ""
     node_tier: int = 0
     node_pool: str = ""
+    unconfirmed_nodes: list[str] = field(default_factory=list)
+
+    @property
+    def outcome_unknown(self) -> bool:
+        """At least one attempt may have run, and no attempt confirmed success."""
+        return bool(self.unconfirmed_nodes) and not self.ok
 
     @property
     def ok(self) -> bool:
@@ -192,6 +198,8 @@ class JobOutcome:
             "node_pool": self.node_pool,
             "routing_reason": self.routing_reason,
             "ok": self.ok,
+            "outcome_unknown": self.outcome_unknown,
+            "unconfirmed_nodes": self.unconfirmed_nodes,
             "returncode": self.returncode,
             "duration_sec": self.duration_sec,
             "timed_out": self.timed_out,
@@ -425,8 +433,9 @@ class MasterController:
 
         Returns tuple `(status_kind, data)` where `status_kind` is one of:
         - `"ok"`: command executed (check `data["returncode"]`)
-        - `"retryable"`: HTTP 503 (overheated/busy) or transient network failure
-        - `"error"`: non-retryable HTTP 4xx error
+        - `"retryable"`: worker rejected the job before admission, or connection was refused
+        - `"unknown"`: worker may have run the job without delivering a valid result
+        - `"error"`: non-retryable rejection
         """
         url = f"{node.base_url}/exec"
         eff_timeout = _safe_float(spec.timeout_sec, float(self.config.default_job_timeout_sec))
@@ -440,9 +449,25 @@ class MasterController:
             url, data=body, headers=self._headers_for(node, "POST", "/exec", body), method="POST"
         )
         http_timeout = min(_MAX_JOB_TIMEOUT_SEC + 30.0, max(eff_timeout + 15.0, 30.0))
+
+        def unknown_result(reason: str) -> tuple[str, dict[str, Any]]:
+            return "unknown", {
+                "error": (
+                    f"Outcome unknown for {spec.job_id} on {node.id}. "
+                    f"The job may have run. Check pc jobs before retrying. ({reason})"
+                )
+            }
+
         try:
             with _DIRECT_OPENER.open(req, timeout=http_timeout) as resp:
-                return "ok", read_json_object_bounded(resp, _MAX_EXEC_RESP_BYTES)
+                data = read_json_object_bounded(resp, MAX_EXEC_RESPONSE_BYTES)
+                expected_id = spec.job_id.strip() if isinstance(spec.job_id, str) else ""
+                returned_id = data.get("job_id")
+                if not isinstance(returned_id, str) or not returned_id or (expected_id and expected_id != returned_id):
+                    return unknown_result("worker returned an unexpected job ID")
+                if type(data.get("returncode")) is not int:
+                    return unknown_result("worker returned an invalid exit status")
+                return "ok", data
         except urllib.error.HTTPError as exc:
             raw_err = _read_http_error_body(exc, 65536)
             try:
@@ -450,11 +475,22 @@ class MasterController:
                 err_data = parsed_err if isinstance(parsed_err, dict) else {"error": raw_err[:300]}
             except (json.JSONDecodeError, RecursionError):
                 err_data = {"error": raw_err[:300]}
-            if exc.code in {HTTPStatus.SERVICE_UNAVAILABLE, HTTPStatus.TOO_MANY_REQUESTS}:
+            reason = err_data.get("error")
+            if exc.code == HTTPStatus.SERVICE_UNAVAILABLE and reason in (
+                "node_busy", "node_not_ready", "node_shutting_down"
+            ):
                 return "retryable", err_data
+            if exc.code == HTTPStatus.TOO_MANY_REQUESTS and reason == "too many failed auth attempts":
+                return "retryable", err_data
+            if exc.code >= 500 or exc.code in (HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS):
+                return unknown_result(f"HTTP {exc.code}")
             return "error", {**err_data, "http_status": exc.code}
-        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
-            return "retryable", {"error": str(exc)}
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
+                return "retryable", {"error": str(exc)}
+            return unknown_result(str(exc))
+        except (http.client.HTTPException, OSError, ValueError, OverflowError) as exc:
+            return unknown_result(str(exc))
 
     def _with_node_env(
         self, spec: JobSpec, node: NodeConfig, cross_env: dict[str, str]
@@ -477,6 +513,7 @@ class MasterController:
         target: str = "auto",
         tags: list[str] | None = None,
         workload_hint: str = "",
+        retry_unknown: bool = False,
     ) -> list[JobOutcome]:
         """Run a job via smart auto-routing (`auto`), Tier/Pool (`tier:1|2|3`, `pool:<name>`),
         best overall node (`best`), all ready nodes (`all`), or a specific node ID.
@@ -492,7 +529,10 @@ class MasterController:
         else:
             snapshots = all_snapshots
         with self.config_lock:
-            cross_env = build_cross_tier_env(all_snapshots, self.config)
+            cross_envs = {
+                snap.node.id: build_cross_tier_env(all_snapshots, self.config, for_node=snap.node)
+                for snap in snapshots if snap.online
+            }
             quarantined = set(self.config.gateway.quarantined_nodes)
         snap_by_id = {s.node.id: s for s in snapshots}
 
@@ -521,7 +561,7 @@ class MasterController:
                     pool.submit(
                         self.exec_on_node,
                         s.node,
-                        self._with_node_env(spec, s.node, cross_env),
+                        self._with_node_env(spec, s.node, cross_envs[s.node.id]),
                     ): s
                     for s in chosen
                 }
@@ -590,18 +630,23 @@ class MasterController:
                     reverse=True,
                 )
                 candidates.extend(spillover)
-            # Fail over automatically across remaining ranked candidates on transient 503/disconnect
+            # A missing result may follow successful execution. Replay requires explicit opt-in.
             last_snap = candidates[0]
             last_kind = "retryable"
             last_data: dict[str, Any] = {}
             attempts = 0
+            unconfirmed_nodes: list[str] = []
             for cand in candidates:
                 attempts += 1
                 last_snap = cand
                 last_kind, last_data = self.exec_on_node(
-                    cand.node, self._with_node_env(spec, cand.node, cross_env)
+                    cand.node, self._with_node_env(spec, cand.node, cross_envs[cand.node.id])
                 )
-                if last_kind != "retryable":
+                if last_kind == "unknown":
+                    unconfirmed_nodes.append(cand.node.id)
+                    if not retry_unknown:
+                        break
+                elif last_kind != "retryable":
                     break
             tier, pool_name = resolve_node_tier_and_pool(last_snap.node, last_snap.health)
             eff_reason = (
@@ -619,6 +664,7 @@ class MasterController:
                     node_tier=tier,
                     node_pool=pool_name,
                     routing_reason=eff_reason,
+                    unconfirmed_nodes=unconfirmed_nodes,
                 )
             ]
 
@@ -672,7 +718,7 @@ class MasterController:
         tier, pool_name = resolve_node_tier_and_pool(
             node, snap.health if snap and snap.online else None
         )
-        kind, data = self.exec_on_node(node, self._with_node_env(spec, node, cross_env))
+        kind, data = self.exec_on_node(node, self._with_node_env(spec, node, cross_envs.get(node.id, {})))
         return [
             self._to_outcome(
                 spec,
@@ -696,6 +742,7 @@ class MasterController:
         on_result: Callable[[JobOutcome, int, int], None] | None = None,
         target: str = "auto",
         workload_hint: str = "",
+        retry_unknown: bool = False,
     ) -> list[JobOutcome]:
         """Dynamically distribute a batch of jobs across compatible healthy cluster nodes.
 
@@ -703,7 +750,7 @@ class MasterController:
         Tier/Pool (e.g., Docker -> Tier 3, Debian services -> Tier 2, general compute -> Tier 1
         with automatic spillover). Respects per-node `max_concurrency`, avoids overheated phones,
         avoids head-of-line blocking across pools, injects live cross-tier `PHONECLUSTER_*` env
-        variables, and retries/reroutes on worker throttle (HTTP 503) or disconnect.
+        variables, and retries pre-admission rejections. Lost results require retry_unknown.
         """
         if not jobs:
             return []
@@ -711,6 +758,7 @@ class MasterController:
         total_jobs = len(jobs)
         outcomes_by_slot: dict[int, JobOutcome] = {}
         last_reason_by_slot: dict[int, str] = {}
+        unconfirmed_by_slot: dict[int, list[str]] = collections.defaultdict(list)
         completed_count = 0
 
         def _record_immediate_fail(slot_idx: int, spec: JobSpec, node_id: str, err: str, why: str) -> None:
@@ -784,11 +832,11 @@ class MasterController:
         ] = {}
 
         snapshots: list[NodeSnapshot] = []
-        cross_env: dict[str, str] = {}
+        cross_envs: dict[str, dict[str, str]] = {}
         last_poll = 0.0
 
         def _refresh_health() -> None:
-            nonlocal snapshots, cross_env, last_poll
+            nonlocal snapshots, cross_envs, last_poll
             all_snaps = self.poll_health()
             if tags:
                 want_tags = set(tags)
@@ -796,7 +844,10 @@ class MasterController:
             else:
                 snapshots = all_snaps
             with self.config_lock:
-                cross_env = build_cross_tier_env(all_snaps, self.config)
+                cross_envs = {
+                    snap.node.id: build_cross_tier_env(all_snaps, self.config, for_node=snap.node)
+                    for snap in snapshots if snap.online
+                }
             last_poll = time.monotonic()
             for s in snapshots:
                 # Account for jobs already running on this phone outside this map_jobs() batch
@@ -864,7 +915,7 @@ class MasterController:
                     )
                     chosen_snap = pool_candidates[0]
                     in_flight_per_node[chosen_snap.node.id] += 1
-                    enriched = self._with_node_env(spec, chosen_snap.node, cross_env)
+                    enriched = self._with_node_env(spec, chosen_snap.node, cross_envs[chosen_snap.node.id])
                     fut = pool.submit(self.exec_on_node, chosen_snap.node, enriched)
                     running_futures[fut] = (slot_idx, spec, chosen_snap, attempt + 1, failed_nodes, reason)
                     dispatched_any = True
@@ -874,9 +925,13 @@ class MasterController:
                     pending.appendleft(item)
 
                 if running_futures:
+                    wait_sec = 0.25
+                    if health_refresh_sec > 0:
+                        until_poll = last_poll + health_refresh_sec - time.monotonic()
+                        wait_sec = min(wait_sec, max(0.0, until_poll))
                     done, _ = concurrent.futures.wait(
                         running_futures.keys(),
-                        timeout=0.25,
+                        timeout=wait_sec,
                         return_when=concurrent.futures.FIRST_COMPLETED,
                     )
                     needs_refresh = False
@@ -887,7 +942,9 @@ class MasterController:
                         )
                         kind, data = fut.result()
 
-                        if kind == "retryable" and attempt <= retries:
+                        if kind == "unknown" and snap.node.id not in unconfirmed_by_slot[slot_idx]:
+                            unconfirmed_by_slot[slot_idx].append(snap.node.id)
+                        if attempt <= retries and (kind == "retryable" or (kind == "unknown" and retry_unknown)):
                             failed_nodes.add(snap.node.id)
                             pending.appendleft((slot_idx, spec, attempt, failed_nodes))
                             needs_refresh = True
@@ -903,6 +960,7 @@ class MasterController:
                             node_tier=tier,
                             node_pool=pool_name,
                             routing_reason=reason,
+                            unconfirmed_nodes=unconfirmed_by_slot[slot_idx],
                         )
                         outcomes_by_slot[slot_idx] = outcome
                         completed_count += 1
@@ -939,6 +997,7 @@ class MasterController:
                                 attempts=attempt,
                                 error=err_text,
                                 routing_reason=why,
+                                unconfirmed_nodes=unconfirmed_by_slot[slot_idx],
                             )
                             outcomes_by_slot[slot_idx] = outcome
                             completed_count += 1
@@ -1178,6 +1237,8 @@ class MasterController:
                     rec["returncode"] = first_fail.returncode
                     rec["timed_out"] = any(o.timed_out for o in outcomes)
                     rec["cancelled"] = any(o.cancelled for o in outcomes)
+                    rec["outcome_unknown"] = any(o.outcome_unknown for o in outcomes)
+                    rec["unconfirmed_nodes"] = [node for o in outcomes for node in o.unconfirmed_nodes]
             results.append(rec)
 
             clean_out = rec["stdout"].replace("\x00", "").strip()
@@ -1223,7 +1284,11 @@ class MasterController:
         node_tier: int = 0,
         node_pool: str = "",
         routing_reason: str = "",
+        unconfirmed_nodes: list[str] | None = None,
     ) -> JobOutcome:
+        uncertain = list(unconfirmed_nodes or [])
+        if kind == "unknown" and node_id not in uncertain:
+            uncertain.append(node_id)
         if kind == "ok":
             return JobOutcome(
                 index=spec.index,
@@ -1240,6 +1305,7 @@ class MasterController:
                 routing_reason=routing_reason,
                 node_tier=node_tier,
                 node_pool=node_pool,
+                unconfirmed_nodes=uncertain,
             )
         raw_reasons = data.get("reasons")
         reasons_txt = (
@@ -1260,6 +1326,7 @@ class MasterController:
             routing_reason=routing_reason,
             node_tier=node_tier,
             node_pool=node_pool,
+            unconfirmed_nodes=uncertain,
         )
 
     # ------------------------------------------------------------------
@@ -1294,6 +1361,70 @@ class MasterController:
                 entries.append(f"{format_host_for_url(snap.node.host)}/{cores},lzo")
         return " ".join(entries)
 
+    def start_llama_rpc(self, spec: JobSpec) -> list[JobOutcome]:
+        snapshots = self.poll_health()
+        quarantined = self._quarantined_ids()
+        workers = [
+            s for s in snapshots
+            if s.ready_for_jobs and s.node.role != "master" and s.node.id not in quarantined
+        ]
+        if not workers:
+            return [JobOutcome(
+                index=spec.index, job_id=spec.job_id, label=spec.label, node_id="none",
+                returncode=-1, duration_sec=0.0, error="No ready worker phones for llama.cpp RPC. Master skipped.",
+            )]
+        with self.config_lock:
+            work = [
+                (s, self._with_node_env(spec, s.node, build_cross_tier_env(snapshots, self.config, for_node=s.node)))
+                for s in workers
+            ]
+
+        def start(item: tuple[NodeSnapshot, JobSpec]) -> JobOutcome:
+            snapshot, enriched = item
+            kind, data = self.exec_on_node(snapshot.node, enriched)
+            tier, pool_name = resolve_node_tier_and_pool(snapshot.node, snapshot.health)
+            return self._to_outcome(
+                spec, snapshot.node.id, kind, data, attempts=1, node_tier=tier, node_pool=pool_name,
+                routing_reason="Start RPC on ready worker phones",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, len(work))) as pool:
+            outcomes = list(pool.map(start, work))
+        return sorted(outcomes, key=lambda outcome: outcome.node_id)
+
+    def stop_llama_rpc(self) -> list[dict[str, Any]]:
+        """Stop managed RPC servers even if the worker has closed job admission."""
+        nodes = self._filter_nodes()
+        if not nodes:
+            return []
+
+        def stop(node: NodeConfig) -> dict[str, Any]:
+            path = "/workloads/llama-rpc-stop"
+            body = b"{}"
+            request = urllib.request.Request(
+                f"{node.base_url}{path}", data=body, method="POST",
+                headers=self._headers_for(node, "POST", path, body),
+            )
+            failed = {"node_id": node.id, "ok": False}
+            try:
+                with _DIRECT_OPENER.open(request, timeout=14.0) as response:
+                    result = read_json_object_bounded(response, _MAX_CTRL_RESP_BYTES)
+                if result.get("node_id") != node.id or type(result.get("ok")) is not bool:
+                    raise ValueError("unexpected worker stop response")
+                return result
+            except urllib.error.HTTPError as exc:
+                _read_http_error_body(exc, 4096)
+                if exc.code == HTTPStatus.NOT_FOUND:
+                    return {**failed, "error": "RPC stop unavailable. Upgrade this worker."}
+                return {**failed, "error": f"RPC stop failed (HTTP {exc.code}).", "outcome_unknown": exc.code >= 500}
+            except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
+                if isinstance(getattr(exc, "reason", exc), (ConnectionRefusedError, socket.gaierror)):
+                    return {**failed, "error": f"Worker unreachable: {exc}"}
+                return {**failed, "error": f"RPC stop unconfirmed: {exc}", "outcome_unknown": True}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes))) as pool:
+            return list(pool.map(stop, nodes))
+
     def build_llama_rpc_arg(
         self,
         port: int = 50052,
@@ -1309,6 +1440,12 @@ class MasterController:
                 continue
             if not include_master and snap.node.role == "master":
                 continue
+            if snap.node.adb is not None or "usb-mode:adb" in snap.node.tags:
+                # An ADB HTTP forward is not the worker's RPC endpoint.
+                continue
+            tools = snap.health.get("tools")
+            if isinstance(tools, dict) and tools.get("llama_rpc") is False:
+                continue
             raw_svcs = snap.health.get("services")
             svcs = raw_svcs if isinstance(raw_svcs, dict) else {}
             raw_lp = snap.health.get("listening_ports")
@@ -1322,7 +1459,7 @@ class MasterController:
             active = (port == 50052 and bool(svcs.get("llama_rpc_50052"))) or (port in lp_ports)
             if active and not self._is_remote_port_loopback_only(snap, port):
                 endpoints.append(format_host_port(snap.node.host, port))
-        return ",".join(endpoints)
+        return ",".join(dict.fromkeys(endpoints))
 
     def build_mpi_hostfile(self, snapshots: list[NodeSnapshot] | None = None) -> str:
         """Generate an OpenMPI hostfile containing healthy, non-quarantined nodes (prefers mpirun-capable)."""
@@ -1532,7 +1669,8 @@ class MasterController:
             "from pathlib import Path\n"
             "dk = shutil.which('docker') or ('/snap/bin/docker' if os.path.exists('/snap/bin/docker') else '')\n"
             "out = {'docker_bin': dk, 'is_snap': dk.startswith('/snap/') or os.path.exists('/var/snap/docker'), "
-            "'ok': False, 'error': '', 'server_version': '', 'swarm_state': 'inactive', 'swarm_manager': False, "
+            "'ok': False, 'engine_ok': False, 'inventory_ok': False, 'error': '', "
+            "'server_version': '', 'swarm_state': 'inactive', 'swarm_manager': False, "
             "'swarm_nodes': 0, 'containers_running': 0, 'containers_total': 0, 'containers': [], "
             "'volume_root': str(Path.home() / 'phonecluster' / 'docker-data')}\n"
             "if not dk:\n"
@@ -1544,25 +1682,32 @@ class MasterController:
             "    print(json.dumps(out)); raise SystemExit(0)\n"
             "try:\n"
             "    info = json.loads(p.stdout)\n"
-            "except Exception as exc:\n"
+            "    if not isinstance(info, dict):\n"
+            "        raise ValueError('expected a JSON object')\n"
+            "except ValueError as exc:\n"
             "    out['error'] = f'invalid docker info JSON: {exc}'\n"
             "    print(json.dumps(out)); raise SystemExit(0)\n"
             "sw = info.get('Swarm') or {}\n"
-            "out['ok'] = True\n"
+            "out['engine_ok'] = True\n"
             "out['server_version'] = str(info.get('ServerVersion') or '')\n"
             "out['swarm_state'] = str(sw.get('LocalNodeState') or 'inactive').lower()\n"
             "out['swarm_manager'] = bool(sw.get('ControlAvailable', False))\n"
             "out['swarm_nodes'] = int(sw.get('Nodes') or 0)\n"
             "out['containers_running'] = int(info.get('ContainersRunning') or 0)\n"
             "out['containers_total'] = int(info.get('Containers') or 0)\n"
-            "ps = subprocess.run([dk, 'ps', '-a', '--format', '{{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'], "
+            "try:\n"
+            "    ps = subprocess.run([dk, 'ps', '-a', '--no-trunc', '--format', '{{json .}}'], "
             "capture_output=True, text=True, timeout=8)\n"
-            "if ps.returncode == 0:\n"
-            "    for ln in ps.stdout.splitlines()[:25]:\n"
-            "        parts = ln.split('\\t')\n"
-            "        if len(parts) >= 3:\n"
-            "            out['containers'].append({'name': parts[0], 'image': parts[1], 'status': parts[2], "
-            "'ports': parts[3] if len(parts) > 3 else ''})\n"
+            "    if ps.returncode:\n"
+            "        raise ValueError((ps.stderr or ps.stdout or 'docker ps failed').strip()[:260])\n"
+            "    rows = ps.stdout.splitlines()\n"
+            "    items = [json.loads(row) for row in rows[:25]]\n"
+            "    out['containers'] = [{'id': row['ID'], 'name': row['Names'], 'image': row['Image'], "
+            "'status': row['Status'], 'ports': row.get('Ports', '')} for row in items]\n"
+            "    out['inventory_truncated'] = len(rows) > 25\n"
+            "    out['inventory_ok'] = out['ok'] = True\n"
+            "except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as exc:\n"
+            "    out['error'] = f'Docker inventory unavailable: {exc}'[:300]\n"
             "print(json.dumps(out))\n"
         )
 
@@ -1584,6 +1729,8 @@ class MasterController:
                 "ubuntu_touch": bool(snap.health.get("ubuntu_touch")),
                 "docker_snap": bool(snap.health.get("docker_snap")),
                 "socket_accessible": bool(snap.health.get("docker_socket_accessible")),
+                "engine_ok": False,
+                "inventory_ok": False,
             }
             if kind != "ok":
                 return {**base, "ok": False, "error": str(data.get("error", kind))}
@@ -1604,9 +1751,10 @@ class MasterController:
             "nodes": rows,
             "total_nodes": len(rows),
             "ready_nodes": sum(1 for r in rows if r.get("ok")),
+            "engine_ready_nodes": sum(1 for r in rows if r.get("engine_ok")),
             "swarm_active": any(r.get("swarm_state") == "active" for r in rows),
             "swarm_managers": [r["node_id"] for r in rows if r.get("swarm_manager")],
-            "total_running_containers": sum(int(r.get("containers_running") or 0) for r in rows if r.get("ok")),
+            "total_running_containers": sum(int(r.get("containers_running") or 0) for r in rows if r.get("engine_ok")),
         }
 
     def docker_swarm_setup(
@@ -1617,8 +1765,7 @@ class MasterController:
     ) -> dict[str, Any]:
         """Initialize Docker Swarm on a Tier 3 / Ubuntu Touch manager and join peer Docker phones securely.
 
-        Transfers the Swarm worker join token solely via `PHONECLUSTER_SWARM_TOKEN` over
-        PhoneCluster's authenticated HTTP channel (never in CLI argv or returned API JSON).
+        The controller passes the join token to the worker probe through its job environment.
         """
         if advertise_addr:
             advertise_addr = validate_host(advertise_addr)
@@ -1656,15 +1803,27 @@ class MasterController:
         else:
             mgr_snap = next((s for s in eligible if s.node.role == "master"), eligible[0])
 
+        target_workers = [s for s in eligible if s.node.id != mgr_snap.node.id]
+        if worker_node_ids is not None:
+            wanted = set(worker_node_ids)
+            target_workers = [s for s in target_workers if s.node.id in wanted]
+            missing = wanted - {s.node.id for s in target_workers}
+            if missing:
+                return {
+                    "ok": False,
+                    "error": "Selected Docker workers unavailable: " + ", ".join(sorted(missing)),
+                    "workers": [],
+                    "joined_count": 0,
+                }
+
         adv = advertise_addr or normalize_host(mgr_snap.node.host)
+        usb = mgr_snap.node.adb is not None or "usb-mode:adb" in mgr_snap.node.tags
+        if not advertise_addr and not usb and mgr_snap.node.role == "master" and is_loopback_or_unspecified_host(adv):
+            adv = normalize_host(detect_local_ip())
         if not adv or is_loopback_or_unspecified_host(adv):
-            lan_ip = normalize_host(detect_local_ip())
-            if lan_ip and not is_loopback_or_unspecified_host(lan_ip):
-                adv = lan_ip
-        if not adv:
             return {
                 "ok": False,
-                "error": "Could not determine a non-loopback LAN advertise address for Swarm manager.",
+                "error": "Supply the selected manager's non-loopback address reachable by the Docker workers.",
                 "workers": [],
                 "joined_count": 0,
             }
@@ -1693,7 +1852,7 @@ class MasterController:
             "    print(json.dumps({'ok': False, 'error': 'node is already a Swarm worker, not a manager'})); raise SystemExit(0)\n"
             "tk = subprocess.run([dk, 'swarm', 'join-token', '-q', 'worker'], capture_output=True, text=True, timeout=10)\n"
             "if tk.returncode != 0 or not tk.stdout.strip():\n"
-            "    print(json.dumps({'ok': False, 'error': (tk.stderr or 'failed to fetch worker join token').strip()[:240]})); raise SystemExit(0)\n"
+            "    print(json.dumps({'ok': False, 'error': 'failed to fetch worker join token'})); raise SystemExit(0)\n"
             "print(json.dumps({'ok': True, 'initialized': initialized, 'token': tk.stdout.strip()}))\n"
         )
         mgr_spec = JobSpec(
@@ -1703,29 +1862,29 @@ class MasterController:
             script_name="swarm_init.py",
             interpreter="python3",
             env={"PHONECLUSTER_SWARM_ADV": adv},
-            timeout_sec=30.0,
+            timeout_sec=45.0,
             force=True,
         )
         m_kind, m_data = self.exec_on_node(mgr_snap.node, mgr_spec)
-        if m_kind != "ok":
+        if m_kind != "ok" or m_data.get("returncode") != 0:
             return {
                 "ok": False,
                 "manager_node_id": mgr_snap.node.id,
                 "manager_addr": format_host_port(adv, 2377),
-                "error": str(m_data.get("error", m_kind)),
+                "error": str(m_data.get("error") or "Swarm manager probe failed."),
                 "workers": [],
                 "joined_count": 0,
             }
         try:
             m_parsed = json.loads(str(m_data.get("stdout") or "").strip())
         except json.JSONDecodeError:
-            m_parsed = {"ok": False, "error": str(m_data.get("stderr") or m_data.get("stdout") or "invalid manager output")[:240]}
+            m_parsed = None
         if not isinstance(m_parsed, dict) or not m_parsed.get("ok") or not m_parsed.get("token"):
             return {
                 "ok": False,
                 "manager_node_id": mgr_snap.node.id,
                 "manager_addr": format_host_port(adv, 2377),
-                "error": str((m_parsed or {}).get("error", "Swarm init failed")),
+                "error": str(m_parsed.get("error", "Swarm init failed")) if isinstance(m_parsed, dict) else "Invalid manager response.",
                 "workers": [],
                 "joined_count": 0,
                 "note": "If your Ubuntu Touch Halium kernel lacks VXLAN/overlay modules, use direct PhoneCluster Tier 3 container jobs (`pc run --target tier:3` / `pc map`) instead of Swarm overlay networks.",
@@ -1733,10 +1892,6 @@ class MasterController:
 
         join_token = str(m_parsed["token"])
         manager_addr = format_host_port(adv, 2377)
-        target_workers = [s for s in eligible if s.node.id != mgr_snap.node.id]
-        if worker_node_ids is not None:
-            want_w = set(worker_node_ids)
-            target_workers = [s for s in target_workers if s.node.id in want_w]
 
         join_script = (
             "import json, os, shutil, subprocess\n"
@@ -1745,13 +1900,22 @@ class MasterController:
             "mgr = os.environ.get('PHONECLUSTER_SWARM_MANAGER', '').strip()\n"
             "if not dk:\n"
             "    print(json.dumps({'ok': False, 'error': 'docker binary not found'})); raise SystemExit(0)\n"
-            "st = subprocess.run([dk, 'info', '--format', '{{.Swarm.LocalNodeState}}'], capture_output=True, text=True, timeout=10)\n"
-            "if st.returncode == 0 and st.stdout.strip().lower() == 'active':\n"
-            "    print(json.dumps({'ok': True, 'already_active': True})); raise SystemExit(0)\n"
-            "r = subprocess.run([dk, 'swarm', 'join', '--token', tok, mgr], capture_output=True, text=True, timeout=20)\n"
-            "if r.returncode != 0:\n"
-            "    print(json.dumps({'ok': False, 'error': (r.stderr or r.stdout).strip()[:280]})); raise SystemExit(0)\n"
-            "print(json.dumps({'ok': True, 'already_active': False}))\n"
+            "def swarm_info():\n"
+            "    status = subprocess.run([dk, 'info', '--format', '{{.Swarm.LocalNodeState}}|{{.Swarm.NodeID}}'], "
+            "capture_output=True, text=True, timeout=8, check=True)\n"
+            "    state, _, node_id = status.stdout.strip().partition('|')\n"
+            "    return state, node_id\n"
+            "state, node_id = swarm_info()\n"
+            "already_active = state.lower() == 'active'\n"
+            "if not already_active:\n"
+            "    r = subprocess.run([dk, 'swarm', 'join', '--token', tok, mgr], capture_output=True, text=True, timeout=20)\n"
+            "    if r.returncode:\n"
+            "        detail = (r.stderr or 'docker swarm join failed').replace(tok, '[redacted]').strip()[:280]\n"
+            "        print(json.dumps({'ok': False, 'error': detail})); raise SystemExit(0)\n"
+            "    state, node_id = swarm_info()\n"
+            "if state.lower() != 'active' or not node_id:\n"
+            "    print(json.dumps({'ok': False, 'error': 'Swarm node ID could not be confirmed'})); raise SystemExit(0)\n"
+            "print(json.dumps({'ok': True, 'already_active': already_active, 'swarm_node_id': node_id}))\n"
         )
 
         worker_results: list[dict[str, Any]] = []
@@ -1766,26 +1930,61 @@ class MasterController:
                     "PHONECLUSTER_SWARM_TOKEN": join_token,
                     "PHONECLUSTER_SWARM_MANAGER": manager_addr,
                 },
-                timeout_sec=30.0,
+                timeout_sec=42.0,
                 force=True,
             )
             wk, wd = self.exec_on_node(ws.node, w_spec)
-            if wk != "ok":
-                worker_results.append({"node_id": ws.node.id, "ok": False, "error": str(wd.get("error", wk))})
+            if wk != "ok" or wd.get("returncode") != 0:
+                error = str(wd.get("error") or wd.get("stderr") or "Swarm worker probe failed")
+                worker_results.append({"node_id": ws.node.id, "ok": False, "error": error.replace(join_token, "[redacted]")[:240]})
                 continue
             try:
                 wp = json.loads(str(wd.get("stdout") or "").strip())
                 if isinstance(wp, dict):
-                    worker_results.append({"node_id": ws.node.id, **wp})
+                    worker_results.append({
+                        "node_id": ws.node.id, "ok": wp.get("ok") is True,
+                        "already_active": wp.get("already_active") is True,
+                        "swarm_node_id": str(wp.get("swarm_node_id") or ""),
+                        "error": str(wp.get("error") or "").replace(join_token, "[redacted]")[:240],
+                    })
                     continue
             except json.JSONDecodeError:
                 pass
             worker_results.append(
-                {"node_id": ws.node.id, "ok": False, "error": str(wd.get("stderr") or wd.get("stdout") or "join failed")[:240]}
+                {"node_id": ws.node.id, "ok": False, "error": "Invalid Swarm worker response."}
             )
+
+        if any(result["ok"] for result in worker_results):
+            membership_script = (
+                "import os, shutil, subprocess\n"
+                "dk = shutil.which('docker') or ('/snap/bin/docker' if os.path.exists('/snap/bin/docker') else '')\n"
+                "if not dk:\n"
+                "    raise SystemExit(1)\n"
+                "raise SystemExit(subprocess.run([dk, 'node', 'ls', '--no-trunc', '--format', '{{.ID}}'], timeout=10).returncode)\n"
+            )
+            membership_spec = replace(
+                mgr_spec, job_id=f"swarm-members-{mgr_snap.node.id}-{uuid.uuid4().hex[:6]}",
+                script_content=membership_script, script_name="swarm_members.py", env={}, timeout_sec=12.0,
+            )
+            kind, membership = self.exec_on_node(mgr_snap.node, membership_spec)
+            verified = kind == "ok" and membership.get("returncode") == 0
+            member_ids = set(str(membership.get("stdout") or "").split()) if verified else set()
+            for result in worker_results:
+                if result["ok"] and result["swarm_node_id"] not in member_ids:
+                    error = (
+                        "Worker's Swarm node ID is absent from the selected manager."
+                        if verified else "Could not verify membership on the selected manager."
+                    )
+                    result.update(ok=False, error=error)
 
         joined_ok = sum(1 for r in worker_results if r.get("ok"))
         all_ok = all(r.get("ok") for r in worker_results)
+        if not all_ok:
+            note = "Some worker joins failed or could not be verified. Check each worker result."
+        elif worker_results:
+            note = "Selected worker memberships confirmed by the Swarm manager."
+        else:
+            note = "Swarm manager ready. No worker joins were requested or eligible."
         return {
             "ok": all_ok,
             "manager_node_id": mgr_snap.node.id,
@@ -1793,11 +1992,7 @@ class MasterController:
             "manager_initialized": bool(m_parsed.get("initialized")),
             "workers": worker_results,
             "joined_count": joined_ok,
-            "note": (
-                "Swarm active across Docker nodes. Remember: Snap Docker bind mounts must live inside $HOME (e.g. ~/phonecluster/docker-data)."
-                if all_ok
-                else "Some worker(s) could not join Swarm (Halium kernels sometimes lack VXLAN/netfilter modules). Direct PhoneCluster Tier 3 container scheduling (`pc run --target tier:3`) remains fully available."
-            ),
+            "note": note,
         }
 
     def check_workers_wan_isolation(
@@ -1917,7 +2112,7 @@ class MasterController:
         outcomes = self.run_single(spec, target=target, workload_hint=workload_hint)
         # Self-heal stale tracked `cwd` (e.g. directory removed or worker phone rebooted)
         if cwd and outcomes and all(
-            (not o.ok) and "workdir does not exist" in (o.error or "").lower()
+            (not o.ok) and not o.outcome_unknown and "workdir does not exist" in (o.error or "").lower()
             for o in outcomes
         ):
             spec_fallback = replace(spec, workdir=None)
@@ -2029,7 +2224,9 @@ class MasterController:
         try:
             with _DIRECT_OPENER.open(req, timeout=timeout_sec) as resp:
                 data = read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES)
-                return {**data, "node_id": node.id, "ok": True}
+                if data.get("node_id") != node.id or data.get("updated") is not True:
+                    return {"node_id": node.id, "ok": False, "error": "Worker did not confirm this policy update."}
+                return {**data, "persisted": data.get("persisted") is True, "ok": True}
         except urllib.error.HTTPError as exc:
             raw = _read_http_error_body(exc, 4096)[:200]
             return {"node_id": node.id, "ok": False, "error": f"HTTP {exc.code}: {raw}"}
@@ -2047,7 +2244,7 @@ class MasterController:
             else:
                 nodes = list(self.config.nodes)
         if not nodes:
-            return {"ok_count": 0, "total": 0, "results": []}
+            return {"ok_count": 0, "persisted_count": 0, "total": 0, "results": []}
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes))) as pool:
             futs = {pool.submit(self.push_config_to_node, n, timeout_sec): idx for idx, n in enumerate(nodes)}
             ordered: list[dict[str, Any] | None] = [None] * len(nodes)
@@ -2055,7 +2252,8 @@ class MasterController:
                 ordered[futs[fut]] = fut.result()
         results = [r for r in ordered if r is not None]
         ok_count = sum(1 for r in results if r.get("ok"))
-        return {"ok_count": ok_count, "total": len(results), "results": results}
+        persisted_count = sum(1 for r in results if r.get("ok") and r.get("persisted"))
+        return {"ok_count": ok_count, "persisted_count": persisted_count, "total": len(results), "results": results}
 
     def cancel_node_job(self, node_id: str, job_id: str) -> dict[str, Any]:
         """Cancel a running job on a specific node."""

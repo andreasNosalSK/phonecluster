@@ -16,13 +16,16 @@ import threading
 import time
 import urllib.parse
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .bundled import bundled_script
 from .config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SSH_PORT,
+    config_revision,
     create_default_config,
     format_host_for_url,
     format_host_port,
@@ -83,7 +86,8 @@ def _configure_logging(verbose: bool, is_daemon: bool = False) -> None:
 
 def _cmd_init_config(args: argparse.Namespace) -> int:
     out_path = Path(args.output)
-    if out_path.exists() and not args.force:
+    previous_revision = config_revision(out_path)
+    if previous_revision and not args.force:
         print(
             f"Config already exists at '{out_path}'. Pass --force to overwrite.",
             file=sys.stderr,
@@ -97,7 +101,7 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
         ssh_user=args.ssh_user,
         ssh_port=args.ssh_port,
     )
-    saved = save_config(cfg, out_path)
+    saved = save_config(cfg, out_path, expected_revision=previous_revision)
     print(f"Created cluster config at: {saved}")
     print(f"Cluster name : {cfg.cluster_name}")
     print(f"Master node  : node0 ({cfg.nodes[0].host})")
@@ -313,6 +317,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         target=args.target,
         tags=tags,
         workload_hint=getattr(args, "workload", "") or "",
+        retry_unknown=args.retry_unknown,
     )
 
     if args.json:
@@ -320,6 +325,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         for o in outcomes:
             status = "OK" if o.ok else f"FAIL(rc={o.returncode})"
+            if o.outcome_unknown:
+                status = "UNKNOWN"
             tier_tag = f" · T{o.node_tier}:{o.node_pool}" if o.node_tier else ""
             why_tag = f" — {o.routing_reason}" if o.routing_reason else ""
             print(f"=== [{o.node_id}{tier_tag}] {status} ({o.duration_sec:.2f}s){why_tag} ===")
@@ -466,45 +473,59 @@ def _cmd_map(args: argparse.Namespace) -> int:
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
     t0 = time.monotonic()
 
-    def _on_result(o: JobOutcome, done: int, total: int) -> None:
-        if args.quiet:
-            return
-        tag = "OK" if o.ok else f"FAIL({o.returncode})"
-        tier_col = f"T{o.node_tier}:{o.node_pool}" if o.node_tier else "-"
-        first_line = (o.stdout.strip().splitlines()[0] if o.stdout.strip() else o.error or "")[:80]
-        print(f"[{done}/{total}] {tag:9s} {o.node_id:7s} {tier_col:11s} {o.duration_sec:5.2f}s | {o.label[:36]} -> {first_line}")
+    with ExitStack() as files:
+        jsonl = None
+        if args.output_jsonl:
+            out_path = Path(args.output_jsonl)
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                jsonl = files.enter_context(out_path.open("x", encoding="utf-8"))
+            except FileExistsError:
+                print(f"Batch output already exists: {out_path}. Choose a new --output-jsonl path.", file=sys.stderr)
+                return 2
+            except OSError as exc:
+                print(f"Cannot open batch output {out_path}: {exc}", file=sys.stderr)
+                return 2
 
-    outcomes = ctrl.map_jobs(
-        jobs,
-        retries=args.retries,
-        tags=tags,
-        wait_for_ready_sec=args.wait_ready,
-        on_result=_on_result,
-        target=getattr(args, "target", "auto") or "auto",
-        workload_hint=getattr(args, "workload", "") or "",
-    )
+        def _on_result(o: JobOutcome, done: int, total: int) -> None:
+            if jsonl is not None:
+                jsonl.write(json.dumps(o.to_dict()) + "\n")
+                jsonl.flush()
+            if args.quiet:
+                return
+            tag = "OK" if o.ok else f"FAIL({o.returncode})"
+            if o.outcome_unknown:
+                tag = "UNKNOWN"
+            tier_col = f"T{o.node_tier}:{o.node_pool}" if o.node_tier else "-"
+            first_line = (o.stdout.strip().splitlines()[0] if o.stdout.strip() else o.error or "")[:80]
+            print(f"[{done}/{total}] {tag:9s} {o.node_id:7s} {tier_col:11s} {o.duration_sec:5.2f}s | {o.label[:36]} -> {first_line}")
+
+        outcomes = ctrl.map_jobs(
+            jobs,
+            retries=args.retries,
+            tags=tags,
+            wait_for_ready_sec=args.wait_ready,
+            on_result=_on_result,
+            target=getattr(args, "target", "auto") or "auto",
+            workload_hint=getattr(args, "workload", "") or "",
+            retry_unknown=args.retry_unknown,
+        )
     wall = round(time.monotonic() - t0, 2)
 
-    if args.output_jsonl:
-        out_p = Path(args.output_jsonl)
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        with out_p.open("w", encoding="utf-8") as fh:
-            for o in outcomes:
-                fh.write(json.dumps(o.to_dict()) + "\n")
-
     ok_count = sum(1 for o in outcomes if o.ok)
-    fail_count = len(outcomes) - ok_count
+    unknown_count = sum(1 for o in outcomes if o.outcome_unknown)
+    fail_count = len(outcomes) - ok_count - unknown_count
     per_node: dict[str, int] = {}
     for o in outcomes:
         per_node[o.node_id] = per_node.get(o.node_id, 0) + 1
     dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(per_node.items()))
     print(
         f"\nCompleted {len(outcomes)} jobs in {wall}s | "
-        f"OK={ok_count} FAIL={fail_count} | Distribution: {dist_str}"
+        f"OK={ok_count} FAIL={fail_count} UNKNOWN={unknown_count} | Distribution: {dist_str}"
     )
     if args.output_jsonl:
         print(f"Full results saved to: {args.output_jsonl}")
-    return 0 if fail_count == 0 else 1
+    return 0 if ok_count == len(outcomes) else 1
 
 
 def _cmd_distcc_env(args: argparse.Namespace) -> int:
@@ -614,7 +635,10 @@ def _cmd_docker(args: argparse.Namespace) -> int:
         if res.get("error"):
             print(f"Manager Error : {res['error']}", file=sys.stderr)
         for w in res.get("workers") or []:
-            st = "OK (already active)" if w.get("already_active") else ("JOINED" if w.get("ok") else f"FAILED: {w.get('error')}")
+            if w.get("ok"):
+                st = "OK (already joined)" if w.get("already_active") else "JOINED"
+            else:
+                st = f"FAILED: {w.get('error')}"
             print(f"  Worker {w.get('node_id')}: {st}")
         if res.get("note"):
             print(f"\nNote: {res['note']}")
@@ -625,10 +649,9 @@ def _cmd_docker(args: argparse.Namespace) -> int:
             index=0,
             job_id=f"docker-ps-{uuid.uuid4().hex[:6]}",
             command='docker ps -a --format "table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}"',
-            workload_hint="docker",
             timeout_sec=args.timeout,
         )
-        outcomes = ctrl.run_single(spec, target=args.target or "all")
+        outcomes = ctrl.run_single(spec, target=args.target or "tier:3", workload_hint="docker")
         if args.json:
             print(json.dumps([o.to_dict() for o in outcomes], indent=2))
             return 0 if any(o.ok for o in outcomes) else 1
@@ -688,24 +711,26 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
             if not ready:
                 print("No authorized ADB phones found on USB hub. Run `adb devices` and approve USB debugging.", file=sys.stderr)
                 return 1
+            cfg_path = resolve_config_path(args.config)
+            cfg = load_config(cfg_path) if cfg_path.exists() or (args.write_config and not args.dry_run) else None
             plan = plan_adb_usb_hub(
                 ready,
                 worker_base_port=args.worker_base_port,
                 ssh_base_port=args.ssh_base_port,
+                remote_worker_port=args.remote_worker_port,
                 remote_ssh_port=args.remote_ssh_port,
                 gateway_port=args.gateway_port,
                 enable_gateway_reverse=not args.no_gateway_reverse,
                 enable_peer_mesh=not args.no_peer_mesh,
+                existing_nodes=cfg.nodes if cfg is not None else None,
             )
             apply_res = (
-                {"ok": True, "dry_run": True, "applied": 0, "failed": 0, "errors": []}
+                {"ok": True, "dry_run": True, "applied": 0, "unchanged": 0, "failed": 0, "errors": []}
                 if args.dry_run
                 else apply_adb_usb_hub(plan)
             )
             updated: list[str] = []
-            if args.write_config and not args.dry_run:
-                cfg_path = resolve_config_path(args.config)
-                cfg = load_config(cfg_path)
+            if args.write_config and not args.dry_run and apply_res.get("ok") and cfg is not None:
                 updated = sync_usb_hub_into_config(cfg, plan)
                 save_config(cfg, cfg_path)
             out = {"plan": plan, "apply": apply_res, "updated_nodes": updated}
@@ -716,11 +741,13 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
             for n in plan["nodes"]:
                 print(f"  - {n['node_id']} ({n['serial']}) -> 127.0.0.1:{n['worker_port']} (worker), 127.0.0.1:{n['ssh_port']} (ssh)")
             if args.dry_run:
-                print("(dry-run: no adb commands executed)")
+                print("(dry-run: tunnel changes previewed)")
             else:
-                print(f"Applied {apply_res['applied']} tunnel rule(s), {apply_res['failed']} failed.")
+                print(f"Created {apply_res['applied']} tunnel rule(s), {apply_res.get('unchanged', 0)} already matched, {apply_res['failed']} failed.")
                 for err in apply_res.get("errors") or []:
                     print(f"  ERR: {err}", file=sys.stderr)
+                if args.write_config and not apply_res.get("ok"):
+                    print("Cluster config was not saved because tunnel setup failed.", file=sys.stderr)
             if updated:
                 print(f"Saved USB hub nodes into config: {', '.join(updated)}")
             return 0 if apply_res.get("ok") else 1
@@ -762,14 +789,17 @@ def _cmd_usb_hub(args: argparse.Namespace) -> int:
         if not math.isfinite(args.interval) or args.interval < 1.0 or args.interval > 3600.0:
             print(f"Error: --interval must be between 1 and 3600 seconds (got {args.interval})", file=sys.stderr)
             return 2
+        cfg_path = resolve_config_path(args.config)
         wd = UsbHubWatchdog(
             interval_sec=args.interval,
             worker_base_port=args.worker_base_port,
             ssh_base_port=args.ssh_base_port,
+            remote_worker_port=args.remote_worker_port,
             remote_ssh_port=args.remote_ssh_port,
             gateway_port=args.gateway_port,
             enable_gateway_reverse=not args.no_gateway_reverse,
             enable_peer_mesh=not args.no_peer_mesh,
+            config_path=cfg_path if cfg_path.exists() else None,
         )
         res = wd.sync_once()
         print(
@@ -1217,7 +1247,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
 
 
 def _cmd_wizard(args: argparse.Namespace) -> int:
-    return run_setup_wizard(args.config)
+    return run_setup_wizard(args.config, master_id=args.master_id)
 
 
 def _cmd_menu(args: argparse.Namespace) -> int:
@@ -1320,9 +1350,25 @@ def _cmd_token(args: argparse.Namespace) -> int:
     cfg_path = resolve_config_path(args.config)
     cfg = load_config(cfg_path)
     if args.rotate:
+        if not any(n.role == "master" for n in cfg.nodes):
+            raise ValueError("Rotate credentials using the Master config, then run pc sync.")
+        repairs = cfg.workers_needing_tokens()
+        retired = {n.auth_token for n in repairs} | {cfg.auth_token}
+        for n in repairs:
+            n.auth_token = generate_auth_token()
+        for n in cfg.nodes:
+            if n.role == "master" and n.auth_token in retired:
+                n.auth_token = ""
         cfg.auth_token = generate_auth_token()
         save_config(cfg, cfg_path)
-        print(f"Rotated auth_token in {cfg_path}. Run `pc sync` to update worker phones.", file=sys.stderr)
+        if repairs:
+            print("Provisioned individual tokens for " + ", ".join(n.id for n in repairs), file=sys.stderr)
+        print(
+            f"Rotated auth_token in {cfg_path}. On the Master, run `pc sync --skip-node <master-id>` "
+            "to sync remote workers. Drain jobs and restart the local worker if enabled, "
+            "the dashboard, and any separately running gateway to load the new credentials.",
+            file=sys.stderr,
+        )
     print(cfg.auth_token)
     return 0
 
@@ -1382,12 +1428,20 @@ def _cmd_copy(args: argparse.Namespace) -> int:
 
 def _cmd_push_config(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
+    if args.node_id:
+        try:
+            cfg.get_node(args.node_id)
+        except KeyError:
+            print(f"Unknown node ID '{args.node_id}'. Check pc status.", file=sys.stderr)
+            return 2
     ctrl = MasterController(cfg)
     node_ids = [args.node_id] if args.node_id else None
     res = ctrl.push_config_to_all(node_ids=node_ids)
+    required_count = res["persisted_count"] if args.require_persisted else res["ok_count"]
+    status = 0 if required_count == res["total"] else 1
     if args.json:
         print(json.dumps(res, indent=2))
-        return 0 if res["ok_count"] == res["total"] else 1
+        return status
     rows = [
         [
             r["node_id"],
@@ -1400,22 +1454,29 @@ def _cmd_push_config(args: argparse.Namespace) -> int:
         for r in res["results"]
     ]
     print(_fmt_table(["NODE", "STATUS", "MAX-JOBS", "TEMP-LIMIT", "IP-LOCK", "DETAIL"], rows))
-    print(f"\nLive policy pushed to {res['ok_count']}/{res['total']} node(s) over authenticated HTTP.")
-    return 0 if res["ok_count"] == res["total"] else 1
+    print(
+        f"\nPolicy applied on {res['ok_count']}/{res['total']} nodes. "
+        f"Saved to disk on {res['persisted_count']}/{res['total']}."
+    )
+    return status
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
     cfg_path = resolve_config_path(args.config).resolve()
-    script = REPO_ROOT / "scripts" / "03_sync_cluster.sh"
-    if not script.exists():
-        print(f"Error: sync script not found at {script}", file=sys.stderr)
+    script = bundled_script("03_sync_cluster.sh")
+    if script is None:
+        print("Error: sync files are missing. Reinstall PhoneCluster or run pc from its checkout.", file=sys.stderr)
         return 2
     cmd = ["bash", str(script), "--config", str(cfg_path)]
     if args.setup_keys:
         cmd.append("--setup-keys")
     if args.skip_node:
         cmd.extend(["--skip-node", args.skip_node])
-    return subprocess.call(cmd, cwd=str(REPO_ROOT))
+    for node_id in args.node_id:
+        cmd.extend(["--node-id", node_id])
+    if args.dry_run:
+        cmd.append("--dry-run")
+    return subprocess.call(cmd, env={**os.environ, "PHONECLUSTER_MODULE_ROOT": str(REPO_ROOT)})
 
 
 def _cmd_pools(args: argparse.Namespace) -> int:
@@ -1520,6 +1581,9 @@ def _cmd_pipeline(args: argparse.Namespace) -> int:
 
 
 def _cmd_update(args: argparse.Namespace) -> int:
+    if not (REPO_ROOT / ".git").exists() or not (REPO_ROOT / "install.sh").is_file():
+        print("Use the package manager that installed PhoneCluster to update it, then run pc sync.", file=sys.stderr)
+        return 2
     print(f"Updating PhoneCluster in {REPO_ROOT}...")
     rc = subprocess.call(["git", "-C", str(REPO_ROOT), "pull", "--ff-only"])
     if rc != 0:
@@ -1590,6 +1654,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # wizard
     p_wiz = sub.add_parser("wizard", help="Guided interactive setup wizard (easiest way to configure)")
+    p_wiz.add_argument("--master-id", default="node0", help="Master node ID used for its local worker (default: node0)")
     p_wiz.set_defaults(func=_cmd_wizard)
 
     # menu
@@ -1680,7 +1745,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # token
     p_tok = sub.add_parser("token", help="Show (or rotate) the cluster auth_token for unlocking the Web UI")
-    p_tok.add_argument("--rotate", action="store_true", help="Generate and save a fresh auth_token")
+    p_tok.add_argument("--rotate", action="store_true", help="Rotate the Master token and provision missing or shared worker tokens")
     p_tok.set_defaults(func=_cmd_token)
 
     # ssh & copy
@@ -1701,6 +1766,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Push live safety, concurrency, and Master-IP allowlist policy to online workers over HTTP (no SSH needed)",
     )
     p_push.add_argument("--node-id", default="", help="Optional single node ID to push to (default: all)")
+    p_push.add_argument("--require-persisted", action="store_true", help="Fail unless all selected nodes save the policy to disk")
     p_push.add_argument("--json", action="store_true", help="Output raw JSON")
     p_push.set_defaults(func=_cmd_push_config)
 
@@ -1708,6 +1774,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync = sub.add_parser("sync", help="Push code & cluster.json to all phones and restart workers")
     p_sync.add_argument("--setup-keys", action="store_true", help="Copy SSH keys with ssh-copy-id first")
     p_sync.add_argument("--skip-node", default="", help="Skip syncing one node ID (e.g. node0)")
+    p_sync.add_argument("--node-id", action="append", default=[], help="Sync only this node (repeat for multiple nodes)")
+    p_sync.add_argument("--dry-run", action="store_true", help="Preview selected nodes without SSH or key setup")
     p_sync.set_defaults(func=_cmd_sync)
 
     p_upd = sub.add_parser("update", help="Pull latest PhoneCluster updates from GitHub")
@@ -1750,6 +1818,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--timeout", type=float, default=0, help="Job timeout in seconds")
     p_run.add_argument("--workdir", default=None, help="Remote working directory")
     p_run.add_argument("--force", action="store_true", help="Bypass thermal/RAM gate")
+    p_run.add_argument("--retry-unknown", action="store_true", help="Allow failover after a lost result for work safe to repeat")
     p_run.add_argument("--json", action="store_true", help="Output raw JSON")
     p_run.add_argument("command", nargs="*", help="Shell command to execute")
     p_run.set_defaults(func=_cmd_run)
@@ -1772,13 +1841,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_map.add_argument("--interpreter", default=None, help="Interpreter override for --script")
     p_map.add_argument("--script-args", nargs="*", default=None, help="Args passed to --script when using --repeat")
     p_map.add_argument("--repeat", type=int, default=0, help="Repeat command or --script N times across cluster")
-    p_map.add_argument("--retries", type=int, default=1, help="Retries on thermal throttle or disconnect")
+    p_map.add_argument("--retries", type=int, default=1, help="Retries after pre-execution rejection or connection refusal")
+    p_map.add_argument("--retry-unknown", action="store_true", help="Also retry lost results for jobs safe to repeat, up to --retries")
     p_map.add_argument("--wait-ready", type=float, default=30.0, help="Seconds to wait if all nodes are hot/busy")
     p_map.add_argument("--tags", default=None, help="Comma-separated node tags filter")
     p_map.add_argument("--timeout", type=float, default=0, help="Per-job timeout in seconds")
     p_map.add_argument("--workdir", default=None, help="Remote working directory")
     p_map.add_argument("--force", action="store_true", help="Bypass thermal/RAM gate")
-    p_map.add_argument("--output-jsonl", default=None, help="Write per-job JSONL results to path")
+    p_map.add_argument("--output-jsonl", default=None, help="Write and flush results in completion order to a new file")
     p_map.add_argument("-q", "--quiet", action="store_true", help="Suppress per-job progress lines")
     p_map.add_argument("command", nargs="*", help="Shell command (used with --repeat)")
     p_map.set_defaults(func=_cmd_map)
@@ -1820,6 +1890,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_usb.add_argument("--subnet-prefix", default=DEFAULT_USB_SUBNET_PREFIX, help="Private /16 prefix for rndis /30 subnets (default: 10.77)")
     p_usb.add_argument("--worker-base-port", type=int, default=DEFAULT_ADB_WORKER_BASE_PORT, help="Base local port for ADB worker forwards (default: 18760)")
     p_usb.add_argument("--ssh-base-port", type=int, default=DEFAULT_ADB_SSH_BASE_PORT, help="Base local port for ADB SSH forwards (default: 18020)")
+    p_usb.add_argument("--remote-worker-port", type=int, default=8765, help="New ADB phones' worker listener port (default: 8765)")
     p_usb.add_argument("--remote-ssh-port", type=int, default=22, help="Phone SSH port (22 for Ubuntu Touch/Debian, 8022 for Termux)")
     p_usb.add_argument("--gateway-port", type=int, default=8888, help="Master Network Guard port for ADB reverse (default: 8888)")
     p_usb.add_argument("--no-gateway-reverse", action="store_true", help="Disable ADB reverse tunnel to Master Network Guard")
