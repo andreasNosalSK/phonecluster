@@ -381,7 +381,17 @@ class TestLiveClusterEndToEnd(unittest.TestCase):
                     self.assertEqual(data["cluster_name"], "test-redmi-cluster")
                     self.assertEqual(data["nodes_ready"], 2)
 
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/doctor", timeout=3.0) as resp:
+                # /api/doctor exposes local paths & cluster diagnostics, so it always requires auth
+                with self.assertRaises(urllib.error.HTTPError) as doc_unauth:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/doctor", timeout=3.0)
+                self.assertEqual(doc_unauth.exception.code, 401)
+                doc_unauth.exception.close()
+
+                req_doc = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/doctor",
+                    headers=build_auth_headers(self.token),
+                )
+                with urllib.request.urlopen(req_doc, timeout=3.0) as resp:
                     doc = json.loads(resp.read().decode("utf-8"))
                     self.assertIn("checks", doc)
                     names = {c["name"] for c in doc["checks"]}
@@ -1905,8 +1915,17 @@ class TestMasterNetworkGuard(unittest.TestCase):
                     self.assertIn(b"403 Forbidden", _proxy_try())
                     self.assertIn(b"429 Too Many Requests", _proxy_try())
 
-                    # 3c. GET /api/network/audit flags unexpected port 5555 & includes AdGuard/nftables guides
-                    with urllib.request.urlopen(f"http://127.0.0.1:{d_port}/api/network/audit", timeout=5.0) as resp:
+                    # 3c. GET /api/network/audit requires auth, flags unexpected port 5555 & includes AdGuard/nftables guides
+                    with self.assertRaises(urllib.error.HTTPError) as audit_unauth:
+                        urllib.request.urlopen(f"http://127.0.0.1:{d_port}/api/network/audit", timeout=5.0)
+                    self.assertEqual(audit_unauth.exception.code, 401)
+                    audit_unauth.exception.close()
+
+                    req_audit = urllib.request.Request(
+                        f"http://127.0.0.1:{d_port}/api/network/audit",
+                        headers=build_auth_headers(m_tok),
+                    )
+                    with urllib.request.urlopen(req_audit, timeout=5.0) as resp:
                         self.assertEqual(resp.headers.get("X-Frame-Options"), "DENY")
                         self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
                         audit = json.loads(resp.read().decode("utf-8"))

@@ -30,12 +30,18 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 SPARK_CHARS = " ▁▂▃▄▅▆▇█"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-_TERM_ESCAPE_RE = re.compile(r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-9;?]*[ -/]*[@-~]|[@-Z\\-_])")
-_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_TERM_ESCAPE_RE = re.compile(
+    r"(?:"
+    r"\x1b(?:\][^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)|[PX^_][^\x1b\x9c]*(?:\x1b\\|\x9c)|\[[0-9;?]*[ -/]*[@-~]|[@-Z\\-_])"
+    r"|\x9b[0-9;?]*[ -/]*[@-~]"
+    r"|[\x90\x98\x9d\x9e\x9f][^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?"
+    r")"
+)
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 
 
 def _clean_term_text(val: Any, max_len: int = 120) -> str:
-    """Strip terminal ANSI/OSC escape sequences and C0 control chars from untrusted worker text."""
+    """Strip 7-bit/8-bit ANSI/OSC/DCS/APC escapes, C0/C1 control chars, and BiDi overrides."""
     s = _TERM_ESCAPE_RE.sub("", str(val if val is not None else ""))
     return _CTRL_CHARS_RE.sub("", s)[:max_len]
 
@@ -106,12 +112,46 @@ def _visible_len(text: str) -> int:
     return len(ANSI_RE.sub("", text))
 
 
+def _truncate_ansi(text: str, width: int) -> str:
+    """Truncate `text` to `width` visible columns while preserving SGR color escapes cleanly."""
+    if width <= 0:
+        return ""
+    if _visible_len(text) <= width:
+        return text
+    limit = max(0, width - 1)
+    out: list[str] = []
+    vis = 0
+    saw_ansi = False
+    pos = 0
+    for m in ANSI_RE.finditer(text):
+        chunk = text[pos : m.start()]
+        if chunk:
+            rem = limit - vis
+            if rem <= 0:
+                break
+            if len(chunk) > rem:
+                out.append(chunk[:rem])
+                vis += rem
+                break
+            out.append(chunk)
+            vis += len(chunk)
+        out.append(m.group(0))
+        saw_ansi = True
+        pos = m.end()
+    else:
+        tail = text[pos:]
+        if tail and vis < limit:
+            out.append(tail[: limit - vis])
+    out.append("…")
+    if saw_ansi:
+        out.append("\033[0m")
+    return "".join(out)
+
+
 def _pad_visible(text: str, width: int) -> str:
     vis = _visible_len(text)
     if vis > width:
-        # Strip ANSI only when truncation is necessary so escape codes stay balanced
-        plain = ANSI_RE.sub("", text)
-        return plain[: max(0, width - 1)] + ("…" if width >= 1 else "")
+        return _truncate_ansi(text, width)
     return text + (" " * (width - vis))
 
 
@@ -163,7 +203,8 @@ def make_core_bars(per_core: list[float], pal: Palette) -> str:
     if not per_core:
         return ""
     blocks: list[str] = []
-    for pct in per_core[:16]:
+    for raw_pct in per_core[:16]:
+        pct = _safe_num(raw_pct, 0.0)
         idx = int(round(max(0.0, min(100.0, pct)) / 100.0 * (len(SPARK_CHARS) - 1)))
         ch = SPARK_CHARS[max(1, idx)]
         if pct >= 85:
@@ -191,8 +232,71 @@ def _box_lines(title: str, body_lines: list[str], width: int, pal: Palette) -> l
     return out
 
 
+_TUI_SORT_MODES = ("config", "cpu", "temp", "ram", "jobs")
+
+
+def _sort_nodes_for_tui(nodes: list[dict[str, Any]], sort_by: str = "config") -> list[dict[str, Any]]:
+    """Return nodes sorted consistently between `render_top_frame()` and `run_top_tui()`."""
+    if sort_by == "config" or sort_by not in _TUI_SORT_MODES:
+        return list(nodes)
+
+    def _key(n: dict[str, Any]) -> tuple[int, float, str]:
+        online = 1 if n.get("online") else 0
+        h = n.get("health") if isinstance(n.get("health"), dict) else {}
+        nid = str(n.get("id", ""))
+        if sort_by == "cpu":
+            return (online, _safe_num(h.get("cpu_pct"), -1.0), nid)
+        if sort_by == "temp":
+            return (online, _safe_num(h.get("temp_c"), -1.0), nid)
+        if sort_by == "ram":
+            tot = max(0, _safe_int(h.get("mem_total_mb", 0), 0))
+            avail = max(0, _safe_int(h.get("mem_available_mb", 0), 0))
+            pct = ((max(0, tot - avail) / tot) * 100.0) if tot > 0 else -1.0
+            return (online, pct, nid)
+        if sort_by == "jobs":
+            return (online, float(_safe_int(h.get("active_jobs", 0), 0)), nid)
+        return (online, 0.0, nid)
+
+    return sorted(nodes, key=_key, reverse=True)
+
+
+def _build_node_inspect_banner(node: dict[str, Any], all_jobs: list[dict[str, Any]]) -> str:
+    """Build a concise sanitized diagnostic summary for the selected phone (`i` key)."""
+    nid = _clean_term_text(node.get("id", "?"), 24)
+    host = _clean_term_text(node.get("host", "?"), 40)
+    tier = _safe_int(node.get("tier", 1), 1) or 1
+    pool = _clean_term_text(node.get("pool", "compute"), 20)
+    lines = [f"Inspect {nid} ({host}) · T{tier}:{pool} · role={_clean_term_text(node.get('role', 'worker'), 12)}"]
+    if not node.get("online"):
+        lines.append(f"  Status: OFFLINE — {_clean_term_text(node.get('error', 'unreachable'), 90)}")
+        return "\n".join(lines)
+    h = node.get("health") if isinstance(node.get("health"), dict) else {}
+    reasons = h.get("not_ready_reasons") if isinstance(h.get("not_ready_reasons"), list) else []
+    st = "QUARANTINED" if node.get("quarantined") else ("READY" if node.get("ready_for_jobs") else "PAUSED: " + ", ".join(_clean_term_text(r, 24) for r in reasons))
+    disk_gb = _safe_num(h.get("disk_free_gb"), -1.0)
+    disk_txt = f"{disk_gb:.1f}GB free" if disk_gb >= 0 else "N/A"
+    bat_h = _clean_term_text(h.get("battery_health", ""), 16)
+    lines.append(f"  Status: {st} · OS={_clean_term_text(h.get('os_env', 'linux'), 16)} · Disk={disk_txt}" + (f" · BatHealth={bat_h}" if bat_h else ""))
+    notes = _clean_term_text(node.get("notes", ""), 80)
+    if notes:
+        lines.append(f"  Notes: {notes}")
+    raw_ports = h.get("listening_ports")
+    if isinstance(raw_ports, list) and raw_ports:
+        p_nums = sorted({_safe_int(p.get("port"), 0) for p in raw_ports if isinstance(p, dict) and 1 <= _safe_int(p.get("port"), 0) <= 65535})
+        if p_nums:
+            lines.append("  Open ports: " + ", ".join(str(p) for p in p_nums[:12]))
+    node_entry = next((e for e in all_jobs if isinstance(e, dict) and e.get("node_id") == node.get("id")), None)
+    active = (node_entry or {}).get("active") if isinstance(node_entry, dict) else []
+    if isinstance(active, list) and active and isinstance(active[0], dict):
+        j0 = active[0]
+        tail = _clean_term_text(j0.get("last_output", ""), 80)
+        lines.append(f"  Active [{_clean_term_text(j0.get('job_id', '?'), 20)}]: {_clean_term_text(j0.get('command', ''), 48)}" + (f" ↳ {tail}" if tail else ""))
+    return "\n".join(lines[:5])
+
+
 def _tier_badge(tier: int, pool: str, pal: Palette) -> str:
-    label = f"T{tier}:{pool}"
+    clean_pool = _clean_term_text(pool, 20) or "compute"
+    label = f"T{tier}:{clean_pool}"
     if tier == 3:
         return pal.warn(label)
     if tier == 2:
@@ -215,12 +319,16 @@ def render_top_frame(
     height: int | None = None,
     use_color: bool = True,
     pool_filter: str = "all",
+    show_help: bool = False,
+    sort_by: str = "config",
 ) -> str:
     """Render one complete multi-device btop frame as a string."""
     pal = Palette(enabled=use_color)
     term_sz = shutil.get_terminal_size((100, 32))
     cols = max(36, min(140, int(width))) if width is not None else max(36, min(140, term_sz.columns))
     rows_avail = max(14, int(height)) if height is not None else max(14, term_sz.lines)
+    compact = cols < 78
+    clean_pool_filter = _clean_term_text(pool_filter or "all", 24) or "all"
 
     # 1. Unified Cluster Overview Header ("One Computer" btop summary)
     cluster_hist = history.get("cluster", []) if isinstance(history, dict) else []
@@ -258,15 +366,21 @@ def render_top_frame(
     cpu_bar_w = 8 if cols < 64 else (12 if cols < 100 else 16)
     mem_bar_w = 8 if cols < 64 else (12 if cols < 100 else 16)
 
+    nodes_ready_i = max(0, _safe_int(summary.get("nodes_ready", 0), 0))
+    nodes_total_i = max(0, _safe_int(summary.get("nodes_total", 0), 0))
+    tasks_i = max(0, _safe_int(summary.get("total_active_jobs", 0), 0))
+    avg_lat = max(0.0, _safe_num(summary.get("avg_latency_ms", 0.0), 0.0))
+    total_cores_i = max(0, _safe_int(summary.get("total_cores", 0), 0))
+
     top_row = (
         f"{pal.purple(_clean_term_text(summary.get('cluster_name', 'phonecluster'), 36))}  "
         f"{live_tag}  "
-        f"Ready: {pal.ok(str(summary.get('nodes_ready', 0)))}/{summary.get('nodes_total', 0)}  "
-        f"Tasks: {pal.accent(str(summary.get('total_active_jobs', 0)))}  "
-        f"Ping: {pal.dim(str(summary.get('avg_latency_ms', 0.0)) + 'ms')}  "
+        f"Ready: {pal.ok(str(nodes_ready_i))}/{nodes_total_i}  "
+        f"Tasks: {pal.accent(str(tasks_i))}  "
+        f"Ping: {pal.dim(f'{avg_lat:.1f}ms')}  "
         f"{pal.dim(time.strftime('%H:%M:%S'))}"
     )
-    cpu_part = f"CPU  {pal.bold(f'{cpu_pct:5.1f}%')} {make_bar(cpu_pct, cpu_bar_w, pal)} {spark_cluster} ({summary.get('total_cores', 0)}c)"
+    cpu_part = f"CPU  {pal.bold(f'{cpu_pct:5.1f}%')} {make_bar(cpu_pct, cpu_bar_w, pal)} {spark_cluster} ({total_cores_i}c)"
     mem_part = f"MEM  {pal.bold(f'{ram_pct:4.1f}%')} {make_bar(ram_pct, mem_bar_w, pal)} {mem_used_gb:.2f}/{mem_tot_gb:.2f} GB"
     meta_row = (
         f"TEMP Peak {temp_styled} (limit {max_temp_limit:.0f}°C)   "
@@ -279,25 +393,34 @@ def render_top_frame(
         header_lines = [top_row, cpu_part, mem_part, meta_row]
 
     # Show heterogeneous Tier/Pool overview & live cross-tier Service Mesh in header
-    pools = summary.get("pools") or []
+    pools = summary.get("pools") if isinstance(summary.get("pools"), list) else []
     if pools:
         pool_chips: list[str] = []
         for p in pools:
-            badge = _tier_badge(int(p.get("tier", 1)), str(p.get("pool", "compute")), pal)
-            chip = f"{badge} {p.get('nodes_ready', 0)}/{p.get('nodes_total', 0)} ({p.get('total_cores', 0)}c)"
-            pool_chips.append(chip)
-        header_lines.append("POOLS " + " · ".join(pool_chips))
+            if not isinstance(p, dict):
+                continue
+            badge = _tier_badge(_safe_int(p.get("tier", 1), 1) or 1, str(p.get("pool", "compute")), pal)
+            p_ready = max(0, _safe_int(p.get("nodes_ready", 0), 0))
+            p_tot = max(0, _safe_int(p.get("nodes_total", 0), 0))
+            p_cores = max(0, _safe_int(p.get("total_cores", 0), 0))
+            pool_chips.append(f"{badge} {p_ready}/{p_tot} ({p_cores}c)")
+        if pool_chips:
+            header_lines.append("POOLS " + " · ".join(pool_chips))
 
-    svcs_reg = summary.get("services_registry") or []
+    svcs_reg = summary.get("services_registry") if isinstance(summary.get("services_registry"), list) else []
     if svcs_reg:
         svc_items: list[str] = []
         seen_svc: set[tuple[str, str]] = set()
         for entry in svcs_reg:
-            pair = (str(entry.get("name", "")), str(entry.get("node_id", "")))
-            if pair in seen_svc:
+            if not isinstance(entry, dict):
+                continue
+            s_name = _clean_term_text(entry.get("name", ""), 24)
+            s_node = _clean_term_text(entry.get("node_id", ""), 20)
+            pair = (s_name, s_node)
+            if not s_name or pair in seen_svc:
                 continue
             seen_svc.add(pair)
-            svc_items.append(f"{pal.ok(pair[0])}@{pair[1]}")
+            svc_items.append(f"{pal.ok(s_name)}@{s_node}")
             if len(svc_items) >= 6:
                 break
         if svc_items:
@@ -306,12 +429,27 @@ def render_top_frame(
     frames: list[str] = []
     frames.extend(_box_lines("PHONECLUSTER · UNIFIED MULTI-DEVICE BTOP", header_lines, cols, pal))
 
+    if show_help:
+        help_lines = [
+            f"{pal.accent('[↑/↓ or j/k]')} Select phone       {pal.accent('[o]')} Cycle sort (config/cpu/temp/ram/jobs)",
+            f"{pal.accent('[x]')} Auto-Route command        {pal.accent('[p]')} Filter by Tier/Pool",
+            f"{pal.accent('[r]')} Run on selected phone     {pal.accent('[a]')} Broadcast command to all ready",
+            f"{pal.accent('[i]')} Inspect selected phone    {pal.accent('[s]')} Interactive SSH to selected phone",
+            f"{pal.accent('[c]')} Cancel running job        {pal.accent('[d]')} Toggle Tasks / Shared Processes",
+            f"{pal.accent('[f]')} Force immediate refresh   {pal.accent('[+/-]')} Faster / slower refresh rate",
+            f"{pal.accent('[Space]')} Pause / Resume        {pal.accent('[Esc/?]')} Close help / clear banner   {pal.accent('[q]')} Quit",
+        ]
+        frames.extend(_box_lines("KEYBINDINGS & SHORTCUTS (press ? or Esc to close)", help_lines, cols, pal))
+        return "\n".join(frames)
+
     # 2. Per-Device Shared btop Panel (height-aware viewport anchored around selected_idx)
-    all_nodes = summary.get("nodes", [])
+    raw_all_nodes = summary.get("nodes", [])
+    all_nodes = [n for n in raw_all_nodes if isinstance(n, dict)] if isinstance(raw_all_nodes, list) else []
     if pool_filter and pool_filter != "all":
-        nodes = [n for n in all_nodes if str(n.get("pool", "")) == pool_filter]
+        filtered_nodes = [n for n in all_nodes if str(n.get("pool", "")) == pool_filter]
     else:
-        nodes = all_nodes
+        filtered_nodes = all_nodes
+    nodes = _sort_nodes_for_tui(filtered_nodes, sort_by=sort_by)
     node_hist_map = history.get("nodes", {}) if isinstance(history, dict) else {}
     est_bottom_rows = (5 if last_command_banner else 0) + 10
     dev_row_budget = max(4, rows_avail - len(frames) - est_bottom_rows)
@@ -331,22 +469,28 @@ def render_top_frame(
     for pos, (idx, n) in enumerate(visible_pairs):
         is_sel = idx == selected_idx
         pointer = pal.sel_bg("▶") if is_sel else " "
-        h = n.get("health") or {}
+        h = n.get("health") if isinstance(n.get("health"), dict) else {}
         role_badge = pal.purple("MASTER") if n.get("role") == "master" else pal.dim("WORKER")
         tier_num = _safe_int(n.get("tier", 1), 1) or 1
-        pool_name = str(n.get("pool", "compute") or "compute")
+        pool_name = _clean_term_text(n.get("pool", "compute") or "compute", 20) or "compute"
         t_badge = _tier_badge(tier_num, pool_name, pal)
-        nid_styled = pal.sel_bg(f"{n['id']:<6s}") if is_sel else pal.bold(f"{n['id']:<6s}")
+        nid_clean = _clean_term_text(n.get("id", "?"), 20) or "?"
+        nid_styled = pal.sel_bg(f"{nid_clean:<6s}") if is_sel else pal.bold(f"{nid_clean:<6s}")
         n_tags = n.get("tags") if isinstance(n.get("tags"), list) else []
-        host_disp = str(n.get("host", ""))
+        host_disp = _clean_term_text(n.get("host", ""), 40)
         if host_disp == "127.0.0.1" and ("usb-mode:adb" in n_tags or "usb-hub" in n_tags):
-            host_disp = f"usb:{n.get('worker_port', '')}"
+            wp = _safe_int(n.get("worker_port", 0), 0)
+            host_disp = f"usb:{wp if wp > 0 else ''}"
 
         if not n.get("online"):
             err = _clean_term_text(n.get("error", "unreachable"), 42)
-            device_lines.append(
-                f"{pointer} {nid_styled} [{role_badge} {t_badge}] {host_disp:<15s}  {pal.bad('✕ OFFLINE')}  {pal.dim(err)}"
-            )
+            off_badge = pal.bad("✕ QUAR·OFF") if n.get("quarantined") else pal.bad("✕ OFFLINE")
+            if compact:
+                device_lines.append(f"{pointer} {nid_styled} [{t_badge}] {host_disp} {off_badge}")
+            else:
+                device_lines.append(
+                    f"{pointer} {nid_styled} [{role_badge} {t_badge}] {host_disp:<15s}  {off_badge}  {pal.dim(err)}"
+                )
             continue
 
         if n.get("quarantined"):
@@ -365,33 +509,39 @@ def render_top_frame(
         up_s = _format_uptime(_safe_int(up_raw, 0) if up_raw is not None else None)
         os_s = _clean_term_text(h.get("os_env", "linux"), 10)
         lat_txt = f"{_safe_num(n.get('latency_ms', 0), 0.0):.1f}ms"
-        device_lines.append(
-            f"{pointer} {nid_styled} [{role_badge} {t_badge}] {host_disp:<15s} {pal.dim(f'{os_s:<10s}')} "
-            f"up {up_s:<6s} {st_badge}  {pal.dim(lat_txt)}"
-        )
+        if compact:
+            device_lines.append(f"{pointer} {nid_styled} [{t_badge}] {host_disp} {st_badge}")
+        else:
+            device_lines.append(
+                f"{pointer} {nid_styled} [{role_badge} {t_badge}] {host_disp:<15s} {pal.dim(f'{os_s:<10s}')} "
+                f"up {up_s:<6s} {st_badge}  {pal.dim(lat_txt)}"
+            )
 
         # CPU + sparkline + per-core bars + RAM
         n_cpu = min(100.0, max(0.0, _safe_num(h.get("cpu_pct"), 0.0)))
-        n_hist = [_safe_num(p.get("cpu_pct", 0.0), 0.0) for p in node_hist_map.get(n["id"], []) if isinstance(p, dict)]
-        n_spark = pal.cyan(make_sparkline(n_hist, width=10, max_val=100.0))
+        n_hist = [_safe_num(p.get("cpu_pct", 0.0), 0.0) for p in node_hist_map.get(n.get("id", ""), []) if isinstance(p, dict)]
+        n_spark = pal.cyan(make_sparkline(n_hist, width=8 if compact else 10, max_val=100.0))
         raw_pc = h.get("per_core_pct")
         per_core_clean = [_safe_num(x, 0.0) for x in raw_pc] if isinstance(raw_pc, list) else []
-        cores_vis = make_core_bars(per_core_clean, pal)
+        cores_vis = "" if cols < 64 else make_core_bars(per_core_clean, pal)
         mem_tot = max(0, _safe_int(h.get("mem_total_mb", 0), 0))
         mem_avail = max(0, _safe_int(h.get("mem_available_mb", 0), 0))
         mem_used = max(0, mem_tot - mem_avail)
         mem_pct = (mem_used / mem_tot) * 100.0 if mem_tot else 0.0
-        device_lines.append(
-            f"    CPU {n_cpu:5.1f}% {n_spark} {cores_vis}  "
-            f"RAM {make_bar(mem_pct, 10, pal)} {mem_used}/{mem_tot}MB ({mem_pct:4.0f}%)"
-        )
+        if cols < 72:
+            device_lines.append(f"  CPU {n_cpu:4.0f}% {n_spark}  RAM {mem_pct:3.0f}% ({mem_used}/{mem_tot}M)")
+        else:
+            device_lines.append(
+                f"    CPU {n_cpu:5.1f}% {n_spark} {cores_vis}  "
+                f"RAM {make_bar(mem_pct, 10, pal)} {mem_used}/{mem_tot}MB ({mem_pct:4.0f}%)"
+            )
 
         # Temp + Battery + Net + Services
         temp_raw = h.get("temp_c")
         temp_v = _safe_num(temp_raw, -999.0) if temp_raw is not None else None
         if temp_v is not None and temp_v <= -500.0:
             temp_v = None
-        t_bar = make_bar((temp_v / 50.0) * 100.0, 8, pal, warn_at=(max_temp_limit - 3) * 2, bad_at=max_temp_limit * 2) if temp_v is not None else pal.dim("────────")
+        t_bar = make_bar((temp_v / 50.0) * 100.0, 6 if compact else 8, pal, warn_at=(max_temp_limit - 3) * 2, bad_at=max_temp_limit * 2) if temp_v is not None else pal.dim("──────" if compact else "────────")
         t_txt = f"{temp_v:4.1f}°C" if temp_v is not None else "  N/A "
 
         bat_raw = h.get("battery_pct")
@@ -412,35 +562,42 @@ def render_top_frame(
         net_txt = f"↓{rx_v:.0f} ↑{tx_v:.0f}KB/s" if rx_v >= 0.0 and tx_v >= 0.0 else ""
         raw_svcs = h.get("services") if isinstance(h, dict) else None
         svcs = ",".join(_clean_term_text(k.split("_")[0], 20) for k, v in (raw_svcs.items() if isinstance(raw_svcs, dict) else ()) if v)
-        device_lines.append(
-            f"    TMP {t_txt} {t_bar}  BAT {bat_txt}  "
-            f"{pal.cyan(net_txt)}  {pal.dim(svcs)}"
-        )
+        if compact:
+            device_lines.append(f"  TMP {t_txt} {t_bar} BAT {bat_txt} {pal.dim(svcs)}")
+        else:
+            device_lines.append(
+                f"    TMP {t_txt} {t_bar}  BAT {bat_txt}  "
+                f"{pal.cyan(net_txt)}  {pal.dim(svcs)}"
+            )
 
-        # Show inline running task or top processes briefly
+        # Show inline running task + live last_output preview
         raw_active = h.get("active_job_list")
         active_list = [j for j in raw_active if isinstance(j, dict)] if isinstance(raw_active, list) else []
         if active_list:
-            running_txt = " · ".join(
-                f"[{_clean_term_text(j.get('job_id', '?'), 20)} {_safe_num(j.get('running_sec', 0), 0.0):.1f}s] "
-                f"{_clean_term_text(j.get('command', ''), 28)}"
-                for j in active_list[:2]
-            )
-            device_lines.append(f"    {pal.accent('RUN')} {running_txt}")
+            run_chunks: list[str] = []
+            for j in active_list[:2]:
+                tail = _clean_term_text(j.get("last_output", ""), 32)
+                tail_s = f" ↳ {tail}" if tail else ""
+                run_chunks.append(
+                    f"[{_clean_term_text(j.get('job_id', '?'), 20)} {_safe_num(j.get('running_sec', 0), 0.0):.1f}s] "
+                    f"{_clean_term_text(j.get('command', ''), 28)}{tail_s}"
+                )
+            device_lines.append(f"    {pal.accent('RUN')} " + " · ".join(run_chunks))
 
         if pos < len(visible_pairs) - 1:
             device_lines.append(pal.border("  " + "·" * max(10, cols - 8)))
 
     if not device_lines:
         if pool_filter and pool_filter != "all":
-            device_lines.append(pal.dim(f"No phones in pool '{pool_filter}' — press [p] to show all."))
+            device_lines.append(pal.dim(f"No phones in pool '{clean_pool_filter}' — press [p] to show all."))
         else:
             device_lines.append(pal.dim("No nodes configured in cluster.json."))
 
+    sort_note = f" · SORT:{sort_by.upper()}" if sort_by != "config" and sort_by in _TUI_SORT_MODES else ""
     dev_title = (
-        f"DEVICES · SHARED CLUSTER VIEW{scroll_note}"
+        f"DEVICES · SHARED CLUSTER VIEW{sort_note}{scroll_note}"
         if not pool_filter or pool_filter == "all"
-        else f"DEVICES · POOL FILTER: {pool_filter.upper()}{scroll_note} (press 'p' for all)"
+        else f"DEVICES · POOL FILTER: {clean_pool_filter.upper()}{sort_note}{scroll_note} (press 'p' for all)"
     )
     frames.extend(_box_lines(dev_title, device_lines, cols, pal))
 
@@ -452,8 +609,8 @@ def render_top_frame(
         for n in nodes:
             if not n.get("online"):
                 continue
-            nid_col = pal.bold(f"{n['id']:<6s}")
-            raw_procs = (n.get("health") or {}).get("top_processes")
+            nid_col = pal.bold(f"{_clean_term_text(n.get('id', '?'), 16):<6s}")
+            raw_procs = (n.get("health") or {}).get("top_processes") if isinstance(n.get("health"), dict) else None
             for p in (raw_procs if isinstance(raw_procs, list) else []):
                 if not isinstance(p, dict):
                     continue
@@ -471,13 +628,17 @@ def render_top_frame(
         active_rows: list[str] = []
         recent_rows: list[str] = []
         for node_jobs in all_jobs:
+            if not isinstance(node_jobs, dict):
+                continue
             nid = _clean_term_text(node_jobs.get("node_id", "?"), 20)
             for j in (node_jobs.get("active") if isinstance(node_jobs.get("active"), list) else []):
                 if not isinstance(j, dict):
                     continue
+                tail = _clean_term_text(j.get("last_output", ""), 36)
+                tail_s = f" {pal.dim('↳ ' + tail)}" if tail else ""
                 active_rows.append(
                     f"{pal.warn('● RUN ')} {pal.bold(f'{nid:<6s}')} {_clean_term_text(j.get('job_id', '?'), 14):<14s} "
-                    f"{_safe_num(j.get('running_sec', 0), 0.0):5.1f}s  {_clean_term_text(j.get('command', ''), 44)}"
+                    f"{_safe_num(j.get('running_sec', 0), 0.0):5.1f}s  {_clean_term_text(j.get('command', ''), 38)}{tail_s}"
                 )
             for j in (node_jobs.get("recent") if isinstance(node_jobs.get("recent"), list) else [])[:3]:
                 if not isinstance(j, dict):
@@ -497,7 +658,7 @@ def render_top_frame(
                     f"{_safe_num(j.get('duration_sec', 0), 0.0):5.2f}s  {_clean_term_text(j.get('command', ''), 44)}"
                 )
         bottom_lines = (active_rows + recent_rows)[:7] or [
-            pal.dim("Idle — press [r] to run on selected phone or [a] to broadcast to all.")
+            pal.dim("Idle — press [r] to run on selected phone, [a] all, or [?] help.")
         ]
 
     frames.extend(_box_lines(panel_title, bottom_lines, cols, pal))
@@ -507,20 +668,29 @@ def render_top_frame(
         cmd_lines = [_clean_term_text(line, max_len=max(80, cols)) for line in last_command_banner.splitlines()[:5]]
         frames.extend(_box_lines("LAST COMMAND OUTPUT", cmd_lines, cols, pal))
 
-    # 5. Keybinding Footer Bar
-    footer = (
-        f" {pal.accent('[↑/↓]')} Sel  "
-        f"{pal.accent('[x]')} Auto-Run  "
-        f"{pal.accent('[p]')} Pool({pool_filter})  "
-        f"{pal.accent('[r]')} Run  "
-        f"{pal.accent('[a]')} All  "
-        f"{pal.accent('[s]')} SSH  "
-        f"{pal.accent('[c]')} Cancel  "
-        f"{pal.accent('[d]')} Tasks/Procs  "
-        f"{pal.accent('[Space]')} Pause  "
-        f"{pal.accent('[q]')} Quit"
-    )
-    frames.append(footer)
+    # 5. Keybinding Footer Bar (fits single line cleanly on narrow screens)
+    if cols < 92:
+        footer = (
+            f" {pal.accent('[↑↓]')}Sel {pal.accent('[r]')}Run {pal.accent('[a]')}All "
+            f"{pal.accent('[i]')}Info {pal.accent('[o]')}Sort {pal.accent('[p]')}Pool "
+            f"{pal.accent('[?]')}Help {pal.accent('[q]')}Quit"
+        )
+    else:
+        footer = (
+            f" {pal.accent('[↑/↓]')} Sel  "
+            f"{pal.accent('[x]')} Auto  "
+            f"{pal.accent('[p]')} Pool({clean_pool_filter})  "
+            f"{pal.accent('[o]')} Sort({sort_by})  "
+            f"{pal.accent('[r]')} Run  "
+            f"{pal.accent('[a]')} All  "
+            f"{pal.accent('[i]')} Info  "
+            f"{pal.accent('[s]')} SSH  "
+            f"{pal.accent('[c]')} Cancel  "
+            f"{pal.accent('[d]')} View  "
+            f"{pal.accent('[?]')} Help  "
+            f"{pal.accent('[q]')} Quit"
+        )
+    frames.append(_truncate_ansi(footer, cols))
     return "\n".join(frames)
 
 
@@ -633,6 +803,8 @@ def run_top_tui(
     selected_idx = 0
     view_mode = "tasks"
     pool_filter = "all"
+    sort_by = "config"
+    show_help = False
     paused = False
     last_banner = ""
     speed = max(0.5, refresh_sec)
@@ -663,17 +835,18 @@ def run_top_tui(
 
         while not stop_requested:
             now = time.monotonic()
-            if not paused and (now - last_poll >= speed):
+            if (not paused and (now - last_poll >= speed)) or last_poll == 0.0:
                 summary = controller.cluster_summary()
                 all_jobs = controller.get_all_jobs()
                 last_poll = now
 
             all_nodes = summary.get("nodes", [])
-            nodes = (
+            filtered_nodes = (
                 [n for n in all_nodes if str(n.get("pool", "")) == pool_filter]
                 if pool_filter != "all"
                 else all_nodes
             )
+            nodes = _sort_nodes_for_tui(filtered_nodes, sort_by=sort_by)
             if nodes:
                 selected_idx = max(0, min(selected_idx, len(nodes) - 1))
 
@@ -688,6 +861,8 @@ def run_top_tui(
                 last_command_banner=last_banner,
                 use_color=True,
                 pool_filter=pool_filter,
+                show_help=show_help,
+                sort_by=sort_by,
             )
             sys.stdout.write("\033[H\033[J" + frame)
             sys.stdout.flush()
@@ -699,8 +874,15 @@ def run_top_tui(
 
             if key in {"q", "Q", "\x03", "EOF"}:
                 break
+            elif key in {"?", "h", "H"}:
+                show_help = not show_help
             elif key == "ESC":
-                last_banner = ""
+                if show_help:
+                    show_help = False
+                else:
+                    last_banner = ""
+            elif show_help:
+                continue
             elif key in {"UP", "k"}:
                 if nodes:
                     selected_idx = (selected_idx - 1) % len(nodes)
@@ -709,6 +891,14 @@ def run_top_tui(
                     selected_idx = (selected_idx + 1) % len(nodes)
             elif key == " ":
                 paused = not paused
+            elif key in {"f", "F"}:
+                last_poll = 0.0
+            elif key in {"o", "O"}:
+                cur_s = _TUI_SORT_MODES.index(sort_by) if sort_by in _TUI_SORT_MODES else 0
+                sort_by = _TUI_SORT_MODES[(cur_s + 1) % len(_TUI_SORT_MODES)]
+                selected_idx = 0
+            elif key in {"i", "I"} and nodes:
+                last_banner = _build_node_inspect_banner(nodes[selected_idx], all_jobs)
             elif key in {"d", "D"}:
                 view_mode = "procs" if view_mode == "tasks" else "tasks"
             elif key in {"p", "P"}:
@@ -732,13 +922,14 @@ def run_top_tui(
                         tier_tag = f"T{o.node_tier}:{o.node_pool}" if o.node_tier else "none"
                         status_str = "OK" if o.ok else "FAIL"
                         parts.append(
-                            f"[{o.node_id} · {tier_tag}] {status_str} ({o.duration_sec:.2f}s) — {_clean_term_text(o.routing_reason, 60)}\n  {first}"
+                            f"[{_clean_term_text(o.node_id, 20)} · {tier_tag}] {status_str} ({o.duration_sec:.2f}s) — {_clean_term_text(o.routing_reason, 60)}\n  {first}"
                         )
                     last_banner = "\n".join(parts)
                     last_poll = 0.0
             elif key in {"r", "R", "a", "A"} and nodes:
                 target = "all" if key in {"a", "A"} else nodes[selected_idx]["id"]
-                cmd = _prompt_line(f"Run on [{target}]> ", old_settings)
+                safe_target = _clean_term_text(target, 24)
+                cmd = _prompt_line(f"Run on [{safe_target}]> ", old_settings)
                 if cmd:
                     spec = JobSpec(index=0, job_id=f"top-{int(time.time())}-{uuid.uuid4().hex[:6]}", command=cmd, timeout_sec=60.0)
                     outcomes = controller.run_single(spec, target=target)
@@ -748,7 +939,7 @@ def run_top_tui(
                         first = _clean_term_text(first_raw, 80)
                         tier_tag = f"T{o.node_tier}:{o.node_pool}" if o.node_tier else ""
                         status_str = "OK" if o.ok else "FAIL"
-                        parts.append(f"[{o.node_id} {tier_tag}] {status_str} ({o.duration_sec:.2f}s): {first}")
+                        parts.append(f"[{_clean_term_text(o.node_id, 20)} {tier_tag}] {status_str} ({o.duration_sec:.2f}s): {first}")
                     last_banner = "\n".join(parts)
                     last_poll = 0.0  # force immediate refresh
             elif key in {"c", "C"} and nodes:
@@ -760,15 +951,16 @@ def run_top_tui(
                 if jid:
                     try:
                         res = controller.cancel_node_job(sel_id, jid)
-                        last_banner = f"Cancel {_clean_term_text(jid, 32)} on {sel_id}: {'OK' if res.get('cancelled') else _clean_term_text(res.get('error', ''), 80)}"
+                        last_banner = f"Cancel {_clean_term_text(jid, 32)} on {_clean_term_text(sel_id, 20)}: {'OK' if res.get('cancelled') else _clean_term_text(res.get('error', ''), 80)}"
                     except KeyError as exc:
                         last_banner = f"Cancel failed: {exc}"
                     last_poll = 0.0
                 else:
-                    last_banner = f"No running job on {sel_id} to cancel."
+                    last_banner = f"No running job on {_clean_term_text(sel_id, 20)} to cancel."
             elif key in {"s", "S"} and nodes:
                 try:
-                    sel_node = controller.config.get_node(nodes[selected_idx]["id"])
+                    with controller.config_lock:
+                        sel_node = controller.config.get_node(nodes[selected_idx]["id"])
                 except KeyError as exc:
                     last_banner = f"SSH failed: {exc}"
                     continue

@@ -25,6 +25,7 @@ from typing import Any
 
 from .auth import (
     AuthRateLimiter,
+    _is_webhook_ip_disallowed,
     build_webhook_opener,
     is_allowed_http_host,
     is_webhook_target_unsafe,
@@ -79,7 +80,77 @@ from .usbhub import (
 LOG = logging.getLogger("phonecluster.dashboard")
 
 MAX_DASHBOARD_BODY = 2 * 1024 * 1024
+MAX_PAIR_COMPLETE_BODY = 64 * 1024
+MAX_CUSTOM_SERVICES = 64
+MAX_CLUSTER_NODES = 256
+MAX_GATEWAY_RULES = 500
 _WEBHOOK_OPENER = build_webhook_opener()
+_CTRL_CHARS_STRIP_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _is_endpoint_host_unsafe(host: str, port: int = 80) -> bool:
+    """Block link-local/cloud metadata (169.254/16, fe80::/10), 0/8, unspecified, or multicast endpoints."""
+    clean = normalize_host(host).rstrip(".")
+    if not clean or "%" in clean:
+        return True
+    try:
+        lit = ipaddress.ip_address(clean)
+        return _is_webhook_ip_disallowed(lit)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(clean, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    for _fam, _type, _proto, _cname, sockaddr in infos:
+        ip_str = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            if _is_webhook_ip_disallowed(ipaddress.ip_address(ip_str)):
+                return True
+        except ValueError:
+            return True
+    return False
+
+
+def _redact_unauthenticated_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Strip host usernames and local filesystem paths from Read-Only unauthenticated `/api/status` & `/api/live`."""
+    if not isinstance(summary, dict):
+        return summary
+    out = dict(summary)
+    raw_nodes = summary.get("nodes")
+    if isinstance(raw_nodes, list):
+        redacted_nodes: list[Any] = []
+        for n in raw_nodes:
+            if not isinstance(n, dict):
+                redacted_nodes.append(n)
+                continue
+            nc = dict(n)
+            nc.pop("ssh_user", None)
+            h = nc.get("health")
+            if isinstance(h, dict) and "docker_volume_root" in h:
+                hc = dict(h)
+                hc.pop("docker_volume_root", None)
+                nc["health"] = hc
+            redacted_nodes.append(nc)
+        out["nodes"] = redacted_nodes
+    return out
+
+
+def _host_with_default_port(netloc: str, scheme: str) -> str:
+    """Normalize `host[:port]` lowercased with implicit default port stripped for exact origin comparison."""
+    raw = str(netloc or "").strip().lower()
+    if not raw:
+        return ""
+    default_p = "443" if scheme == "https" else "80"
+    if raw.startswith("["):
+        if "]:" in raw:
+            h, p = raw.rsplit(":", 1)
+            return h if p == default_p else raw
+        return raw
+    if ":" in raw:
+        h, p = raw.rsplit(":", 1)
+        return h if p == default_p else raw
+    return raw
 
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en" data-theme="dark" data-scale="normal">
@@ -111,8 +182,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     --bad-bg: rgba(248, 81, 73, 0.18);
     --focus: #ffd33d;
     --term-bg: #070b11;
+    --term-input-bg: #0c121b;
     --term-fg: #dce6f5;
     --term-prompt: #3fb950;
+    --term-err: #ff7b72;
+    --term-muted: #8b9bb4;
     --shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
   }
   [data-theme="light"] {
@@ -137,8 +211,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     --bad-bg: #fee2e2;
     --focus: #1d4ed8;
     --term-bg: #0f172a;
+    --term-input-bg: #1e293b;
     --term-fg: #e2e8f0;
     --term-prompt: #4ade80;
+    --term-err: #fca5a5;
+    --term-muted: #94a3b8;
     --shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
   }
   [data-theme="contrast"] {
@@ -162,8 +239,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     --bad-bg: #3b0000;
     --focus: #00ffff;
     --term-bg: #000000;
+    --term-input-bg: #0f0f0f;
     --term-fg: #ffffff;
     --term-prompt: #00ff66;
+    --term-err: #ff6666;
+    --term-muted: #d4d4d4;
     --shadow: none;
   }
   [data-scale="large"] { --font-size: 18px; }
@@ -228,7 +308,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   button.small { padding: 5px 9px; font-size: 0.83rem; }
 
   .toast {
-    position: fixed; bottom: 18px; right: 18px; max-width: 440px; z-index: 999;
+    position: fixed; bottom: 18px; right: 18px; max-width: min(440px, calc(100vw - 24px)); z-index: 999;
     background: var(--surface); border: 2px solid var(--accent); border-radius: 12px;
     padding: 12px 16px; box-shadow: 0 12px 32px rgba(0,0,0,0.48);
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -269,7 +349,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   /* Hero KPI + Sparklines */
   .kpi-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
     gap: 12px; margin-bottom: 16px;
   }
   .kpi-card {
@@ -291,7 +371,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   /* Multi-Device btop Cards */
   .nodes-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; margin-bottom: 16px;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 14px; margin-bottom: 16px;
   }
   .node-card {
     background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 16px;
@@ -433,10 +513,21 @@ DASHBOARD_HTML = r"""<!doctype html>
     color: var(--fg); font-weight: 400;
   }
   .profile-btn:hover { border-color: var(--accent); background: rgba(88, 166, 255, 0.08); }
+  .profile-btn.active-profile {
+    border-color: var(--ok);
+    background: var(--ok-bg);
+    box-shadow: inset 0 0 0 1px var(--ok);
+  }
   .profile-btn strong { font-size: 0.94rem; }
   .profile-btn span { font-size: 0.79rem; color: var(--muted); line-height: 1.38; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
-  .col-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
+  .filter-bar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 9px 12px; margin-bottom: 14px;
+  }
+  .filter-bar input[type="search"] { flex: 1; min-width: 180px; }
+  .col-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 14px; }
   .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 10px; }
   .field label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 3px; }
   .field input, .field select { width: 100%; }
@@ -465,19 +556,52 @@ DASHBOARD_HTML = r"""<!doctype html>
     font-size: 0.87rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
   }
   .term-entry { margin-bottom: 12px; }
+  .term-entry-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
   .term-cmd-line { color: var(--term-prompt); font-weight: 700; }
-  .term-meta { color: var(--muted); font-size: 0.78rem; margin-left: 8px; font-weight: 400; }
-  .term-err { color: #ff7b72; }
+  .term-meta { color: var(--term-muted); font-size: 0.78rem; margin-left: 8px; font-weight: 400; }
+  .term-err { color: var(--term-err); }
+  .term-node-block {
+    margin-top: 6px; padding: 6px 10px; border-left: 3px solid var(--accent);
+    background: rgba(255, 255, 255, 0.03); border-radius: 0 6px 6px 0;
+  }
+  .term-node-block.bad { border-left-color: var(--bad); }
+  .term-node-block.warn { border-left-color: var(--warn); }
+  .term-copy-btn {
+    padding: 2px 7px; font-size: 0.74rem; background: rgba(255,255,255,0.06);
+    color: var(--term-muted); border: 1px solid rgba(255,255,255,0.14); border-radius: 6px;
+  }
+  .term-copy-btn:hover { color: var(--term-fg); border-color: var(--accent); }
   .term-input-bar {
     display: flex; gap: 8px; align-items: center; padding: 10px 14px;
-    border-top: 1px solid var(--border); background: #0c121b;
+    border-top: 1px solid var(--border); background: var(--term-input-bg);
   }
+  .term-input-bar:focus-within { box-shadow: inset 0 0 0 2px var(--focus); }
   .term-prompt-label { color: var(--term-prompt); font-weight: 700; white-space: nowrap; font-size: 0.88rem; }
   .term-input-bar input {
-    flex: 1; background: transparent; border: none; color: #f0f6fc; padding: 6px 4px;
+    flex: 1; background: transparent; border: none; color: var(--term-fg); padding: 6px 4px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9rem;
   }
   .term-input-bar input:focus { outline: none; }
+
+  .wl-summary-box {
+    margin-top: 8px; padding: 10px 12px; border-radius: 10px;
+    background: var(--surface-3); border: 1px solid var(--border); font-size: 0.84rem;
+  }
+  .kbd {
+    display: inline-block; padding: 1px 6px; border-radius: 5px;
+    background: var(--surface-3); border: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; font-weight: 700;
+  }
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.62); z-index: 1050;
+    display: grid; place-items: center; padding: 16px;
+  }
+  .modal-backdrop[hidden] { display: none; }
+  .modal-card {
+    background: var(--surface); border: 1px solid var(--border-hi); border-radius: 14px;
+    max-width: 520px; width: 100%; padding: 18px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+  }
+  .node-note { color: var(--muted); font-size: 0.79rem; margin-top: 3px; font-style: italic; }
 
   .check-item {
     border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; margin-bottom: 8px;
@@ -489,6 +613,22 @@ DASHBOARD_HTML = r"""<!doctype html>
   .hint { color: var(--muted); font-size: 0.84rem; margin-top: 4px; }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
 
+  @media (max-width: 640px) {
+    .wrap { padding: 10px; }
+    header.topbar { padding: 12px; gap: 10px; }
+    .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .kpi-card { padding: 10px 12px; }
+    .stat-val { font-size: 1.25rem; }
+    nav.tabs { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: thin; padding-bottom: 8px; }
+    nav.tabs button[role="tab"] { flex: 0 0 auto; white-space: nowrap; padding: 8px 12px; font-size: 0.86rem; }
+    .toast { left: 12px; right: 12px; bottom: 12px; max-width: none; }
+    .term-screen { height: 320px; }
+    .pool-chip { min-width: 145px; }
+  }
+  @media (pointer: coarse) {
+    button, input, select { min-height: 40px; }
+    button.small { min-height: 36px; padding: 6px 11px; }
+  }
   @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
   }
@@ -499,6 +639,26 @@ DASHBOARD_HTML = r"""<!doctype html>
 <div id="toast" class="toast hidden" role="status" aria-live="polite">
   <span id="toast-msg"></span>
   <button class="small ghost" onclick="hideToast()" aria-label="Dismiss notification">✕</button>
+</div>
+<div id="shortcuts-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" hidden onclick="if(event.target===this)toggleShortcutsModal(false)">
+  <div class="modal-card">
+    <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+      <h2 id="shortcuts-title" style="margin:0;">Keyboard Shortcuts</h2>
+      <button class="small ghost" onclick="toggleShortcutsModal(false)" aria-label="Close shortcuts">✕</button>
+    </div>
+    <table>
+      <tbody>
+        <tr><td><span class="kbd">1</span> – <span class="kbd">6</span></td><td>Switch Control Center tabs</td></tr>
+        <tr><td><span class="kbd">/</span></td><td>Focus Phone Search (Tab 1) or Terminal input (Tab 2)</td></tr>
+        <tr><td><span class="kbd">r</span></td><td>Refresh cluster telemetry</td></tr>
+        <tr><td><span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></td><td>Run Parallel Batch or Pipeline step command</td></tr>
+        <tr><td><span class="kbd">Ctrl</span>+<span class="kbd">C</span></td><td>Cancel running terminal command (when focused in terminal)</td></tr>
+        <tr><td><span class="kbd">Esc</span></td><td>Close overlays, editors, or toast notifications</td></tr>
+        <tr><td><span class="kbd">?</span></td><td>Toggle this shortcuts dialog</td></tr>
+      </tbody>
+    </table>
+    <p class="hint" style="margin:10px 0 0;">Single-key shortcuts are ignored while typing inside inputs, textareas, or dropdowns.</p>
+  </div>
 </div>
 
 <div class="wrap">
@@ -535,21 +695,22 @@ DASHBOARD_HTML = r"""<!doctype html>
         <option value="0">Paused</option>
       </select>
       <button class="small primary" onclick="refreshAll()">Refresh</button>
+      <button id="btn-shortcuts" class="small ghost" onclick="toggleShortcutsModal()" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
     </div>
   </header>
 
   <section class="auth-bar" aria-label="Cluster authentication">
-    <div class="row" style="margin:0; flex:1; min-width:260px;">
+    <div class="row" style="margin:0; flex:1; min-width:240px;">
       <span id="auth-pill" class="pill neutral">Read-Only Mode</span>
       <label class="sr-only" for="auth-token">Cluster auth token</label>
-      <input id="auth-token" type="password" placeholder="Paste token (run `pc token` on Master) to unlock Terminal &amp; Controls" style="flex:1; min-width:220px" />
+      <input id="auth-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste token (run `pc token` on Master) to unlock Terminal &amp; Controls" style="flex:1; min-width:200px" />
       <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:4px;">
         <input id="remember-token" type="checkbox" style="width:auto; padding:0;" /> Remember
       </label>
-      <button class="small primary" onclick="verifyAndSaveToken()">Unlock</button>
-      <button class="small ghost" onclick="clearToken()">Lock</button>
+      <button id="btn-auth-unlock" class="small primary" onclick="verifyAndSaveToken()">Unlock</button>
+      <button id="btn-auth-lock" class="small ghost" onclick="clearToken()">Lock</button>
     </div>
-    <div class="hint" style="margin:0;">Tip: Run <code class="mono">pc top</code> in SSH for the matching terminal btop dashboard.</div>
+    <div class="hint" id="auth-tip-line" style="margin:0;">Tip: Run <code class="mono">pc top</code> in SSH for the matching terminal btop dashboard. Press <span class="kbd">?</span> for shortcuts.</div>
   </section>
 
   <div id="battery-banner" class="banner warn hidden" role="status" aria-live="polite">
@@ -611,16 +772,36 @@ DASHBOARD_HTML = r"""<!doctype html>
       </div>
 
       <div id="pool-strip" class="pool-strip" role="group" aria-label="Filter phones by Tier and Pool"></div>
+      <div id="fleet-filter-bar" class="filter-bar" aria-label="Search and sort phones">
+        <label class="sr-only" for="node-search">Search phones</label>
+        <input id="node-search" type="search" placeholder="Filter phones by name, IP, OS, service, note... (press /)" aria-label="Filter phones" oninput="onNodeFilterChange()" />
+        <label class="sr-only" for="node-status-filter">Status filter</label>
+        <select id="node-status-filter" aria-label="Filter phones by status" onchange="onNodeFilterChange()">
+          <option value="all">All Status</option>
+          <option value="ready">Ready Only</option>
+          <option value="attention">Warm / Offline / Quarantined</option>
+          <option value="usb">USB Hub Only</option>
+        </select>
+        <label class="sr-only" for="node-sort">Sort phones</label>
+        <select id="node-sort" aria-label="Sort phones" onchange="onNodeFilterChange()">
+          <option value="default">Sort: Default Order</option>
+          <option value="cpu">Sort: Highest CPU</option>
+          <option value="temp">Sort: Hottest First</option>
+          <option value="ram">Sort: Highest RAM</option>
+          <option value="name">Sort: Name A–Z</option>
+        </select>
+        <span id="node-filter-count" class="hint mono" style="margin:0;"></span>
+      </div>
       <div id="node-tier-editor" class="card" style="display:none" aria-live="polite"></div>
 
-      <div id="nodes-grid" class="nodes-grid" aria-live="polite"></div>
+      <div id="nodes-grid" class="nodes-grid"></div>
 
       <div class="card">
         <div class="row" style="justify-content:space-between; margin-bottom:10px;">
           <h2 style="margin:0;">Shared Running Tasks &amp; Top Processes</h2>
           <div class="row" style="margin:0;">
-            <button id="btn-board-tasks" class="small primary" onclick="setBoardView('tasks')">Running &amp; Recent Tasks</button>
-            <button id="btn-board-procs" class="small" onclick="setBoardView('procs')">Shared Processes (All Phones)</button>
+            <button id="btn-board-tasks" class="small primary" aria-pressed="true" onclick="setBoardView('tasks')">Running &amp; Recent Tasks</button>
+            <button id="btn-board-procs" class="small" aria-pressed="false" onclick="setBoardView('procs')">Shared Processes (All Phones)</button>
           </div>
         </div>
         <div id="tasks-board-wrap" class="hint">Loading cluster tasks...</div>
@@ -643,17 +824,19 @@ DASHBOARD_HTML = r"""<!doctype html>
               <option value="all">ALL READY PHONES (Broadcast)</option>
             </select>
             <span id="term-cwd-pill" class="pill neutral mono">~</span>
+            <span id="term-status-pill" class="pill neutral">Smart Routing</span>
           </div>
           <div class="row" style="margin:0;">
             <button id="btn-term-cancel" class="small danger" onclick="cancelActiveTermJob()" title="Cancel the running command on a specifically selected phone" disabled>Cancel command</button>
+            <button class="small" onclick="copyTermLog()">Copy Log</button>
             <button class="small" onclick="clearTerminal()">Clear</button>
             <button class="small" onclick="downloadTermLog()">Save Log</button>
           </div>
         </div>
-        <div id="term-screen" class="term-screen" aria-live="polite" onclick="document.getElementById('term-input').focus()">
+        <div id="term-screen" class="term-screen" aria-live="polite" onclick="onTermScreenClick()">
           <div class="term-entry">
             <span class="term-cmd-line">PhoneCluster Unified Terminal (Auto-Routing Across Tiers)</span>
-            <div class="hint" style="color:#8b9bb4;">In Auto-Route mode, commands are automatically routed to the right tier (Docker → Tier 3, Debian services/MQTT → Tier 2, compute/AI → Tier 1) with live <code class="mono">$PHONECLUSTER_*</code> cross-tier service env vars injected.</div>
+            <div class="hint" style="color:var(--term-muted);">In Auto-Route mode, commands are automatically routed to the right tier (Docker → Tier 3, Debian services/MQTT → Tier 2, compute/AI → Tier 1) with live <code class="mono">$PHONECLUSTER_*</code> cross-tier service env vars injected.</div>
           </div>
         </div>
         <div class="term-input-bar">
@@ -670,6 +853,8 @@ DASHBOARD_HTML = r"""<!doctype html>
         <button class="small" onclick="runTermPreset('docker ps 2>&1')">Docker Status (Tier 3)</button>
         <button class="small" onclick="runTermPreset('df -h ~')">Disk Space</button>
         <button class="small" onclick="runTermPreset('uptime && head -n 5 /proc/meminfo')">Load &amp; RAM</button>
+        <button class="small" onclick="runTermPreset('cat /sys/class/power_supply/battery/capacity /sys/class/power_supply/battery/temp 2>/dev/null || termux-battery-status 2>/dev/null || echo No battery sysfs')">Battery &amp; Temp</button>
+        <button class="small" onclick="runTermPreset('ip -br a 2>/dev/null || ifconfig')">Network IPs</button>
         <button class="small" onclick="runTermPreset('ps -eo pid,pcpu,pmem,comm --sort=-pcpu 2>/dev/null | head -n 12 || ps | head -n 12')">Top Processes</button>
       </div>
     </section>
@@ -742,10 +927,17 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
 
         <div class="row" style="margin-top:10px;">
           <button id="btn-run-map" class="primary" onclick="runParallelMap()">Run Batch Across Cluster</button>
+          <span id="map-job-count" class="pill neutral mono">4 jobs</span>
           <button class="small" onclick="copyEl('map-out')">Copy Output</button>
           <button id="btn-dl-map" class="small" onclick="downloadLastMapJson()" disabled>Download JSON</button>
         </div>
         <div id="map-summary-chips" class="chips"></div>
+        <div id="map-filter-bar" class="row" style="display:none; margin-top:8px; margin-bottom:4px;">
+          <span class="hint" style="margin:0;">Filter output:</span>
+          <button id="btn-map-f-all" class="small primary" onclick="setMapOutFilter('all')">All</button>
+          <button id="btn-map-f-fail" class="small" onclick="setMapOutFilter('fail')">Failed &amp; Unknown</button>
+          <button id="btn-map-f-ok" class="small" onclick="setMapOutFilter('ok')">OK Only</button>
+        </div>
         <pre id="map-out" class="code" aria-live="polite">Batch results will appear here.</pre>
       </div>
 
@@ -874,6 +1066,7 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
             <button class="small primary" onclick="workloadAction('docker-status')">Check Docker Containers</button>
             <button class="small" onclick="workloadAction('docker-swarm-init')">Init 2-Phone Docker Swarm</button>
           </div>
+          <div id="wl-action-summary" class="wl-summary-box" style="display:none"></div>
           <pre id="wl-action-out" class="code" style="display:none"></pre>
         </div>
       </div>
@@ -888,8 +1081,9 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
             <p class="hint" style="margin:2px 0 0;">Pick <strong>Wireless (Wi-Fi / LAN)</strong> for phones on your router, or <strong>USB 3.0 Hub (Zero Wi-Fi)</strong> to connect 2–6 phones through one powered USB 3.0 hub.</p>
           </div>
           <div class="row" style="margin:0;">
-            <button id="btn-setup-mode-wifi" class="primary" onclick="setSetupConnectionMode('wifi')">📶 Wireless (Wi-Fi / LAN)</button>
-            <button id="btn-setup-mode-usb" onclick="setSetupConnectionMode('usb')">🔌 USB 3.0 Hub (Zero Wi-Fi)</button>
+            <button id="btn-setup-mode-wifi" class="primary" aria-pressed="true" onclick="setSetupConnectionMode('wifi')">📶 Wireless (Wi-Fi / LAN)</button>
+            <button id="btn-setup-mode-usb" aria-pressed="false" onclick="setSetupConnectionMode('usb')">🔌 USB 3.0 Hub (Zero Wi-Fi)</button>
+            <button id="btn-setup-reload-cfg" class="small ghost" onclick="reloadConfigFromDisk()" title="Reload cluster.json if edited via CLI">🔄 Reload Config</button>
           </div>
         </div>
       </div>
@@ -921,7 +1115,10 @@ print(f"node={os.environ.get('PHONECLUSTER_NODE_ID')} square({n})={n*n}")</texta
                 <div id="pair-pin" class="mono" style="font-size:2rem; font-weight:800; letter-spacing:0.12em; color:var(--ok); margin:4px 0;">--- ---</div>
                 <div class="hint">Master Fingerprint: <strong id="pair-fp" class="mono">-</strong> · Attempts left: <strong id="pair-att">5</strong> · Slots left: <strong id="pair-rem">1</strong></div>
               </div>
-              <span id="pair-timer" class="pill warn mono" style="font-size:0.95rem;">120s</span>
+              <div class="row" style="margin:0;">
+                <button id="btn-pair-copy" class="small" onclick="copyPairPin()">Copy PIN</button>
+                <span id="pair-timer" class="pill warn mono" style="font-size:0.95rem;">120s</span>
+              </div>
             </div>
           </div>
 
@@ -1006,7 +1203,13 @@ pc usb-hub verify</pre>
 
           <h2 style="margin-top:18px;">3. Cluster Doctor (Health Audit)</h2>
           <div class="row">
-            <button class="primary" onclick="runDoctorUi()">Run Doctor Now</button>
+            <button id="btn-run-doctor" class="primary" onclick="runDoctorUi()">Run Doctor Now</button>
+            <span id="doctor-summary-chips" class="chips" style="margin:0;"></span>
+          </div>
+          <div id="doctor-toolbar" class="row" style="display:none; margin-bottom:8px;">
+            <button id="btn-doc-all" class="small primary" onclick="setDoctorFilter('all')">All Checks</button>
+            <button id="btn-doc-issues" class="small" onclick="setDoctorFilter('issues')">Issues Only</button>
+            <button class="small" onclick="copyDoctorReport()">Copy Report</button>
           </div>
           <div id="doctor-list" aria-live="polite" class="hint">Click "Run Doctor Now" to inspect SSH, Termux:API, thermal, and battery safety.</div>
         </div>
@@ -1025,15 +1228,15 @@ pc usb-hub verify</pre>
         </div>
         <p class="hint" style="margin:0 0 8px;">Pick a <strong>1-Click Security Profile</strong> below (can be switched back to Standard Home LAN anytime — no Docker required!):</p>
         <div class="profile-grid">
-          <button type="button" class="profile-btn" onclick="applySecurityProfile('standard')">
+          <button type="button" id="btn-prof-standard" class="profile-btn" onclick="applySecurityProfile('standard')">
             <strong>🟢 Standard Home LAN (Default)</strong>
             <span>Network Guard OFF, direct LAN peers, zero friction on a trusted home Wi-Fi.</span>
           </button>
-          <button type="button" class="profile-btn" onclick="applySecurityProfile('airgap_workers')">
+          <button type="button" id="btn-prof-airgap_workers" class="profile-btn" onclick="applySecurityProfile('airgap_workers')">
             <strong>🛡️ Air-Gapped Old Phones (Recommended)</strong>
             <span>Network Guard Allowlist ON, SSRF Private-IP Guard ON, Per-Phone Rate Quota ON. Ideal when router blocks worker WAN.</span>
           </button>
-          <button type="button" class="profile-btn" onclick="applySecurityProfile('lockdown')">
+          <button type="button" id="btn-prof-lockdown" class="profile-btn" onclick="applySecurityProfile('lockdown')">
             <strong>🔒 Maximum Lockdown (Strict)</strong>
             <span>Air-Gap Proxy (block_all), Dashboard Read-Auth Lock ON, Worker Master-IP Allowlist ON, 60 req/min cap.</span>
           </button>
@@ -1113,11 +1316,24 @@ pc usb-hub verify</pre>
         </div>
 
         <div class="row">
-          <button class="primary" onclick="saveGatewaySettings()">Save &amp; Apply Network Guard</button>
+          <button id="btn-save-gw" class="primary" onclick="saveGatewaySettings()">Save &amp; Apply Network Guard</button>
           <button class="small danger" onclick="clearGatewayLogs()">Clear Audit Log</button>
+          <span id="gw-unsaved-pill" class="pill warn" style="display:none">Unsaved edits</span>
         </div>
 
         <h3 style="margin:12px 0 6px;">Live Worker Traffic Audit Log</h3>
+        <div class="filter-bar" style="margin-bottom:8px;">
+          <label class="sr-only" for="gw-log-search">Filter traffic log</label>
+          <input id="gw-log-search" type="search" placeholder="Filter traffic log by domain, phone, reason..." aria-label="Filter traffic log" oninput="renderGatewayEventsTable()" />
+          <label class="sr-only" for="gw-log-action">Filter traffic action</label>
+          <select id="gw-log-action" aria-label="Filter traffic action" onchange="renderGatewayEventsTable()">
+            <option value="all">All Actions</option>
+            <option value="block">Blocked Only</option>
+            <option value="allow">Allowed Only</option>
+            <option value="auth_denied">Auth Denied</option>
+          </select>
+          <button class="small" onclick="copyGatewayLog()">Copy Log</button>
+        </div>
         <div id="gw-events-table" class="hint">Network Guard is currently OFF.</div>
       </div>
 
@@ -1167,8 +1383,9 @@ pc usb-hub verify</pre>
             </label>
           </div>
           <div class="row">
-            <button class="primary small" onclick="saveHardeningSettings()">Save &amp; Push Hardening</button>
+            <button id="btn-save-hardening" class="primary small" onclick="saveHardeningSettings()">Save &amp; Push Hardening</button>
             <button class="small" onclick="pushLivePolicyToWorkers()">📡 Push Live Policy to All Workers</button>
+            <span id="hard-unsaved-pill" class="pill warn" style="display:none">Unsaved edits</span>
           </div>
 
           <h3 style="margin:12px 0 6px;">Hardening Checklist</h3>
@@ -1222,9 +1439,93 @@ let lastMapData = null;
 let toastTimer = null;
 let boardView = 'tasks';
 let activePoolFilter = 'all';
+let authLockedByServer = false;
+let authRateLimitUntil = 0;
+let mapOutFilter = 'all';
+let lastDoctorChecks = [];
+let doctorFilter = 'all';
+let lastGwEvents = [];
+let gwFormDirty = false;
+let hardFormDirty = false;
+const inFlightActions = new Set();
+const MAX_UPLOAD_BYTES = 1024 * 1024;
+const MAX_TERM_DOM_ENTRIES = 150;
+const MAX_TERM_TRANSCRIPT_ENTRIES = 300;
+const DEFAULT_TOKEN_PLACEHOLDER = 'Paste token (run `pc token` on Master) to unlock Terminal & Controls';
+
+function hasOwn(obj, key) {
+  return Boolean(obj && Object.prototype.hasOwnProperty.call(obj, key));
+}
+
+function safePort(val) {
+  const n = Number(val);
+  return (Number.isInteger(n) && n >= 1 && n <= 65535) ? n : 0;
+}
+
+function safeHttpUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s || /[\x00-\x1f\x7f\s]/.test(s)) return null;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    if (!u.hostname || u.username || u.password) return null;
+    return u.href;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function confirmAction(message) {
+  return typeof confirm === 'function' ? confirm(message) : true;
+}
+
+async function readJsonSafe(resp) {
+  try {
+    const txt = await resp.text();
+    if (!txt) return null;
+    return JSON.parse(txt);
+  } catch (_e) {
+    return null;
+  }
+}
+
+async function withBusyAction(key, btnOrId, busyText, fn) {
+  if (inFlightActions.has(key)) return;
+  const btn = typeof btnOrId === 'string' ? document.getElementById(btnOrId) : btnOrId;
+  const prevText = btn ? btn.textContent : '';
+  inFlightActions.add(key);
+  if (btn) {
+    btn.disabled = true;
+    if (busyText) btn.textContent = busyText;
+  }
+  try {
+    return await fn();
+  } finally {
+    inFlightActions.delete(key);
+    if (btn) {
+      btn.disabled = false;
+      if (busyText && prevText) btn.textContent = prevText;
+    }
+  }
+}
+
+function toggleShortcutsModal(force) {
+  const modal = document.getElementById('shortcuts-modal');
+  if (!modal) return;
+  const nextOpen = typeof force === 'boolean' ? force : modal.hidden;
+  modal.hidden = !nextOpen;
+  if (nextOpen) {
+    const closeBtn = modal.querySelector('button');
+    if (closeBtn) closeBtn.focus();
+  } else {
+    const trigger = document.getElementById('btn-shortcuts');
+    if (trigger) trigger.focus();
+  }
+}
 
 function tierPillHtml(tier, pool) {
-  const t = Number(tier || 1);
+  const rawT = Number(tier);
+  const t = (rawT === 1 || rawT === 2 || rawT === 3) ? rawT : 1;
   const p = String(pool || 'compute').toUpperCase();
   const cls = t === 3 ? 'warn' : (t === 2 ? 'purple' : 'accent');
   return '<span class="pill ' + cls + '">T' + t + ' · ' + esc(p) + '</span>';
@@ -1238,13 +1539,17 @@ function setPoolFilter(filterKey) {
   }
 }
 
+function onNodeFilterChange() {
+  if (lastLive) renderNodesGrid(lastLive);
+}
+
 function renderPoolStrip(summary) {
   const strip = document.getElementById('pool-strip');
   if (!strip) return;
-  const pools = summary.pools || [];
+  const pools = Array.isArray(summary.pools) ? summary.pools : [];
   let html = '<button class="pool-chip' + (activePoolFilter === 'all' ? ' active' : '') + '" onclick="setPoolFilter(\'all\')">'
     + '<span class="pool-chip-title">All Phones <span class="pill ok">' + esc(summary.nodes_ready) + '/' + esc(summary.nodes_total) + '</span></span>'
-    + '<span class="pool-chip-sub mono">' + esc(summary.total_cores) + ' cores · ' + ((summary.mem_total_mb || 0) / 1024).toFixed(1) + ' GB RAM</span>'
+    + '<span class="pool-chip-sub mono">' + esc(summary.total_cores) + ' cores · ' + ((Number(summary.mem_total_mb) || 0) / 1024).toFixed(1) + ' GB RAM</span>'
     + '</button>';
   for (const p of pools) {
     const key = 'pool:' + p.pool;
@@ -1252,7 +1557,7 @@ function renderPoolStrip(summary) {
     html += '<button class="pool-chip' + (isAct ? ' active' : '') + '" onclick="setPoolFilter(' + jsArg(key) + ')">'
       + '<span class="pool-chip-title">' + tierPillHtml(p.tier, p.pool)
       + ' <span class="mono">' + esc(p.nodes_ready) + '/' + esc(p.nodes_total) + '</span></span>'
-      + '<span class="pool-chip-sub mono">' + esc(p.total_cores) + 'c · ' + ((p.mem_total_mb || 0) / 1024).toFixed(1) + ' GB · ' + esc((p.node_ids || []).join(', ')) + '</span>'
+      + '<span class="pool-chip-sub mono">' + esc(p.total_cores) + 'c · ' + ((Number(p.mem_total_mb) || 0) / 1024).toFixed(1) + ' GB · ' + esc((p.node_ids || []).join(', ')) + '</span>'
       + '</button>';
   }
   strip.innerHTML = html;
@@ -1267,7 +1572,7 @@ function openNodeTierEditor(nodeId) {
   const cfgPool = String(n.configured_pool || 'auto');
   ed.style.display = 'block';
   ed.innerHTML = '<div class="row" style="justify-content:space-between; margin-bottom:8px;">'
-    + '<h3 style="margin:0;">Configure Tier &amp; Pool for <span class="mono">' + esc(n.id) + '</span> (' + esc(n.host) + ')</h3>'
+    + '<h3 style="margin:0;">Configure Tier, Pool &amp; Notes for <span class="mono">' + esc(n.id) + '</span> (' + esc(n.host) + ')</h3>'
     + '<button class="small ghost" onclick="closeNodeTierEditor()">✕ Close</button></div>'
     + '<div class="form-grid">'
     + '<div class="field"><label for="ed-tier">Tier Role</label><select id="ed-tier">'
@@ -1279,36 +1584,49 @@ function openNodeTierEditor(nodeId) {
     + '<div class="field"><label for="ed-pool">Workload Pool</label>'
     + '<input id="ed-pool" value="' + esc(cfgPool) + '" placeholder="auto / compute / services / docker" /></div>'
     + '<div class="field"><label for="ed-conc">Max Parallel Jobs</label>'
-    + '<input id="ed-conc" type="number" min="1" max="16" value="' + esc(n.max_concurrency || 2) + '" /></div>'
+    + '<input id="ed-conc" type="number" min="1" max="32" value="' + esc(n.max_concurrency || 2) + '" /></div>'
+    + '<div class="field"><label for="ed-notes">Phone Label / Notes</label>'
+    + '<input id="ed-notes" maxlength="240" value="' + esc(n.notes || '') + '" placeholder="e.g. Shelf 2 · USB Port 3" /></div>'
     + '</div>'
     + '<div class="row" style="margin:0;">'
-    + '<button class="small primary" onclick="saveNodeTier(' + jsArg(n.id) + ')">Save Tier &amp; Pool</button>'
+    + '<button id="btn-save-node-tier" class="small primary" onclick="saveNodeTier(' + jsArg(n.id) + ')">Save Changes</button>'
     + '<span class="hint" style="margin:0;">Effective now: ' + tierPillHtml(n.tier, n.pool) + '</span>'
     + '</div>';
 }
 
 function closeNodeTierEditor() {
   const ed = document.getElementById('node-tier-editor');
-  if (ed) ed.style.display = 'none';
+  if (ed) {
+    ed.style.display = 'none';
+    ed.innerHTML = '';
+  }
 }
 
 async function saveNodeTier(nodeId) {
-  const tier = Number(document.getElementById('ed-tier').value || 0);
-  const pool = document.getElementById('ed-pool').value.trim() || 'auto';
-  const max_concurrency = Number(document.getElementById('ed-conc').value || 2);
-  const data = await authPost('/api/nodes/update', { id: nodeId, tier, pool, max_concurrency });
-  if (data.error) { showToast('Update failed: ' + data.error, 'bad'); return; }
-  closeNodeTierEditor();
-  showPolicyResult('Saved tier ' + (tier || 'auto') + ' and pool ' + pool + ' for ' + nodeId + '.', data.pushed);
-  refreshLive();
+  await withBusyAction('node-tier:' + nodeId, 'btn-save-node-tier', 'Saving...', async () => {
+    const tier = Number(document.getElementById('ed-tier').value || 0);
+    const pool = document.getElementById('ed-pool').value.trim() || 'auto';
+    const max_concurrency = Number(document.getElementById('ed-conc').value || 2);
+    const notesEl = document.getElementById('ed-notes');
+    const notes = notesEl ? notesEl.value.trim() : undefined;
+    const payload = { id: nodeId, tier, pool, max_concurrency };
+    if (notes !== undefined) payload.notes = notes;
+    const data = await authPost('/api/nodes/update', payload);
+    if (data.error) { showToast('Update failed: ' + data.error, 'bad'); return; }
+    closeNodeTierEditor();
+    showPolicyResult('Saved tier ' + (tier || 'auto') + ' and pool ' + pool + ' for ' + nodeId + '.', data.pushed);
+    refreshLive();
+  });
 }
 
 // Interactive Web Terminal state
 const termCwds = {};
 const termHistory = [];
 let termHistIdx = -1;
+let termDraft = '';
 let termTranscript = [];
 let activeTermJob = null;
+let termElapsedTimer = null;
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1319,9 +1637,11 @@ function jsArg(s) {
 
 function fmtUptime(sec) {
   if (sec == null) return '-';
-  const d = Math.floor(sec / 86400);
-  const h = Math.floor((sec % 86400) / 3600);
-  const m = Math.floor((sec % 3600) / 60);
+  const num = Number(sec);
+  if (!Number.isFinite(num) || num < 0) return '-';
+  const d = Math.floor(num / 86400);
+  const h = Math.floor((num % 86400) / 3600);
+  const m = Math.floor((num % 3600) / 60);
   if (d > 0) return d + 'd ' + h + 'h';
   if (h > 0) return h + 'h ' + m + 'm';
   return m + 'm';
@@ -1330,7 +1650,7 @@ function fmtUptime(sec) {
 function renderSparklineSvg(values, maxVal, strokeColor, fillColor) {
   const w = 200, h = 34;
   const pts = (values && values.length) ? values.slice(-40) : [0, 0];
-  const safeMax = Math.max(1, maxVal || 100);
+  const safeMax = Math.max(1, Number(maxVal) || 100);
   const step = pts.length > 1 ? w / (pts.length - 1) : w;
   const coords = pts.map((v, i) => {
     const x = (i * step).toFixed(1);
@@ -1341,8 +1661,8 @@ function renderSparklineSvg(values, maxVal, strokeColor, fillColor) {
   const lineD = coords.map((p, i) => (i === 0 ? 'M' : 'L') + p[0] + ',' + p[1]).join(' ');
   const areaD = lineD + ' L' + coords[coords.length - 1][0] + ',' + h + ' L' + coords[0][0] + ',' + h + ' Z';
   return '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">'
-    + '<path d="' + areaD + '" fill="' + fillColor + '" />'
-    + '<path d="' + lineD + '" fill="none" stroke="' + strokeColor + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />'
+    + '<path d="' + areaD + '" fill="' + esc(fillColor) + '" />'
+    + '<path d="' + lineD + '" fill="none" stroke="' + esc(strokeColor) + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />'
     + '</svg>';
 }
 
@@ -1379,49 +1699,19 @@ function updateAuthBadge() {
   const pill = document.getElementById('auth-pill');
   const inp = document.getElementById('auth-token');
   const rem = document.getElementById('remember-token');
-  rem.checked = Boolean(localStorage.getItem('pc_token'));
+  if (rem) rem.checked = Boolean(localStorage.getItem('pc_token'));
   if (getToken()) {
-    pill.textContent = '✓ Unlocked';
-    pill.className = 'pill ok';
-    inp.value = '••••••••••••';
+    if (pill) { pill.textContent = '✓ Unlocked'; pill.className = 'pill ok'; }
+    if (inp) { inp.value = ''; inp.placeholder = 'Unlocked — paste a new token to replace, or click Lock'; }
   } else {
-    pill.textContent = 'Read-Only Mode';
-    pill.className = 'pill neutral';
-    inp.value = '';
+    if (pill) { pill.textContent = 'Read-Only Mode'; pill.className = 'pill neutral'; }
+    if (inp) { inp.value = ''; inp.placeholder = DEFAULT_TOKEN_PLACEHOLDER; }
   }
 }
-async function verifyAndSaveToken() {
-  const raw = document.getElementById('auth-token').value.trim();
-  const candidate = (!raw || raw.startsWith('••')) ? getToken() : raw;
-  if (!candidate) {
-    showToast('Paste your auth_token first (run `pc token` on the Master phone).', 'warn');
-    return;
-  }
-  try {
-    const r = await fetch('/api/auth/verify', { headers: { 'Authorization': 'Bearer ' + candidate } });
-    if (!r.ok) {
-      showToast('Invalid auth_token — check config/cluster.json or run `pc token`.', 'bad');
-      return;
-    }
-    if (document.getElementById('remember-token').checked) {
-      localStorage.setItem('pc_token', candidate);
-      sessionStorage.removeItem('pc_token');
-    } else {
-      sessionStorage.setItem('pc_token', candidate);
-      localStorage.removeItem('pc_token');
-    }
-    updateAuthBadge();
-    loadSafetySettings();
-    refreshAll();
-    showToast('Token verified — Terminal & Cluster controls unlocked!', 'ok');
-  } catch (e) {
-    showToast('Could not reach Master to verify token: ' + e, 'bad');
-  }
-}
-function clearToken(silent) {
-  sessionStorage.removeItem('pc_token');
-  localStorage.removeItem('pc_token');
+
+function scrubSensitiveDom(scrubFleet) {
   if (pairPollTimer) { clearInterval(pairPollTimer); pairPollTimer = null; }
+  lastPairedKey = null;
   const pairBox = document.getElementById('pair-active-box');
   if (pairBox) pairBox.style.display = 'none';
   const btnClose = document.getElementById('btn-pair-close');
@@ -1430,6 +1720,156 @@ function clearToken(silent) {
   if (pinEl) pinEl.textContent = '------';
   const wbEl = document.getElementById('set-webhook');
   if (wbEl) wbEl.value = '';
+
+  termTranscript = [];
+  termHistory.length = 0;
+  termHistIdx = -1;
+  termDraft = '';
+  const termScr = document.getElementById('term-screen');
+  if (termScr) {
+    termScr.innerHTML = '<div class="term-entry"><span class="term-cmd-line">PhoneCluster Unified Terminal</span>'
+      + '<div class="hint" style="color:var(--term-muted);">Session cleared on lock. Paste your auth_token above to unlock Terminal &amp; Controls.</div></div>';
+  }
+
+  lastMapData = null;
+  const mapOut = document.getElementById('map-out');
+  if (mapOut) mapOut.textContent = 'Batch results will appear here.';
+  const mapChips = document.getElementById('map-summary-chips');
+  if (mapChips) mapChips.innerHTML = '';
+  const mapFbar = document.getElementById('map-filter-bar');
+  if (mapFbar) mapFbar.style.display = 'none';
+  const btnDlMap = document.getElementById('btn-dl-map');
+  if (btnDlMap) btnDlMap.disabled = true;
+
+  lastPipeResults = [];
+  const pipeCards = document.getElementById('pipe-results-cards');
+  if (pipeCards) pipeCards.innerHTML = '';
+  const pipeOut = document.getElementById('pipe-out');
+  if (pipeOut) pipeOut.textContent = '';
+  const pipeDetails = document.getElementById('pipe-details');
+  if (pipeDetails) pipeDetails.hidden = true;
+
+  const wlOut = document.getElementById('wl-action-out');
+  if (wlOut) { wlOut.textContent = ''; wlOut.style.display = 'none'; }
+  const wlSum = document.getElementById('wl-action-summary');
+  if (wlSum) { wlSum.innerHTML = ''; wlSum.style.display = 'none'; }
+  const envEl = document.getElementById('mesh-env-code');
+  if (envEl) envEl.textContent = '# Unlock or refresh to view cluster env variables.';
+  const hostsEl = document.getElementById('mesh-hosts-code');
+  if (hostsEl) hostsEl.textContent = '# Unlock or refresh to view .cluster hosts.';
+
+  lastGwEvents = [];
+  lastNetAudit = null;
+  const gwTbl = document.getElementById('gw-events-table');
+  if (gwTbl) gwTbl.innerHTML = '<p class="hint">Unlock with your Master token to inspect Network Guard traffic logs.</p>';
+  const netTbl = document.getElementById('net-nodes-table');
+  if (netTbl) netTbl.innerHTML = '<p class="hint">Unlock with your Master token to view cluster network posture.</p>';
+  const netChk = document.getElementById('net-checks-list');
+  if (netChk) netChk.innerHTML = '<p class="hint">Unlock with your Master token to view hardening checks.</p>';
+  const gwIso = document.getElementById('gw-isolation-box');
+  if (gwIso) gwIso.innerHTML = '';
+
+  closeNodeTierEditor();
+  lastDoctorChecks = [];
+  const docBox = document.getElementById('doctor-list');
+  if (docBox) docBox.innerHTML = '<p class="hint">Unlock with your Master token, then click "Run Doctor Now".</p>';
+  const docBar = document.getElementById('doctor-toolbar');
+  if (docBar) docBar.style.display = 'none';
+  const docChips = document.getElementById('doctor-summary-chips');
+  if (docChips) docChips.innerHTML = '';
+  const discBox = document.getElementById('discover-list');
+  if (discBox) discBox.innerHTML = '';
+
+  if (scrubFleet) {
+    lastLive = null;
+    for (const id of ['k-cpu', 'k-ram', 'k-temp', 'k-tasks', 'k-nodes']) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = '-';
+    }
+    const strip = document.getElementById('pool-strip');
+    if (strip) strip.innerHTML = '';
+  }
+}
+
+function handleAuthFailure(status, retryAfterSec) {
+  authLockedByServer = true;
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+  if (pairPollTimer) { clearInterval(pairPollTimer); pairPollTimer = null; }
+  const dot = document.getElementById('live-dot');
+  if (dot) dot.classList.add('paused');
+  const pill = document.getElementById('auth-pill');
+  if (status === 429) {
+    const wait = Number(retryAfterSec) > 0 ? Math.ceil(Number(retryAfterSec)) : 60;
+    authRateLimitUntil = Date.now() + wait * 1000;
+    if (pill) { pill.textContent = '⏳ Rate Limited (' + wait + 's)'; pill.className = 'pill bad'; }
+    const lu = document.getElementById('last-updated');
+    if (lu) lu.textContent = 'Auth rate-limited — auto-refresh paused for ' + wait + 's to prevent lockout.';
+    showToast('Too many failed auth attempts — wait ' + wait + 's before retrying.', 'bad');
+    return;
+  }
+  const hadToken = Boolean(getToken());
+  if (hadToken) {
+    sessionStorage.removeItem('pc_token');
+    localStorage.removeItem('pc_token');
+  }
+  scrubSensitiveDom(true);
+  updateAuthBadge();
+  if (pill) {
+    pill.textContent = hadToken ? '✕ Token Rejected' : '🔒 Auth Required';
+    pill.className = hadToken ? 'pill bad' : 'pill warn';
+  }
+  const lu = document.getElementById('last-updated');
+  if (lu) lu.textContent = 'Dashboard locked — paste auth_token above and click Unlock (auto-refresh paused).';
+}
+
+async function verifyAndSaveToken() {
+  await withBusyAction('auth-verify', 'btn-auth-unlock', 'Checking...', async () => {
+    const inp = document.getElementById('auth-token');
+    const raw = inp ? inp.value.trim() : '';
+    const candidate = raw || getToken();
+    if (!candidate) {
+      showToast('Paste your auth_token first (run `pc token` on the Master phone).', 'warn');
+      return;
+    }
+    try {
+      const r = await apiFetch('/api/auth/verify', {
+        headers: { 'Authorization': 'Bearer ' + candidate },
+        timeoutMs: 10000,
+      });
+      if (r.status === 429) {
+        const body = await readJsonSafe(r);
+        handleAuthFailure(429, body && body.retry_after_sec);
+        return;
+      }
+      if (!r.ok) {
+        const body = await readJsonSafe(r);
+        showToast((body && body.error) ? body.error : 'Invalid auth_token — check config/cluster.json or run `pc token`.', 'bad');
+        return;
+      }
+      if (document.getElementById('remember-token').checked) {
+        localStorage.setItem('pc_token', candidate);
+        sessionStorage.removeItem('pc_token');
+      } else {
+        sessionStorage.setItem('pc_token', candidate);
+        localStorage.removeItem('pc_token');
+      }
+      authLockedByServer = false;
+      authRateLimitUntil = 0;
+      updateAuthBadge();
+      scheduleRefresh();
+      loadSafetySettings();
+      refreshAll();
+      showToast('Token verified — Terminal & Cluster controls unlocked!', 'ok');
+    } catch (e) {
+      showToast('Could not reach Master to verify token: ' + (e && e.message ? e.message : String(e)), 'bad');
+    }
+  });
+}
+
+function clearToken(silent) {
+  sessionStorage.removeItem('pc_token');
+  localStorage.removeItem('pc_token');
+  scrubSensitiveDom(false);
   updateAuthBadge();
   if (!silent) {
     refreshAll();
@@ -1438,13 +1878,14 @@ function clearToken(silent) {
 }
 
 function scheduleRefresh() {
-  if (refreshTimer) clearInterval(refreshTimer);
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
   const dot = document.getElementById('live-dot');
-  if (pollMs > 0) {
-    dot.classList.remove('paused');
+  const shouldRun = pollMs > 0 && !authLockedByServer && !document.hidden;
+  if (shouldRun) {
+    if (dot) dot.classList.remove('paused');
     refreshTimer = setInterval(() => refreshLive({ fresh: false }), pollMs);
   } else {
-    dot.classList.add('paused');
+    if (dot) dot.classList.add('paused');
   }
 }
 
@@ -1470,7 +1911,59 @@ function initPreferences() {
     scheduleRefresh();
   });
 
-  // Terminal keyboard shortcuts (Enter, Up/Down history, Ctrl+L clear)
+  // Pause background polling when browser tab is hidden to save battery & Master CPU
+  document.addEventListener('visibilitychange', () => {
+    scheduleRefresh();
+    if (!document.hidden && pollMs > 0 && !authLockedByServer) {
+      refreshLive({ fresh: false });
+    }
+  });
+
+  // Enter submits auth token
+  const authInp = document.getElementById('auth-token');
+  if (authInp) {
+    authInp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); verifyAndSaveToken(); }
+    });
+  }
+
+  // Enter submits custom service form & manual node add form
+  for (const id of ['custom-svc-name', 'custom-svc-url']) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addCustomService(); } });
+  }
+  for (const id of ['add-host', 'add-user', 'add-pool']) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addManualNode(); } });
+  }
+
+  // Track unsaved edits on Network Guard & Hardening forms so Refresh does not clobber them
+  for (const id of ['gw-enabled', 'gw-mode', 'gw-port', 'gw-rpm', 'gw-ssrf', 'gw-inject', 'gw-allowed', 'gw-blocked']) {
+    const el = document.getElementById(id);
+    if (el) {
+      const markGwDirty = () => {
+        gwFormDirty = true;
+        const p = document.getElementById('gw-unsaved-pill');
+        if (p) p.style.display = 'inline-flex';
+      };
+      el.addEventListener('input', markGwDirty);
+      el.addEventListener('change', markGwDirty);
+    }
+  }
+  for (const id of ['hard-subnet', 'hard-ag-url', 'hard-req-auth', 'hard-src-ip', 'hard-signed-only']) {
+    const el = document.getElementById(id);
+    if (el) {
+      const markHardDirty = () => {
+        hardFormDirty = true;
+        const p = document.getElementById('hard-unsaved-pill');
+        if (p) p.style.display = 'inline-flex';
+      };
+      el.addEventListener('input', markHardDirty);
+      el.addEventListener('change', markHardDirty);
+    }
+  }
+
+  // Terminal keyboard shortcuts (Enter, Up/Down history preserving draft, Ctrl+L clear, Ctrl+C cancel)
   const termInp = document.getElementById('term-input');
   termInp.addEventListener('keydown', e => {
     if (e.key === 'Enter') {
@@ -1479,6 +1972,7 @@ function initPreferences() {
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       if (termHistory.length && termHistIdx < termHistory.length - 1) {
+        if (termHistIdx === -1) termDraft = termInp.value;
         termHistIdx++;
         termInp.value = termHistory[termHistory.length - 1 - termHistIdx];
       }
@@ -1487,24 +1981,79 @@ function initPreferences() {
       if (termHistIdx > 0) {
         termHistIdx--;
         termInp.value = termHistory[termHistory.length - 1 - termHistIdx];
-      } else {
+      } else if (termHistIdx === 0) {
         termHistIdx = -1;
-        termInp.value = '';
+        termInp.value = termDraft;
       }
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') {
       e.preventDefault();
       clearTerminal();
+    } else if (e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 'c') {
+      if (activeTermJob) {
+        e.preventDefault();
+        cancelActiveTermJob();
+      } else if (termInp.value && !window.getSelection().toString()) {
+        e.preventDefault();
+        termInp.value = '';
+        termHistIdx = -1;
+        termDraft = '';
+      }
     }
   });
 
   for (const id of ['map-commands', 'map-script', 'map-args']) {
-    document.getElementById(id).addEventListener('keydown', e => {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.addEventListener('input', updateMapJobCount);
+    el.addEventListener('keydown', e => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault();
         if (!e.repeat) runParallelMap();
       }
     });
   }
+
+  // Global keyboard shortcuts (1-6 tabs, / search or terminal, r refresh, Esc close, ? help)
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      const modal = document.getElementById('shortcuts-modal');
+      if (modal && !modal.hidden) { toggleShortcutsModal(false); return; }
+      const ed = document.getElementById('node-tier-editor');
+      if (ed && ed.style.display !== 'none') { closeNodeTierEditor(); return; }
+      hideToast();
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target && e.target.isContentEditable)) return;
+    const tabMap = { '1': 'overview', '2': 'terminal', '3': 'jobs', '4': 'workloads', '5': 'network', '6': 'setup' };
+    if (hasOwn(tabMap, e.key)) {
+      e.preventDefault();
+      selectTab(tabMap[e.key]);
+    } else if (e.key === '?') {
+      e.preventDefault();
+      toggleShortcutsModal();
+    } else if (e.key === '/') {
+      e.preventDefault();
+      if (document.getElementById('panel-terminal').classList.contains('active')) {
+        document.getElementById('term-input').focus();
+      } else {
+        selectTab('overview');
+        const srch = document.getElementById('node-search');
+        if (srch) srch.focus();
+      }
+    } else if (e.key === 'r') {
+      e.preventDefault();
+      refreshAll();
+    }
+  });
+
+  // Restore saved setup mode (wifi / usb)
+  const savedSetupMode = localStorage.getItem('pc_setup_mode');
+  if (savedSetupMode === 'usb' || savedSetupMode === 'wifi') {
+    setSetupConnectionMode(savedSetupMode, { skipScan: true, skipSave: true });
+  }
+  updateMapJobCount();
 }
 
 function selectTab(name) {
@@ -1517,10 +2066,22 @@ function selectTab(name) {
     btn.tabIndex = active ? 0 : -1;
     panel.classList.toggle('active', active);
   }
-  if (name === 'jobs') renderPipeBuilder();
+  if (name === 'jobs') { renderPipeBuilder(); updateMapJobCount(); }
   if (name === 'workloads') loadWorkloads();
   if (name === 'network') loadNetworkCenter();
-  if (name === 'setup' && getToken()) { loadSafetySettings(); pollPairingStatus(); }
+  if (name === 'setup') {
+    const savedMode = localStorage.getItem('pc_setup_mode');
+    if (!savedMode && lastLive && Array.isArray(lastLive.summary && lastLive.summary.nodes)) {
+      const hasUsb = lastLive.summary.nodes.some(n => Array.isArray(n.tags) && (n.tags.includes('usb-hub') || n.tags.includes('usb-mode:adb') || n.tags.includes('usb-mode:rndis')));
+      if (hasUsb) setSetupConnectionMode('usb', { skipSave: true });
+    }
+    if (getToken()) {
+      loadSafetySettings();
+      pollPairingStatus();
+      const usbCard = document.getElementById('setup-usb-card');
+      if (usbCard && usbCard.style.display !== 'none') loadUsbHub();
+    }
+  }
 }
 
 document.querySelector('nav.tabs').addEventListener('keydown', e => {
@@ -1551,8 +2112,10 @@ function metricBar(label, valueText, pct, tone) {
 
 function setBoardView(mode) {
   boardView = mode;
-  document.getElementById('btn-board-tasks').className = 'small' + (mode === 'tasks' ? ' primary' : '');
-  document.getElementById('btn-board-procs').className = 'small' + (mode === 'procs' ? ' primary' : '');
+  const bt = document.getElementById('btn-board-tasks');
+  const bp = document.getElementById('btn-board-procs');
+  if (bt) { bt.className = 'small' + (mode === 'tasks' ? ' primary' : ''); bt.setAttribute('aria-pressed', String(mode === 'tasks')); }
+  if (bp) { bp.className = 'small' + (mode === 'procs' ? ' primary' : ''); bp.setAttribute('aria-pressed', String(mode === 'procs')); }
   if (lastLive) renderTasksBoard(lastLive);
 }
 
@@ -1630,9 +2193,20 @@ function renderTasksBoard(live) {
   }
 }
 
-async function apiFetch(url) {
+async function apiFetch(url, opts) {
+  const options = opts || {};
   const token = getToken();
-  const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
+  const headers = Object.assign(token ? { 'Authorization': 'Bearer ' + token } : {}, options.headers || {});
+  const timeoutMs = Number(options.timeoutMs || 15000);
+  if (typeof AbortController !== 'undefined' && timeoutMs > 0) {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      return await fetch(url, { headers, signal: ctrl.signal });
+    } finally {
+      clearTimeout(tid);
+    }
+  }
   return await fetch(url, { headers });
 }
 
@@ -1645,20 +2219,25 @@ async function refreshLive(opts) {
     if (wantFresh) liveFreshQueued = true;
     return;
   }
+  if (authRateLimitUntil && Date.now() < authRateLimitUntil) {
+    const rem = Math.ceil((authRateLimitUntil - Date.now()) / 1000);
+    const lu = document.getElementById('last-updated');
+    if (lu) lu.textContent = 'Auth rate-limited — retry in ' + rem + 's.';
+    return;
+  }
   liveInFlight = true;
   try {
-    const r = await apiFetch(wantFresh ? '/api/live?fresh=1' : '/api/live');
-    if (r.status === 401) {
-      if (getToken()) {
-        clearToken(true);
-        const pill = document.getElementById('auth-pill');
-        if (pill) { pill.textContent = '✕ Token Rejected'; pill.className = 'pill bad'; }
-      }
-      document.getElementById('last-updated').textContent = 'Dashboard locked — paste auth_token above and click Unlock.';
+    const r = await apiFetch(wantFresh ? '/api/live?fresh=1' : '/api/live', { timeoutMs: 15000 });
+    if (r.status === 401 || r.status === 429) {
+      const body = await readJsonSafe(r);
+      handleAuthFailure(r.status, body && body.retry_after_sec);
       const grid = document.getElementById('nodes-grid');
-      if (grid) grid.innerHTML = '<div class="card"><p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p></div>';
+      const lockMsg = r.status === 429
+        ? 'Auth rate-limited — wait for the cooldown before retrying.'
+        : 'Dashboard locked — paste auth_token above and click Unlock.';
+      if (grid) grid.innerHTML = '<div class="card"><p class="hint">' + esc(lockMsg) + '</p></div>';
       const tasks = document.getElementById('tasks-board-wrap');
-      if (tasks) tasks.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
+      if (tasks) tasks.innerHTML = '<p class="hint">' + esc(lockMsg) + '</p>';
       return;
     }
     if (r.status === 503) {
@@ -1669,23 +2248,32 @@ async function refreshLive(opts) {
       document.getElementById('last-updated').textContent = 'Dashboard error (HTTP ' + r.status + ')';
       return;
     }
-    const live = await r.json();
+    const live = await readJsonSafe(r);
+    if (!live || typeof live !== 'object' || !live.summary) {
+      document.getElementById('last-updated').textContent = 'Invalid telemetry payload from Master.';
+      return;
+    }
+    if (authLockedByServer) {
+      authLockedByServer = false;
+      scheduleRefresh();
+    }
     lastLive = live;
     const d = live.summary;
+    const nodesArr = Array.isArray(d.nodes) ? d.nodes : [];
     const hist = live.history || { cluster: [], nodes: {} };
     const safety = d.safety || {};
     const maxTemp = safety.max_temp_c ?? 40;
     const resTemp = safety.resume_temp_c ?? 37;
     const batHigh = safety.battery_high_pct ?? 60;
 
-    document.getElementById('cluster-title').textContent = d.cluster_name + ' — Shared btop';
-    document.getElementById('last-updated').textContent = 'Sampled ' + new Date(d.timestamp * 1000).toLocaleTimeString() + ' · ' + d.nodes_online + '/' + d.nodes_total + ' phones connected';
+    document.getElementById('cluster-title').textContent = (d.cluster_name || 'PhoneCluster') + ' — Shared btop';
+    document.getElementById('last-updated').textContent = 'Sampled ' + new Date((d.timestamp || Date.now() / 1000) * 1000).toLocaleTimeString() + ' · ' + (d.nodes_online ?? 0) + '/' + (d.nodes_total ?? nodesArr.length) + ' phones connected';
 
     // Hero KPIs + Sparklines
-    const cHist = hist.cluster || [];
+    const cHist = Array.isArray(hist.cluster) ? hist.cluster : [];
     const clusterCpuNum = Number(d.cluster_cpu_pct ?? 0);
     document.getElementById('k-cpu').textContent = (Number.isFinite(clusterCpuNum) ? clusterCpuNum : 0).toFixed(1) + '%';
-    document.getElementById('k-cores').textContent = d.total_cores + ' cores';
+    document.getElementById('k-cores').textContent = (d.total_cores ?? 0) + ' cores';
     document.getElementById('spark-cpu').innerHTML = renderSparklineSvg(
       cHist.map(p => p.cpu_pct), 100, '#58a6ff', 'rgba(88,166,255,0.18)'
     );
@@ -1718,9 +2306,9 @@ async function refreshLive(opts) {
     document.getElementById('k-tasks-sub').textContent = d.total_active_jobs ? 'Active across cluster' : 'Idle · ready for work';
     document.getElementById('k-net').textContent = '↓' + (d.total_net_rx_kbps ?? 0) + ' ↑' + (d.total_net_tx_kbps ?? 0) + ' KB/s';
 
-    document.getElementById('k-nodes').textContent = d.nodes_ready + ' / ' + d.nodes_total;
+    document.getElementById('k-nodes').textContent = (d.nodes_ready ?? 0) + ' / ' + (d.nodes_total ?? nodesArr.length);
     document.getElementById('k-ping').textContent = (d.avg_latency_ms ?? 0) + ' ms';
-    document.getElementById('k-nodes-sub').textContent = d.nodes_online + ' online · ' + d.nodes_ready + ' ready';
+    document.getElementById('k-nodes-sub').textContent = (d.nodes_online ?? 0) + ' online · ' + (d.nodes_ready ?? 0) + ' ready';
 
     // Update Terminal Target Dropdown dynamically only when options change and select is not open/focused
     const termSel = document.getElementById('term-target');
@@ -1733,7 +2321,7 @@ async function refreshLive(opts) {
         dynPools.push(p.pool);
       }
     }
-    const termSig = JSON.stringify([dynPools, (d.nodes || []).map(n => [n.id, n.role, n.tier || 1, n.pool || 'compute', n.host])]);
+    const termSig = JSON.stringify([dynPools, nodesArr.map(n => [n.id, n.role, n.tier || 1, n.pool || 'compute', n.host])]);
     if (termSel.dataset.sig !== termSig && document.activeElement !== termSel) {
       let termOpts = '<option value="auto">⚡ Auto-Route by Workload (Smart Tier)</option>'
         + '<option value="tier:1">Tier 1 · Termux Compute &amp; AI</option>'
@@ -1745,7 +2333,7 @@ async function refreshLive(opts) {
         termOpts += '<option value="pool:' + esc(pname) + '">Pool: ' + esc(pname) + '</option>';
       }
       termSel.innerHTML = termOpts;
-      for (const n of (d.nodes || [])) {
+      for (const n of nodesArr) {
         const opt = document.createElement('option');
         opt.value = n.id;
         opt.textContent = n.id + ' (' + n.role + ' · T' + (n.tier || 1) + ':' + (n.pool || 'compute') + ' · ' + n.host + ')';
@@ -1769,7 +2357,7 @@ async function refreshLive(opts) {
         mapOpts += '<option value="pool:' + esc(pname) + '">Pool: ' + esc(pname) + '</option>';
       }
       mapSel.innerHTML = mapOpts;
-      for (const n of (d.nodes || [])) {
+      for (const n of nodesArr) {
         const opt = document.createElement('option');
         opt.value = n.id;
         opt.textContent = n.id + ' (' + n.role + ' · T' + (n.tier || 1) + ':' + (n.pool || 'compute') + ')';
@@ -1785,7 +2373,7 @@ async function refreshLive(opts) {
     renderNodesGrid(live);
 
     const batWarnings = [];
-    for (const n of d.nodes) {
+    for (const n of nodesArr) {
       const h = n.health || {};
       if (n.online && h.battery_pct != null && h.battery_pct >= batHigh && (h.battery_status === 'CHARGING' || h.battery_status === 'FULL')) {
         batWarnings.push(n.id + ' is at ' + h.battery_pct + '% (' + h.battery_status + ')');
@@ -1803,7 +2391,10 @@ async function refreshLive(opts) {
 
     renderTasksBoard(live);
   } catch (e) {
-    document.getElementById('last-updated').textContent = 'Connection error: ' + e;
+    const isAbort = e && e.name === 'AbortError';
+    document.getElementById('last-updated').textContent = isAbort
+      ? 'Master timed out (retrying on next tick)...'
+      : ('Connection error: ' + (e && e.message ? e.message : String(e)));
   } finally {
     liveInFlight = false;
     if (liveFreshQueued) {
@@ -1811,6 +2402,43 @@ async function refreshLive(opts) {
       refreshLive({ fresh: true });
     }
   }
+}
+
+function _nodeCpuPct(n) {
+  const h = n.health || {};
+  const rawCores = Number(h.cpu_cores);
+  const cores = (Number.isFinite(rawCores) && rawCores > 0) ? Math.floor(rawCores) : 1;
+  const rawCpu = h.cpu_pct != null ? Number(h.cpu_pct) : Math.min(100, ((Number(h.load_1m) || 0) / cores) * 100);
+  return Number.isFinite(rawCpu) ? rawCpu : 0;
+}
+
+function _nodeRamPct(n) {
+  const h = n.health || {};
+  const tot = Number(h.mem_total_mb || 0);
+  const avail = Number(h.mem_available_mb || 0);
+  return tot > 0 ? Math.min(100, (Math.max(0, tot - avail) / tot) * 100) : 0;
+}
+
+function _isUsbNode(n) {
+  return Array.isArray(n.tags) && (n.tags.includes('usb-hub') || n.tags.includes('usb-mode:adb') || n.tags.includes('usb-mode:rndis'));
+}
+
+function copyNodeSsh(nodeId) {
+  if (!lastLive) return;
+  const n = (lastLive.summary.nodes || []).find(x => x.id === nodeId);
+  if (!n) return;
+  const port = safePort(n.ssh_port) || 8022;
+  const target = n.ssh_user ? (n.ssh_user + '@' + n.host) : n.host;
+  copyText('ssh -p ' + port + ' ' + target, 'Copied SSH command for ' + nodeId + '!');
+}
+
+async function pushSingleNodePolicy(nodeId) {
+  await withBusyAction('push-node:' + nodeId, null, '', async () => {
+    const data = await authPost('/api/network/push-config', { node_ids: [nodeId] });
+    if (data.error) { showToast('Push failed for ' + nodeId + ': ' + data.error, 'bad'); return; }
+    showPolicyResult('Pushed live config to ' + nodeId + '.', data);
+    refreshLive();
+  });
 }
 
 function renderNodesGrid(live) {
@@ -1821,31 +2449,75 @@ function renderNodesGrid(live) {
     const resTemp = safety.resume_temp_c ?? 37;
     const batHigh = safety.battery_high_pct ?? 60;
 
-    // Render Shared Multi-Device btop Cards (respecting active Tier/Pool filter)
+    // Render Shared Multi-Device btop Cards (respecting active Tier/Pool, search, status & sort)
     const grid = document.getElementById('nodes-grid');
     const active = document.activeElement;
-    const focusedAction = grid.contains(active) ? active.dataset.action : '';
-    const focusedNode = focusedAction ? active.closest('[data-node-id]').dataset.nodeId : '';
+    const focusedAction = (grid && active && grid.contains(active)) ? (active.dataset.action || '') : '';
+    const focusedNode = focusedAction ? (active.closest('[data-node-id]')?.dataset?.nodeId || '') : '';
     grid.innerHTML = '';
 
-    const visibleNodes = (d.nodes || []).filter(n => {
-      if (activePoolFilter === 'all') return true;
-      if (activePoolFilter.startsWith('pool:')) return ('pool:' + (n.pool || 'compute')) === activePoolFilter;
+    const allNodes = Array.isArray(d.nodes) ? d.nodes : [];
+    const searchQ = (document.getElementById('node-search')?.value || '').trim().toLowerCase();
+    const statusFilter = document.getElementById('node-status-filter')?.value || 'all';
+    const sortBy = document.getElementById('node-sort')?.value || 'default';
+
+    let visibleNodes = allNodes.filter(n => {
+      if (activePoolFilter !== 'all' && activePoolFilter.startsWith('pool:')) {
+        if (('pool:' + (n.pool || 'compute')) !== activePoolFilter) return false;
+      }
+      if (statusFilter === 'ready' && !(n.online && n.ready_for_jobs && !n.quarantined)) return false;
+      if (statusFilter === 'attention' && (n.online && n.ready_for_jobs && !n.quarantined)) return false;
+      if (statusFilter === 'usb' && !_isUsbNode(n)) return false;
+      if (searchQ) {
+        const h = n.health || {};
+        const svcsObj = (h.services && typeof h.services === 'object' && !Array.isArray(h.services)) ? h.services : {};
+        const svcNames = Object.entries(svcsObj).filter(([, v]) => v).map(([k]) => k).join(' ');
+        const hay = [n.id, n.host, n.role, n.pool, n.notes, h.os_env, (n.tags || []).join(' '), svcNames].join(' ').toLowerCase();
+        if (!hay.includes(searchQ)) return false;
+      }
       return true;
     });
 
+    if (sortBy === 'cpu') {
+      visibleNodes = visibleNodes.slice().sort((a, b) => (b.online ? _nodeCpuPct(b) : -1) - (a.online ? _nodeCpuPct(a) : -1));
+    } else if (sortBy === 'temp') {
+      visibleNodes = visibleNodes.slice().sort((a, b) => Number(b.health?.temp_c ?? -1) - Number(a.health?.temp_c ?? -1));
+    } else if (sortBy === 'ram') {
+      visibleNodes = visibleNodes.slice().sort((a, b) => (b.online ? _nodeRamPct(b) : -1) - (a.online ? _nodeRamPct(a) : -1));
+    } else if (sortBy === 'name') {
+      visibleNodes = visibleNodes.slice().sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+    }
+
+    const cntEl = document.getElementById('node-filter-count');
+    if (cntEl) {
+      cntEl.textContent = allNodes.length ? ('Showing ' + visibleNodes.length + '/' + allNodes.length) : '';
+    }
+
+    if (!allNodes.length) {
+      grid.innerHTML = '<div class="card"><h3>Welcome to PhoneCluster</h3>'
+        + '<p class="hint">No phones configured yet. Connect phones over Wi-Fi PIN pairing or a powered USB 3.0 Hub:</p>'
+        + '<div class="row" style="margin:8px 0 0;">'
+        + '<button class="small primary" onclick="selectTab(\'setup\'); setSetupConnectionMode(\'wifi\')">📶 Pair Over Wi-Fi</button>'
+        + '<button class="small" onclick="openUsbHubSetupTab()">🔌 Setup USB 3.0 Hub</button>'
+        + '</div></div>';
+      return;
+    }
+
     if (!visibleNodes.length) {
-      grid.innerHTML = '<div class="card"><p class="hint">No phones in this pool yet. Click "All Phones" above or assign a phone via Tier / Pool.</p></div>';
+      grid.innerHTML = '<div class="card"><p class="hint">No phones match your current filter. Click "All Phones" or clear the search box above.</p></div>';
       return;
     }
 
     for (const n of visibleNodes) {
       const h = n.health || {};
       const nHist = (hist.nodes && hist.nodes[n.id]) ? hist.nodes[n.id] : [];
+      const isUsbNode = _isUsbNode(n);
       let badge = '<span class="pill bad">✕ OFFLINE</span>';
       let cardCls = 'node-card offline';
-      if (n.online && n.quarantined) {
-        badge = '<span class="pill bad">🔒 QUARANTINED</span>';
+      if (n.quarantined) {
+        badge = n.online
+          ? '<span class="pill bad">🔒 QUARANTINED</span>'
+          : '<span class="pill bad">🔒 QUARANTINED · OFFLINE</span>';
         cardCls = 'node-card offline';
       } else if (n.online && n.ready_for_jobs) {
         const actNum = Number.isFinite(Number(h.active_jobs)) ? Number(h.active_jobs) : 0;
@@ -1861,15 +2533,13 @@ function renderNodesGrid(live) {
 
       let bodyHtml = '';
       if (!n.online) {
-        const isUsbNode = Array.isArray(n.tags) && (n.tags.includes('usb-hub') || n.tags.includes('usb-mode:adb') || n.tags.includes('usb-mode:rndis'));
         const fixCmd = isUsbNode ? ('pc usb-hub verify && pc sync --node-id ' + n.id) : ('pc sync --node-id ' + n.id);
         bodyHtml = '<p class="hint">Unreachable: ' + esc(n.error || 'connection refused') + '</p>'
           + '<p class="hint mono" style="font-size:0.78rem; margin-top:4px;">Tip: start worker via <code>' + esc(fixCmd) + '</code></p>';
       } else {
         const rawCores = Number(h.cpu_cores);
         const cores = (Number.isFinite(rawCores) && rawCores > 0) ? Math.floor(rawCores) : 1;
-        const rawCpu = h.cpu_pct != null ? Number(h.cpu_pct) : Math.min(100, ((Number(h.load_1m) || 0) / cores) * 100);
-        const cpuPct = Number.isFinite(rawCpu) ? rawCpu : 0;
+        const cpuPct = _nodeCpuPct(n);
         const perCore = Array.isArray(h.per_core_pct) ? h.per_core_pct : [];
         const coreCols = perCore.length
           ? '<div class="core-grid" title="Per-core CPU utilization">'
@@ -1937,10 +2607,21 @@ function renderNodesGrid(live) {
       const rolePill = n.role === 'master'
         ? '<span class="pill purple">MASTER</span>'
         : '<span class="pill neutral">WORKER</span>';
+      const usbPill = isUsbNode ? ' <span class="pill accent">🔌 USB</span>' : '';
+      const hostDisp = (n.host === '127.0.0.1' && isUsbNode && safePort(n.worker_port))
+        ? ('usb:' + n.worker_port + ' (127.0.0.1)')
+        : String(n.host || '');
+      const noteHtml = n.notes ? '<div class="node-note">' + esc(n.notes) + '</div>' : '';
+
       let actionsHtml = '<div class="node-actions">'
         + '<button class="small primary" data-action="terminal" onclick="openNodeTerminal(' + jsArg(n.id) + ')">Terminal</button>'
-        + '<button class="small" data-action="edit" onclick="openNodeTierEditor(' + jsArg(n.id) + ')">Tier / Pool</button>';
+        + '<button class="small" data-action="edit" onclick="openNodeTierEditor(' + jsArg(n.id) + ')">Tier / Pool</button>'
+        + '<button class="small" data-action="ssh" onclick="copyNodeSsh(' + jsArg(n.id) + ')" title="Copy SSH command">Copy SSH</button>'
+        + '<button class="small" data-action="push" onclick="pushSingleNodePolicy(' + jsArg(n.id) + ')" title="Push live config to this phone">Sync</button>';
       if (n.role !== 'master') {
+        actionsHtml += n.quarantined
+          ? '<button class="small primary" data-action="quarantine" onclick="toggleQuarantine(' + jsArg(n.id) + ', false)">Unblock</button>'
+          : '<button class="small" data-action="quarantine" onclick="toggleQuarantine(' + jsArg(n.id) + ', true)">Quarantine</button>';
         actionsHtml += '<button class="small danger" data-action="remove" onclick="removeNode(' + jsArg(n.id) + ')">Remove</button>';
       }
       actionsHtml += '</div>';
@@ -1949,8 +2630,8 @@ function renderNodesGrid(live) {
       card.className = cardCls;
       card.dataset.nodeId = n.id;
       card.innerHTML = '<div><div class="node-head">'
-        + '<div><div class="node-title">' + esc(n.id) + ' ' + rolePill + ' ' + tierPillHtml(n.tier, n.pool) + '</div>'
-        + '<div class="node-meta mono">' + esc(n.host) + '</div></div>'
+        + '<div><div class="node-title">' + esc(n.id) + ' ' + rolePill + ' ' + tierPillHtml(n.tier, n.pool) + usbPill + '</div>'
+        + '<div class="node-meta mono">' + esc(hostDisp) + '</div>' + noteHtml + '</div>'
         + badge + '</div>' + bodyHtml + '</div>' + actionsHtml;
       grid.appendChild(card);
       if (focusedNode === n.id) {
@@ -1986,6 +2667,37 @@ function selectTerminalTarget(target) {
   sel.value = target;
 }
 
+function updateTermStatusPill(target) {
+  const pill = document.getElementById('term-status-pill');
+  if (!pill) return;
+  if (target === 'auto' || target === 'best' || target === 'all' || target.startsWith('tier:') || target.startsWith('pool:')) {
+    const readyN = lastLive && lastLive.summary ? (lastLive.summary.nodes_ready ?? 0) : 0;
+    const totalN = lastLive && lastLive.summary ? (lastLive.summary.nodes_total ?? 0) : 0;
+    pill.className = 'pill ' + (readyN ? 'ok' : 'neutral');
+    pill.textContent = target === 'all' ? ('Broadcast · ' + readyN + '/' + totalN + ' ready') : ('Smart · ' + readyN + '/' + totalN + ' ready');
+    return;
+  }
+  const n = lastLive && lastLive.summary && (lastLive.summary.nodes || []).find(x => x.id === target);
+  if (!n) {
+    pill.className = 'pill bad';
+    pill.textContent = 'Unavailable';
+    return;
+  }
+  if (n.quarantined) {
+    pill.className = 'pill bad';
+    pill.textContent = '🔒 Quarantined';
+  } else if (!n.online) {
+    pill.className = 'pill bad';
+    pill.textContent = '✕ Offline';
+  } else {
+    const h = n.health || {};
+    const tStr = (h.temp_c != null && Number.isFinite(Number(h.temp_c))) ? (' · ' + Number(h.temp_c).toFixed(1) + '°C') : '';
+    const cStr = h.cpu_cores ? (' · ' + h.cpu_cores + 'c') : '';
+    pill.className = 'pill ' + (n.ready_for_jobs ? 'ok' : 'warn');
+    pill.textContent = (n.ready_for_jobs ? '✓ Ready' : '⚠ Paused') + tStr + cStr;
+  }
+}
+
 function onTermTargetChange() {
   const target = document.getElementById('term-target').value;
   const cwd = termCwds[target] || '~';
@@ -1994,6 +2706,14 @@ function onTermTargetChange() {
   document.getElementById('term-cwd-pill').textContent = cwd;
   document.getElementById('term-prompt').textContent = available
     ? target + ':' + shortCwd(cwd) + ' $' : target + ' unavailable — choose a target';
+  updateTermStatusPill(target);
+}
+
+function onTermScreenClick() {
+  const sel = window.getSelection && window.getSelection();
+  if (sel && String(sel).trim()) return;
+  const inp = document.getElementById('term-input');
+  if (inp) inp.focus();
 }
 
 function openNodeTerminal(nodeId, prefillCmd) {
@@ -2017,6 +2737,20 @@ function runTermPreset(cmd) {
 function clearTerminal() {
   document.getElementById('term-screen').innerHTML = '';
   termTranscript = [];
+}
+
+function copyTermLog() {
+  if (!termTranscript.length) {
+    showToast('Terminal log is empty.', 'warn');
+    return;
+  }
+  copyText(termTranscript.join('\n\n'), 'Copied terminal transcript!');
+}
+
+function copyTermEntry(idx) {
+  const txt = termTranscript[idx];
+  if (txt == null) return;
+  copyText(txt, 'Copied command output!');
 }
 
 function downloadTermLog() {
@@ -2043,15 +2777,21 @@ async function submitTerminalCommand() {
   }
   const cwd = termCwds[target] || '';
   termHistory.push(cmd);
+  if (termHistory.length > 200) termHistory.shift();
   termHistIdx = -1;
+  termDraft = '';
   inp.value = '';
 
   const screen = document.getElementById('term-screen');
   const entry = document.createElement('div');
   entry.className = 'term-entry';
   const promptText = target + ':' + shortCwd(cwd) + ' $ ' + cmd;
-  entry.innerHTML = '<div class="term-cmd-line">' + esc(promptText) + '<span class="term-meta">running...</span></div>';
+  const startedAt = Date.now();
+  entry.innerHTML = '<div class="term-cmd-line">' + esc(promptText) + '<span class="term-meta term-elapsed">running... 0.0s</span></div>';
   screen.appendChild(entry);
+  while (screen.children.length > MAX_TERM_DOM_ENTRIES) {
+    screen.removeChild(screen.firstElementChild);
+  }
   screen.scrollTop = screen.scrollHeight;
 
   const jobId = 'wterm-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
@@ -2060,6 +2800,12 @@ async function submitTerminalCommand() {
   const isDynamicTarget = (target === 'auto' || target === 'all' || target === 'best' || target.startsWith('tier:') || target.startsWith('pool:'));
   document.getElementById('btn-term-cancel').disabled = isDynamicTarget;
 
+  if (termElapsedTimer) clearInterval(termElapsedTimer);
+  termElapsedTimer = setInterval(() => {
+    const elSp = entry.querySelector('.term-elapsed');
+    if (elSp) elSp.textContent = 'running... ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's';
+  }, 250);
+
   try {
     const data = await authPost('/api/terminal/exec', { command: cmd, target, cwd, job_id: jobId });
     if (data.error) {
@@ -2067,9 +2813,11 @@ async function submitTerminalCommand() {
       showToast(data.error, 'bad');
       return;
     }
-    let html = '<div class="term-cmd-line">' + esc(promptText) + '</div>';
+    const results = Array.isArray(data.results) ? data.results : [];
     let plainOut = '$ ' + promptText + '\n';
-    for (const r of (data.results || [])) {
+    const isMulti = results.length > 1;
+    let bodyHtml = '';
+    for (const r of results) {
       if (!isDynamicTarget && r.cwd) {
         termCwds[target] = r.cwd;
         onTermTargetChange();
@@ -2077,16 +2825,28 @@ async function submitTerminalCommand() {
       const tierStr = r.node_tier ? (' · T' + r.node_tier + ':' + (r.node_pool || 'compute')) : '';
       const whyStr = r.routing_reason ? (' — ' + r.routing_reason) : '';
       const meta = '[' + r.node_id + tierStr + ' · ' + (r.ok ? 'OK' : (r.outcome_unknown ? 'Outcome unknown' : 'rc=' + r.returncode)) + ' · ' + r.duration_sec + 's' + whyStr + ']';
-      html += '<div class="term-meta" style="margin-left:0;">' + esc(meta) + '</div>';
-      if (r.stdout) { html += '<div>' + esc(r.stdout) + '</div>'; plainOut += meta + '\n' + r.stdout + '\n'; }
-      if (r.stderr) { html += '<div class="term-err">' + esc(r.stderr) + '</div>'; plainOut += '[stderr]\n' + r.stderr + '\n'; }
-      if (r.error) { html += '<div class="term-err">Error: ' + esc(r.error) + '</div>'; plainOut += '[error] ' + r.error + '\n'; }
+      let chunk = '<div class="term-meta" style="margin-left:0;">' + esc(meta) + '</div>';
+      plainOut += meta + '\n';
+      if (r.stdout) { chunk += '<div>' + esc(r.stdout) + '</div>'; plainOut += r.stdout + '\n'; }
+      if (r.stderr) { chunk += '<div class="term-err">' + esc(r.stderr) + '</div>'; plainOut += '[stderr]\n' + r.stderr + '\n'; }
+      if (r.error) { chunk += '<div class="term-err">Error: ' + esc(r.error) + '</div>'; plainOut += '[error] ' + r.error + '\n'; }
+      if (isMulti) {
+        const blkTone = r.ok ? '' : (r.outcome_unknown ? ' warn' : ' bad');
+        bodyHtml += '<div class="term-node-block' + blkTone + '">' + chunk + '</div>';
+      } else {
+        bodyHtml += chunk;
+      }
     }
-    entry.innerHTML = html;
+    if (termTranscript.length >= MAX_TERM_TRANSCRIPT_ENTRIES) termTranscript.shift();
+    const trIdx = termTranscript.length;
     termTranscript.push(plainOut.trim());
+    entry.innerHTML = '<div class="term-entry-head"><div class="term-cmd-line">' + esc(promptText) + '</div>'
+      + '<button type="button" class="term-copy-btn" onclick="event.stopPropagation(); copyTermEntry(' + trIdx + ')">Copy</button></div>'
+      + bodyHtml;
     screen.scrollTop = screen.scrollHeight;
     refreshLive();
   } finally {
+    if (termElapsedTimer) { clearInterval(termElapsedTimer); termElapsedTimer = null; }
     activeTermJob = null;
     onTermTargetChange();
     document.getElementById('btn-term-cancel').disabled = true;
@@ -2099,10 +2859,12 @@ async function cancelActiveTermJob() {
 }
 
 async function cancelJob(nodeId, jobId) {
-  const data = await authPost('/api/jobs/cancel', { node_id: nodeId, job_id: jobId });
-  if (data.error) { showToast('Cancel failed: ' + data.error, 'bad'); return; }
-  showToast('Cancelled job ' + jobId + ' on ' + nodeId, 'warn');
-  refreshLive();
+  await withBusyAction('cancel:' + nodeId + ':' + jobId, null, '', async () => {
+    const data = await authPost('/api/jobs/cancel', { node_id: nodeId, job_id: jobId });
+    if (data.error) { showToast('Cancel failed: ' + data.error, 'bad'); return; }
+    showToast('Cancelled job ' + jobId + ' on ' + nodeId, 'warn');
+    refreshLive();
+  });
 }
 
 /* ---------------- Parallel Batch, Workloads, Setup & Doctor ---------------- */
@@ -2147,19 +2909,27 @@ function applyMapTemplate(name) {
   }
   showToast('Loaded template: ' + name, 'ok');
   document.getElementById('map-template').value = '';
+  updateMapJobCount();
 }
 
 function loadFileInto(input, targetId) {
   const file = input.files && input.files[0];
   if (!file) return;
+  if (file.size > MAX_UPLOAD_BYTES) {
+    showToast('File too large (max 1 MB).', 'bad');
+    input.value = '';
+    return;
+  }
   const reader = new FileReader();
   reader.onload = () => {
     document.getElementById(targetId).value = String(reader.result || '');
     if (targetId === 'map-script' && file.name.endsWith('.sh')) {
       document.getElementById('map-interp').value = 'bash';
     }
+    updateMapJobCount();
     showToast('Loaded ' + file.name, 'ok');
   };
+  reader.onerror = () => showToast('Could not read file.', 'bad');
   reader.readAsText(file);
   input.value = '';
 }
@@ -2176,35 +2946,45 @@ async function authPost(url, payload) {
       body: JSON.stringify(payload),
     });
     const text = await r.text();
+    let parsed = null;
     try {
-      const parsed = JSON.parse(text);
-      if (r.status === 409 && parsed && typeof parsed === 'object' && String(parsed.error || '').toLowerCase().includes('changed on disk')) {
-        const cb = document.getElementById('config-conflict-banner');
-        const ct = document.getElementById('config-conflict-text');
-        if (ct) ct.textContent = String(parsed.error);
-        if (cb) cb.classList.remove('hidden');
-      }
-      if (!r.ok && (!parsed || typeof parsed !== 'object' || !parsed.error)) {
-        return Object.assign(typeof parsed === 'object' && parsed ? parsed : {}, {
-          error: 'Request failed (HTTP ' + r.status + ')',
-        });
-      }
-      return parsed;
+      parsed = text ? JSON.parse(text) : null;
     } catch (_e) {
+      if (r.status === 401 || r.status === 429) handleAuthFailure(r.status);
       return { error: 'Unexpected server response (HTTP ' + r.status + ')' };
     }
+    if (r.status === 401 || r.status === 429) {
+      handleAuthFailure(r.status, parsed && parsed.retry_after_sec);
+    }
+    if (r.status === 409 && parsed && typeof parsed === 'object' && String(parsed.error || '').toLowerCase().includes('changed on disk')) {
+      const cb = document.getElementById('config-conflict-banner');
+      const ct = document.getElementById('config-conflict-text');
+      if (ct) ct.textContent = String(parsed.error);
+      if (cb) cb.classList.remove('hidden');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { error: 'Unexpected server response (HTTP ' + r.status + ')' };
+    }
+    if (!r.ok && !parsed.error) {
+      return Object.assign({}, parsed, { error: 'Request failed (HTTP ' + r.status + ')' });
+    }
+    return parsed;
   } catch (e) {
     return { error: 'Could not reach Master: ' + (e && e.message ? e.message : String(e)) };
   }
 }
 
 async function reloadConfigFromDisk() {
-  const data = await authPost('/api/config/reload', {});
-  if (data.error) { showToast('Reload failed: ' + data.error, 'bad'); return; }
-  const cb = document.getElementById('config-conflict-banner');
-  if (cb) cb.classList.add('hidden');
-  showToast('Reloaded cluster.json (' + (data.node_count ?? '?') + ' node(s)) from disk!', 'ok');
-  refreshAll();
+  await withBusyAction('config-reload', 'btn-setup-reload-cfg', 'Reloading...', async () => {
+    const data = await authPost('/api/config/reload', {});
+    if (data.error) { showToast('Reload failed: ' + data.error, 'bad'); return; }
+    const cb = document.getElementById('config-conflict-banner');
+    if (cb) cb.classList.add('hidden');
+    gwFormDirty = false;
+    hardFormDirty = false;
+    showToast('Reloaded cluster.json (' + (data.node_count ?? '?') + ' node(s)) from disk!', 'ok');
+    refreshAll();
+  });
 }
 
 function formatJobOutput(result) {
@@ -2215,10 +2995,43 @@ function formatJobOutput(result) {
   return sections.join('\n') || '(no output)';
 }
 
+function updateMapJobCount() {
+  const el = document.getElementById('map-job-count');
+  const modeEl = document.getElementById('map-mode');
+  if (!el || !modeEl) return;
+  const srcId = modeEl.value === 'script' ? 'map-args' : 'map-commands';
+  const srcEl = document.getElementById(srcId);
+  const count = srcEl ? srcEl.value.split('\n').map(s => s.trim()).filter(Boolean).length : 0;
+  el.textContent = count + (count === 1 ? ' job' : ' jobs');
+}
+
+function setMapOutFilter(mode) {
+  mapOutFilter = mode || 'all';
+  for (const [id, k] of [['btn-map-f-all', 'all'], ['btn-map-f-fail', 'fail'], ['btn-map-f-ok', 'ok']]) {
+    const b = document.getElementById(id);
+    if (b) b.className = 'small' + (mapOutFilter === k ? ' primary' : '');
+  }
+  const out = document.getElementById('map-out');
+  if (!out || !lastMapData) return;
+  const rows = (lastMapData.results || []).filter(r => {
+    if (mapOutFilter === 'fail') return !r.ok;
+    if (mapOutFilter === 'ok') return r.ok === true;
+    return true;
+  });
+  let txt = '';
+  for (const r of rows) {
+    const tierStr = r.node_tier ? (' [T' + r.node_tier + ':' + (r.node_pool || 'compute') + ']') : '';
+    txt += '[' + (r.ok ? 'OK' : (r.outcome_unknown ? 'UNKNOWN' : 'FAIL')) + '] ' + r.node_id + tierStr + ' (' + r.duration_sec + 's) ' + r.label + '\n  '
+      + formatJobOutput(r).replace(/\n/g, '\n  ') + '\n';
+  }
+  out.textContent = txt || '(No batch jobs match this filter.)';
+}
+
 function toggleMapMode() {
   const mode = document.getElementById('map-mode').value;
   document.getElementById('map-commands-box').style.display = mode === 'commands' ? 'block' : 'none';
   document.getElementById('map-script-box').style.display = mode === 'script' ? 'block' : 'none';
+  updateMapJobCount();
 }
 
 async function runParallelMap() {
@@ -2229,8 +3042,10 @@ async function runParallelMap() {
   const out = document.getElementById('map-out');
   const chips = document.getElementById('map-summary-chips');
   const download = document.getElementById('btn-dl-map');
+  const filterBar = document.getElementById('map-filter-bar');
   btn.disabled = true;
   download.disabled = true;
+  if (filterBar) filterBar.style.display = 'none';
   lastMapData = null;
   chips.innerHTML = '';
   out.textContent = 'Dispatching parallel batch (target: ' + target + ')...';
@@ -2263,6 +3078,15 @@ async function runParallelMap() {
         + formatJobOutput(r).replace(/\n/g, '\n  ') + '\n';
     }
     out.textContent = txt || 'Done.';
+    if (filterBar && (data.results || []).length > 1) {
+      filterBar.style.display = 'flex';
+      const bAll = document.getElementById('btn-map-f-all');
+      const bFail = document.getElementById('btn-map-f-fail');
+      const bOk = document.getElementById('btn-map-f-ok');
+      if (bAll) bAll.className = 'small primary';
+      if (bFail) bFail.className = 'small';
+      if (bOk) bOk.className = 'small';
+    }
     showToast('Batch complete: ' + data.ok_count + ' succeeded, ' + failed + ' failed'
       + (unknown ? ', ' + unknown + ' unknown' : ''), data.fail_count ? 'warn' : 'ok');
     refreshLive();
@@ -2324,7 +3148,7 @@ function getAvailableMeshVars(stepIdx) {
     postgres: { label: '+ Postgres Host', val: '$PHONECLUSTER_POSTGRES_HOST' }
   };
   for (const s of svcs) {
-    if (svcToVar[s.name] && !seen.has(s.name)) {
+    if (hasOwn(svcToVar, s.name) && !seen.has(s.name)) {
       seen.add(s.name);
       vars.push(svcToVar[s.name]);
     } else if (s.source === 'config' && !seen.has('cfg:' + s.name)) {
@@ -2401,7 +3225,7 @@ function renderPipeBuilder() {
       + '<button type="button" class="small" title="Duplicate step" onclick="dupPipeStep(' + idx + ')">Copy</button>'
       + '<button type="button" class="small danger" title="Remove step" onclick="removePipeStep(' + idx + ')"' + (pipeSteps.length <= 1 ? ' disabled' : '') + '>✕</button>'
       + '</div></div>'
-      + '<textarea id="pipe-cmd-' + idx + '" aria-label="Step ' + (idx + 1) + ' command" style="min-height:58px;" placeholder="Enter shell command (plain text — no JSON escaping needed)..." oninput="updatePipeStep(' + idx + ',\'command\',this.value)">' + esc(st.command || '') + '</textarea>'
+      + '<textarea id="pipe-cmd-' + idx + '" aria-label="Step ' + (idx + 1) + ' command" style="min-height:58px;" placeholder="Enter shell command (Ctrl+Enter to run pipeline)..." oninput="updatePipeStep(' + idx + ',\'command\',this.value)" onkeydown="if((event.ctrlKey||event.metaKey)&&event.key===\'Enter\'){event.preventDefault();if(!event.repeat)runCrossTierPipeline();}">' + esc(st.command || '') + '</textarea>'
       + '<div class="row" style="justify-content:space-between; margin:6px 0 0;">'
       + '<div class="chips" style="margin:0;">' + varsHtml + '</div>'
       + '<label style="font-size:0.8rem; color:var(--muted); display:inline-flex; align-items:center; gap:5px;">'
@@ -2513,6 +3337,11 @@ function applyPipeJsonFromDrawer() {
 function importPipeJsonFile(input) {
   const file = input.files && input.files[0];
   if (!file) return;
+  if (file.size > MAX_UPLOAD_BYTES) {
+    showToast('Pipeline file too large (max 1 MB).', 'bad');
+    input.value = '';
+    return;
+  }
   const reader = new FileReader();
   reader.onload = () => {
     if (document.getElementById('pipe-visual-controls').disabled) {
@@ -2593,7 +3422,7 @@ function applyPipeTemplate(name) {
       }
     ]
   };
-  if (templates[name]) {
+  if (hasOwn(templates, name)) {
     pipeSteps = templates[name].map(s => Object.assign({}, s));
     lastPipeResults = [];
     renderPipeBuilder();
@@ -2637,7 +3466,7 @@ async function runCrossTierPipeline() {
       + '<span class="pill neutral mono">' + esc(data.duration_sec) + 's</span>'
       + '<span class="pill neutral">' + esc(data.steps_completed) + '/' + esc(data.steps_total) + ' steps</span>';
 
-    cardsBox.innerHTML = lastPipeResults.map(r => {
+    cardsBox.innerHTML = lastPipeResults.map((r, rIdx) => {
       const tp = r.node_tier ? tierPillHtml(r.node_tier, r.node_pool) : '<span class="pill neutral">none</span>';
       const body = formatJobOutput(r);
       const tone = r.outcome_unknown ? 'warn' : (r.ok ? 'ok' : 'bad');
@@ -2647,9 +3476,10 @@ async function runCrossTierPipeline() {
         + '<div><strong>Step ' + esc(r.step_index) + ': ' + esc(r.name) + '</strong> '
         + '<span class="pill ' + tone + '">' + state + '</span> '
         + '<span class="pill neutral mono">' + esc(r.node_id) + '</span> ' + tp + '</div>'
-        + '<span class="hint mono" style="margin:0;">' + esc(r.duration_sec) + 's</span></div>'
+        + '<div class="row" style="margin:0;"><span class="hint mono" style="margin:0;">' + esc(r.duration_sec) + 's</span>'
+        + '<button type="button" class="small" onclick="copyEl(\'pipe-res-pre-' + rIdx + '\')">Copy</button></div></div>'
         + (r.routing_reason ? '<div class="hint" style="margin:0 0 6px;">Route: ' + esc(r.routing_reason) + '</div>' : '')
-        + '<pre class="code" style="margin:0; max-height:180px;">' + esc(body) + '</pre>'
+        + '<pre id="pipe-res-pre-' + rIdx + '" class="code" style="margin:0; max-height:180px;">' + esc(body) + '</pre>'
         + '</div>';
     }).join('');
 
@@ -2674,124 +3504,141 @@ function downloadLastMapJson() {
 }
 
 async function loadWorkloads() {
-  try {
-    const r = await apiFetch('/api/workloads');
-    if (r.status === 401) {
-      document.getElementById('wl-distcc').textContent = '# Dashboard locked — paste auth_token above and click Unlock.';
-      return;
-    }
-    if (!r.ok) {
-      document.getElementById('wl-distcc').textContent = '# Error loading workloads (HTTP ' + r.status + ')';
-      return;
-    }
-    const d = await r.json();
-    const cidrInput = document.getElementById('distcc-cidr');
-    if (cidrInput && d.lan_subnet && cidrInput.dataset.edited !== 'user') {
-      cidrInput.value = d.lan_subnet;
-      cidrInput.dataset.edited = 'auto';
-    }
-    document.getElementById('wl-distcc').textContent = d.distcc_hosts
-      ? 'export DISTCC_HOSTS="' + d.distcc_hosts + '"'
-      : '# No running distccd workers detected (click Start All above).';
-    document.getElementById('wl-llama').textContent = d.llama_rpc
-      ? '--rpc ' + d.llama_rpc
-      : '# No running llama.cpp rpc-server detected on port 50052.';
-    document.getElementById('wl-mpi').textContent = d.mpi_hostfile || '# No ready nodes available.';
-
-    let svcHtml = '';
-    if (d.home_assistant_urls && d.home_assistant_urls.length) {
-      svcHtml += '<p><strong>✓ Home Assistant detected:</strong> '
-        + d.home_assistant_urls.map(u => /^https?:\/\//i.test(String(u || ''))
-            ? '<a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">' + esc(u) + '</a>'
-            : '<span class="mono">' + esc(u) + '</span>'
-          ).join(', ')
-        + '</p>';
-    } else {
-      svcHtml += '<p><strong>Home Assistant:</strong> Not detected on port 8123. Best deployed on Tier 2 (Rooted Debian 13 chroot) or Tier 3 (Docker).</p>';
-    }
-    svcHtml += '<p><strong>Docker-ready nodes:</strong> ' + (d.docker_nodes.length ? esc(d.docker_nodes.join(', ')) : 'None yet (install Snap Docker on Ubuntu Touch or Tier 3 Linux)') + '</p>';
-    if (Array.isArray(d.docker_snap_nodes) && d.docker_snap_nodes.length) {
-      svcHtml += '<p class="hint" style="margin-top:4px;">Snap Docker detected on <strong>' + esc(d.docker_snap_nodes.join(', ')) + '</strong> — keep bind-mount volumes under <code class="mono">~/phonecluster/docker-data</code> ($HOME).</p>';
-    }
-    if (Array.isArray(d.docker_socket_issues) && d.docker_socket_issues.length) {
-      svcHtml += '<p class="hint" style="color:var(--warn); margin-top:4px;">⚠ Docker socket permission needed on <strong>' + esc(d.docker_socket_issues.join(', ')) + '</strong> — run <code class="mono">bash scripts/06_ubuntu_touch_node_setup.sh</code>.</p>';
-    }
-    document.getElementById('wl-services').innerHTML = svcHtml;
-
-    // Cross-Tier Live Service Mesh Diagram + Table + .env + .cluster DNS hosts
-    const mesh = d.services_info || {};
-    const svcs = mesh.services || [];
-    const pools = mesh.pools || [];
-    const diagBox = document.getElementById('mesh-tier-diagram');
-    if (diagBox) {
-      const tiersMeta = [
-        { t: 1, title: 'Tier 1 · Termux Compute', desc: 'Parallel scripts, Local LLMs, distcc' },
-        { t: 2, title: 'Tier 2 · Debian 13 Services', desc: 'Mosquitto MQTT, AdGuard DNS, glibc apps' },
-        { t: 3, title: 'Tier 3 · Docker & Containers', desc: 'Home Assistant, Docker stacks, K3s' }
-      ];
-      diagBox.innerHTML = tiersMeta.map(tm => {
-        const matchedPools = pools.filter(p => Number(p.tier) === tm.t);
-        const readyN = matchedPools.reduce((a, p) => a + (p.nodes_ready || 0), 0);
-        const totalN = matchedPools.reduce((a, p) => a + (p.nodes_total || 0), 0);
-        const tierSvcs = svcs.filter(s => Number(s.tier) === tm.t);
-        const svcPills = tierSvcs.length
-          ? tierSvcs.map(s => '<span class="pill ok">' + esc(s.name) + '</span>').join(' ')
-          : '<span class="hint" style="margin:0;">No active services detected</span>';
-        return '<div class="mesh-tier-box">'
-          + '<div class="row" style="justify-content:space-between; margin-bottom:4px;">'
-          + '<strong>' + esc(tm.title) + '</strong>'
-          + '<span class="pill ' + (readyN ? 'ok' : 'neutral') + '">' + readyN + '/' + totalN + ' ready</span></div>'
-          + '<div class="hint" style="margin:0 0 8px;">' + esc(tm.desc) + '</div>'
-          + '<div class="chips" style="margin:0;">' + svcPills + '</div></div>';
-      }).join('');
-    }
-    const meshBox = document.getElementById('mesh-services-table');
-    if (meshBox) {
-      if (!svcs.length) {
-        meshBox.innerHTML = '<p class="hint">No cross-tier services detected yet (start Mosquitto, AdGuard Home, Home Assistant, llama.cpp, distcc, or Docker on any tier, or register a Custom Service below).</p>';
-      } else {
-        meshBox.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Service</th><th>Phone</th><th>Tier / Pool</th><th>Endpoint</th><th>Status</th><th>Action</th></tr></thead><tbody>'
-          + svcs.map((s, idx) => {
-              const link = /^https?:\/\//i.test(String(s.url || ''))
-                ? '<a href="' + esc(s.url) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">' + esc(s.url) + '</a>'
-                : '<span class="mono">' + esc(s.url) + '</span>';
-              const tp = s.tier ? tierPillHtml(s.tier, s.pool) : '<span class="pill neutral">custom</span>';
-              let actions = '';
-              if (s.host && Number(s.port) > 0) {
-                actions += '<button class="small" id="probe-btn-' + idx + '" onclick="probeService(' + idx + ',' + jsArg(s.name) + ',' + jsArg(s.host) + ',' + Number(s.port) + ')">Test</button> ';
-              }
-              if (s.source === 'config') {
-                actions += '<button class="small danger" onclick="removeCustomService(' + jsArg(s.name) + ')">Remove</button>';
-              }
-              const stCls = s.loopback_only ? 'warn' : (s.ready ? 'ok' : 'warn');
-              const stLbl = s.loopback_only ? '⚠ Localhost-Only' : (s.ready ? '✓ Live' : 'Warm/Busy');
-              return '<tr><td><strong>' + esc(s.name) + '</strong></td><td class="mono">' + esc(s.node_id) + '</td>'
-                + '<td>' + tp + '</td><td>' + link + '</td>'
-                + '<td><span id="probe-st-' + idx + '" class="pill ' + stCls + '">' + stLbl + '</span></td>'
-                + '<td>' + (actions || '<span class="hint">-</span>') + '</td></tr>';
-            }).join('')
-          + '</tbody></table></div>';
+  await withBusyAction('load-workloads', null, '', async () => {
+    try {
+      const r = await apiFetch('/api/workloads', { timeoutMs: 20000 });
+      if (r.status === 401 || r.status === 429) {
+        const body = await readJsonSafe(r);
+        handleAuthFailure(r.status, body && body.retry_after_sec);
+        document.getElementById('wl-distcc').textContent = '# Dashboard locked — paste auth_token above and click Unlock.';
+        return;
       }
+      if (!r.ok) {
+        document.getElementById('wl-distcc').textContent = '# Error loading workloads (HTTP ' + r.status + ')';
+        return;
+      }
+      const d = await readJsonSafe(r);
+      if (!d || typeof d !== 'object') {
+        document.getElementById('wl-distcc').textContent = '# Invalid workloads payload from Master.';
+        return;
+      }
+      const cidrInput = document.getElementById('distcc-cidr');
+      if (cidrInput && d.lan_subnet && cidrInput.dataset.edited !== 'user') {
+        cidrInput.value = d.lan_subnet;
+        cidrInput.dataset.edited = 'auto';
+      }
+      document.getElementById('wl-distcc').textContent = d.distcc_hosts
+        ? 'export DISTCC_HOSTS="' + d.distcc_hosts + '"'
+        : '# No running distccd workers detected (click Start All above).';
+      document.getElementById('wl-llama').textContent = d.llama_rpc
+        ? '--rpc ' + d.llama_rpc
+        : '# No running llama.cpp rpc-server detected on port 50052.';
+      document.getElementById('wl-mpi').textContent = d.mpi_hostfile || '# No ready nodes available.';
+
+      let svcHtml = '';
+      if (Array.isArray(d.home_assistant_urls) && d.home_assistant_urls.length) {
+        svcHtml += '<p><strong>✓ Home Assistant detected:</strong> '
+          + d.home_assistant_urls.map(u => {
+              const safe = safeHttpUrl(u);
+              return safe
+                ? '<a href="' + esc(safe) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">' + esc(safe) + '</a>'
+                : '<span class="mono">' + esc(u) + '</span>';
+            }).join(', ')
+          + '</p>';
+      } else {
+        svcHtml += '<p><strong>Home Assistant:</strong> Not detected on port 8123. Best deployed on Tier 2 (Rooted Debian 13 chroot) or Tier 3 (Docker).</p>';
+      }
+      const dockerNodes = Array.isArray(d.docker_nodes) ? d.docker_nodes : [];
+      svcHtml += '<p><strong>Docker-ready nodes:</strong> ' + (dockerNodes.length ? esc(dockerNodes.join(', ')) : 'None yet (install Snap Docker on Ubuntu Touch or Tier 3 Linux)') + '</p>';
+      if (Array.isArray(d.docker_snap_nodes) && d.docker_snap_nodes.length) {
+        svcHtml += '<p class="hint" style="margin-top:4px;">Snap Docker detected on <strong>' + esc(d.docker_snap_nodes.join(', ')) + '</strong> — keep bind-mount volumes under <code class="mono">~/phonecluster/docker-data</code> ($HOME).</p>';
+      }
+      if (Array.isArray(d.docker_socket_issues) && d.docker_socket_issues.length) {
+        svcHtml += '<p class="hint" style="color:var(--warn); margin-top:4px;">⚠ Docker socket permission needed on <strong>' + esc(d.docker_socket_issues.join(', ')) + '</strong> — run <code class="mono">bash scripts/06_ubuntu_touch_node_setup.sh</code>.</p>';
+      }
+      document.getElementById('wl-services').innerHTML = svcHtml;
+
+      // Cross-Tier Live Service Mesh Diagram + Table + .env + .cluster DNS hosts
+      const mesh = d.services_info || {};
+      const svcs = Array.isArray(mesh.services) ? mesh.services : [];
+      const pools = Array.isArray(mesh.pools) ? mesh.pools : [];
+      const diagBox = document.getElementById('mesh-tier-diagram');
+      if (diagBox) {
+        const tiersMeta = [
+          { t: 1, title: 'Tier 1 · Termux Compute', desc: 'Parallel scripts, Local LLMs, distcc' },
+          { t: 2, title: 'Tier 2 · Debian 13 Services', desc: 'Mosquitto MQTT, AdGuard DNS, glibc apps' },
+          { t: 3, title: 'Tier 3 · Docker & Containers', desc: 'Home Assistant, Docker stacks, K3s' }
+        ];
+        diagBox.innerHTML = tiersMeta.map(tm => {
+          const matchedPools = pools.filter(p => Number(p.tier) === tm.t);
+          const readyN = matchedPools.reduce((a, p) => a + (Number(p.nodes_ready) || 0), 0);
+          const totalN = matchedPools.reduce((a, p) => a + (Number(p.nodes_total) || 0), 0);
+          const tierSvcs = svcs.filter(s => Number(s.tier) === tm.t);
+          const svcPills = tierSvcs.length
+            ? tierSvcs.map(s => '<span class="pill ok">' + esc(s.name) + '</span>').join(' ')
+            : '<span class="hint" style="margin:0;">No active services detected</span>';
+          return '<div class="mesh-tier-box">'
+            + '<div class="row" style="justify-content:space-between; margin-bottom:4px;">'
+            + '<strong>' + esc(tm.title) + '</strong>'
+            + '<span class="pill ' + (readyN ? 'ok' : 'neutral') + '">' + esc(readyN) + '/' + esc(totalN) + ' ready</span></div>'
+            + '<div class="hint" style="margin:0 0 8px;">' + esc(tm.desc) + '</div>'
+            + '<div class="chips" style="margin:0;">' + svcPills + '</div></div>';
+        }).join('');
+      }
+      const meshBox = document.getElementById('mesh-services-table');
+      if (meshBox) {
+        if (!svcs.length) {
+          meshBox.innerHTML = '<p class="hint">No cross-tier services detected yet (start Mosquitto, AdGuard Home, Home Assistant, llama.cpp, distcc, or Docker on any tier, or register a Custom Service below).</p>';
+        } else {
+          meshBox.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Service</th><th>Phone</th><th>Tier / Pool</th><th>Endpoint</th><th>Status</th><th>Action</th></tr></thead><tbody>'
+            + svcs.map((s, idx) => {
+                const safeHref = safeHttpUrl(s.url);
+                const link = safeHref
+                  ? '<a href="' + esc(safeHref) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">' + esc(safeHref) + '</a>'
+                  : '<span class="mono">' + esc(s.url) + '</span>';
+                const tp = s.tier ? tierPillHtml(s.tier, s.pool) : '<span class="pill neutral">custom</span>';
+                let actions = '';
+                const portNum = safePort(s.port);
+                if (s.host && portNum > 0) {
+                  actions += '<button class="small" id="probe-btn-' + idx + '" onclick="probeService(' + idx + ',' + jsArg(s.name) + ',' + jsArg(s.host) + ',' + portNum + ')">Test</button> ';
+                }
+                if (s.url) {
+                  actions += '<button class="small" onclick="copyText(' + jsArg(s.url) + ',\'Copied service endpoint!\')">Copy</button> ';
+                }
+                if (s.source === 'config') {
+                  actions += '<button class="small danger" onclick="removeCustomService(' + jsArg(s.name) + ')">Remove</button>';
+                }
+                const stCls = s.loopback_only ? 'warn' : (s.ready ? 'ok' : 'warn');
+                const stLbl = s.loopback_only ? '⚠ Localhost-Only' : (s.ready ? '✓ Live' : 'Warm/Busy');
+                return '<tr><td><strong>' + esc(s.name) + '</strong></td><td class="mono">' + esc(s.node_id) + '</td>'
+                  + '<td>' + tp + '</td><td>' + link + '</td>'
+                  + '<td><span id="probe-st-' + idx + '" class="pill ' + stCls + '">' + stLbl + '</span></td>'
+                  + '<td>' + (actions || '<span class="hint">-</span>') + '</td></tr>';
+              }).join('')
+            + '</tbody></table></div>';
+        }
+      }
+      const envObj = mesh.env || {};
+      const envEl = document.getElementById('mesh-env-code');
+      if (envEl) {
+        const shQuote = v => "'" + String(v ?? '').replace(/'/g, "'\\''") + "'";
+        const lines = Object.entries(envObj).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => 'export ' + k + '=' + shQuote(v));
+        envEl.textContent = lines.join('\n') || '# No cluster env variables yet.';
+      }
+      const hostsEl = document.getElementById('mesh-hosts-code');
+      if (hostsEl) {
+        hostsEl.textContent = mesh.dns_hosts || '# No hosts generated yet.';
+      }
+    } catch (e) {
+      document.getElementById('wl-distcc').textContent = 'Error loading workloads: ' + (e && e.message ? e.message : String(e));
     }
-    const envObj = mesh.env || {};
-    const envEl = document.getElementById('mesh-env-code');
-    if (envEl) {
-      const shQuote = v => "'" + String(v ?? '').replace(/'/g, "'\\''") + "'";
-      const lines = Object.entries(envObj).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => 'export ' + k + '=' + shQuote(v));
-      envEl.textContent = lines.join('\n') || '# No cluster env variables yet.';
-    }
-    const hostsEl = document.getElementById('mesh-hosts-code');
-    if (hostsEl) {
-      hostsEl.textContent = mesh.dns_hosts || '# No hosts generated yet.';
-    }
-  } catch (e) {
-    document.getElementById('wl-distcc').textContent = 'Error loading workloads: ' + e;
-  }
+  });
 }
 
 async function probeService(idx, name, host, port) {
   const btn = document.getElementById('probe-btn-' + idx);
   const st = document.getElementById('probe-st-' + idx);
+  if (btn && btn.disabled) return;
   if (btn) btn.disabled = true;
   try {
     const data = await authPost('/api/services/probe', { name, host, port });
@@ -2809,49 +3656,88 @@ async function probeService(idx, name, host, port) {
 }
 
 async function addCustomService() {
-  const name = document.getElementById('custom-svc-name').value.trim();
-  const url = document.getElementById('custom-svc-url').value.trim();
-  if (!name || !url) { showToast('Enter both a service name and endpoint URL.', 'warn'); return; }
-  const data = await authPost('/api/services/custom', { name, url });
-  if (data.error) { showToast('Could not save service: ' + data.error, 'bad'); return; }
-  document.getElementById('custom-svc-name').value = '';
-  document.getElementById('custom-svc-url').value = '';
-  showToast('Registered "' + data.name + '" in Cross-Tier Service Mesh!', 'ok');
-  loadWorkloads();
-  refreshLive();
+  await withBusyAction('add-custom-svc', null, '', async () => {
+    const name = document.getElementById('custom-svc-name').value.trim();
+    const url = document.getElementById('custom-svc-url').value.trim();
+    if (!name || !url) { showToast('Enter both a service name and endpoint URL.', 'warn'); return; }
+    const data = await authPost('/api/services/custom', { name, url });
+    if (data.error) { showToast('Could not save service: ' + data.error, 'bad'); return; }
+    document.getElementById('custom-svc-name').value = '';
+    document.getElementById('custom-svc-url').value = '';
+    showToast('Registered "' + data.name + '" in Cross-Tier Service Mesh!', 'ok');
+    loadWorkloads();
+    refreshLive();
+  });
 }
 
 async function removeCustomService(name) {
-  const data = await authPost('/api/services/custom/remove', { name });
-  if (data.error) { showToast('Remove failed: ' + data.error, 'bad'); return; }
-  showToast('Removed "' + name + '" from Service Mesh.', 'warn');
-  loadWorkloads();
-  refreshLive();
+  if (!confirmAction('Remove custom service "' + name + '" from the Service Mesh?')) return;
+  await withBusyAction('rm-custom-svc:' + name, null, '', async () => {
+    const data = await authPost('/api/services/custom/remove', { name });
+    if (data.error) { showToast('Remove failed: ' + data.error, 'bad'); return; }
+    showToast('Removed "' + name + '" from Service Mesh.', 'warn');
+    loadWorkloads();
+    refreshLive();
+  });
 }
 
 async function workloadAction(action) {
+  if (workloadAction._busy) return;
+  const confirmMsgs = {
+    'distcc-stop': 'Stop distcc compiler daemons on all ready phones?',
+    'llama-rpc-stop': 'Stop all running llama.cpp RPC servers across the cluster?',
+    'docker-swarm-init': 'Initialize or join Docker Swarm across Docker-capable phones?',
+  };
+  if (Object.prototype.hasOwnProperty.call(confirmMsgs, action) && typeof confirm === 'function') {
+    if (!confirm(confirmMsgs[action])) return;
+  }
+  workloadAction._busy = true;
   const cidr = document.getElementById('distcc-cidr').value.trim() || '192.168.1.0/24';
   const out = document.getElementById('wl-action-out');
+  const sumEl = document.getElementById('wl-action-summary');
   out.style.display = 'block';
   out.textContent = 'Running ' + action + ' on all ready phones...';
-  const data = await authPost('/api/workloads/action', { action, cidr });
-  out.textContent = JSON.stringify(data, null, 2);
-  const rows = data.results || data.nodes || data.workers || [];
-  const failures = rows.filter(row => row.ok !== true);
-  if (data.error) {
-    showToast(data.error, 'bad');
-  } else if (failures.length) {
-    const message = failures.length === 1 && failures[0].error
-      ? failures[0].error : failures.length + ' node actions failed or are unconfirmed.';
-    showToast(message, failures.length === rows.length ? 'bad' : 'warn');
-  } else if (data.ok === false) {
-    showToast('Workload command failed: ' + action, 'bad');
-  } else if (!rows.length && !data.manager_node_id) {
-    showToast('No matching nodes reported for ' + action, 'warn');
-  } else {
-    showToast('Workload command finished: ' + action, 'ok');
+  if (sumEl) { sumEl.style.display = 'none'; sumEl.innerHTML = ''; }
+  try {
+    const data = await authPost('/api/workloads/action', { action, cidr });
+    out.textContent = JSON.stringify(data, null, 2);
+    const rows = data.results || data.nodes || data.workers || [];
+    const failures = rows.filter(row => row.ok !== true);
+    if (sumEl && !data.error) {
+      let sumHtml = '<strong>' + esc(action) + '</strong> ';
+      if (data.manager_node_id) {
+        sumHtml += '<span class="pill ok">Manager: ' + esc(data.manager_node_id) + '</span> ';
+      }
+      if (rows.length) {
+        sumHtml += '<div class="chips" style="margin-top:6px;">' + rows.map(row => {
+          const nid = row.node_id || row.id || '?';
+          const ok = row.ok === true;
+          const detail = row.containers != null
+            ? (row.containers + ' container(s)')
+            : (row.error ? String(row.error).slice(0, 48) : (ok ? 'OK' : 'FAIL'));
+          return '<span class="pill ' + (ok ? 'ok' : 'bad') + '">' + esc(nid) + ': ' + esc(detail) + '</span>';
+        }).join('') + '</div>';
+      }
+      sumEl.innerHTML = sumHtml;
+      sumEl.style.display = 'block';
+    }
+    if (data.error) {
+      showToast(data.error, 'bad');
+    } else if (failures.length) {
+      const message = failures.length === 1 && failures[0].error
+        ? failures[0].error : failures.length + ' node actions failed or are unconfirmed.';
+      showToast(message, failures.length === rows.length ? 'bad' : 'warn');
+    } else if (data.ok === false) {
+      showToast('Workload command failed: ' + action, 'bad');
+    } else if (!rows.length && !data.manager_node_id) {
+      showToast('No matching nodes reported for ' + action, 'warn');
+    } else {
+      showToast('Workload command finished: ' + action, 'ok');
+    }
+    setTimeout(loadWorkloads, 800);
+  } finally {
+    workloadAction._busy = false;
   }
-  setTimeout(loadWorkloads, 800);
 }
 
 let pairPollTimer = null;
@@ -2902,170 +3788,313 @@ function renderPairingState(st) {
   _checkNewlyPaired(st.recent_paired || []);
 }
 
+function copyPairPin() {
+  const pin = (document.getElementById('pair-pin')?.textContent || '').trim();
+  if (!pin || pin.includes('-')) { showToast('No active pairing PIN to copy.', 'warn'); return; }
+  copyText(pin.replace(/\s+/g, ''), 'Copied 6-digit pairing PIN!');
+}
+
 async function openPairingWindow() {
-  const max_devices = Number(document.getElementById('pair-slots').value || 1);
-  const data = await authPost('/api/pair/open', { ttl_sec: 120, max_devices });
-  if (data.error) { showToast('Could not open pairing: ' + data.error, 'bad'); return; }
-  lastPairedKey = _pairedEntryKey(data.recent_paired || []);
-  renderPairingState(data);
-  showToast('Pairing window open for 2 minutes! Run `pc join` on your new phone.', 'ok');
+  await withBusyAction('pair-open', 'btn-pair-open', 'Opening...', async () => {
+    const max_devices = Number(document.getElementById('pair-slots').value || 1);
+    const data = await authPost('/api/pair/open', { ttl_sec: 120, max_devices });
+    if (data.error) { showToast('Could not open pairing: ' + data.error, 'bad'); return; }
+    lastPairedKey = _pairedEntryKey(data.recent_paired || []);
+    renderPairingState(data);
+    showToast('Pairing window open for 2 minutes! Run `pc join` on your new phone.', 'ok');
+  });
 }
 
 async function closePairingWindow() {
-  const data = await authPost('/api/pair/close', {});
-  if (data.error) { showToast(data.error, 'bad'); return; }
-  renderPairingState(data);
-  showToast('Pairing window closed — cluster is silent on Wi-Fi.', 'neutral');
+  await withBusyAction('pair-close', 'btn-pair-close', 'Closing...', async () => {
+    const data = await authPost('/api/pair/close', {});
+    if (data.error) { showToast(data.error, 'bad'); return; }
+    renderPairingState(data);
+    showToast('Pairing window closed — cluster is silent on Wi-Fi.', 'neutral');
+  });
 }
 
 async function pollPairingStatus() {
-  if (!getToken()) return;
+  if (!getToken() || authLockedByServer) {
+    if (pairPollTimer) { clearInterval(pairPollTimer); pairPollTimer = null; }
+    return;
+  }
   try {
-    const r = await apiFetch('/api/pair/status');
+    const r = await apiFetch('/api/pair/status', { timeoutMs: 8000 });
+    if (r.status === 401 || r.status === 429) {
+      const body = await readJsonSafe(r);
+      handleAuthFailure(r.status, body && body.retry_after_sec);
+      return;
+    }
     if (!r.ok) return;
-    const st = await r.json();
+    const st = await readJsonSafe(r);
+    if (!st || typeof st !== 'object') return;
     _checkNewlyPaired(st.recent_paired || []);
     renderPairingState(st);
-  } catch (e) {}
+  } catch (_e) {}
 }
 
 async function scanLan() {
   const box = document.getElementById('discover-list');
-  box.innerHTML = 'Scanning Wi-Fi (2 seconds)...';
-  try {
-    const r = await apiFetch('/api/discover');
-    if (r.status === 401) {
-      box.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
-      return;
-    }
-    if (!r.ok) {
-      box.innerHTML = '<p class="hint">Discovery failed (HTTP ' + r.status + ').</p>';
-      return;
-    }
-    const d = await r.json();
-    if (!d.discovered || !d.discovered.length) {
-      box.innerHTML = '<p class="hint">No phones answered UDP discovery on port 8766. Make sure workers are running on the same Wi-Fi, or use Manual Add below.</p>';
-      return;
-    }
-    box.innerHTML = d.discovered.map(item => {
-      const btn = item.already_configured
-        ? '<span class="pill ok">✓ Already in Cluster</span>'
-        : '<button class="small primary" onclick="addDiscoveredNode(' + jsArg(item.host) + ',' + Number(item.worker_port) + ',' + Number(item.ssh_port) + ',' + jsArg(item.ssh_user) + ')">+ Add to Cluster</button>';
-      return '<div class="check-item" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">'
-        + '<div><strong>' + esc(item.host) + '</strong> (' + esc(item.os_env) + ', ' + esc(item.cpu_cores) + ' cores, ' + esc(item.mem_total_mb) + ' MB RAM)</div>'
-        + btn + '</div>';
-    }).join('');
-  } catch (e) {
-    box.textContent = 'Discovery failed: ' + e;
+  if (!getToken()) {
+    box.innerHTML = '<p class="hint">Unlock with your Master token in the top bar to scan Wi-Fi for opt-in workers.</p>';
+    return;
   }
+  await withBusyAction('scan-lan', null, '', async () => {
+    box.innerHTML = 'Scanning Wi-Fi (2 seconds)...';
+    try {
+      const r = await apiFetch('/api/discover', { timeoutMs: 12000 });
+      if (r.status === 401 || r.status === 429) {
+        const body = await readJsonSafe(r);
+        handleAuthFailure(r.status, body && body.retry_after_sec);
+        box.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
+        return;
+      }
+      if (!r.ok) {
+        box.innerHTML = '<p class="hint">Discovery failed (HTTP ' + r.status + ').</p>';
+        return;
+      }
+      const d = await readJsonSafe(r);
+      const found = (d && Array.isArray(d.discovered)) ? d.discovered : [];
+      if (!found.length) {
+        box.innerHTML = '<p class="hint">No phones answered UDP discovery on port 8766. Make sure workers are running on the same Wi-Fi, or use Manual Add below.</p>';
+        return;
+      }
+      box.innerHTML = found.map(item => {
+        const wPort = safePort(item.worker_port) || 8765;
+        const sPort = safePort(item.ssh_port) || 8022;
+        const btn = item.already_configured
+          ? '<span class="pill ok">✓ Already in Cluster</span>'
+          : '<button class="small primary" onclick="addDiscoveredNode(' + jsArg(item.host) + ',' + wPort + ',' + sPort + ',' + jsArg(item.ssh_user || '') + ')">+ Add to Cluster</button>';
+        return '<div class="check-item" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">'
+          + '<div><strong>' + esc(item.host) + '</strong> (' + esc(item.os_env) + ', ' + esc(item.cpu_cores) + ' cores, ' + esc(item.mem_total_mb) + ' MB RAM)</div>'
+          + btn + '</div>';
+      }).join('');
+    } catch (e) {
+      box.textContent = 'Discovery failed: ' + (e && e.message ? e.message : String(e));
+    }
+  });
 }
 
 async function addDiscoveredNode(host, worker_port, ssh_port, ssh_user) {
-  const data = await authPost('/api/nodes/add', { host, worker_port, ssh_port, ssh_user });
-  if (data.error) { showToast('Could not add node: ' + data.error, 'bad'); return; }
-  showToast('Added ' + data.node.id + '. Run pc sync on the Master to provision its worker token.', 'ok');
-  scanLan();
-  refreshLive();
+  await withBusyAction('add-disc:' + host, null, '', async () => {
+    const data = await authPost('/api/nodes/add', { host, worker_port, ssh_port, ssh_user });
+    if (data.error) { showToast('Could not add node: ' + data.error, 'bad'); return; }
+    showToast('Added ' + data.node.id + '. Run pc sync on the Master to provision its worker token.', 'ok');
+    scanLan();
+    refreshLive();
+  });
 }
 
 async function addManualNode() {
-  const host = document.getElementById('add-host').value.trim();
-  const ssh_user = document.getElementById('add-user').value.trim();
-  const ssh_port = Number(document.getElementById('add-ssh-port').value || 8022);
-  const max_concurrency = Number(document.getElementById('add-conc').value || 2);
-  const tier = Number(document.getElementById('add-tier').value || 0);
-  const pool = document.getElementById('add-pool').value.trim() || 'auto';
-  if (!host) { showToast('Enter an IP address first.', 'warn'); return; }
-  const data = await authPost('/api/nodes/add', { host, ssh_user, ssh_port, max_concurrency, tier, pool });
-  if (data.error) { showToast('Could not add phone: ' + data.error, 'bad'); return; }
-  document.getElementById('add-host').value = '';
-  showToast('Added ' + data.node.id + '. Run pc sync on the Master to provision its worker token.', 'ok');
-  refreshLive();
+  await withBusyAction('add-manual-node', null, '', async () => {
+    const host = document.getElementById('add-host').value.trim();
+    const ssh_user = document.getElementById('add-user').value.trim();
+    const ssh_port = safePort(document.getElementById('add-ssh-port').value || 8022);
+    const max_concurrency = Number(document.getElementById('add-conc').value || 2);
+    const tier = Number(document.getElementById('add-tier').value || 0);
+    const pool = document.getElementById('add-pool').value.trim() || 'auto';
+    if (!host) { showToast('Enter an IP address first.', 'warn'); return; }
+    if (!ssh_port) { showToast('SSH port must be between 1 and 65535.', 'warn'); return; }
+    const data = await authPost('/api/nodes/add', { host, ssh_user, ssh_port, max_concurrency, tier, pool });
+    if (data.error) { showToast('Could not add phone: ' + data.error, 'bad'); return; }
+    document.getElementById('add-host').value = '';
+    showToast('Added ' + data.node.id + '. Run pc sync on the Master to provision its worker token.', 'ok');
+    refreshLive();
+  });
 }
 
 async function removeNode(nodeId) {
-  if (!confirm('Remove ' + nodeId + ' from cluster.json?')) return;
-  const data = await authPost('/api/nodes/remove', { id: nodeId });
-  if (data.error) { showToast('Remove failed: ' + data.error, 'bad'); return; }
-  showToast('Removed ' + nodeId + ' from cluster.', 'warn');
-  refreshLive();
+  if (!confirmAction('Remove ' + nodeId + ' from cluster.json?')) return;
+  await withBusyAction('rm-node:' + nodeId, null, '', async () => {
+    const data = await authPost('/api/nodes/remove', { id: nodeId });
+    if (data.error) { showToast('Remove failed: ' + data.error, 'bad'); return; }
+    showToast('Removed ' + nodeId + ' from cluster.', 'warn');
+    refreshLive();
+  });
 }
 
 async function loadSafetySettings() {
-  const token = getToken();
-  if (!token) return;
+  if (!getToken() || authLockedByServer) return;
   try {
-    const r = await fetch('/api/settings', { headers: { 'Authorization': 'Bearer ' + token } });
+    const r = await apiFetch('/api/settings', { timeoutMs: 10000 });
+    if (r.status === 401 || r.status === 429) {
+      const body = await readJsonSafe(r);
+      handleAuthFailure(r.status, body && body.retry_after_sec);
+      return;
+    }
     if (!r.ok) return;
-    const s = await r.json();
+    const s = await readJsonSafe(r);
+    if (!s || typeof s !== 'object') return;
     document.getElementById('set-max-temp').value = s.max_temp_c;
     document.getElementById('set-res-temp').value = s.resume_temp_c;
     document.getElementById('set-bat-low').value = s.battery_low_pct;
     document.getElementById('set-bat-high').value = s.battery_high_pct;
     document.getElementById('set-webhook').value = s.battery_webhook_url || '';
-  } catch (e) {}
+  } catch (_e) {}
 }
 
 async function saveSafetySettings() {
-  const rawMaxT = document.getElementById('set-max-temp').value.trim();
-  const rawResT = document.getElementById('set-res-temp').value.trim();
-  const rawLowB = document.getElementById('set-bat-low').value.trim();
-  const rawHighB = document.getElementById('set-bat-high').value.trim();
-  if (!rawMaxT || !rawResT || !rawLowB || !rawHighB) {
-    showToast('Please fill in all temperature and battery threshold fields.', 'warn');
-    return;
-  }
-  const payload = {
-    max_temp_c: Number(rawMaxT),
-    resume_temp_c: Number(rawResT),
-    battery_low_pct: Number(rawLowB),
-    battery_high_pct: Number(rawHighB),
-    battery_webhook_url: document.getElementById('set-webhook').value.trim(),
-  };
-  const data = await authPost('/api/settings', payload);
-  if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
-  showPolicyResult('Controller safety settings saved.', data.pushed);
-  refreshLive();
+  await withBusyAction('save-safety', null, '', async () => {
+    const rawMaxT = document.getElementById('set-max-temp').value.trim();
+    const rawResT = document.getElementById('set-res-temp').value.trim();
+    const rawLowB = document.getElementById('set-bat-low').value.trim();
+    const rawHighB = document.getElementById('set-bat-high').value.trim();
+    if (!rawMaxT || !rawResT || !rawLowB || !rawHighB) {
+      showToast('Please fill in all temperature and battery threshold fields.', 'warn');
+      return;
+    }
+    const maxT = Number(rawMaxT);
+    const resT = Number(rawResT);
+    const lowB = Number(rawLowB);
+    const highB = Number(rawHighB);
+    if (!Number.isFinite(maxT) || !Number.isFinite(resT) || resT >= maxT) {
+      showToast('Resume temperature must be lower than pause temperature.', 'warn');
+      return;
+    }
+    if (!Number.isFinite(lowB) || !Number.isFinite(highB) || lowB >= highB || lowB < 5 || highB > 100) {
+      showToast('Battery charge-on % must be lower than cut-charge % (between 5 and 100).', 'warn');
+      return;
+    }
+    const webhookUrl = document.getElementById('set-webhook').value.trim();
+    if (webhookUrl && !safeHttpUrl(webhookUrl)) {
+      showToast('Webhook URL must be a valid http:// or https:// URL without spaces or credentials.', 'warn');
+      return;
+    }
+    const payload = {
+      max_temp_c: maxT,
+      resume_temp_c: resT,
+      battery_low_pct: lowB,
+      battery_high_pct: highB,
+      battery_webhook_url: webhookUrl,
+    };
+    const data = await authPost('/api/settings', payload);
+    if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
+    showPolicyResult('Controller safety settings saved.', data.pushed);
+    refreshLive();
+  });
 }
 
 async function testSafetyWebhook() {
-  const url = document.getElementById('set-webhook').value.trim();
-  const data = await authPost('/api/settings/test-webhook', { battery_webhook_url: url });
-  if (data.error) { showToast('Webhook test failed: ' + data.error, 'bad'); return; }
-  showToast('Test webhook delivered (HTTP ' + data.http_status + ')!', 'ok');
+  await withBusyAction('test-webhook', null, '', async () => {
+    const url = document.getElementById('set-webhook').value.trim();
+    if (url && !safeHttpUrl(url)) {
+      showToast('Enter a valid http:// or https:// webhook URL first.', 'warn');
+      return;
+    }
+    const data = await authPost('/api/settings/test-webhook', { battery_webhook_url: url });
+    if (data.error) { showToast('Webhook test failed: ' + data.error, 'bad'); return; }
+    showToast('Test webhook delivered (HTTP ' + data.http_status + ')!', 'ok');
+  });
+}
+
+function setDoctorFilter(mode) {
+  doctorFilter = mode || 'all';
+  const bAll = document.getElementById('btn-doc-all');
+  const bIss = document.getElementById('btn-doc-issues');
+  if (bAll) bAll.className = 'small' + (doctorFilter === 'all' ? ' primary' : '');
+  if (bIss) bIss.className = 'small' + (doctorFilter === 'issues' ? ' primary' : '');
+  renderDoctorList();
+}
+
+function renderDoctorList() {
+  const box = document.getElementById('doctor-list');
+  if (!box) return;
+  const icons = { ok: '✓ OK', warn: '⚠ WARN', fail: '✕ FAIL' };
+  const cls = { ok: 'ok', warn: 'warn', fail: 'bad' };
+  const shown = doctorFilter === 'issues'
+    ? lastDoctorChecks.filter(c => c.status !== 'ok')
+    : lastDoctorChecks;
+  if (!shown.length) {
+    box.innerHTML = '<p class="hint">No issues found in this Cluster Doctor run!</p>';
+    return;
+  }
+  box.innerHTML = shown.map(c => {
+    const stKey = String(c.status || '');
+    const pCls = hasOwn(cls, stKey) ? cls[stKey] : 'neutral';
+    const pIcon = hasOwn(icons, stKey) ? icons[stKey] : esc(stKey);
+    return '<div class="check-item">'
+      + '<span class="pill ' + pCls + '">' + pIcon + '</span> '
+      + '<strong>' + esc(c.name) + '</strong>: ' + esc(c.detail)
+      + (c.fix_hint ? '<div class="hint">Fix: ' + esc(c.fix_hint) + '</div>' : '')
+      + '</div>';
+  }).join('');
+}
+
+function copyDoctorReport() {
+  if (!lastDoctorChecks.length) { showToast('Run Doctor first.', 'warn'); return; }
+  const txt = lastDoctorChecks.map(c =>
+    '[' + String(c.status || '').toUpperCase() + '] ' + c.name + ': ' + c.detail
+    + (c.fix_hint ? ('\n  Fix: ' + c.fix_hint) : '')
+  ).join('\n');
+  copyText(txt, 'Copied Cluster Doctor report!');
 }
 
 async function runDoctorUi() {
   const box = document.getElementById('doctor-list');
-  box.innerHTML = 'Running diagnostics...';
-  try {
-    const r = await apiFetch('/api/doctor');
-    if (r.status === 401) {
-      box.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
-      return;
-    }
-    if (!r.ok) {
-      box.innerHTML = '<p class="hint">Doctor failed (HTTP ' + r.status + ').</p>';
-      return;
-    }
-    const d = await r.json();
-    const icons = { ok: '✓ OK', warn: '⚠ WARN', fail: '✕ FAIL' };
-    const cls = { ok: 'ok', warn: 'warn', fail: 'bad' };
-    box.innerHTML = (d.checks || []).map(c =>
-      '<div class="check-item">'
-      + '<span class="pill ' + (cls[c.status] || 'neutral') + '">' + (icons[c.status] || esc(c.status)) + '</span> '
-      + '<strong>' + esc(c.name) + '</strong>: ' + esc(c.detail)
-      + (c.fix_hint ? '<div class="hint">Fix: ' + esc(c.fix_hint) + '</div>' : '')
-      + '</div>'
-    ).join('');
-  } catch (e) {
-    box.textContent = 'Doctor failed: ' + e;
+  if (!getToken()) {
+    box.innerHTML = '<p class="hint">Unlock with your Master token in the top bar to run Cluster Doctor diagnostics.</p>';
+    return;
   }
+  await withBusyAction('run-doctor', 'btn-run-doctor', 'Running Doctor...', async () => {
+    box.innerHTML = 'Running diagnostics...';
+    try {
+      const r = await apiFetch('/api/doctor', { timeoutMs: 45000 });
+      if (r.status === 401 || r.status === 429) {
+        const body = await readJsonSafe(r);
+        handleAuthFailure(r.status, body && body.retry_after_sec);
+        box.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
+        return;
+      }
+      if (!r.ok) {
+        box.innerHTML = '<p class="hint">Doctor failed (HTTP ' + r.status + ').</p>';
+        return;
+      }
+      const d = await readJsonSafe(r);
+      const checks = (d && Array.isArray(d.checks)) ? d.checks : [];
+      lastDoctorChecks = checks;
+      const okN = checks.filter(c => c.status === 'ok').length;
+      const warnN = checks.filter(c => c.status === 'warn').length;
+      const failN = checks.filter(c => c.status === 'fail').length;
+      const chips = document.getElementById('doctor-summary-chips');
+      if (chips) {
+        chips.innerHTML = '<span class="pill ok">✓ ' + okN + ' OK</span>'
+          + (warnN ? '<span class="pill warn">⚠ ' + warnN + ' Warn</span>' : '')
+          + (failN ? '<span class="pill bad">✕ ' + failN + ' Fail</span>' : '');
+      }
+      const bar = document.getElementById('doctor-toolbar');
+      if (bar) bar.style.display = checks.length ? 'flex' : 'none';
+      doctorFilter = 'all';
+      setDoctorFilter('all');
+    } catch (e) {
+      box.textContent = 'Doctor failed: ' + (e && e.message ? e.message : String(e));
+    }
+  });
 }
 
 let gwPresetsCache = {};
 let lastNetAudit = null;
+let lastGwStatus = null;
 let activeFwTab = 'router';
+
+function highlightActiveProfile() {
+  const hd = (lastNetAudit && lastNetAudit.hardening) ? lastNetAudit.hardening : null;
+  const gw = lastGwStatus || (lastNetAudit && lastNetAudit.gateway) || null;
+  let active = '';
+  if (hd && gw) {
+    if (gw.enabled && gw.mode === 'block_all' && hd.dashboard_require_auth && hd.enforce_worker_source_ip) {
+      active = 'lockdown';
+    } else if (gw.enabled && gw.mode === 'allowlist' && gw.block_private_ips) {
+      active = 'airgap_workers';
+    } else if (!gw.enabled && !hd.dashboard_require_auth) {
+      active = 'standard';
+    }
+  }
+  for (const name of ['standard', 'airgap_workers', 'lockdown']) {
+    const btn = document.getElementById('btn-prof-' + name);
+    if (btn) btn.classList.toggle('active-profile', active === name);
+  }
+}
 
 function setFwTab(tab) {
   activeFwTab = tab;
@@ -3085,121 +4114,162 @@ async function loadNetworkCenter() {
 }
 
 async function loadNetworkAudit() {
+  const nb = document.getElementById('net-nodes-table');
+  const cb = document.getElementById('net-checks-list');
+  const hero = document.getElementById('net-hero-chips');
+  if (!getToken()) {
+    const lockHtml = '<p class="hint">Unlock with your Master token in the top bar to view cluster network posture, open ports, and hardening guides.</p>';
+    if (hero) hero.innerHTML = '<span class="pill warn">🔒 Unlock with Master token to inspect Network Audit</span>';
+    if (nb) nb.innerHTML = lockHtml;
+    if (cb) cb.innerHTML = lockHtml;
+    return;
+  }
   try {
-    const r = await apiFetch('/api/network/audit');
-    if (r.status === 401) {
+    const r = await apiFetch('/api/network/audit', { timeoutMs: 20000 });
+    if (r.status === 401 || r.status === 429) {
+      const body = await readJsonSafe(r);
+      handleAuthFailure(r.status, body && body.retry_after_sec);
       const msg = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
-      const nb = document.getElementById('net-nodes-table');
-      const cb = document.getElementById('net-checks-list');
       if (nb) nb.innerHTML = msg;
       if (cb) cb.innerHTML = msg;
       return;
     }
-    if (!r.ok) return;
-    const d = await r.json();
+    if (!r.ok) {
+      const msg = '<p class="hint">Network audit failed (HTTP ' + r.status + ').</p>';
+      if (nb) nb.innerHTML = msg;
+      if (cb) cb.innerHTML = msg;
+      return;
+    }
+    const d = await readJsonSafe(r);
+    if (!d || typeof d !== 'object') return;
     lastNetAudit = d;
     const hi = d.host_info || {};
     const scoreTone = d.score >= 80 ? 'ok' : (d.score >= 55 ? 'accent' : 'warn');
     const boardIcon = hi.is_raspberry_pi ? '🥧 ' : (hi.is_termux ? '📱 ' : '🐧 ');
-    document.getElementById('net-hero-chips').innerHTML =
-      '<span class="pill ' + scoreTone + '">Hardening Score: ' + esc(d.score) + '/100 (' + esc(d.grade) + ')</span>'
-      + '<span class="pill purple">' + boardIcon + esc(hi.friendly_name || 'Master') + '</span>'
-      + '<span class="pill neutral mono">Master IP: ' + esc(hi.master_host || hi.lan_ip || '-') + '</span>'
-      + '<span class="pill neutral mono">LAN: ' + esc(hi.lan_subnet || '-') + '</span>'
-      + (d.adguard_url
-          ? '<span class="pill ok">✓ AdGuard Home Live (' + esc(d.adguard_node) + ')</span>'
-          : '<span class="pill neutral">AdGuard Home: Not Detected (No Docker Needed)</span>');
+    if (hero) {
+      hero.innerHTML =
+        '<span class="pill ' + scoreTone + '">Hardening Score: ' + esc(d.score) + '/100 (' + esc(d.grade) + ')</span>'
+        + '<span class="pill purple">' + boardIcon + esc(hi.friendly_name || 'Master') + '</span>'
+        + '<span class="pill neutral mono">Master IP: ' + esc(hi.master_host || hi.lan_ip || '-') + '</span>'
+        + '<span class="pill neutral mono">LAN: ' + esc(hi.lan_subnet || '-') + '</span>'
+        + (d.adguard_url
+            ? '<span class="pill ok">✓ AdGuard Home Live (' + esc(d.adguard_node) + ')</span>'
+            : '<span class="pill neutral">AdGuard Home: Not Detected (No Docker Needed)</span>');
+    }
 
     // Per-phone attack surface & quarantine table
-    const nodes = d.nodes || [];
-    const nBox = document.getElementById('net-nodes-table');
-    if (!nodes.length) {
-      nBox.innerHTML = '<p class="hint">No phones configured yet.</p>';
-    } else {
-      nBox.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Phone</th><th>Tier</th><th>Token Isolation</th><th>Master-IP Lock</th><th>Open Ports</th><th>Proxy Traffic</th><th>Action</th></tr></thead><tbody>'
-        + nodes.map(n => {
-            const tokPill = n.token_isolated ? '<span class="pill ok">✓ Unique</span>' : '<span class="pill warn">⚠ Shared</span>';
-            const ipPill = n.role === 'master'
-              ? '<span class="pill purple">MASTER</span>'
-              : (n.source_ip_allowlist_active ? '<span class="pill ok">✓ Enforced</span>' : '<span class="pill neutral">Open LAN</span>');
-            const portCell = !n.online
-              ? '<span class="pill bad">Offline</span>'
-              : (n.unexpected_ports && n.unexpected_ports.length
-                  ? '<span class="pill warn">⚠ ' + esc(n.unexpected_ports.join(', ')) + '</span>'
-                  : '<span class="pill ok">✓ Clean (' + (n.exposed_ports || []).length + ')</span>');
-            const traf = n.role === 'master'
-              ? '<span class="hint">Gateway</span>'
-              : '<span class="mono">' + esc(n.proxy_allowed || 0) + ' ok / ' + esc(n.proxy_blocked || 0) + ' blk</span>';
-            let act = '<span class="hint">-</span>';
-            if (n.role !== 'master') {
-              act = n.quarantined
-                ? '<button class="small primary" onclick="toggleQuarantine(' + jsArg(n.id) + ', false)">✓ Unblock</button>'
-                : '<button class="small danger" onclick="toggleQuarantine(' + jsArg(n.id) + ', true)">🔒 Quarantine</button>';
-            }
-            const nameBadge = n.quarantined
-              ? '<strong>' + esc(n.id) + '</strong> <span class="pill bad">QUARANTINED</span>'
-              : '<strong>' + esc(n.id) + '</strong>';
-            return '<tr><td>' + nameBadge + '<div class="hint mono" style="margin:0;">' + esc(n.host) + '</div></td>'
-              + '<td>' + tierPillHtml(n.tier, n.pool) + '</td><td>' + tokPill + '</td><td>' + ipPill + '</td>'
-              + '<td>' + portCell + '</td><td>' + traf + '</td><td>' + act + '</td></tr>';
-          }).join('')
-        + '</tbody></table></div>';
+    const nodes = Array.isArray(d.nodes) ? d.nodes : [];
+    if (nb) {
+      if (!nodes.length) {
+        nb.innerHTML = '<p class="hint">No phones configured yet.</p>';
+      } else {
+        nb.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Phone</th><th>Tier</th><th>Token Isolation</th><th>Master-IP Lock</th><th>Open Ports</th><th>Proxy Traffic</th><th>Action</th></tr></thead><tbody>'
+          + nodes.map(n => {
+              const tokPill = n.token_isolated ? '<span class="pill ok">✓ Unique</span>' : '<span class="pill warn">⚠ Shared</span>';
+              const ipPill = n.role === 'master'
+                ? '<span class="pill purple">MASTER</span>'
+                : (n.source_ip_allowlist_active ? '<span class="pill ok">✓ Enforced</span>' : '<span class="pill neutral">Open LAN</span>');
+              const portCell = !n.online
+                ? '<span class="pill bad">Offline</span>'
+                : (n.unexpected_ports && n.unexpected_ports.length
+                    ? '<span class="pill warn">⚠ ' + esc(n.unexpected_ports.join(', ')) + '</span>'
+                    : '<span class="pill ok">✓ Clean (' + (n.exposed_ports || []).length + ')</span>');
+              const traf = n.role === 'master'
+                ? '<span class="hint">Gateway</span>'
+                : '<span class="mono">' + esc(n.proxy_allowed || 0) + ' ok / ' + esc(n.proxy_blocked || 0) + ' blk</span>';
+              let act = '<span class="hint">-</span>';
+              if (n.role !== 'master') {
+                act = n.quarantined
+                  ? '<button class="small primary" onclick="toggleQuarantine(' + jsArg(n.id) + ', false)">✓ Unblock</button>'
+                  : '<button class="small danger" onclick="toggleQuarantine(' + jsArg(n.id) + ', true)">🔒 Quarantine</button>';
+              }
+              const nameBadge = n.quarantined
+                ? '<strong>' + esc(n.id) + '</strong> <span class="pill bad">QUARANTINED</span>'
+                : '<strong>' + esc(n.id) + '</strong>';
+              return '<tr><td>' + nameBadge + '<div class="hint mono" style="margin:0;">' + esc(n.host) + '</div></td>'
+                + '<td>' + tierPillHtml(n.tier, n.pool) + '</td><td>' + tokPill + '</td><td>' + ipPill + '</td>'
+                + '<td>' + portCell + '</td><td>' + traf + '</td><td>' + act + '</td></tr>';
+            }).join('')
+          + '</tbody></table></div>';
+      }
     }
 
     // AdGuard & Pi hub
     const agBox = document.getElementById('net-adguard-status');
-    if (d.adguard_url) {
-      const agLink = /^https?:\/\//i.test(String(d.adguard_url || ''))
-        ? '<a href="' + esc(d.adguard_url) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">' + esc(d.adguard_url) + '</a>'
-        : '<span class="mono">' + esc(d.adguard_url) + '</span>';
-      agBox.innerHTML = '<span class="pill ok">✓ Active</span> AdGuard Home reachable on <strong>' + esc(d.adguard_node) + '</strong>: ' + agLink;
-    } else if (hi.is_termux) {
-      agBox.innerHTML = '<span class="pill warn">Unrooted Termux Master</span> Port 53 requires root — run native AdGuard Home on a <strong>Raspberry Pi Zero 2 W</strong> Master or a <strong>Tier 2 Debian 13</strong> phone (no Docker needed!).';
-    } else {
-      agBox.innerHTML = '<span class="pill neutral">Not Installed</span> Your controller (' + esc(hi.friendly_name) + ') can run <strong>native AdGuard Home</strong> directly without Docker using the 1-line installer below!';
+    if (agBox) {
+      if (d.adguard_url) {
+        const safeAg = safeHttpUrl(d.adguard_url);
+        const agLink = safeAg
+          ? '<a href="' + esc(safeAg) + '" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">' + esc(safeAg) + '</a>'
+          : '<span class="mono">' + esc(d.adguard_url) + '</span>';
+        agBox.innerHTML = '<span class="pill ok">✓ Active</span> AdGuard Home reachable on <strong>' + esc(d.adguard_node) + '</strong>: ' + agLink;
+      } else if (hi.is_termux) {
+        agBox.innerHTML = '<span class="pill warn">Unrooted Termux Master</span> Port 53 requires root — run native AdGuard Home on a <strong>Raspberry Pi Zero 2 W</strong> Master or a <strong>Tier 2 Debian 13</strong> phone (no Docker needed!).';
+      } else {
+        agBox.innerHTML = '<span class="pill neutral">Not Installed</span> Your controller (' + esc(hi.friendly_name) + ') can run <strong>native AdGuard Home</strong> directly without Docker using the 1-line installer below!';
+      }
     }
     const sn = d.adguard_snippets || {};
     document.getElementById('net-ag-install').textContent = sn.native_install_cmd || '';
     document.getElementById('net-ag-rewrites').textContent = sn.rewrites_yaml || '';
     document.getElementById('net-ag-blocks').textContent = sn.worker_block_rules || '';
 
-    // Hardening controls & checklist
+    // Hardening controls & checklist (do not overwrite unsaved user edits!)
     const hd = d.hardening || {};
-    document.getElementById('hard-subnet').value = hd.lan_subnet || '';
-    document.getElementById('hard-ag-url').value = hd.adguard_url || '';
-    document.getElementById('hard-req-auth').checked = Boolean(hd.dashboard_require_auth);
-    document.getElementById('hard-src-ip').checked = Boolean(hd.enforce_worker_source_ip);
-    const signedEl = document.getElementById('hard-signed-only');
-    if (signedEl) signedEl.checked = Boolean(hd.require_signed_requests);
+    if (!hardFormDirty) {
+      document.getElementById('hard-subnet').value = hd.lan_subnet || '';
+      document.getElementById('hard-ag-url').value = hd.adguard_url || '';
+      document.getElementById('hard-req-auth').checked = Boolean(hd.dashboard_require_auth);
+      document.getElementById('hard-src-ip').checked = Boolean(hd.enforce_worker_source_ip);
+      const signedEl = document.getElementById('hard-signed-only');
+      if (signedEl) signedEl.checked = Boolean(hd.require_signed_requests);
+    }
 
-    const cBox = document.getElementById('net-checks-list');
-    const cIcons = { ok: '✓ OK', warn: '⚠ WARN', info: 'ℹ TIP' };
-    const cCls = { ok: 'ok', warn: 'warn', info: 'neutral' };
-    cBox.innerHTML = (d.checks || []).map(c =>
-      '<div class="check-item"><span class="pill ' + (cCls[c.status] || 'neutral') + '">' + (cIcons[c.status] || esc(c.status)) + '</span> '
-      + '<strong>' + esc(c.name) + '</strong>: ' + esc(c.detail)
-      + (c.fix ? '<div class="hint">' + esc(c.fix) + '</div>' : '')
-      + '</div>'
-    ).join('');
+    if (cb) {
+      const cIcons = { ok: '✓ OK', warn: '⚠ WARN', info: 'ℹ TIP' };
+      const cCls = { ok: 'ok', warn: 'warn', info: 'neutral' };
+      cb.innerHTML = (d.checks || []).map(c => {
+        const stKey = String(c.status || '');
+        const pCls = hasOwn(cCls, stKey) ? cCls[stKey] : 'neutral';
+        const pIcon = hasOwn(cIcons, stKey) ? cIcons[stKey] : esc(stKey);
+        return '<div class="check-item"><span class="pill ' + pCls + '">' + pIcon + '</span> '
+          + '<strong>' + esc(c.name) + '</strong>: ' + esc(c.detail)
+          + (c.fix ? '<div class="hint">' + esc(c.fix) + '</div>' : '')
+          + '</div>';
+      }).join('');
+    }
 
     setFwTab(activeFwTab);
+    highlightActiveProfile();
     loadUsbHub();
-  } catch (e) {}
+  } catch (e) {
+    if (nb) nb.innerHTML = '<p class="hint">Could not load network audit: ' + esc(e && e.message ? e.message : String(e)) + '</p>';
+  }
 }
 
 let lastUsbWatchdogRunning = false;
 
-function setSetupConnectionMode(mode) {
+function setSetupConnectionMode(mode, opts) {
   const isUsb = mode === 'usb';
+  const options = opts || {};
   const wifiCard = document.getElementById('setup-wireless-card');
   const usbCard = document.getElementById('setup-usb-card');
   const btnWifi = document.getElementById('btn-setup-mode-wifi');
   const btnUsb = document.getElementById('btn-setup-mode-usb');
   if (wifiCard) wifiCard.style.display = isUsb ? 'none' : '';
   if (usbCard) usbCard.style.display = isUsb ? '' : 'none';
-  if (btnWifi) btnWifi.classList.toggle('primary', !isUsb);
-  if (btnUsb) btnUsb.classList.toggle('primary', isUsb);
-  if (isUsb) loadUsbHub();
+  if (btnWifi) {
+    btnWifi.classList.toggle('primary', !isUsb);
+    btnWifi.setAttribute('aria-pressed', String(!isUsb));
+  }
+  if (btnUsb) {
+    btnUsb.classList.toggle('primary', isUsb);
+    btnUsb.setAttribute('aria-pressed', String(isUsb));
+  }
+  if (!options.skipSave) {
+    try { localStorage.setItem('pc_setup_mode', isUsb ? 'usb' : 'wifi'); } catch (_e) {}
+  }
+  if (isUsb && !options.skipScan) loadUsbHub();
 }
 
 function openUsbHubSetupTab() {
@@ -3228,17 +4298,25 @@ async function loadUsbHub(opts) {
   const cmdEl = document.getElementById('usb-hub-cmds');
   const setupCmdEl = document.getElementById('setup-usb-cmds');
   if (!box && !setupBox) return;
+  if (!getToken()) {
+    const msg = 'Unlock with Master token to scan local USB hub devices.';
+    if (box) box.textContent = msg;
+    if (setupBox) setupBox.textContent = msg;
+    return;
+  }
   try {
-    const r = await apiFetch('/api/usb-hub');
-    if (r.status === 401) {
+    const r = await apiFetch('/api/usb-hub', { timeoutMs: 20000 });
+    if (r.status === 401 || r.status === 429) {
+      const body = await readJsonSafe(r);
+      handleAuthFailure(r.status, body && body.retry_after_sec);
       const msg = 'Unlock with Master token to scan local USB hub devices.';
       if (box) box.textContent = msg;
       if (setupBox) setupBox.textContent = msg;
       return;
     }
-    const d = await r.json();
-    if (!r.ok || d.error) {
-      const msg = 'USB hub scan error: ' + (d.error || ('HTTP ' + r.status));
+    const d = await readJsonSafe(r);
+    if (!r.ok || !d || d.error) {
+      const msg = 'USB hub scan error: ' + ((d && d.error) || ('HTTP ' + r.status));
       if (box) box.textContent = msg;
       if (setupBox) setupBox.textContent = msg;
       return;
@@ -3250,7 +4328,7 @@ async function loadUsbHub(opts) {
     const netN = Number(topo.usb_net_count || 0);
     const cols = Array.isArray(topo.subnet_collisions) ? topo.subnet_collisions : [];
     let html = '<span class="pill ' + ((adbN || netN) ? 'ok' : 'neutral') + '">'
-      + 'ADB Ready: ' + adbN + ' · USB-Net: ' + netN + '</span> '
+      + 'ADB Ready: ' + esc(adbN) + ' · USB-Net: ' + esc(netN) + '</span> '
       + '<span class="pill ' + (topo.ipv4_forwarding_enabled ? 'ok' : 'neutral') + '">IPv4 Forward: '
       + (topo.ipv4_forwarding_enabled ? 'ON' : 'OFF') + '</span> '
       + '<span class="pill ' + (wd.running ? 'ok' : 'neutral') + '">Auto-Heal: ' + (wd.running ? 'ON' : 'OFF') + '</span> '
@@ -3291,91 +4369,117 @@ async function loadUsbHub(opts) {
     const cmdTxt = lines.join('\n');
     if (cmdEl && !preserveCmds) cmdEl.textContent = cmdTxt;
     if (setupCmdEl && !preserveCmds) setupCmdEl.textContent = cmdTxt;
-  } catch (e) {}
+  } catch (e) {
+    const msg = 'USB hub scan failed: ' + (e && e.message ? e.message : String(e));
+    if (box) box.textContent = msg;
+    if (setupBox) setupBox.textContent = msg;
+  }
 }
 
 async function applyUsbHubSetup(mode) {
-  const data = await authPost('/api/usb-hub/setup', { mode, auto_detect: true, start_watchdog: true });
-  if (data.error) { showToast('USB Hub setup error: ' + data.error, 'bad'); return; }
-  const count = (data.updated_nodes || []).length;
-  showToast('USB Hub (' + mode.toUpperCase() + ') saved ' + count + ' phone(s): ' + (data.updated_nodes || []).join(', '), 'ok');
-  if (data.watchdog) _renderUsbWatchdogBadge(data.watchdog);
-  let renderedCustomCmds = false;
-  const setupCmdEl = document.getElementById('setup-usb-cmds');
-  const netCmdEl = document.getElementById('usb-hub-cmds');
-  if (data.commands && Array.isArray(data.commands.host_commands)) {
-    const out = [].concat(data.commands.host_commands);
-    if (data.commands.phone_commands) {
-      for (const [nid, pcmds] of Object.entries(data.commands.phone_commands)) {
-        out.push('# Phone ' + nid + ': ' + (pcmds[1] || pcmds[0] || ''));
+  await withBusyAction('usb-setup:' + mode, null, '', async () => {
+    const data = await authPost('/api/usb-hub/setup', { mode, auto_detect: true, start_watchdog: true });
+    if (data.error) { showToast('USB Hub setup error: ' + data.error, 'bad'); return; }
+    const count = (data.updated_nodes || []).length;
+    showToast('USB Hub (' + mode.toUpperCase() + ') saved ' + count + ' phone(s): ' + (data.updated_nodes || []).join(', '), 'ok');
+    if (data.watchdog) _renderUsbWatchdogBadge(data.watchdog);
+    let renderedCustomCmds = false;
+    const setupCmdEl = document.getElementById('setup-usb-cmds');
+    const netCmdEl = document.getElementById('usb-hub-cmds');
+    if (data.commands && Array.isArray(data.commands.host_commands)) {
+      const out = [].concat(data.commands.host_commands);
+      if (data.commands.phone_commands) {
+        for (const [nid, pcmds] of Object.entries(data.commands.phone_commands)) {
+          out.push('# Phone ' + nid + ': ' + (pcmds[1] || pcmds[0] || ''));
+        }
       }
+      const txt = out.join('\n');
+      if (setupCmdEl) setupCmdEl.textContent = txt;
+      if (netCmdEl) netCmdEl.textContent = txt;
+      renderedCustomCmds = true;
     }
-    const txt = out.join('\n');
-    if (setupCmdEl) setupCmdEl.textContent = txt;
-    if (netCmdEl) netCmdEl.textContent = txt;
-    renderedCustomCmds = true;
-  }
-  loadUsbHub({ preserveCommands: renderedCustomCmds });
-  refreshLive({ fresh: true });
+    loadUsbHub({ preserveCommands: renderedCustomCmds });
+    refreshLive({ fresh: true });
+  });
 }
 
 async function verifyUsbHubUi() {
-  const targets = [document.getElementById('setup-usb-verify-out'), document.getElementById('net-usb-verify-out')].filter(Boolean);
-  for (const el of targets) { el.style.display = 'block'; el.textContent = 'Testing Master ↔ Phone & Phone ↔ Phone USB links...'; }
-  const data = await authPost('/api/usb-hub/verify', {});
-  if (data.error) {
-    for (const el of targets) el.textContent = 'Verification error: ' + data.error;
-    showToast('USB Hub verify error: ' + data.error, 'bad');
-    return;
-  }
-  let html = '<strong>' + esc(data.summary || 'USB Hub Check') + '</strong>';
-  const nodes = Array.isArray(data.nodes) ? data.nodes : [];
-  if (nodes.length) {
-    html += '<div class="hint" style="margin-top:4px;">' + nodes.map(n =>
-      '<span class="pill ' + (n.online ? 'ok' : 'bad') + '">' + esc(n.node_id) + ' (' + esc(n.mode) + ') '
-      + (n.online ? esc(n.latency_ms) + 'ms' : 'OFFLINE') + '</span>'
-    ).join(' ') + '</div>';
-  }
-  const links = Array.isArray(data.peer_links) ? data.peer_links : [];
-  if (links.length) {
-    html += '<div class="hint" style="margin-top:6px;"><strong>Phone ↔ Phone Peer Links:</strong><br/>'
-      + links.map(lk =>
-        '<span class="mono">' + esc(lk.from) + ' → ' + esc(lk.to) + '</span> (' + esc(lk.mode) + '): '
-        + '<strong style="color:' + (lk.ok ? 'var(--ok)' : 'var(--bad)') + '">' + (lk.ok ? 'OK' : 'FAIL') + '</strong>'
-        + (lk.latency_ms != null ? ' ' + esc(lk.latency_ms) + 'ms' : '')
-        + (lk.error ? ' · ' + esc(lk.error) : '')
-      ).join('<br/>') + '</div>';
-  }
-  const warns = Array.isArray(data.warnings) ? data.warnings : [];
-  if (warns.length) {
-    html += '<div class="hint" style="color:var(--warn); margin-top:6px;">' + warns.map(w => '⚠ ' + esc(w)).join('<br/>') + '</div>';
-  }
-  for (const el of targets) { el.style.display = 'block'; el.innerHTML = html; }
-  showToast(data.summary || 'USB Hub check complete', data.ok ? 'ok' : 'warn');
+  await withBusyAction('usb-verify', null, '', async () => {
+    const targets = [document.getElementById('setup-usb-verify-out'), document.getElementById('net-usb-verify-out')].filter(Boolean);
+    for (const el of targets) { el.style.display = 'block'; el.textContent = 'Testing Master ↔ Phone & Phone ↔ Phone USB links...'; }
+    const data = await authPost('/api/usb-hub/verify', {});
+    if (data.error) {
+      for (const el of targets) el.textContent = 'Verification error: ' + data.error;
+      showToast('USB Hub verify error: ' + data.error, 'bad');
+      return;
+    }
+    let html = '<strong>' + esc(data.summary || 'USB Hub Check') + '</strong>';
+    const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+    if (nodes.length) {
+      html += '<div class="hint" style="margin-top:4px;">' + nodes.map(n =>
+        '<span class="pill ' + (n.online ? 'ok' : 'bad') + '">' + esc(n.node_id) + ' (' + esc(n.mode) + ') '
+        + (n.online ? esc(n.latency_ms) + 'ms' : 'OFFLINE') + '</span>'
+      ).join(' ') + '</div>';
+    }
+    const links = Array.isArray(data.peer_links) ? data.peer_links : [];
+    if (links.length) {
+      html += '<div class="hint" style="margin-top:6px;"><strong>Phone ↔ Phone Peer Links:</strong><br/>'
+        + links.map(lk =>
+          '<span class="mono">' + esc(lk.from) + ' → ' + esc(lk.to) + '</span> (' + esc(lk.mode) + '): '
+          + '<strong style="color:' + (lk.ok ? 'var(--ok)' : 'var(--bad)') + '">' + (lk.ok ? 'OK' : 'FAIL') + '</strong>'
+          + (lk.latency_ms != null ? ' ' + esc(lk.latency_ms) + 'ms' : '')
+          + (lk.error ? ' · ' + esc(lk.error) : '')
+        ).join('<br/>') + '</div>';
+    }
+    const warns = Array.isArray(data.warnings) ? data.warnings : [];
+    if (warns.length) {
+      html += '<div class="hint" style="color:var(--warn); margin-top:6px;">' + warns.map(w => '⚠ ' + esc(w)).join('<br/>') + '</div>';
+    }
+    for (const el of targets) { el.style.display = 'block'; el.innerHTML = html; }
+    showToast(data.summary || 'USB Hub check complete', data.ok ? 'ok' : 'warn');
+  });
 }
 
 async function toggleUsbWatchdog() {
-  const nextState = !lastUsbWatchdogRunning;
-  const data = await authPost('/api/usb-hub/watchdog', { enabled: nextState });
-  if (data.error) { showToast('Watchdog error: ' + data.error, 'bad'); return; }
-  _renderUsbWatchdogBadge(data.watchdog);
-  loadUsbHub({ preserveCommands: true });
-  showToast(nextState ? 'USB Hub Auto-Heal Watchdog enabled!' : 'USB Hub Auto-Heal Watchdog stopped.', nextState ? 'ok' : 'neutral');
+  await withBusyAction('usb-watchdog', 'btn-usb-wd-toggle', 'Updating...', async () => {
+    const nextState = !lastUsbWatchdogRunning;
+    const data = await authPost('/api/usb-hub/watchdog', { enabled: nextState });
+    if (data.error) { showToast('Watchdog error: ' + data.error, 'bad'); return; }
+    _renderUsbWatchdogBadge(data.watchdog);
+    loadUsbHub({ preserveCommands: true });
+    showToast(nextState ? 'USB Hub Auto-Heal Watchdog enabled!' : 'USB Hub Auto-Heal Watchdog stopped.', nextState ? 'ok' : 'neutral');
+  });
 }
 
 async function applySecurityProfile(profile) {
-  const data = await authPost('/api/network/profile', { profile });
-  if (data.error) { showToast('Profile error: ' + data.error, 'bad'); return; }
-  showPolicyResult('Applied profile: ' + data.description + '.', data.pushed);
-  loadNetworkCenter();
+  if (profile === 'lockdown') {
+    if (!confirmAction('Apply Maximum Lockdown? This blocks ALL worker WAN proxy traffic, locks read-only stats behind your token, and enforces Master-IP allowlisting on workers.')) return;
+  } else if (profile === 'standard' && lastGwStatus && lastGwStatus.enabled) {
+    if (!confirmAction('Switch back to Standard Home LAN? This disables Network Guard filtering and opens Read-Only Dashboard stats on your LAN.')) return;
+  }
+  await withBusyAction('sec-profile:' + profile, 'btn-prof-' + profile, '', async () => {
+    const data = await authPost('/api/network/profile', { profile });
+    if (data.error) { showToast('Profile error: ' + data.error, 'bad'); return; }
+    gwFormDirty = false;
+    hardFormDirty = false;
+    const gp = document.getElementById('gw-unsaved-pill');
+    const hp = document.getElementById('hard-unsaved-pill');
+    if (gp) gp.style.display = 'none';
+    if (hp) hp.style.display = 'none';
+    showPolicyResult('Applied profile: ' + data.description + '.', data.pushed);
+    loadNetworkCenter();
+  });
 }
 
 async function toggleQuarantine(nodeId, quarantine) {
-  const data = await authPost('/api/gateway/quarantine', { node_id: nodeId, quarantine });
-  if (data.error) { showToast('Quarantine failed: ' + data.error, 'bad'); return; }
-  showToast(quarantine ? ('🔒 Quarantined ' + nodeId + ' (proxy, jobs & service mesh isolated!)') : ('✓ Unblocked ' + nodeId), quarantine ? 'warn' : 'ok');
-  loadNetworkCenter();
-  refreshLive();
+  if (quarantine && !confirmAction('Quarantine "' + nodeId + '"? It will be disconnected from Network Guard, excluded from jobs, and hidden from the Service Mesh.')) return;
+  await withBusyAction('quarantine:' + nodeId, null, '', async () => {
+    const data = await authPost('/api/gateway/quarantine', { node_id: nodeId, quarantine });
+    if (data.error) { showToast('Quarantine failed: ' + data.error, 'bad'); return; }
+    showToast(quarantine ? ('🔒 Quarantined ' + nodeId + ' (proxy, jobs & service mesh isolated!)') : ('✓ Unblocked ' + nodeId), quarantine ? 'warn' : 'ok');
+    loadNetworkCenter();
+    refreshLive();
+  });
 }
 
 async function saveHardeningSettings() {
@@ -3386,30 +4490,111 @@ async function saveHardeningSettings() {
     lan_subnet: document.getElementById('hard-subnet').value.trim(),
     adguard_url: document.getElementById('hard-ag-url').value.trim(),
   };
-  const data = await authPost('/api/network/hardening', payload);
-  if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
-  showPolicyResult('Controller network settings saved.', data.pushed);
-  loadNetworkCenter();
+  if (payload.adguard_url && !safeHttpUrl(payload.adguard_url)) {
+    showToast('Custom AdGuard URL must be a valid http:// or https:// URL without spaces or credentials.', 'warn');
+    return;
+  }
+  const prevSigned = Boolean(lastNetAudit && lastNetAudit.hardening && lastNetAudit.hardening.require_signed_requests);
+  if (payload.require_signed_requests && !prevSigned) {
+    if (!confirmAction('Require HMAC-SHA256 signed requests on all workers? Legacy scripts using raw Bearer tokens will be rejected until upgraded.')) return;
+  }
+  await withBusyAction('save-hardening', 'btn-save-hardening', 'Saving...', async () => {
+    const data = await authPost('/api/network/hardening', payload);
+    if (data.error) { showToast('Save failed: ' + data.error, 'bad'); return; }
+    hardFormDirty = false;
+    const hp = document.getElementById('hard-unsaved-pill');
+    if (hp) hp.style.display = 'none';
+    showPolicyResult('Controller network settings saved.', data.pushed);
+    loadNetworkCenter();
+  });
 }
 
 async function pushLivePolicyToWorkers() {
-  const data = await authPost('/api/network/push-config', {});
-  if (data.error) { showToast('Policy push failed: ' + data.error, 'bad'); return; }
-  showPolicyResult('Policy push complete.', data);
-  loadNetworkCenter();
-  refreshLive();
+  await withBusyAction('push-live-policy', null, '', async () => {
+    const data = await authPost('/api/network/push-config', {});
+    if (data.error) { showToast('Policy push failed: ' + data.error, 'bad'); return; }
+    showPolicyResult('Policy push complete.', data);
+    loadNetworkCenter();
+    refreshLive();
+  });
+}
+
+function renderGatewayEventsTable() {
+  const tbl = document.getElementById('gw-events-table');
+  if (!tbl) return;
+  const evs = Array.isArray(lastGwEvents) ? lastGwEvents : [];
+  if (!evs.length) {
+    const enabled = Boolean(lastGwStatus && lastGwStatus.enabled);
+    tbl.innerHTML = enabled
+      ? '<p class="hint">No worker proxy traffic logged yet. Any worker job making HTTP/HTTPS requests will appear here live.</p>'
+      : '<p class="hint">Network Guard is currently OFF (default). Turn it ON above if you want Master to filter &amp; monitor worker internet traffic.</p>';
+    return;
+  }
+  const q = (document.getElementById('gw-log-search')?.value || '').trim().toLowerCase();
+  const actFilter = document.getElementById('gw-log-action')?.value || 'all';
+  const filtered = evs.filter(ev => {
+    const act = String(ev.action || 'unknown');
+    if (actFilter !== 'all' && act !== actFilter) return false;
+    if (q) {
+      const hay = [ev.node_id, ev.host, ev.port, act, ev.reason].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  if (!filtered.length) {
+    tbl.innerHTML = '<p class="hint">No traffic log entries match your filter.</p>';
+    return;
+  }
+  tbl.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Time</th><th>Phone</th><th>Destination</th><th>Action</th><th>Reason</th><th>Data</th><th>Quick Fix</th></tr></thead><tbody>'
+    + filtered.slice(0, 60).map(ev => {
+        const tm = new Date((ev.ts || 0) * 1000).toLocaleTimeString();
+        const act = String(ev.action || 'unknown');
+        const tone = act === 'allow' ? 'ok' : (act === 'auth_denied' ? 'bad' : 'warn');
+        const totalB = ((ev.bytes_in || 0) + (ev.bytes_out || 0));
+        const dataTxt = totalB > 1024 ? (totalB / 1024).toFixed(1) + ' KB' : totalB + ' B';
+        const canAllow = act === 'block' && ev.host && !String(ev.reason || '').includes('SSRF') && !String(ev.reason || '').includes('port');
+        const fixBtn = canAllow
+          ? '<button class="small" onclick="allowBlockedDomain(' + jsArg(ev.host) + ')">+ Allow</button>'
+          : '<span class="hint">-</span>';
+        return '<tr><td class="mono">' + esc(tm) + '</td><td><strong>' + esc(ev.node_id) + '</strong></td>'
+          + '<td class="mono">' + esc(ev.host) + (ev.port ? ':' + esc(ev.port) : '') + '</td>'
+          + '<td><span class="pill ' + tone + '">' + esc(act.toUpperCase()) + '</span></td>'
+          + '<td>' + esc(ev.reason) + '</td><td class="mono">' + esc(dataTxt) + '</td><td>' + fixBtn + '</td></tr>';
+      }).join('')
+    + '</tbody></table></div>';
+}
+
+function copyGatewayLog() {
+  if (!lastGwEvents.length) { showToast('Traffic audit log is empty.', 'warn'); return; }
+  const txt = lastGwEvents.map(ev =>
+    new Date((ev.ts || 0) * 1000).toISOString() + ' ' + String(ev.action || 'unknown').toUpperCase()
+    + ' ' + (ev.node_id || '?') + ' -> ' + (ev.host || '?') + (ev.port ? ':' + ev.port : '')
+    + ' (' + (ev.reason || '') + ')'
+  ).join('\n');
+  copyText(txt, 'Copied Network Guard traffic log!');
 }
 
 async function loadGatewayStatus() {
+  const tbl = document.getElementById('gw-events-table');
+  if (!getToken()) {
+    if (tbl) tbl.innerHTML = '<p class="hint">Unlock with your Master token in the top bar to view Network Guard status and live traffic logs.</p>';
+    return;
+  }
   try {
-    const r = await apiFetch('/api/gateway/status');
-    if (r.status === 401) {
-      const tbl = document.getElementById('gw-events-table');
+    const r = await apiFetch('/api/gateway/status', { timeoutMs: 12000 });
+    if (r.status === 401 || r.status === 429) {
+      const body = await readJsonSafe(r);
+      handleAuthFailure(r.status, body && body.retry_after_sec);
       if (tbl) tbl.innerHTML = '<p class="hint">Dashboard locked — paste auth_token above and click Unlock.</p>';
       return;
     }
-    if (!r.ok) return;
-    const d = await r.json();
+    if (!r.ok) {
+      if (tbl) tbl.innerHTML = '<p class="hint">Network Guard status error (HTTP ' + r.status + ').</p>';
+      return;
+    }
+    const d = await readJsonSafe(r);
+    if (!d || typeof d !== 'object') return;
+    lastGwStatus = d;
     gwPresetsCache = d.presets || {};
     const pill = document.getElementById('gw-status-pill');
     if (d.enabled && d.running) {
@@ -3423,14 +4608,16 @@ async function loadGatewayStatus() {
       pill.textContent = 'OFF (Direct LAN)';
     }
 
-    document.getElementById('gw-enabled').value = d.enabled ? 'true' : 'false';
-    document.getElementById('gw-mode').value = d.mode || 'allowlist';
-    document.getElementById('gw-port').value = d.port || 8888;
-    document.getElementById('gw-rpm').value = d.max_requests_per_min_per_node ?? 120;
-    document.getElementById('gw-ssrf').checked = Boolean(d.block_private_ips);
-    document.getElementById('gw-inject').checked = Boolean(d.inject_proxy_env);
-    document.getElementById('gw-allowed').value = (d.allowed_domains || []).join('\n');
-    document.getElementById('gw-blocked').value = (d.blocked_domains || []).join('\n');
+    if (!gwFormDirty) {
+      document.getElementById('gw-enabled').value = d.enabled ? 'true' : 'false';
+      document.getElementById('gw-mode').value = d.mode || 'allowlist';
+      document.getElementById('gw-port').value = d.port || 8888;
+      document.getElementById('gw-rpm').value = d.max_requests_per_min_per_node ?? 120;
+      document.getElementById('gw-ssrf').checked = Boolean(d.block_private_ips);
+      document.getElementById('gw-inject').checked = Boolean(d.inject_proxy_env);
+      document.getElementById('gw-allowed').value = (d.allowed_domains || []).join('\n');
+      document.getElementById('gw-blocked').value = (d.blocked_domains || []).join('\n');
+    }
 
     const pBox = document.getElementById('gw-preset-chips');
     if (pBox) {
@@ -3447,34 +4634,16 @@ async function loadGatewayStatus() {
       + '<span class="pill ' + ((st.auth_failures || 0) ? 'bad' : 'neutral') + '">Auth Denied: ' + esc(st.auth_failures || 0) + '</span>'
       + '<span class="pill neutral mono">Relayed: ' + esc(kb) + ' KB</span>';
 
-    const tbl = document.getElementById('gw-events-table');
-    const evs = d.events || [];
-    if (!evs.length) {
-      tbl.innerHTML = d.enabled
-        ? '<p class="hint">No worker proxy traffic logged yet. Any worker job making HTTP/HTTPS requests will appear here live.</p>'
-        : '<p class="hint">Network Guard is currently OFF (default). Turn it ON above if you want Master to filter &amp; monitor worker internet traffic.</p>';
-    } else {
-      tbl.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr><th>Time</th><th>Phone</th><th>Destination</th><th>Action</th><th>Reason</th><th>Data</th><th>Quick Fix</th></tr></thead><tbody>'
-        + evs.slice(0, 40).map(ev => {
-            const tm = new Date((ev.ts || 0) * 1000).toLocaleTimeString();
-            const tone = ev.action === 'allow' ? 'ok' : (ev.action === 'auth_denied' ? 'bad' : 'warn');
-            const totalB = ((ev.bytes_in || 0) + (ev.bytes_out || 0));
-            const dataTxt = totalB > 1024 ? (totalB / 1024).toFixed(1) + ' KB' : totalB + ' B';
-            const canAllow = ev.action === 'block' && ev.host && !String(ev.reason || '').includes('SSRF') && !String(ev.reason || '').includes('port');
-            const fixBtn = canAllow
-              ? '<button class="small" onclick="allowBlockedDomain(' + jsArg(ev.host) + ')">+ Allow</button>'
-              : '<span class="hint">-</span>';
-            return '<tr><td class="mono">' + esc(tm) + '</td><td><strong>' + esc(ev.node_id) + '</strong></td>'
-              + '<td class="mono">' + esc(ev.host) + (ev.port ? ':' + esc(ev.port) : '') + '</td>'
-              + '<td><span class="pill ' + tone + '">' + esc(ev.action.toUpperCase()) + '</span></td>'
-              + '<td>' + esc(ev.reason) + '</td><td class="mono">' + esc(dataTxt) + '</td><td>' + fixBtn + '</td></tr>';
-          }).join('')
-        + '</tbody></table></div>';
-    }
-  } catch (e) {}
+    lastGwEvents = Array.isArray(d.events) ? d.events : [];
+    renderGatewayEventsTable();
+    highlightActiveProfile();
+  } catch (e) {
+    if (tbl) tbl.innerHTML = '<p class="hint">Could not load Network Guard status: ' + esc(e && e.message ? e.message : String(e)) + '</p>';
+  }
 }
 
 function addGatewayPreset(key) {
+  if (!hasOwn(gwPresetsCache, key)) return;
   const p = gwPresetsCache[key];
   if (!p) return;
   const el = document.getElementById('gw-allowed');
@@ -3482,6 +4651,9 @@ function addGatewayPreset(key) {
   const set = new Set(existing);
   for (const d of (p.domains || [])) set.add(d);
   el.value = Array.from(set).join('\n');
+  gwFormDirty = true;
+  const gp = document.getElementById('gw-unsaved-pill');
+  if (gp) gp.style.display = 'inline-flex';
   showToast('Added ' + p.label + ' domains — click Save & Apply to activate.', 'ok');
 }
 
@@ -3496,52 +4668,66 @@ async function saveGatewaySettings() {
     allowed_domains: document.getElementById('gw-allowed').value.split('\n').map(s => s.trim()).filter(Boolean),
     blocked_domains: document.getElementById('gw-blocked').value.split('\n').map(s => s.trim()).filter(Boolean),
   };
-  const data = await authPost('/api/gateway/settings', payload);
-  if (data.error) { showToast('Network Guard error: ' + data.error, 'bad'); return; }
-  showToast(payload.enabled ? 'Network Guard ON (port ' + data.port + ', mode: ' + data.mode + ')!' : 'Network Guard turned OFF.', payload.enabled ? 'ok' : 'neutral');
-  loadNetworkCenter();
+  if (payload.enabled && payload.mode === 'block_all') {
+    if (!confirmAction('Enable Strict Air-Gap (block_all)? All outbound worker internet requests via the proxy will be blocked.')) return;
+  }
+  await withBusyAction('save-gw', 'btn-save-gw', 'Applying...', async () => {
+    const data = await authPost('/api/gateway/settings', payload);
+    if (data.error) { showToast('Network Guard error: ' + data.error, 'bad'); return; }
+    gwFormDirty = false;
+    const gp = document.getElementById('gw-unsaved-pill');
+    if (gp) gp.style.display = 'none';
+    showToast(payload.enabled ? 'Network Guard ON (port ' + data.port + ', mode: ' + data.mode + ')!' : 'Network Guard turned OFF.', payload.enabled ? 'ok' : 'neutral');
+    loadNetworkCenter();
+  });
 }
 
 async function allowBlockedDomain(domain) {
-  const data = await authPost('/api/gateway/allow-domain', { domain });
-  if (data.error) { showToast('Allow failed: ' + data.error, 'bad'); return; }
-  showToast('Added "' + domain + '" to Network Guard allowlist!', 'ok');
-  loadGatewayStatus();
+  await withBusyAction('allow-dom:' + domain, null, '', async () => {
+    const data = await authPost('/api/gateway/allow-domain', { domain });
+    if (data.error) { showToast('Allow failed: ' + data.error, 'bad'); return; }
+    showToast('Added "' + domain + '" to Network Guard allowlist!', 'ok');
+    loadGatewayStatus();
+  });
 }
 
 async function clearGatewayLogs() {
-  const data = await authPost('/api/gateway/logs/clear', {});
-  if (data.error) { showToast('Clear failed: ' + data.error, 'bad'); return; }
-  showToast('Cleared Network Guard audit log.', 'neutral');
-  loadGatewayStatus();
+  if (!confirmAction('Clear all recorded Network Guard traffic audit entries?')) return;
+  await withBusyAction('clear-gw-logs', null, '', async () => {
+    const data = await authPost('/api/gateway/logs/clear', {});
+    if (data.error) { showToast('Clear failed: ' + data.error, 'bad'); return; }
+    showToast('Cleared Network Guard audit log.', 'neutral');
+    loadGatewayStatus();
+  });
 }
 
 async function checkWanIsolation() {
-  const box = document.getElementById('gw-isolation-box');
-  box.innerHTML = 'Testing whether your router blocks direct WAN on worker phones...';
-  const data = await authPost('/api/gateway/check-isolation', {});
-  if (data.error) { box.textContent = 'Check failed: ' + data.error; showToast(data.error, 'bad'); return; }
-  const rows = data.workers || [];
-  if (!rows.length) {
-    box.innerHTML = '<p class="hint">No worker phones configured yet.</p>';
-    return;
-  }
-  box.innerHTML = rows.map(w => {
-    const cls = w.wan_blocked === true ? 'ok' : (w.wan_blocked === false ? 'warn' : 'neutral');
-    const tag = w.wan_blocked === true ? '✓ WAN BLOCKED' : (w.wan_blocked === false ? '⚠ DIRECT WAN OPEN' : 'OFFLINE / UNKNOWN');
-    return '<div class="check-item"><span class="pill ' + cls + '">' + tag + '</span> '
-      + '<strong>' + esc(w.node_id) + '</strong> (' + esc(w.host) + '): ' + esc(w.detail) + '</div>';
-  }).join('');
+  await withBusyAction('check-wan-iso', null, '', async () => {
+    const box = document.getElementById('gw-isolation-box');
+    box.innerHTML = 'Testing whether your router blocks direct WAN on worker phones...';
+    const data = await authPost('/api/gateway/check-isolation', {});
+    if (data.error) { box.textContent = 'Check failed: ' + data.error; showToast(data.error, 'bad'); return; }
+    const rows = data.workers || [];
+    if (!rows.length) {
+      box.innerHTML = '<p class="hint">No worker phones configured yet.</p>';
+      return;
+    }
+    box.innerHTML = rows.map(w => {
+      const cls = w.wan_blocked === true ? 'ok' : (w.wan_blocked === false ? 'warn' : 'neutral');
+      const tag = w.wan_blocked === true ? '✓ WAN BLOCKED' : (w.wan_blocked === false ? '⚠ DIRECT WAN OPEN' : 'OFFLINE / UNKNOWN');
+      return '<div class="check-item"><span class="pill ' + cls + '">' + tag + '</span> '
+        + '<strong>' + esc(w.node_id) + '</strong> (' + esc(w.host) + '): ' + esc(w.detail) + '</div>';
+    }).join('');
+  });
 }
 
-function copyEl(id) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  const txt = el.textContent || '';
+function copyText(txt, okMsg) {
+  const s = String(txt ?? '');
+  const doneMsg = okMsg || 'Copied to clipboard!';
   const fallbackCopy = () => {
     try {
       const ta = document.createElement('textarea');
-      ta.value = txt;
+      ta.value = s;
       ta.setAttribute('readonly', '');
       ta.style.position = 'fixed';
       ta.style.left = '-9999px';
@@ -3549,17 +4735,23 @@ function copyEl(id) {
       ta.select();
       const ok = document.execCommand && document.execCommand('copy');
       document.body.removeChild(ta);
-      if (ok) showToast('Copied to clipboard!', 'ok');
+      if (ok) showToast(doneMsg, 'ok');
       else showToast('Copy blocked by browser — select text manually.', 'warn');
-    } catch (e) {
+    } catch (_e) {
       showToast('Copy failed — select text manually.', 'warn');
     }
   };
   if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(txt).then(() => showToast('Copied to clipboard!', 'ok')).catch(fallbackCopy);
+    navigator.clipboard.writeText(s).then(() => showToast(doneMsg, 'ok')).catch(fallbackCopy);
   } else {
     fallbackCopy();
   }
+}
+
+function copyEl(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  copyText(el.textContent || '', 'Copied to clipboard!');
 }
 
 function refreshAll() {
@@ -3603,20 +4795,27 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.config_path = config_path
         self.sample_live_in_background = False
         self.latest_live: dict[str, Any] | None = None
+        self._live_sampled_mono: float = 0.0
         self._live_sample_lock = threading.Lock()
         self._live_refresh_event = threading.Event()
         self.rate_limiter = AuthRateLimiter(max_failures=10, window_sec=60.0, block_sec=60.0)
         self._conn_sem = threading.BoundedSemaphore(64)
+        self._ip_lock = threading.Lock()
+        self._ip_conns: dict[str, int] = {}
+        self._max_conns_per_ip = 16
+        self._max_conns_loopback = 48
         self._usb_watchdog_lock = threading.Lock()
         self._usb_watchdog: UsbHubWatchdog | None = None
-        if ":" in str(addr[0]):
+        clean_host = normalize_host(str(addr[0])) if addr[0] else ""
+        if ":" in clean_host:
             self.address_family = socket.AF_INET6
-        super().__init__(addr, DashboardRequestHandler)
+        bind_addr = (clean_host, int(addr[1]))
+        super().__init__(bind_addr, DashboardRequestHandler)
         self.pairing_manager = PairingManager(
             config=controller.config,
             config_path=config_path,
             pair_port=self.server_address[1],
-            listen_host=addr[0],
+            listen_host=clean_host or str(addr[0]),
             fail_delay_sec=pairing_fail_delay_sec,
             enable_beacon=enable_pairing_beacon,
             config_lock=controller.config_lock,
@@ -3639,14 +4838,25 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     def invalidate_live(self) -> None:
         """Mark cached `/api/live` snapshot stale and wake the background sampler immediately."""
         self.latest_live = None
+        self._live_sampled_mono = 0.0
         self._live_refresh_event.set()
 
     def get_live_snapshot(self, fresh: bool = False) -> dict[str, Any] | None:
         """Return cached background sample or trigger a coalesced live resample when `fresh=True`."""
         if not self.sample_live_in_background or fresh:
             with self._live_sample_lock:
+                now = time.monotonic()
+                if (
+                    fresh
+                    and self.sample_live_in_background
+                    and self.latest_live is not None
+                    and self._live_sampled_mono > 0.0
+                    and (now - self._live_sampled_mono) < 0.4
+                ):
+                    return self.latest_live
                 live = _collect_live(self.controller)
                 self.latest_live = live
+                self._live_sampled_mono = time.monotonic()
                 return live
         return self.latest_live
 
@@ -3689,20 +4899,61 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             LOG.info("Stopped built-in USB 3.0 Hub Auto-Heal Watchdog.")
         return {"running": False, "interval_sec": 5.0, "last_sync_ts": 0, "online_serials": []}
 
+    def _acquire_ip_slot(self, client_address: Any) -> str | None:
+        raw_ip = str(client_address[0]) if client_address else ""
+        key = AuthRateLimiter._norm_ip(raw_ip)
+        is_lo = False
+        try:
+            ip_obj = ipaddress.ip_address(normalize_host(raw_ip))
+            if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+                ip_obj = ip_obj.ipv4_mapped
+            is_lo = bool(ip_obj.is_loopback)
+        except ValueError:
+            is_lo = normalize_host(raw_ip) in {"127.0.0.1", "::1"}
+        cap = self._max_conns_loopback if is_lo else self._max_conns_per_ip
+        with self._ip_lock:
+            cur = self._ip_conns.get(key, 0)
+            if cur >= cap:
+                return None
+            self._ip_conns[key] = cur + 1
+        return key
+
+    def _release_ip_slot(self, key: str | None) -> None:
+        if not key:
+            return
+        with self._ip_lock:
+            cur = self._ip_conns.get(key, 0)
+            if cur <= 1:
+                self._ip_conns.pop(key, None)
+            else:
+                self._ip_conns[key] = cur - 1
+
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._conn_sem.acquire(blocking=False):
             self.shutdown_request(request)
             return
+        ip_key = self._acquire_ip_slot(client_address)
+        if ip_key is None:
+            self._conn_sem.release()
+            self.shutdown_request(request)
+            return
         try:
-            super().process_request(request, client_address)
+            t = threading.Thread(
+                target=self._process_request_thread_tracked,
+                args=(request, client_address, ip_key),
+                daemon=self.daemon_threads,
+            )
+            t.start()
         except Exception:
+            self._release_ip_slot(ip_key)
             self._conn_sem.release()
             raise
 
-    def process_request_thread(self, request: Any, client_address: Any) -> None:
+    def _process_request_thread_tracked(self, request: Any, client_address: Any, ip_key: str) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
+            self._release_ip_slot(ip_key)
             self._conn_sem.release()
 
     def server_close(self) -> None:
@@ -3724,6 +4975,37 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         msg = re.sub(r"[\x00-\x1f\x7f]", "?", format % args)
         LOG.info("dashboard %s - %s", self.address_string(), msg)
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self._response_sent = True
+        super().send_response(code, message)
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        """Return hardened JSON with full security headers on unsupported methods/protocol errors."""
+        err_msg = str(message or HTTPStatus(int(code)).phrase)
+        try:
+            self._send_json(int(code), {"error": err_msg})
+        except OSError:
+            pass
+
+    def _write_security_headers(self, content_type: str) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        )
+        self.send_header("Cache-Control", "no-store")
+        if content_type.startswith("text/html"):
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+                "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+            )
 
     def _save_config_or_rollback(self, rollback_fn: Any) -> bool:
         """Roll back the in-memory edit if the config changed elsewhere or the save failed."""
@@ -3750,75 +5032,86 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_response(int(status))
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
-        if content_type.startswith("text/html"):
-            self.send_header(
-                "Content-Security-Policy",
-                "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-                "img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
-            )
-        if self.path.startswith("/api/"):
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self._write_security_headers(content_type)
         self.end_headers()
         try:
             self.wfile.write(raw)
         except OSError:
             pass
 
-    def _check_same_origin(self) -> bool:
-        """Block cross-site browser POSTs (CSRF defense) while keeping non-browser API clients working."""
-        sec_fetch_site = self.headers.get("Sec-Fetch-Site", "").strip().lower()
-        if sec_fetch_site == "cross-site":
+    def _check_same_origin(self, *, allow_direct_nav: bool = False) -> bool:
+        """Block cross-site/same-site browser requests (CSRF & lockout-DoS defense) while allowing CLI clients."""
+        sfs_vals = [v.strip().lower() for v in (self.headers.get_all("Sec-Fetch-Site") or []) if v.strip()]
+        if len(sfs_vals) > 1:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden: duplicate Sec-Fetch-Site header"})
+            return False
+        sec_fetch_site = sfs_vals[0] if sfs_vals else ""
+        allowed_sfs = {"", "same-origin", "none"} if allow_direct_nav else {"", "same-origin"}
+        if sec_fetch_site not in allowed_sfs:
             self._send_json(
                 HTTPStatus.FORBIDDEN,
-                {"error": "forbidden: cross-site browser POST rejected"},
+                {"error": f"forbidden: cross-origin browser request rejected ({sec_fetch_site})"},
             )
             return False
         host_hdr = self.headers.get("Host", "").strip().lower()
-        origin = self.headers.get("Origin", "").strip()
-        if origin:
+        origins = [v.strip() for v in (self.headers.get_all("Origin") or []) if v.strip()]
+        if len(origins) > 1:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden: duplicate Origin header"})
+            return False
+        if origins:
+            origin = origins[0]
             try:
-                parsed = urllib.parse.urlparse(origin)
+                parsed = urllib.parse.urlsplit(origin)
                 _ = parsed.port
             except ValueError:
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
-                    {"error": "forbidden: malformed Origin header on browser POST"},
+                    {"error": "forbidden: malformed Origin header on browser request"},
                 )
                 return False
+            scheme = parsed.scheme.lower()
             if (
-                parsed.scheme.lower() not in {"http", "https"}
+                scheme not in {"http", "https"}
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
                 or not host_hdr
-                or parsed.netloc.lower() != host_hdr
+                or _host_with_default_port(parsed.netloc, scheme) != _host_with_default_port(host_hdr, scheme)
             ):
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
-                    {"error": "forbidden: cross-origin browser POST rejected"},
+                    {"error": "forbidden: cross-origin browser request rejected"},
                 )
                 return False
             return True
-        referer = self.headers.get("Referer", "").strip()
-        if referer:
+        referers = [v.strip() for v in (self.headers.get_all("Referer") or []) if v.strip()]
+        if len(referers) > 1:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden: duplicate Referer header"})
+            return False
+        if referers:
+            referer = referers[0]
             try:
-                parsed_ref = urllib.parse.urlparse(referer)
+                parsed_ref = urllib.parse.urlsplit(referer)
                 _ = parsed_ref.port
             except ValueError:
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
-                    {"error": "forbidden: malformed Referer header on browser POST"},
+                    {"error": "forbidden: malformed Referer header on browser request"},
                 )
                 return False
+            scheme = parsed_ref.scheme.lower()
             if (
-                parsed_ref.scheme.lower() not in {"http", "https"}
+                scheme not in {"http", "https"}
+                or parsed_ref.username is not None
+                or parsed_ref.password is not None
                 or not host_hdr
-                or parsed_ref.netloc.lower() != host_hdr
+                or _host_with_default_port(parsed_ref.netloc, scheme) != _host_with_default_port(host_hdr, scheme)
             ):
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
-                    {"error": "forbidden: cross-origin Referer on browser POST rejected"},
+                    {"error": "forbidden: cross-origin Referer on browser request rejected"},
                 )
                 return False
         return True
@@ -3826,18 +5119,65 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, data: dict[str, Any]) -> None:
         self._send(status, "application/json", safe_json_dumps(data).encode("utf-8"))
 
-    def _read_json(self) -> dict[str, Any] | None:
-        length, err_status, err_msg = parse_strict_content_length(self.headers, MAX_DASHBOARD_BODY)
+    def _read_json(
+        self,
+        *,
+        max_bytes: int = MAX_DASHBOARD_BODY,
+        deadline_sec: float = 10.0,
+    ) -> dict[str, Any] | None:
+        length, err_status, err_msg = parse_strict_content_length(self.headers, max_bytes)
         if length is None:
             self._send_json(err_status, {"error": err_msg})
             return None
+        ct_vals = [v.strip() for v in (self.headers.get_all("Content-Type") or []) if v.strip()]
+        if len(ct_vals) > 1:
+            self._send_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "duplicate Content-Type header"})
+            return None
+        if ct_vals:
+            media_type = ct_vals[0].split(";", 1)[0].strip().lower()
+            if media_type != "application/json":
+                self._send_json(
+                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                    {"error": "Content-Type must be application/json"},
+                )
+                return None
+        elif any(
+            self.headers.get(h)
+            for h in ("Origin", "Referer", "Sec-Fetch-Site", "Sec-Fetch-Mode")
+        ):
+            self._send_json(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                {"error": "browser POST requires Content-Type: application/json"},
+            )
+            return None
         try:
             if length > 0:
-                raw_bytes = self.rfile.read(length)
-                if len(raw_bytes) != length:
+                buf = bytearray()
+                deadline = time.monotonic() + max(1.0, float(deadline_sec))
+                read_fn = getattr(self.rfile, "read1", self.rfile.read)
+                try:
+                    while len(buf) < length:
+                        rem_t = deadline - time.monotonic()
+                        if rem_t <= 0:
+                            self._send_json(HTTPStatus.REQUEST_TIMEOUT, {"error": "request body read timed out"})
+                            return None
+                        try:
+                            self.connection.settimeout(min(self.timeout, rem_t))
+                        except OSError:
+                            pass
+                        chunk = read_fn(min(65536, length - len(buf)))
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                finally:
+                    try:
+                        self.connection.settimeout(self.timeout)
+                    except OSError:
+                        pass
+                if len(buf) != length:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "truncated request body"})
                     return None
-                raw = raw_bytes.decode("utf-8")
+                raw = bytes(buf).decode("utf-8")
             else:
                 raw = "{}"
 
@@ -3848,6 +5188,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be an object")
             return body
+        except socket.timeout:
+            self._send_json(HTTPStatus.REQUEST_TIMEOUT, {"error": "request body read timed out"})
+            return None
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, OSError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
             return None
@@ -3865,6 +5208,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 raise ValueError("expected finite integer")
             return int(raw_val)
         return int(raw_val)
+
+    @staticmethod
+    def _parse_bool_arg(body: dict[str, Any], key: str, default: bool) -> bool:
+        if key not in body or body[key] is None:
+            return default
+        val = body[key]
+        if not isinstance(val, bool):
+            raise ValueError(f"'{key}' must be a boolean")
+        return val
 
     def _require_auth(self) -> bool:
         client_ip = normalize_host(str(self.client_address[0]))
@@ -3899,7 +5251,22 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _dispatch_safe(self, fn: Any) -> None:
+        self._response_sent = False
+        try:
+            fn()
+        except Exception:
+            LOG.exception("Unhandled error in dashboard %s %s", self.command, self.path)
+            if not getattr(self, "_response_sent", False):
+                try:
+                    self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal server error"})
+                except OSError:
+                    pass
+
     def do_HEAD(self) -> None:  # noqa: N802
+        self._dispatch_safe(self._handle_head)
+
+    def _handle_head(self) -> None:
         if not self._check_host():
             return
         path = self.path.split("?", 1)[0]
@@ -3908,22 +5275,28 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.send_response(int(HTTPStatus.OK))
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Referrer-Policy", "no-referrer")
+            self._write_security_headers("text/html; charset=utf-8")
             self.end_headers()
         else:
             self.send_response(int(HTTPStatus.NOT_FOUND))
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", "0")
+            self._write_security_headers("application/json")
             self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
+        self._dispatch_safe(self._handle_get)
+
+    def _handle_get(self) -> None:
         if not self._check_host():
             return
         path = self.path.split("?", 1)[0]
         if path in {"/", "/index.html"}:
             self._send(HTTPStatus.OK, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"))
-        elif path == "/api/pair/hello":
+            return
+        if path.startswith("/api/") and not self._check_same_origin(allow_direct_nav=True):
+            return
+        if path == "/api/pair/hello":
             status, data = self.server.pairing_manager.public_hello()
             self._send_json(status, data)
         elif path == "/api/pair/status":
@@ -3935,50 +5308,28 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/settings":
             if not self._require_auth():
                 return
-            s = self.server.controller.config.safety
-            self._send_json(
-                HTTPStatus.OK,
-                {
+            with self.server.controller.config_lock:
+                s = self.server.controller.config.safety
+                safety_payload = {
                     "max_temp_c": s.max_temp_c,
                     "resume_temp_c": s.resume_temp_c,
                     "min_free_ram_mb": s.min_free_ram_mb,
                     "battery_low_pct": s.battery_low_pct,
                     "battery_high_pct": s.battery_high_pct,
                     "battery_webhook_url": s.battery_webhook_url,
-                },
-            )
+                }
+            self._send_json(HTTPStatus.OK, safety_payload)
         elif path in {
-            "/api/status",
-            "/api/metrics",
-            "/api/live",
-            "/api/jobs",
-            "/api/doctor",
-            "/api/workloads",
-            "/api/services",
             "/api/gateway/status",
             "/api/network/audit",
+            "/api/doctor",
             "/api/usb-hub",
             "/api/discover",
         }:
-            if not self._require_read_auth_if_locked():
+            # Always require Master auth for active local/LAN scans, audit logs & host path diagnostics
+            if not self._require_auth():
                 return
-            if path == "/api/status":
-                self._send_json(HTTPStatus.OK, self.server.controller.cluster_summary())
-            elif path == "/api/metrics":
-                self._send_json(HTTPStatus.OK, self.server.controller.metrics_history.snapshot())
-            elif path == "/api/live":
-                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-                want_fresh = str((qs.get("fresh") or [""])[0]).strip().lower() in {"1", "true", "yes"}
-                live = self.server.get_live_snapshot(fresh=want_fresh)
-                if live is None:
-                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Waiting for first health sample"})
-                else:
-                    self._send_json(HTTPStatus.OK, live)
-            elif path == "/api/jobs":
-                self._send_json(HTTPStatus.OK, {"nodes": self.server.controller.get_all_jobs()})
-            elif path == "/api/services":
-                self._send_json(HTTPStatus.OK, self.server.controller.get_services_info())
-            elif path == "/api/gateway/status":
+            if path == "/api/gateway/status":
                 self._send_json(HTTPStatus.OK, self.server.gateway_manager.status())
             elif path == "/api/network/audit":
                 self._send_json(
@@ -3991,53 +5342,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/doctor":
                 report = run_doctor(config_path=self.server.config_path, check_remote=True)
                 self._send_json(HTTPStatus.OK, report)
-            elif path == "/api/workloads":
-                ctrl = self.server.controller
-                snaps = ctrl.poll_health()
-                quarantined = ctrl._quarantined_ids()
-                ha_urls: list[str] = []
-                docker_nodes: list[str] = []
-                docker_snap_nodes: list[str] = []
-                docker_socket_issues: list[str] = []
-                for s in snaps:
-                    if not s.online or s.node.id in quarantined:
-                        continue
-                    raw_svcs = s.health.get("services") if isinstance(s.health, dict) else None
-                    svcs_d = raw_svcs if isinstance(raw_svcs, dict) else {}
-                    raw_tools = s.health.get("tools") if isinstance(s.health, dict) else None
-                    tools_d = raw_tools if isinstance(raw_tools, dict) else {}
-                    if svcs_d.get("homeassistant_8123"):
-                        ha_urls.append(f"http://{format_host_port(s.node.host, 8123)}")
-                    has_dk = bool(tools_d.get("docker")) or resolve_node_tier_and_pool(s.node, s.health)[0] == 3
-                    if has_dk:
-                        docker_nodes.append(s.node.id)
-                        if isinstance(s.health, dict) and s.health.get("docker_snap"):
-                            docker_snap_nodes.append(s.node.id)
-                        if isinstance(s.health, dict) and tools_d.get("docker") and not s.health.get("docker_socket_accessible", True):
-                            docker_socket_issues.append(s.node.id)
-                with ctrl.config_lock:
-                    master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
-                    cfg_subnet = ctrl.config.network.lan_subnet
-                seed_host = (
-                    detect_local_ip()
-                    if is_loopback_or_unspecified_host(master_node.host)
-                    else master_node.host
-                )
-                lan_subnet = infer_lan_subnet(seed_host, cfg_subnet)
-                self._send_json(
-                    HTTPStatus.OK,
-                    {
-                        "distcc_hosts": ctrl.build_distcc_hosts(snapshots=snaps),
-                        "llama_rpc": ctrl.build_llama_rpc_arg(snapshots=snaps),
-                        "mpi_hostfile": ctrl.build_mpi_hostfile(snapshots=snaps),
-                        "home_assistant_urls": ha_urls,
-                        "docker_nodes": docker_nodes,
-                        "docker_snap_nodes": docker_snap_nodes,
-                        "docker_socket_issues": docker_socket_issues,
-                        "lan_subnet": lan_subnet,
-                        "services_info": ctrl.get_services_info(snapshots=snaps),
-                    },
-                )
             elif path == "/api/usb-hub":
                 topo = detect_usb_hub_topology()
                 ready_adb = [d for d in topo["adb_devices"] if d.get("state") == "device"]
@@ -4079,18 +5383,120 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 for item in found:
                     item["already_configured"] = item["host"] in existing_hosts
                 self._send_json(HTTPStatus.OK, {"discovered": found})
+        elif path in {
+            "/api/status",
+            "/api/metrics",
+            "/api/live",
+            "/api/jobs",
+            "/api/workloads",
+            "/api/services",
+        }:
+            if not self._require_read_auth_if_locked():
+                return
+            is_authed = verify_token(self.headers, self.server.controller.config.auth_token)
+            if path == "/api/status":
+                summary = self.server.controller.cluster_summary()
+                if not is_authed:
+                    summary = _redact_unauthenticated_summary(summary)
+                self._send_json(HTTPStatus.OK, summary)
+            elif path == "/api/metrics":
+                self._send_json(HTTPStatus.OK, self.server.controller.metrics_history.snapshot())
+            elif path == "/api/live":
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                want_fresh = str((qs.get("fresh") or [""])[0]).strip().lower() in {"1", "true", "yes"}
+                live = self.server.get_live_snapshot(fresh=want_fresh)
+                if live is None:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Waiting for first health sample"})
+                else:
+                    if not is_authed and isinstance(live, dict) and isinstance(live.get("summary"), dict):
+                        live = {**live, "summary": _redact_unauthenticated_summary(live["summary"])}
+                    self._send_json(HTTPStatus.OK, live)
+            elif path == "/api/jobs":
+                self._send_json(HTTPStatus.OK, {"nodes": self.server.controller.get_all_jobs()})
+            elif path == "/api/services":
+                self._send_json(HTTPStatus.OK, self.server.controller.get_services_info())
+            elif path == "/api/workloads":
+                ctrl = self.server.controller
+                snaps = ctrl.poll_health()
+                quarantined = ctrl._quarantined_ids()
+                ha_urls: list[str] = []
+                docker_nodes: list[str] = []
+                docker_snap_nodes: list[str] = []
+                docker_socket_issues: list[str] = []
+                for s in snaps:
+                    if not s.online or s.node.id in quarantined:
+                        continue
+                    raw_svcs = s.health.get("services") if isinstance(s.health, dict) else None
+                    svcs_d = raw_svcs if isinstance(raw_svcs, dict) else {}
+                    raw_tools = s.health.get("tools") if isinstance(s.health, dict) else None
+                    tools_d = raw_tools if isinstance(raw_tools, dict) else {}
+                    if svcs_d.get("homeassistant_8123"):
+                        ha_urls.append(f"http://{format_host_port(s.node.host, 8123)}")
+                    has_dk = bool(tools_d.get("docker")) or resolve_node_tier_and_pool(s.node, s.health)[0] == 3
+                    if has_dk:
+                        docker_nodes.append(s.node.id)
+                        if isinstance(s.health, dict) and s.health.get("docker_snap"):
+                            docker_snap_nodes.append(s.node.id)
+                        if isinstance(s.health, dict) and tools_d.get("docker") and not s.health.get("docker_socket_accessible", True):
+                            docker_socket_issues.append(s.node.id)
+                with ctrl.config_lock:
+                    master_node = next(
+                        (n for n in ctrl.config.nodes if n.role == "master"),
+                        ctrl.config.nodes[0] if ctrl.config.nodes else None,
+                    )
+                    cfg_subnet = ctrl.config.network.lan_subnet
+                seed_host = (
+                    detect_local_ip()
+                    if (master_node is None or is_loopback_or_unspecified_host(master_node.host))
+                    else master_node.host
+                )
+                lan_subnet = infer_lan_subnet(seed_host, cfg_subnet)
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "distcc_hosts": ctrl.build_distcc_hosts(snapshots=snaps),
+                        "llama_rpc": ctrl.build_llama_rpc_arg(snapshots=snaps),
+                        "mpi_hostfile": ctrl.build_mpi_hostfile(snapshots=snaps),
+                        "home_assistant_urls": ha_urls,
+                        "docker_nodes": docker_nodes,
+                        "docker_snap_nodes": docker_snap_nodes,
+                        "docker_socket_issues": docker_socket_issues,
+                        "lan_subnet": lan_subnet,
+                        "services_info": ctrl.get_services_info(snapshots=snaps),
+                    },
+                )
         else:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        self._dispatch_safe(self._handle_post)
+
+    def _handle_post(self) -> None:
         if not self._check_host():
             return
         path = self.path.split("?", 1)[0]
         if path == "/api/pair/complete":
-            if not self._check_same_origin():
+            # Strictly CLI-to-Master (`pc join`): reject browser headers, enforce 64 KiB cap & rate limit
+            if any(
+                self.headers.get(h)
+                for h in ("Origin", "Referer", "Sec-Fetch-Site")
+            ):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "forbidden: browser requests to /api/pair/complete are not allowed"},
+                )
                 return
-            body = self._read_json()
+            client_ip = normalize_host(str(self.client_address[0]))
+            blocked, retry_after = self.server.rate_limiter.is_blocked(client_ip)
+            if blocked:
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {"error": f"too many failed attempts; retry in {retry_after}s", "retry_after_sec": retry_after},
+                )
+                return
+            body = self._read_json(max_bytes=MAX_PAIR_COMPLETE_BODY, deadline_sec=10.0)
             if body is None:
+                self.server.rate_limiter.record_failure(client_ip)
                 return
             try:
                 local_ip = str(self.connection.getsockname()[0])
@@ -4178,12 +5584,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return None
 
         if path == "/api/exec":
-            command = str(body.get("command") or "").strip()
-            target = str(body.get("target") or "auto").strip() or "auto"
-            workload_hint = str(body.get("workload_hint") or body.get("workload") or "").strip()
-            if not command:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "empty command"})
+            raw_cmd = body.get("command")
+            if not isinstance(raw_cmd, str) or "\x00" in raw_cmd or not raw_cmd.strip():
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "command must be a non-empty string"})
                 return
+            command = raw_cmd.strip()
+            raw_target = body.get("target")
+            if raw_target is not None and not isinstance(raw_target, str):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "target must be a string"})
+                return
+            target = (raw_target or "auto").strip() or "auto"
+            workload_hint = str(body.get("workload_hint") or body.get("workload") or "").strip()
             timeout = _parse_timeout(body.get("timeout_sec"))
             if timeout is None:
                 return
@@ -4197,14 +5608,29 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"results": [o.to_dict() for o in outcomes]})
 
         elif path == "/api/terminal/exec":
-            command = str(body.get("command") or "").strip()
-            target = str(body.get("target") or "auto").strip() or "auto"
-            cwd = str(body.get("cwd") or "").strip() or None
-            job_id = str(body.get("job_id") or "").strip() or None
-            workload_hint = str(body.get("workload_hint") or body.get("workload") or "").strip()
-            if not command:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "empty command"})
+            raw_cmd = body.get("command")
+            if not isinstance(raw_cmd, str) or "\x00" in raw_cmd or not raw_cmd.strip():
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "command must be a non-empty string"})
                 return
+            command = raw_cmd.strip()
+            raw_target = body.get("target")
+            if raw_target is not None and not isinstance(raw_target, str):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "target must be a string"})
+                return
+            target = (raw_target or "auto").strip() or "auto"
+            raw_cwd = body.get("cwd")
+            if raw_cwd is not None and (not isinstance(raw_cwd, str) or "\x00" in raw_cwd):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "cwd must be a valid path string"})
+                return
+            cwd = (raw_cwd or "").strip() or None
+            raw_jid = body.get("job_id")
+            job_id: str | None = None
+            if raw_jid not in (None, ""):
+                if not isinstance(raw_jid, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", raw_jid.strip()):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "job_id must be 1-80 safe characters ([A-Za-z0-9._-])"})
+                    return
+                job_id = raw_jid.strip()
+            workload_hint = str(body.get("workload_hint") or body.get("workload") or "").strip()
             timeout = _parse_timeout(body.get("timeout_sec"))
             if timeout is None:
                 return
@@ -4223,8 +5649,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"results": results})
 
         elif path == "/api/map":
-            mode = str(body.get("mode") or "commands")
-            target = str(body.get("target") or "auto").strip() or "auto"
+            raw_mode = body.get("mode", "commands")
+            if raw_mode is None:
+                raw_mode = "commands"
+            if not isinstance(raw_mode, str) or raw_mode.strip() not in {"commands", "script"}:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "mode must be 'commands' or 'script'"})
+                return
+            mode = raw_mode.strip()
+            raw_target = body.get("target")
+            if raw_target is not None and not isinstance(raw_target, str):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "target must be a string"})
+                return
+            target = (raw_target or "auto").strip() or "auto"
             workload_hint = str(body.get("workload_hint") or body.get("workload") or "").strip()
             timeout = _parse_timeout(body.get("timeout_sec"))
             if timeout is None:
@@ -4232,18 +5668,29 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             jobs: list[JobSpec] = []
             batch_id = uuid.uuid4().hex[:6]
             if mode == "script":
-                script_content = str(body.get("script_content") or "")
-                interpreter = str(body.get("interpreter") or "python3").strip() or "python3"
+                raw_script = body.get("script_content")
+                raw_interp = body.get("interpreter", "python3")
+                if not isinstance(raw_script, str) or "\x00" in raw_script or not raw_script.strip():
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "provide non-empty script_content string"})
+                    return
+                if raw_interp is not None and (not isinstance(raw_interp, str) or "\x00" in raw_interp):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "interpreter must be a string"})
+                    return
+                script_content = raw_script
+                interpreter = (raw_interp or "python3").strip() or "python3"
                 args_lines = body.get("args_lines") or []
-                if not script_content.strip() or not isinstance(args_lines, list) or not args_lines:
+                if not isinstance(args_lines, list) or not args_lines:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "provide script_content and non-empty args_lines"})
                     return
                 if len(args_lines) > 2000:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "maximum 2000 jobs per batch"})
                     return
                 for idx, line in enumerate(args_lines):
+                    if line is not None and (not isinstance(line, str) or "\x00" in line):
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"argument line {idx + 1} must be a string"})
+                        return
                     try:
-                        parsed_args = shlex.split(str("" if line is None else line))
+                        parsed_args = shlex.split(line or "")
                     except ValueError as exc:
                         self._send_json(
                             HTTPStatus.BAD_REQUEST,
@@ -4273,7 +5720,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 for idx, cmd in enumerate(commands):
                     if cmd is None:
                         continue
-                    cmd_s = str(cmd).strip()
+                    if not isinstance(cmd, str) or "\x00" in cmd:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"command {idx + 1} must be a string"})
+                        return
+                    cmd_s = cmd.strip()
                     if cmd_s:
                         jobs.append(
                             JobSpec(
@@ -4319,7 +5769,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     {"error": "maximum 100 steps per pipeline"},
                 )
                 return
-            stop_on_error = bool(body.get("stop_on_error", True))
+            try:
+                stop_on_error = self._parse_bool_arg(body, "stop_on_error", True)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             res = ctrl.run_pipeline(steps, stop_on_error=stop_on_error)
             self._send_json(HTTPStatus.OK, res)
 
@@ -4332,27 +5786,48 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     {"error": "service name must be 1-40 chars (letters, digits, '_' or '-')"},
                 )
                 return
+            if len(url) > 512:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "url exceeds maximum length (512 chars)"})
+                return
             allowed_schemes = {"http", "https", "mqtt", "tcp", "redis", "postgresql", "ssh"}
             url_ok = False
+            svc_host = ""
+            svc_port: int | None = None
             if url and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url):
                 try:
                     p_svc = urllib.parse.urlsplit(url)
                     svc_port = p_svc.port
-                    url_ok = (
+                    if (
                         p_svc.scheme.lower() in allowed_schemes
                         and bool(p_svc.hostname)
+                        and p_svc.username is None
+                        and p_svc.password is None
                         and (svc_port is None or 1 <= svc_port <= 65535)
-                    )
+                    ):
+                        svc_host = validate_host(p_svc.hostname)
+                        url_ok = True
                 except ValueError:
                     url_ok = False
             if not url_ok:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
-                    {"error": "url must be a valid http://, https://, mqtt://, tcp://, redis://, postgresql://, or ssh:// URL with a hostname and valid port"},
+                    {"error": "url must be a valid http://, https://, mqtt://, tcp://, redis://, postgresql://, or ssh:// URL with a valid hostname, port, and no embedded credentials"},
+                )
+                return
+            if _is_endpoint_host_unsafe(svc_host, svc_port or 80):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "service endpoint blocked by SSRF guard (link-local, cloud metadata, unspecified, or multicast targets are disallowed)"},
                 )
                 return
             with ctrl.config_lock:
                 prev_existed = raw_name in ctrl.config.custom_services
+                if not prev_existed and len(ctrl.config.custom_services) >= MAX_CUSTOM_SERVICES:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": f"maximum {MAX_CUSTOM_SERVICES} custom services allowed"},
+                    )
+                    return
                 prev_val = ctrl.config.custom_services.get(raw_name)
                 ctrl.config.custom_services[raw_name] = url
 
@@ -4404,6 +5879,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if not host or port <= 0 or port > 65535:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "valid host and port required"})
                 return
+            if _is_endpoint_host_unsafe(host, port):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "probe target blocked by SSRF guard"},
+                )
+                return
             # Restrict probes strictly to endpoints already registered in the live Service Mesh
             svc_entries = ctrl.get_services_info().get("services", [])
             allowed = any(
@@ -4443,8 +5924,21 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         "max_requests_per_min_per_node", prev_gw.max_requests_per_min_per_node
                     ),
                 }
+                for list_key, cap in (
+                    ("allowed_domains", MAX_GATEWAY_RULES),
+                    ("blocked_domains", MAX_GATEWAY_RULES),
+                    ("quarantined_nodes", MAX_CLUSTER_NODES),
+                ):
+                    if isinstance(merged[list_key], list) and len(merged[list_key]) > cap:
+                        self._send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": f"{list_key} exceeds maximum {cap} entries"},
+                        )
+                        return
                 try:
                     updated_gw = GatewayConfig.from_dict(merged)
+                    for q_id in updated_gw.quarantined_nodes:
+                        validate_node_id(q_id)
                 except (ValueError, TypeError, OverflowError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
@@ -4499,6 +5993,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 prev_allowed = list(ctrl.config.gateway.allowed_domains)
                 prev_blocked = list(ctrl.config.gateway.blocked_domains)
                 if dom not in ctrl.config.gateway.allowed_domains:
+                    if len(ctrl.config.gateway.allowed_domains) >= MAX_GATEWAY_RULES:
+                        self._send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": f"allowed_domains exceeds maximum {MAX_GATEWAY_RULES} entries"},
+                        )
+                        return
                     ctrl.config.gateway.allowed_domains.append(dom)
                 ctrl.config.gateway.blocked_domains = [
                     d for d in ctrl.config.gateway.blocked_domains if d != dom
@@ -4515,7 +6015,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/gateway/quarantine":
             node_id = str(body.get("node_id") or "").strip()
-            quarantine = bool(True if body.get("quarantine") is None else body.get("quarantine"))
+            try:
+                quarantine = self._parse_bool_arg(body, "quarantine", True)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             with ctrl.config_lock:
                 if not node_id or not any(n.id == node_id for n in ctrl.config.nodes):
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": f"node '{node_id}' not found"})
@@ -4611,13 +6115,24 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             # Pre-resolve detected LAN IP outside config_lock in case Master is configured on loopback (ADB USB hub)
             detected_lan = normalize_host(detect_local_ip())
             with ctrl.config_lock:
-                new_req_auth = (
-                    bool(body["dashboard_require_auth"])
-                    if "dashboard_require_auth" in body and body["dashboard_require_auth"] is not None
-                    else ctrl.config.dashboard_require_auth
-                )
                 cur_net = ctrl.config.network
-                master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
+                try:
+                    new_req_auth = self._parse_bool_arg(
+                        body, "dashboard_require_auth", ctrl.config.dashboard_require_auth
+                    )
+                    new_src_ip = self._parse_bool_arg(
+                        body, "enforce_worker_source_ip", cur_net.enforce_worker_source_ip
+                    )
+                    new_signed = self._parse_bool_arg(
+                        body, "require_signed_requests", cur_net.require_signed_requests
+                    )
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                master_node = next(
+                    (n for n in ctrl.config.nodes if n.role == "master"),
+                    ctrl.config.nodes[0] if ctrl.config.nodes else None,
+                )
                 raw_ips = body.get("allowed_master_ips", cur_net.allowed_master_ips)
                 ips: list[str] = []
                 if isinstance(raw_ips, list):
@@ -4645,7 +6160,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 else:
                     ips = list(cur_net.allowed_master_ips)
                 # Ensure Master's own IP (or detected LAN IP when Master is loopback) is preserved within 32-entry cap
-                m_host = normalize_host(master_node.host)
+                m_host = normalize_host(master_node.host) if master_node is not None else ""
                 if not m_host or is_loopback_or_unspecified_host(m_host):
                     m_host = detected_lan if (detected_lan and not is_loopback_or_unspecified_host(detected_lan)) else ""
                 if m_host and not is_loopback_or_unspecified_host(m_host):
@@ -4660,19 +6175,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 raw_ag = body.get("adguard_url", cur_net.adguard_url)
                 ag_url = str("" if raw_ag is None else raw_ag).strip()
                 if ag_url:
+                    if len(ag_url) > 512:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url exceeds maximum length"})
+                        return
                     try:
                         p_ag = urllib.parse.urlsplit(ag_url)
                         ag_port = p_ag.port
+                        ag_host = validate_host(p_ag.hostname or "")
                     except ValueError:
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url is malformed"})
                         return
                     if (
                         any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in ag_url)
                         or p_ag.scheme.lower() not in {"http", "https"}
-                        or not p_ag.hostname
+                        or p_ag.username is not None
+                        or p_ag.password is not None
                         or (ag_port is not None and not (1 <= ag_port <= 65535))
+                        or _is_endpoint_host_unsafe(ag_host, ag_port or 80)
                     ):
-                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must start with http:// or https:// with a valid hostname"})
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "adguard_url must be a safe http:// or https:// URL without embedded credentials"})
                         return
                 raw_sub = body.get("lan_subnet", cur_net.lan_subnet)
                 lan_sub = str("" if raw_sub is None else raw_sub).strip()
@@ -4687,16 +6208,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 prev_net_obj = ctrl.config.network
                 ctrl.config.dashboard_require_auth = new_req_auth
                 ctrl.config.network = NetworkHardeningConfig(
-                    enforce_worker_source_ip=bool(
-                        cur_net.enforce_worker_source_ip
-                        if body.get("enforce_worker_source_ip") is None
-                        else body.get("enforce_worker_source_ip")
-                    ),
-                    require_signed_requests=bool(
-                        cur_net.require_signed_requests
-                        if body.get("require_signed_requests") is None
-                        else body.get("require_signed_requests")
-                    ),
+                    enforce_worker_source_ip=new_src_ip,
+                    require_signed_requests=new_signed,
                     allowed_master_ips=ips,
                     adguard_url=ag_url,
                     lan_subnet=lan_sub,
@@ -4765,11 +6278,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             cidr = str(body.get("cidr") or "").strip()
             if not cidr:
                 with ctrl.config_lock:
-                    master_node = next((n for n in ctrl.config.nodes if n.role == "master"), ctrl.config.nodes[0])
+                    master_node = next(
+                        (n for n in ctrl.config.nodes if n.role == "master"),
+                        ctrl.config.nodes[0] if ctrl.config.nodes else None,
+                    )
                     cfg_subnet = ctrl.config.network.lan_subnet
                 seed_host = (
                     detect_local_ip()
-                    if is_loopback_or_unspecified_host(master_node.host)
+                    if (master_node is None or is_loopback_or_unspecified_host(master_node.host))
                     else master_node.host
                 )
                 cidr = infer_lan_subnet(seed_host, cfg_subnet)
@@ -4828,18 +6344,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 tier = self._parse_int_arg(body.get("tier"), 0)
                 worker_port = self._parse_int_arg(body.get("worker_port"), DEFAULT_WORKER_PORT)
                 ssh_port = self._parse_int_arg(body.get("ssh_port"), DEFAULT_SSH_PORT)
-                max_conc = max(1, min(32, self._parse_int_arg(body.get("max_concurrency"), 2)))
+                max_conc = self._parse_int_arg(body.get("max_concurrency"), 2)
+                if not (1 <= max_conc <= 32):
+                    raise ValueError("max_concurrency must be between 1 and 32")
                 raw_w = body.get("weight", 1.0)
                 if raw_w is None:
                     weight = 1.0
                 elif isinstance(raw_w, bool):
                     raise ValueError("weight must be a number, not boolean")
                 else:
-                    weight = max(0.1, float(raw_w))
-                if not math.isfinite(weight):
-                    raise ValueError("weight must be finite")
-            except (TypeError, ValueError, OverflowError):
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid numeric node parameter"})
+                    weight = float(raw_w)
+                if not math.isfinite(weight) or not (0.1 <= weight <= 1000.0):
+                    raise ValueError("weight must be between 0.1 and 1000")
+            except (TypeError, ValueError, OverflowError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid numeric node parameter: {exc}"})
                 return
             if tier not in {0, 1, 2, 3}:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tier must be 0, 1, 2, or 3"})
@@ -4848,6 +6366,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "ports must be between 1 and 65535"})
                 return
             with ctrl.config_lock:
+                if len(ctrl.config.nodes) >= MAX_CLUSTER_NODES:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": f"maximum {MAX_CLUSTER_NODES} nodes allowed"},
+                    )
+                    return
                 existing_ids = {n.id for n in ctrl.config.nodes}
                 idx = len(ctrl.config.nodes)
                 while f"node{idx}" in existing_ids:
@@ -4925,14 +6449,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     if isinstance(raw_w, bool):
                         raise ValueError("weight must be a number, not boolean")
                     w_val = float(raw_w)
-                    if not math.isfinite(w_val) or w_val <= 0:
-                        raise ValueError("must be positive")
-                    new_weight = max(0.1, w_val)
+                    if not math.isfinite(w_val) or not (0.1 <= w_val <= 1000.0):
+                        raise ValueError("must be between 0.1 and 1000")
+                    new_weight = w_val
                 except (TypeError, ValueError, OverflowError):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid weight"})
                     return
             if "notes" in body:
-                new_notes = str(body["notes"] or "")[:240]
+                new_notes = _CTRL_CHARS_STRIP_RE.sub("", str(body["notes"] or "")).strip()[:240]
 
             with ctrl.config_lock:
                 target_node = next((n for n in ctrl.config.nodes if n.id == node_id), None)
@@ -5052,18 +6576,22 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"saved": True, "pushed": pushed})
 
         elif path == "/api/settings/test-webhook":
-            url = str(body.get("battery_webhook_url") or ctrl.config.safety.battery_webhook_url).strip()
+            with ctrl.config_lock:
+                fallback_webhook = ctrl.config.safety.battery_webhook_url
+            url = str(body.get("battery_webhook_url") or fallback_webhook).strip()
             try:
                 p_url = urllib.parse.urlsplit(url)
-                _ = p_url.port
+                p_port = p_url.port
             except ValueError:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "enter a valid http:// or https:// webhook URL"})
                 return
             if (
                 not url
-                or any(c.isspace() or ord(c) < 32 for c in url)
+                or len(url) > 1024
+                or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url)
                 or p_url.scheme.lower() not in {"http", "https"}
                 or not p_url.hostname
+                or (p_port is not None and not (1 <= p_port <= 65535))
             ):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "enter a valid http:// or https:// webhook URL"})
                 return
@@ -5104,6 +6632,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if mode not in {"auto", "adb", "rndis"}:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "mode must be 'auto', 'adb', or 'rndis'"})
                 return
+            try:
+                auto_detect = self._parse_bool_arg(body, "auto_detect", True)
+                peer_mesh = self._parse_bool_arg(body, "peer_mesh", True)
+                start_wd = self._parse_bool_arg(body, "start_watchdog", True)
+                nat_wan = self._parse_bool_arg(body, "nat_wan", False)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             topo = detect_usb_hub_topology()
             if mode == "auto":
                 mode = str(topo.get("recommended_mode") or "adb")
@@ -5112,7 +6648,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 if not ready_adb:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "No authorized ADB phones found on USB hub."})
                     return
-                if bool(body.get("auto_detect", True)):
+                if auto_detect:
                     enriched = []
                     for dev in ready_adb:
                         prof = probe_adb_device_profile(dev["serial"])
@@ -5130,7 +6666,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                             ready_adb,
                             gateway_port=int(ctrl.config.gateway.port or 8888),
                             enable_gateway_reverse=bool(ctrl.config.gateway.enabled),
-                            enable_peer_mesh=bool(body.get("peer_mesh", True)),
+                            enable_peer_mesh=peer_mesh,
                             existing_nodes=ctrl.config.nodes,
                             quarantined_nodes=ctrl.config.gateway.quarantined_nodes,
                         )
@@ -5157,7 +6693,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         return
                     if not self._save_config_or_rollback(_rb_usb_adb):
                         return
-                wd_state = self.server.start_usb_watchdog() if bool(body.get("start_watchdog", True)) else self.server.usb_watchdog_status()
+                wd_state = self.server.start_usb_watchdog() if start_wd else self.server.usb_watchdog_status()
                 self._send_json(
                     HTTPStatus.OK,
                     {"mode": "adb", "plan": plan, "apply": apply_res, "updated_nodes": updated, "watchdog": wd_state},
@@ -5190,7 +6726,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         return
                     if not self._save_config_or_rollback(_rb_usb_rndis):
                         return
-                cmds = build_rndis_router_commands(plan, nat_wan=bool(body.get("nat_wan", False)), gateway_port=gw_port)
+                cmds = build_rndis_router_commands(plan, nat_wan=nat_wan, gateway_port=gw_port)
                 self._send_json(
                     HTTPStatus.OK,
                     {"mode": "rndis", "plan": plan, "commands": cmds, "updated_nodes": updated, "watchdog": self.server.usb_watchdog_status()},
@@ -5201,16 +6737,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, report)
 
         elif path == "/api/usb-hub/watchdog":
-            enabled = bool(body.get("enabled", True))
+            try:
+                enabled = self._parse_bool_arg(body, "enabled", True)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             if enabled:
-                raw_iv = body.get("interval_sec", 5.0)
-                try:
-                    iv = float(raw_iv) if not isinstance(raw_iv, bool) else 5.0
-                    if not math.isfinite(iv) or not (2.0 <= iv <= 300.0):
-                        raise ValueError("interval_sec must be between 2 and 300")
-                except (TypeError, ValueError) as exc:
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                    return
+                raw_iv = body.get("interval_sec")
+                if raw_iv is None:
+                    iv = 5.0
+                else:
+                    try:
+                        if isinstance(raw_iv, bool):
+                            raise ValueError("interval_sec must be a number, not boolean")
+                        iv = float(raw_iv)
+                        if not math.isfinite(iv) or not (2.0 <= iv <= 300.0):
+                            raise ValueError("interval_sec must be between 2 and 300")
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
                 wd = self.server.start_usb_watchdog(interval_sec=iv)
             else:
                 wd = self.server.stop_usb_watchdog()
@@ -5222,12 +6767,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 fresh_cfg = load_config(self.server.config_path)
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Failed to reload config: {exc}"})
                 return
             with ctrl.config_lock:
                 ctrl.config = fresh_cfg
-                self.server.pairing_manager.config = fresh_cfg
+                with self.server.pairing_manager._lock:
+                    self.server.pairing_manager.config = fresh_cfg
                 self.server.gateway_manager.config = fresh_cfg
                 gw_ok, gw_msg = self.server.gateway_manager.sync_with_config()
                 if fresh_cfg.gateway.enabled:
@@ -5270,6 +6816,7 @@ def _start_background_sampler(
             try:
                 with server._live_sample_lock:
                     server.latest_live = _collect_live(server.controller)
+                    server._live_sampled_mono = time.monotonic()
             except Exception:
                 LOG.exception("Dashboard live sampling failed")
             deadline = time.monotonic() + interval_sec
