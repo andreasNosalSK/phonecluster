@@ -19,6 +19,7 @@ import time
 import uuid
 from typing import Any
 
+from .config import VALID_TRANSPORT_MODES
 from .master import JobSpec, MasterController
 
 try:
@@ -280,6 +281,14 @@ def _build_node_inspect_banner(node: dict[str, Any], all_jobs: list[dict[str, An
     notes = _clean_term_text(node.get("notes", ""), 80)
     if notes:
         lines.append(f"  Notes: {notes}")
+    tr = node.get("transport") if isinstance(node.get("transport"), dict) else {}
+    if tr.get("has_dual_plane"):
+        c_p = _clean_term_text(tr.get("control_plane", "usb"), 8).upper()
+        c_h = _clean_term_text(tr.get("control_host", host), 32)
+        d_p = _clean_term_text(tr.get("data_plane", "wifi"), 8).upper()
+        d_h = _clean_term_text(tr.get("data_host", host), 32)
+        t_st = _clean_term_text(tr.get("state", "dual_plane"), 20).upper()
+        lines.append(f"  Transport [{t_st}]: CTL={c_p}({c_h}) · DATA={d_p}({d_h})")
     raw_ports = h.get("listening_ports")
     if isinstance(raw_ports, list) and raw_ports:
         p_nums = sorted({_safe_int(p.get("port"), 0) for p in raw_ports if isinstance(p, dict) and 1 <= _safe_int(p.get("port"), 0) <= 65535})
@@ -426,6 +435,20 @@ def render_top_frame(
         if svc_items:
             header_lines.append("SVCS  " + " · ".join(svc_items))
 
+    t_sum = summary.get("transport") if isinstance(summary.get("transport"), dict) else {}
+    t_dp = max(0, _safe_int(t_sum.get("dual_plane_nodes", 0), 0))
+    t_fo = max(0, _safe_int(t_sum.get("failover_nodes", 0), 0))
+    t_mode = _clean_term_text(t_sum.get("mode", "auto"), 16).lower() or "auto"
+    if t_dp > 0 or t_mode != "auto":
+        mode_lbl = pal.warn(f"⚠ {t_mode.upper()} ({t_fo} FAILOVER)") if t_fo > 0 else pal.ok(t_mode.upper())
+        header_lines.append(
+            f"XPORT {mode_lbl} · Dual-Plane: {t_dp} · "
+            f"Failover: {t_fo} · "
+            f"Hysteresis: fail={max(1, _safe_int(t_sum.get('failover_threshold', 2), 2))}/"
+            f"rec={max(1, _safe_int(t_sum.get('recovery_threshold', 2), 2))} "
+            f"{pal.dim('(press [t] mode / [T] probe)')}"
+        )
+
     frames: list[str] = []
     frames.extend(_box_lines("PHONECLUSTER · UNIFIED MULTI-DEVICE BTOP", header_lines, cols, pal))
 
@@ -436,6 +459,7 @@ def render_top_frame(
             f"{pal.accent('[r]')} Run on selected phone     {pal.accent('[a]')} Broadcast command to all ready",
             f"{pal.accent('[i]')} Inspect selected phone    {pal.accent('[s]')} Interactive SSH to selected phone",
             f"{pal.accent('[c]')} Cancel running job        {pal.accent('[d]')} Toggle Tasks / Shared Processes",
+            f"{pal.accent('[t]')} Cycle Dual-Plane mode     {pal.accent('[T]')} Probe USB + Wi-Fi planes now",
             f"{pal.accent('[f]')} Force immediate refresh   {pal.accent('[+/-]')} Faster / slower refresh rate",
             f"{pal.accent('[Space]')} Pause / Resume        {pal.accent('[Esc/?]')} Close help / clear banner   {pal.accent('[q]')} Quit",
         ]
@@ -481,6 +505,20 @@ def render_top_frame(
         if host_disp == "127.0.0.1" and ("usb-mode:adb" in n_tags or "usb-hub" in n_tags):
             wp = _safe_int(n.get("worker_port", 0), 0)
             host_disp = f"usb:{wp if wp > 0 else ''}"
+        tr_n = n.get("transport") if isinstance(n.get("transport"), dict) else {}
+        plane_chip = ""
+        if tr_n.get("has_dual_plane"):
+            tr_st = str(tr_n.get("state") or "")
+            if tr_st == "failover_usb_only":
+                plane_chip = " " + pal.warn("FO→USB")
+            elif tr_st == "failover_wifi_only":
+                plane_chip = " " + pal.warn("FO→WiFi")
+            elif tr_st == "forced_usb":
+                plane_chip = " " + pal.accent("USB-ONLY")
+            elif tr_st == "forced_wifi":
+                plane_chip = " " + pal.accent("WiFi-ONLY")
+            elif tr_st == "dual_plane":
+                plane_chip = " " + pal.cyan("USB+WiFi")
 
         if not n.get("online"):
             err = _clean_term_text(n.get("error", "unreachable"), 42)
@@ -510,10 +548,10 @@ def render_top_frame(
         os_s = _clean_term_text(h.get("os_env", "linux"), 10)
         lat_txt = f"{_safe_num(n.get('latency_ms', 0), 0.0):.1f}ms"
         if compact:
-            device_lines.append(f"{pointer} {nid_styled} [{t_badge}] {host_disp} {st_badge}")
+            device_lines.append(f"{pointer} {nid_styled} [{t_badge}]{plane_chip} {host_disp} {st_badge}")
         else:
             device_lines.append(
-                f"{pointer} {nid_styled} [{role_badge} {t_badge}] {host_disp:<15s} {pal.dim(f'{os_s:<10s}')} "
+                f"{pointer} {nid_styled} [{role_badge} {t_badge}]{plane_chip} {host_disp:<15s} {pal.dim(f'{os_s:<10s}')} "
                 f"up {up_s:<6s} {st_badge}  {pal.dim(lat_txt)}"
             )
 
@@ -957,22 +995,43 @@ def run_top_tui(
                     last_poll = 0.0
                 else:
                     last_banner = f"No running job on {_clean_term_text(sel_id, 20)} to cancel."
+            elif key == "t":
+                with controller.config_lock:
+                    cur_m = controller.config.transport.mode
+                idx_m = VALID_TRANSPORT_MODES.index(cur_m) if cur_m in VALID_TRANSPORT_MODES else 0
+                next_m = VALID_TRANSPORT_MODES[(idx_m + 1) % len(VALID_TRANSPORT_MODES)]
+                t_stat = controller.transport.apply_mode(next_m)
+                last_banner = (
+                    f"Transport mode switched to {next_m.upper()} "
+                    f"(dual-plane={t_stat.get('dual_plane_nodes', 0)}, failover={t_stat.get('failover_nodes', 0)})."
+                )
+                last_poll = 0.0
+            elif key == "T":
+                t_stat = controller.transport.probe_all()
+                last_banner = (
+                    f"Dual-plane probe complete: mode={str(t_stat.get('mode', 'auto')).upper()} · "
+                    f"dual-plane={t_stat.get('dual_plane_nodes', 0)} · "
+                    f"failover={t_stat.get('failover_nodes', 0)} · "
+                    f"offline={t_stat.get('offline_nodes', 0)}"
+                )
+                last_poll = 0.0
             elif key in {"s", "S"} and nodes:
                 try:
                     with controller.config_lock:
                         sel_node = controller.config.get_node(nodes[selected_idx]["id"])
-                except KeyError as exc:
+                    ssh_host, ssh_port, _plane = controller.transport.control_ssh_endpoint(sel_node)
+                except (KeyError, ValueError) as exc:
                     last_banner = f"SSH failed: {exc}"
                     continue
-                target_ssh = f"{sel_node.ssh_user}@{sel_node.host}" if sel_node.ssh_user else sel_node.host
+                target_ssh = f"{sel_node.ssh_user}@{ssh_host}" if sel_node.ssh_user else ssh_host
                 # Temporarily exit alternate screen for clean interactive SSH session
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                 sys.stdout.write("\033[?25h\033[?1049l")
                 sys.stdout.flush()
                 try:
-                    ssh_rc = subprocess.call(["ssh", "-p", str(sel_node.ssh_port), "--", target_ssh])
+                    ssh_rc = subprocess.call(["ssh", "-p", str(ssh_port), "--", target_ssh])
                     if ssh_rc != 0:
-                        last_banner = f"SSH to {sel_node.id} ({target_ssh}:{sel_node.ssh_port}) exited with code {ssh_rc}"
+                        last_banner = f"SSH to {sel_node.id} ({target_ssh}:{ssh_port}) exited with code {ssh_rc}"
                 except OSError as exc:
                     last_banner = f"SSH failed: {exc}"
                 finally:

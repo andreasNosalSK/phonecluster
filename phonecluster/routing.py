@@ -353,8 +353,28 @@ _SERVICE_SPEC: list[tuple[str, str, int, str]] = [
 ]
 
 
+def _resolve_node_data_host(
+    node: NodeConfig,
+    config: ClusterConfig,
+    transport_manager: Any | None = None,
+) -> str:
+    """Resolve the active data-plane IP/hostname for a node (honors Dual-Plane failover)."""
+    if transport_manager is not None:
+        return str(transport_manager.data_host(node))
+    if node.has_dual_plane():
+        if config.transport.mode == "usb_only":
+            return node.effective_usb_host() or node.host
+        return node.effective_wifi_host() or node.host
+    return node.host
+
+
 def build_service_registry(
-    snapshots: list[Any], config: ClusterConfig, *, for_node: NodeConfig | None = None, master_lan_host: str = ""
+    snapshots: list[Any],
+    config: ClusterConfig,
+    *,
+    for_node: NodeConfig | None = None,
+    master_lan_host: str = "",
+    transport_manager: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Discover all live cross-tier services running across every non-quarantined online phone."""
     entries: list[dict[str, Any]] = []
@@ -377,17 +397,20 @@ def build_service_registry(
                 pv = _safe_nonneg_int(item.get("port"), 0)
                 if 1 <= pv <= 65535:
                     lp_exposed[pv] = bool(item.get("exposed", True))
-        node_is_local = is_loopback_or_unspecified_host(snap.node.host)
+        active_data_host = _resolve_node_data_host(snap.node, config, transport_manager=transport_manager)
+        use_adb_mesh = snap.node.adb is not None and is_loopback_or_unspecified_host(active_data_host)
+        node_is_local = is_loopback_or_unspecified_host(active_data_host)
         seen_on_node: set[str] = set()
 
         for name, key, port, scheme in _SERVICE_SPEC:
             if not svcs.get(key) or name in seen_on_node:
                 continue
-            host = snap.node.host
+            host = active_data_host
             transport = "lan"
             loopback_only = lp_exposed.get(port) is False
-            if snap.node.adb is not None:
+            if use_adb_mesh:
                 adb = snap.node.adb
+                assert adb is not None
                 host = "127.0.0.1"
                 if for_node is None or for_node.id != snap.node.id:
                     if not adb.peer_mesh or port not in USB_MESH_DEFAULT_PORTS:
@@ -440,9 +463,9 @@ def build_service_registry(
                 {
                     "name": "docker",
                     "node_id": snap.node.id,
-                    "host": snap.node.host,
+                    "host": active_data_host,
                     "port": 0,
-                    "url": f"ssh://{format_host_port(snap.node.host, snap.node.ssh_port)}",
+                    "url": f"ssh://{format_host_port(active_data_host, snap.node.ssh_port)}",
                     "tier": tier,
                     "pool": pool,
                     "ready": snap.ready_for_jobs,
@@ -524,17 +547,28 @@ def build_cross_tier_env(
     *,
     for_node: NodeConfig | None = None,
     master_lan_host: str | None = None,
+    transport_manager: Any | None = None,
 ) -> dict[str, str]:
     """Generate `PHONECLUSTER_*` service-discovery env vars injected into every job.
 
     Enables seamless communication across tiers (e.g. a Tier 1 AI script publishing
     to Tier 2 Mosquitto MQTT or calling Tier 3 Home Assistant without hardcoded IPs).
     """
-    env: dict[str, str] = {"PHONECLUSTER_CLUSTER_NAME": config.cluster_name}
+    env: dict[str, str] = {
+        "PHONECLUSTER_CLUSTER_NAME": config.cluster_name,
+        "PHONECLUSTER_TRANSPORT_MODE": config.transport.mode,
+    }
+    if for_node is not None and transport_manager is not None:
+        c_host, _, c_plane = transport_manager.control_endpoint(for_node)
+        d_host, _, d_plane = transport_manager.data_endpoint(for_node)
+        env["PHONECLUSTER_CONTROL_PLANE"] = c_plane
+        env["PHONECLUSTER_CONTROL_HOST"] = c_host
+        env["PHONECLUSTER_DATA_PLANE"] = d_plane
+        env["PHONECLUSTER_DATA_HOST"] = d_host
     m_host = ""
     if config.nodes:
         master_node = next((n for n in config.nodes if n.role == "master"), config.nodes[0])
-        m_host = normalize_host(master_node.host)
+        m_host = normalize_host(_resolve_node_data_host(master_node, config, transport_manager=transport_manager))
         has_remote_nodes = any(not is_loopback_or_unspecified_host(n.host) for n in config.nodes)
         if is_loopback_or_unspecified_host(m_host) and has_remote_nodes:
             lan_ip = normalize_host(master_lan_host if master_lan_host is not None else detect_local_ip())
@@ -542,7 +576,13 @@ def build_cross_tier_env(
                 m_host = lan_ip
         env["PHONECLUSTER_MASTER_HOST"] = m_host or master_node.host
 
-    registry = build_service_registry(snapshots, config, for_node=for_node, master_lan_host=m_host)
+    registry = build_service_registry(
+        snapshots,
+        config,
+        for_node=for_node,
+        master_lan_host=m_host,
+        transport_manager=transport_manager,
+    )
     by_name: dict[str, list[dict[str, Any]]] = {}
     for item in registry:
         by_name.setdefault(item["name"], []).append(item)
@@ -605,9 +645,9 @@ def build_cross_tier_env(
     )
     for_remote = for_node is not None and (for_node.adb is not None or not is_loopback_or_unspecified_host(for_node.host))
     for snap in ordered_snaps:
-        if snap.node.adb is not None:
+        node_host = _resolve_node_data_host(snap.node, config, transport_manager=transport_manager)
+        if snap.node.adb is not None and is_loopback_or_unspecified_host(node_host):
             continue
-        node_host = snap.node.host
         if for_remote and is_loopback_or_unspecified_host(node_host):
             if (
                 snap.node.role == "master"
@@ -628,10 +668,14 @@ def build_cross_tier_env(
         if key:
             env[f"PHONECLUSTER_POOL_{key}_HOSTS"] = ",".join(hosts)
 
-    usb_nodes = [s.node.id for s in ordered_snaps if "usb-hub" in (s.node.tags or []) or s.node.adb is not None]
+    usb_nodes = [
+        s.node.id
+        for s in ordered_snaps
+        if "usb-hub" in (s.node.tags or []) or s.node.adb is not None or bool(s.node.usb_host)
+    ]
     if usb_nodes:
         env["PHONECLUSTER_USB_HUB_NODES"] = ",".join(usb_nodes)
-    if for_node is not None and (for_node.adb is not None or "usb-hub" in (for_node.tags or [])):
+    if for_node is not None and (for_node.adb is not None or "usb-hub" in (for_node.tags or []) or bool(for_node.usb_host)):
         usb_mode = "adb" if (for_node.adb is not None or "usb-mode:adb" in (for_node.tags or [])) else "rndis"
         env["PHONECLUSTER_USB_MODE"] = usb_mode
         peer_entries: list[str] = []
@@ -639,8 +683,9 @@ def build_cross_tier_env(
             for snap in ordered_snaps:
                 if snap.node.id == for_node.id or snap.node.adb is not None:
                     continue
-                if "usb-mode:rndis" in (snap.node.tags or []) or "usb-hub" in (snap.node.tags or []):
-                    peer_entries.append(f"{snap.node.id}={snap.node.host}")
+                peer_usb = snap.node.effective_usb_host()
+                if peer_usb and ("usb-mode:rndis" in (snap.node.tags or []) or "usb-hub" in (snap.node.tags or []) or bool(snap.node.usb_host)):
+                    peer_entries.append(f"{snap.node.id}={peer_usb}")
         elif for_node.adb is not None and for_node.adb.peer_mesh:
             for snap in ordered_snaps:
                 if snap.node.id == for_node.id or snap.node.adb is None or not snap.node.adb.peer_mesh:

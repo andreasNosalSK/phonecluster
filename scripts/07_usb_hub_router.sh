@@ -23,18 +23,24 @@ WAN_IFACE=""
 PEER_MESH=1
 GW_PORT="8888"
 PHONE_IFACE="auto"
+DUAL_PLANE=0
 
 usage() {
   cat <<'EOF'
-PhoneCluster USB 3.0 Hub Router (Zero-Wi-Fi Multi-Phone Mode)
+PhoneCluster USB 3.0 Hub Router (Zero-Wi-Fi & Dual-Plane Multi-Phone Mode)
 
 Usage:
   bash scripts/07_usb_hub_router.sh scan
   bash scripts/07_usb_hub_router.sh status
   bash scripts/07_usb_hub_router.sh setup-adb [--config <path>] [--no-peer-mesh] [--gateway-port 8888]
-  sudo bash scripts/07_usb_hub_router.sh setup-rndis [--prefix 10.77] [--gateway-port 8888] [--nat-wan --wan-iface <if>] [--dry-run]
-  sudo bash scripts/07_usb_hub_router.sh phone-setup <index 1..62> [--prefix 10.77] [--iface auto|rndis0|usb0]
+  sudo bash scripts/07_usb_hub_router.sh setup-rndis [--prefix 10.77] [--gateway-port 8888] [--dual-plane] [--nat-wan --wan-iface <if>] [--dry-run]
+  sudo bash scripts/07_usb_hub_router.sh phone-setup <index 1..62> [--prefix 10.77] [--iface auto|rndis0|usb0] [--dual-plane] [--dry-run]
   sudo bash scripts/07_usb_hub_router.sh teardown [--prefix 10.77]
+
+Dual-Plane Mode (--dual-plane):
+  Keeps USB RNDIS (/30 subnets: 10.77.<k>.0/30) strictly scoped as the Control Plane
+  while preserving each phone's Wi-Fi (wlan0) default route & high-speed LAN Data Plane
+  with loose rp_filter=2 for clean dual-homed Ubuntu Touch / Linux routing.
 
 Hardware Note:
   USB is Host-Device (not peer-to-peer). Plug your 2-6 phones into a POWERED
@@ -67,6 +73,14 @@ run_cmd() {
   fi
 }
 
+run_cmd_best_effort() {
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    printf '[dry-run] %s\n' "$*"
+  else
+    "$@" >/dev/null 2>&1 || true
+  fi
+}
+
 case "${CMD}" in
   scan)
     exec python3 "${REPO_ROOT}/phonecluster_cli.py" --config "${CONFIG_PATH}" usb-hub scan
@@ -87,6 +101,12 @@ case "${CMD}" in
       if iptables -S PHONECLUSTER_USB_IN >/dev/null 2>&1; then
         echo "Firewall chain PHONECLUSTER_USB_IN : ACTIVE"
       fi
+    fi
+    if command -v ip >/dev/null 2>&1; then
+      echo
+      echo "Active IPv4 default & USB routes (Dual-Plane check):"
+      ip -4 route show default 2>/dev/null || true
+      ip -4 route show "${PREFIX}.0.0/16" 2>/dev/null || true
     fi
     ;;
 
@@ -123,6 +143,7 @@ case "${CMD}" in
         --gateway-port)
           [[ $# -ge 2 ]] || { echo "Error: --gateway-port requires a port" >&2; exit 2; }
           GW_PORT="$2"; shift 2 ;;
+        --dual-plane) DUAL_PLANE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
@@ -185,8 +206,11 @@ PY
       if command -v nmcli >/dev/null 2>&1; then
         run_cmd nmcli dev set "${IFACE}" managed no 2>/dev/null || true
       fi
-      # Disable IPv6 + Router Advertisements (blocks rogue RAs & fe80:: SSH) and enforce strict rp_filter anti-spoofing
-      run_cmd sysctl -w "net.ipv6.conf.${IFACE}.disable_ipv6=1" "net.ipv6.conf.${IFACE}.accept_ra=0" "net.ipv4.conf.${IFACE}.rp_filter=1" >/dev/null 2>&1 || true
+      # Disable IPv6 + Router Advertisements (blocks rogue RAs & fe80:: SSH) and configure rp_filter
+      # (rp_filter=2 loose mode in --dual-plane avoids asymmetric drop alongside Wi-Fi data plane)
+      RP_MODE=1
+      [[ "${DUAL_PLANE}" -eq 1 ]] && RP_MODE=2
+      run_cmd_best_effort sysctl -w "net.ipv6.conf.${IFACE}.disable_ipv6=1" "net.ipv6.conf.${IFACE}.accept_ra=0" "net.ipv4.conf.${IFACE}.rp_filter=${RP_MODE}"
       run_cmd ip addr flush dev "${IFACE}"
       run_cmd ip addr add "${HOST_IP}/30" dev "${IFACE}"
       run_cmd ip link set "${IFACE}" up
@@ -254,13 +278,22 @@ PY
 
     echo
     echo "Next: Run the matching phone-side command on each Ubuntu Touch / Linux phone:"
+    DP_FLAG=""
+    [[ "${DUAL_PLANE}" -eq 1 ]] && DP_FLAG=" --dual-plane"
     while IFS='|' read -r IDX IFACE MAC DRV; do
       [[ -z "${IFACE}" ]] && continue
-      echo "  Phone ${IDX} (${IFACE}, mac=${MAC}):  sudo bash ~/phonecluster/scripts/07_usb_hub_router.sh phone-setup ${IDX} --prefix ${PREFIX}"
+      echo "  Phone ${IDX} (${IFACE}, mac=${MAC}):  sudo bash ~/phonecluster/scripts/07_usb_hub_router.sh phone-setup ${IDX} --prefix ${PREFIX}${DP_FLAG}"
     done <<< "${IFACE_ROWS}"
     echo
     echo "Then save all USB phones into config/cluster.json with:"
-    echo "  pc usb-hub setup --mode rndis --subnet-prefix ${PREFIX} --write-config"
+    if [[ "${DUAL_PLANE}" -eq 1 ]]; then
+      echo "  pc usb-hub setup --mode rndis --subnet-prefix ${PREFIX} --write-config"
+      echo "  pc transport mode dual_plane"
+      echo "  # Pair each phone's Wi-Fi data IP with its USB control IP:"
+      echo "  pc transport set-node usb1 --usb-host ${PREFIX}.1.2 --wifi-host <PHONE_WIFI_IP>"
+    else
+      echo "  pc usb-hub setup --mode rndis --subnet-prefix ${PREFIX} --write-config"
+    fi
     ;;
 
   phone-setup)
@@ -278,6 +311,7 @@ PY
         --iface)
           [[ $# -ge 2 ]] || { echo "Error: --iface requires an interface name" >&2; exit 2; }
           PHONE_IFACE="$2"; shift 2 ;;
+        --dual-plane) DUAL_PLANE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
@@ -314,8 +348,22 @@ PY
     run_cmd ip addr flush dev "${PHONE_IFACE}"
     run_cmd ip addr add "${PHONE_IP}/30" dev "${PHONE_IFACE}"
     run_cmd ip link set "${PHONE_IFACE}" up
-    run_cmd ip route replace "${CLUSTER_CIDR}" via "${HOST_IP}" dev "${PHONE_IFACE}"
-    echo "Ready! This phone is ${PHONE_IP} and can reach Master (${HOST_IP}) and all sibling USB phones (${CLUSTER_CIDR}) with Wi-Fi OFF."
+    if [[ "${DUAL_PLANE}" -eq 1 ]]; then
+      # Dual-Plane Split: keep Wi-Fi (wlan0) default gateway & LAN routes completely intact,
+      # use loose rp_filter=2 for dual-homed USB+Wi-Fi, and scope USB strictly to ${CLUSTER_CIDR}
+      run_cmd_best_effort sysctl -w "net.ipv4.conf.all.rp_filter=2" "net.ipv4.conf.${PHONE_IFACE}.rp_filter=2"
+      run_cmd ip route replace "${CLUSTER_CIDR}" via "${HOST_IP}" dev "${PHONE_IFACE}" metric 200
+      WIFI_IP="$(ip -4 -o addr show 2>/dev/null | awk '$2 ~ /^wl/ {sub(/\/.*/, "", $4); print $4; exit}' || true)"
+      echo "Ready (Dual-Plane Split)!"
+      echo "  USB Control Plane : ${PHONE_IP}/30 on ${PHONE_IFACE} (scoped route ${CLUSTER_CIDR} via ${HOST_IP})"
+      echo "  Wi-Fi Data Plane  : ${WIFI_IP:-<not connected yet>} (default gateway untouched)"
+      if [[ -n "${WIFI_IP}" ]]; then
+        echo "  Register on Master: pc transport set-node usb${IDX} --usb-host ${PHONE_IP} --wifi-host ${WIFI_IP}"
+      fi
+    else
+      run_cmd ip route replace "${CLUSTER_CIDR}" via "${HOST_IP}" dev "${PHONE_IFACE}"
+      echo "Ready! This phone is ${PHONE_IP} and can reach Master (${HOST_IP}) and all sibling USB phones (${CLUSTER_CIDR}) with Wi-Fi OFF."
+    fi
     ;;
 
   teardown)

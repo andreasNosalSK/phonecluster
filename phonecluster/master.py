@@ -37,7 +37,7 @@ from .config import (
     validate_host,
 )
 from .discovery import detect_local_ip
-from .gateway import build_worker_proxy_env
+from .gateway import _rndis_master_host_for_node, build_worker_proxy_env
 from .routing import (
     build_cluster_dns_hosts,
     build_cross_tier_env,
@@ -47,6 +47,7 @@ from .routing import (
     select_snapshots_for_target,
     summarize_pools,
 )
+from .transport import TransportManager
 from .usbhub import USB_MESH_DEFAULT_PORTS
 
 LOG = logging.getLogger("phonecluster.master")
@@ -390,6 +391,7 @@ class MasterController:
         self.headers = build_auth_headers(config.auth_token)
         self.metrics_history = MetricsHistory(maxlen=60)
         self.gateway_port_override: int | None = None
+        self.transport = TransportManager(self)
 
     def _headers_for(
         self, node: NodeConfig, method: str = "GET", path: str = "/", body: bytes = b""
@@ -422,27 +424,43 @@ class MasterController:
         return [n for n in nodes if want.issubset(set(n.tags))]
 
     def check_node_health(self, node: NodeConfig) -> NodeSnapshot:
-        """Query GET /health on a single worker node."""
-        url = f"{node.base_url}/health"
-        req = urllib.request.Request(
-            url, headers=self._headers_for(node, "GET", "/health"), method="GET"
-        )
-        t0 = time.monotonic()
-        try:
-            health_to = max(0.5, float(self.config.health_timeout_sec))
-            with _DIRECT_OPENER.open(req, timeout=health_to) as resp:
-                data = read_json_object_bounded(resp, _MAX_HEALTH_RESP_BYTES, deadline_sec=health_to)
-                latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
-                return NodeSnapshot(node=node, online=True, latency_ms=latency_ms, health=data)
-        except urllib.error.HTTPError as exc:
-            err_body = _read_http_error_body(exc, 4096)[:200]
-            return NodeSnapshot(
-                node=node,
-                online=False,
-                error=f"HTTP {exc.code}: {err_body}",
+        """Query GET /health on a single worker node via its active control plane."""
+        health_to = max(0.5, float(self.config.health_timeout_sec))
+        tried: set[tuple[str, int]] = set()
+        last_err = ""
+        for _attempt in range(2):
+            ctl_host, ctl_port, ctl_plane = self.transport.control_endpoint(node)
+            if (ctl_host, ctl_port) in tried:
+                break
+            tried.add((ctl_host, ctl_port))
+            url = f"http://{format_host_port(ctl_host, ctl_port)}/health"
+            req = urllib.request.Request(
+                url, headers=self._headers_for(node, "GET", "/health"), method="GET"
             )
-        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
-            return NodeSnapshot(node=node, online=False, error=str(exc))
+            t0 = time.monotonic()
+            try:
+                with _DIRECT_OPENER.open(req, timeout=health_to) as resp:
+                    data = read_json_object_bounded(resp, _MAX_HEALTH_RESP_BYTES, deadline_sec=health_to)
+                    latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
+                    self.transport.record_probe(node.id, ctl_plane, True, latency_ms=latency_ms)
+                    return NodeSnapshot(node=node, online=True, latency_ms=latency_ms, health=data)
+            except urllib.error.HTTPError as exc:
+                err_body = _read_http_error_body(exc, 4096)[:200]
+                last_err = f"HTTP {exc.code}: {err_body}"
+                self.transport.record_probe(node.id, ctl_plane, False, error=last_err)
+                return NodeSnapshot(
+                    node=node,
+                    online=False,
+                    error=last_err,
+                )
+            except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
+                last_err = str(exc)
+                self.transport.record_probe(node.id, ctl_plane, False, error=last_err)
+                # If hysteresis failover just switched control plane, retry immediately on the new active plane
+                next_h, next_p, _ = self.transport.control_endpoint(node)
+                if (next_h, next_p) in tried:
+                    break
+        return NodeSnapshot(node=node, online=False, error=last_err or "unreachable")
 
     def poll_health(self, tags: list[str] | None = None) -> list[NodeSnapshot]:
         """Poll all configured nodes in parallel and preserve config ordering."""
@@ -467,7 +485,6 @@ class MasterController:
         - `"unknown"`: worker may have run the job without delivering a valid result
         - `"error"`: non-retryable rejection
         """
-        url = f"{node.base_url}/exec"
         eff_timeout = _safe_float(spec.timeout_sec, float(self.config.default_job_timeout_sec))
         if eff_timeout <= 0:
             eff_timeout = float(self.config.default_job_timeout_sec)
@@ -475,9 +492,6 @@ class MasterController:
         payload = spec.to_payload()
         payload["timeout_sec"] = eff_timeout
         body = safe_json_dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=body, headers=self._headers_for(node, "POST", "/exec", body), method="POST"
-        )
         http_timeout = min(_MAX_JOB_TIMEOUT_SEC + 30.0, max(eff_timeout + 15.0, 30.0))
 
         def unknown_result(reason: str) -> tuple[str, dict[str, Any]]:
@@ -488,39 +502,55 @@ class MasterController:
                 )
             }
 
-        try:
-            with _DIRECT_OPENER.open(req, timeout=http_timeout) as resp:
-                data = read_json_object_bounded(resp, MAX_EXEC_RESPONSE_BYTES, deadline_sec=http_timeout)
-                expected_id = spec.job_id.strip() if isinstance(spec.job_id, str) else ""
-                returned_id = data.get("job_id")
-                if not isinstance(returned_id, str) or not returned_id or (expected_id and expected_id != returned_id):
-                    return unknown_result("worker returned an unexpected job ID")
-                if type(data.get("returncode")) is not int:
-                    return unknown_result("worker returned an invalid exit status")
-                return "ok", data
-        except urllib.error.HTTPError as exc:
-            raw_err = _read_http_error_body(exc, 65536)
+        tried: set[tuple[str, int]] = set()
+        for _attempt in range(2):
+            ctl_host, ctl_port, ctl_plane = self.transport.control_endpoint(node)
+            tried.add((ctl_host, ctl_port))
+            url = f"http://{format_host_port(ctl_host, ctl_port)}/exec"
+            req = urllib.request.Request(
+                url, data=body, headers=self._headers_for(node, "POST", "/exec", body), method="POST"
+            )
             try:
-                parsed_err = json.loads(raw_err)
-                err_data = parsed_err if isinstance(parsed_err, dict) else {"error": raw_err[:300]}
-            except (json.JSONDecodeError, RecursionError):
-                err_data = {"error": raw_err[:300]}
-            reason = err_data.get("error")
-            if exc.code == HTTPStatus.SERVICE_UNAVAILABLE and reason in (
-                "node_busy", "node_not_ready", "node_shutting_down"
-            ):
-                return "retryable", err_data
-            if exc.code == HTTPStatus.TOO_MANY_REQUESTS and reason == "too many failed auth attempts":
-                return "retryable", err_data
-            if exc.code >= 500 or exc.code in (HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS):
-                return unknown_result(f"HTTP {exc.code}")
-            return "error", {**err_data, "http_status": exc.code}
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
-                return "retryable", {"error": str(exc)}
-            return unknown_result(str(exc))
-        except (http.client.HTTPException, OSError, ValueError, OverflowError) as exc:
-            return unknown_result(str(exc))
+                with _DIRECT_OPENER.open(req, timeout=http_timeout) as resp:
+                    data = read_json_object_bounded(resp, MAX_EXEC_RESPONSE_BYTES, deadline_sec=http_timeout)
+                    self.transport.record_probe(node.id, ctl_plane, True)
+                    expected_id = spec.job_id.strip() if isinstance(spec.job_id, str) else ""
+                    returned_id = data.get("job_id")
+                    if not isinstance(returned_id, str) or not returned_id or (expected_id and expected_id != returned_id):
+                        return unknown_result("worker returned an unexpected job ID")
+                    if type(data.get("returncode")) is not int:
+                        return unknown_result("worker returned an invalid exit status")
+                    return "ok", data
+            except urllib.error.HTTPError as exc:
+                raw_err = _read_http_error_body(exc, 65536)
+                try:
+                    parsed_err = json.loads(raw_err)
+                    err_data = parsed_err if isinstance(parsed_err, dict) else {"error": raw_err[:300]}
+                except (json.JSONDecodeError, RecursionError):
+                    err_data = {"error": raw_err[:300]}
+                reason = err_data.get("error")
+                if exc.code == HTTPStatus.SERVICE_UNAVAILABLE and reason in (
+                    "node_busy", "node_not_ready", "node_shutting_down"
+                ):
+                    return "retryable", err_data
+                if exc.code == HTTPStatus.TOO_MANY_REQUESTS and reason == "too many failed auth attempts":
+                    return "retryable", err_data
+                if exc.code >= 500 or exc.code in (HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS):
+                    return unknown_result(f"HTTP {exc.code}")
+                return "error", {**err_data, "http_status": exc.code}
+            except urllib.error.URLError as exc:
+                self.transport.record_probe(node.id, ctl_plane, False, error=str(exc))
+                if isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
+                    # Guaranteed pre-delivery refusal: if failover just activated a different plane, retry once
+                    next_h, next_p, _ = self.transport.control_endpoint(node)
+                    if (next_h, next_p) not in tried:
+                        continue
+                    return "retryable", {"error": str(exc)}
+                return unknown_result(str(exc))
+            except (http.client.HTTPException, OSError, ValueError, OverflowError) as exc:
+                self.transport.record_probe(node.id, ctl_plane, False, error=str(exc))
+                return unknown_result(str(exc))
+        return "retryable", {"error": "control plane unreachable"}
 
     def _resolve_master_lan_host_unlocked(self) -> str:
         """Resolve local LAN IP outside `config_lock` if Master is bound to loopback with remote workers."""
@@ -592,7 +622,11 @@ class MasterController:
         with self.config_lock:
             cross_envs = {
                 snap.node.id: build_cross_tier_env(
-                    all_snapshots, self.config, for_node=snap.node, master_lan_host=master_lan
+                    all_snapshots,
+                    self.config,
+                    for_node=snap.node,
+                    master_lan_host=master_lan,
+                    transport_manager=self.transport,
                 )
                 for snap in snapshots if snap.online
             }
@@ -785,7 +819,11 @@ class MasterController:
         if node_cross_env is None:
             with self.config_lock:
                 node_cross_env = build_cross_tier_env(
-                    all_snapshots, self.config, for_node=node, master_lan_host=master_lan
+                    all_snapshots,
+                    self.config,
+                    for_node=node,
+                    master_lan_host=master_lan,
+                    transport_manager=self.transport,
                 )
         kind, data = self.exec_on_node(
             node, self._with_node_env(spec, node, node_cross_env, master_lan_host=master_lan)
@@ -918,7 +956,11 @@ class MasterController:
             with self.config_lock:
                 cross_envs = {
                     snap.node.id: build_cross_tier_env(
-                        all_snaps, self.config, for_node=snap.node, master_lan_host=m_lan
+                        all_snaps,
+                        self.config,
+                        for_node=snap.node,
+                        master_lan_host=m_lan,
+                        transport_manager=self.transport,
                     )
                     for snap in snapshots if snap.online
                 }
@@ -1447,18 +1489,19 @@ class MasterController:
             if running and self._is_remote_port_loopback_only(snap, 3632):
                 continue
             cores = max(1, min(_MAX_WORKER_CPU_CORES, _safe_int(snap.health.get("cpu_cores", 4), 4)))
-            if snap.node.adb is not None:
+            data_host = self.transport.data_host(snap.node)
+            if snap.node.adb is not None and is_loopback_or_unspecified_host(data_host):
                 if snap.node.adb.peer_mesh and 3632 in USB_MESH_DEFAULT_PORTS:
                     mesh_port = snap.node.adb.mesh_base_port + USB_MESH_DEFAULT_PORTS.index(3632)
                     entries.append(f"127.0.0.1:{mesh_port}/{cores},lzo")
                 continue
-            if "usb-mode:adb" in (snap.node.tags or []):
+            if "usb-mode:adb" in (snap.node.tags or []) and is_loopback_or_unspecified_host(data_host):
                 continue
-            if snap.node.role == "master" or is_loopback_or_unspecified_host(snap.node.host):
+            if snap.node.role == "master" or is_loopback_or_unspecified_host(data_host):
                 slots = max(1, cores - 2)
                 entries.append(f"localhost/{slots}")
             else:
-                entries.append(f"{format_host_for_url(snap.node.host)}/{cores},lzo")
+                entries.append(f"{format_host_for_url(data_host)}/{cores},lzo")
         return " ".join(entries)
 
     def start_llama_rpc(self, spec: JobSpec) -> list[JobOutcome]:
@@ -1476,7 +1519,13 @@ class MasterController:
         master_lan = self._resolve_master_lan_host_unlocked()
         with self.config_lock:
             cross_by_id = {
-                s.node.id: build_cross_tier_env(snapshots, self.config, for_node=s.node, master_lan_host=master_lan)
+                s.node.id: build_cross_tier_env(
+                    snapshots,
+                    self.config,
+                    for_node=s.node,
+                    master_lan_host=master_lan,
+                    transport_manager=self.transport,
+                )
                 for s in workers
             }
         work = [
@@ -1506,8 +1555,9 @@ class MasterController:
         def stop(node: NodeConfig) -> dict[str, Any]:
             path = "/workloads/llama-rpc-stop"
             body = b"{}"
+            base_url = self.transport.control_base_url(node)
             request = urllib.request.Request(
-                f"{node.base_url}{path}", data=body, method="POST",
+                f"{base_url}{path}", data=body, method="POST",
                 headers=self._headers_for(node, "POST", path, body),
             )
             failed = {"node_id": node.id, "ok": False}
@@ -1545,7 +1595,8 @@ class MasterController:
                 continue
             if not include_master and snap.node.role == "master":
                 continue
-            if snap.node.adb is not None or "usb-mode:adb" in snap.node.tags:
+            data_host = self.transport.data_host(snap.node)
+            if (snap.node.adb is not None or "usb-mode:adb" in snap.node.tags) and is_loopback_or_unspecified_host(data_host):
                 # An ADB HTTP forward is not the worker's RPC endpoint.
                 continue
             tools = snap.health.get("tools")
@@ -1563,30 +1614,30 @@ class MasterController:
                             lp_ports.add(pv)
             active = (port == 50052 and bool(svcs.get("llama_rpc_50052"))) or (port in lp_ports)
             if active and not self._is_remote_port_loopback_only(snap, port):
-                endpoints.append(format_host_port(snap.node.host, port))
+                endpoints.append(format_host_port(data_host, port))
         return ",".join(dict.fromkeys(endpoints))
 
     def build_mpi_hostfile(self, snapshots: list[NodeSnapshot] | None = None) -> str:
         """Generate an OpenMPI hostfile containing healthy, non-quarantined nodes (prefers mpirun-capable)."""
         snaps = snapshots if snapshots is not None else self.poll_health()
         quarantined = self._quarantined_ids()
-        ready_snaps = [
-            s
-            for s in snaps
-            if s.ready_for_jobs
-            and s.node.id not in quarantined
-            and s.node.adb is None
-            and "usb-mode:adb" not in (s.node.tags or [])
-        ]
+        ready_snaps: list[tuple[NodeSnapshot, str]] = []
+        for s in snaps:
+            if not s.ready_for_jobs or s.node.id in quarantined:
+                continue
+            d_host = self.transport.data_host(s.node)
+            if (s.node.adb is not None or "usb-mode:adb" in (s.node.tags or [])) and is_loopback_or_unspecified_host(d_host):
+                continue
+            ready_snaps.append((s, d_host))
         mpi_snaps = [
-            s for s in ready_snaps
+            (s, d_host) for s, d_host in ready_snaps
             if isinstance(s.health.get("tools"), dict) and s.health["tools"].get("mpirun")
         ]
         chosen = mpi_snaps if mpi_snaps else ready_snaps
         lines: list[str] = []
-        for snap in chosen:
+        for snap, d_host in chosen:
             cores = max(1, min(_MAX_WORKER_CPU_CORES, _safe_int(snap.health.get("cpu_cores", 4), 4)))
-            lines.append(f"{snap.node.host} slots={cores}")
+            lines.append(f"{d_host} slots={cores}")
         return "\n".join(lines) + ("\n" if lines else "")
 
     def cluster_summary(self, record_history: bool = True) -> dict[str, Any]:
@@ -1641,6 +1692,11 @@ class MasterController:
                 {
                     "id": snap.node.id,
                     "host": snap.node.host,
+                    "usb_host": snap.node.usb_host,
+                    "wifi_host": snap.node.wifi_host,
+                    "usb_worker_port": snap.node.usb_worker_port,
+                    "wifi_worker_port": snap.node.wifi_worker_port,
+                    "usb_ssh_port": snap.node.usb_ssh_port,
                     "role": snap.node.role,
                     "tier": eff_tier,
                     "pool": eff_pool,
@@ -1659,6 +1715,7 @@ class MasterController:
                     "latency_ms": snap.latency_ms,
                     "error": snap.error,
                     "health": snap.health,
+                    "transport": self.transport.compact_node_status(snap.node),
                 }
             )
 
@@ -1676,7 +1733,9 @@ class MasterController:
 
         with self.config_lock:
             cluster_name = self.config.cluster_name
-            services_reg = build_service_registry(snapshots, self.config)
+            services_reg = build_service_registry(
+                snapshots, self.config, transport_manager=self.transport
+            )
             s_cfg = self.config.safety
             safety_dict = {
                 "max_temp_c": s_cfg.max_temp_c,
@@ -1705,6 +1764,7 @@ class MasterController:
             "pools": summarize_pools(snapshots, quarantined_nodes=quarantined),
             "services_registry": services_reg,
             "safety": safety_dict,
+            "transport": self.transport.status(event_limit=10),
             "timestamp": int(time.time()),
             "nodes": node_dicts,
         }
@@ -1720,8 +1780,12 @@ class MasterController:
         master_lan = self._resolve_master_lan_host_unlocked()
         with self.config_lock:
             quarantined = set(self.config.gateway.quarantined_nodes)
-            services = build_service_registry(snaps, self.config, master_lan_host=master_lan)
-            env = build_cross_tier_env(snaps, self.config, master_lan_host=master_lan)
+            services = build_service_registry(
+                snaps, self.config, master_lan_host=master_lan, transport_manager=self.transport
+            )
+            env = build_cross_tier_env(
+                snaps, self.config, master_lan_host=master_lan, transport_manager=self.transport
+            )
             dns_hosts = build_cluster_dns_hosts(snaps, self.config)
         return {
             "pools": summarize_pools(snaps, quarantined_nodes=quarantined),
@@ -1965,8 +2029,8 @@ class MasterController:
                     "joined_count": 0,
                 }
 
-        adv = advertise_addr or normalize_host(mgr_snap.node.host)
-        usb = mgr_snap.node.adb is not None or "usb-mode:adb" in mgr_snap.node.tags
+        adv = advertise_addr or normalize_host(self.transport.data_host(mgr_snap.node))
+        usb = (mgr_snap.node.adb is not None or "usb-mode:adb" in mgr_snap.node.tags) and is_loopback_or_unspecified_host(adv)
         if not advertise_addr and not usb and mgr_snap.node.role == "master" and is_loopback_or_unspecified_host(adv):
             adv = normalize_host(detect_local_ip())
         if not adv or is_loopback_or_unspecified_host(adv):
@@ -2325,25 +2389,38 @@ class MasterController:
         return results
 
     def get_node_jobs(self, node: NodeConfig) -> dict[str, Any]:
-        """Fetch active and recent jobs from one worker node."""
-        url = f"{node.base_url}/jobs"
-        req = urllib.request.Request(
-            url, headers=self._headers_for(node, "GET", "/jobs"), method="GET"
-        )
-        try:
-            jobs_to = max(0.5, float(self.config.health_timeout_sec))
-            with _DIRECT_OPENER.open(req, timeout=jobs_to) as resp:
-                data = read_json_object_bounded(resp, _MAX_JOBS_RESP_BYTES, deadline_sec=jobs_to)
-                raw_active = data.get("active")
-                raw_recent = data.get("recent")
-                active = [j for j in raw_active if isinstance(j, dict)][:64] if isinstance(raw_active, list) else []
-                recent = [j for j in raw_recent if isinstance(j, dict)][:50] if isinstance(raw_recent, list) else []
-                return {"node_id": node.id, "online": True, "active": active, "recent": recent}
-        except urllib.error.HTTPError as exc:
-            err = _read_http_error_body(exc, 4096)[:200]
-            return {"node_id": node.id, "online": False, "error": f"HTTP {exc.code}: {err}", "active": [], "recent": []}
-        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
-            return {"node_id": node.id, "online": False, "error": str(exc), "active": [], "recent": []}
+        """Fetch active and recent jobs from one worker node via its active control plane."""
+        jobs_to = max(0.5, float(self.config.health_timeout_sec))
+        tried: set[tuple[str, int]] = set()
+        last_err = ""
+        for _attempt in range(2):
+            ctl_host, ctl_port, ctl_plane = self.transport.control_endpoint(node)
+            if (ctl_host, ctl_port) in tried:
+                break
+            tried.add((ctl_host, ctl_port))
+            url = f"http://{format_host_port(ctl_host, ctl_port)}/jobs"
+            req = urllib.request.Request(
+                url, headers=self._headers_for(node, "GET", "/jobs"), method="GET"
+            )
+            try:
+                with _DIRECT_OPENER.open(req, timeout=jobs_to) as resp:
+                    data = read_json_object_bounded(resp, _MAX_JOBS_RESP_BYTES, deadline_sec=jobs_to)
+                    self.transport.record_probe(node.id, ctl_plane, True)
+                    raw_active = data.get("active")
+                    raw_recent = data.get("recent")
+                    active = [j for j in raw_active if isinstance(j, dict)][:64] if isinstance(raw_active, list) else []
+                    recent = [j for j in raw_recent if isinstance(j, dict)][:50] if isinstance(raw_recent, list) else []
+                    return {"node_id": node.id, "online": True, "active": active, "recent": recent}
+            except urllib.error.HTTPError as exc:
+                err = _read_http_error_body(exc, 4096)[:200]
+                return {"node_id": node.id, "online": False, "error": f"HTTP {exc.code}: {err}", "active": [], "recent": []}
+            except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
+                last_err = str(exc)
+                self.transport.record_probe(node.id, ctl_plane, False, error=last_err)
+                next_h, next_p, _ = self.transport.control_endpoint(node)
+                if (next_h, next_p) in tried:
+                    break
+        return {"node_id": node.id, "online": False, "error": last_err or "unreachable", "active": [], "recent": []}
 
     def get_all_jobs(self) -> list[dict[str, Any]]:
         """Query active & recent jobs across all configured nodes in parallel."""
@@ -2371,11 +2448,21 @@ class MasterController:
             req_signed = net.require_signed_requests
             allowed_ips = list(net.allowed_master_ips)
             need_lan_ip = False
-            if enforce_ip and master_node is not None and master_node.host:
-                m_host = normalize_host(master_node.host)
-                if m_host and m_host not in {"0.0.0.0", "::"} and m_host not in allowed_ips:
-                    allowed_ips.append(m_host)
-                if is_loopback_or_unspecified_host(m_host) and not is_loopback_or_unspecified_host(node.host):
+            if enforce_ip and master_node is not None:
+                for m_raw in master_node.all_hosts():
+                    m_host = normalize_host(m_raw)
+                    if m_host and m_host not in {"0.0.0.0", "::"} and m_host not in allowed_ips:
+                        allowed_ips.append(m_host)
+                m_primary = normalize_host(master_node.host)
+                if is_loopback_or_unspecified_host(m_primary) and any(
+                    not is_loopback_or_unspecified_host(h) for h in node.all_hosts()
+                ):
+                    need_lan_ip = True
+                # Include Master's RNDIS /30 .1 host IP for Dual-Plane / RNDIS nodes so failover never locks out
+                rndis_m_ip = _rndis_master_host_for_node(node)
+                if rndis_m_ip and rndis_m_ip not in allowed_ips:
+                    allowed_ips.append(rndis_m_ip)
+                if node.has_dual_plane():
                     need_lan_ip = True
             safety_dict = {
                 "max_temp_c": s.max_temp_c,
@@ -2402,25 +2489,38 @@ class MasterController:
                 "allowed_master_ips": allowed_ips,
             },
         }
-        url = f"{node.base_url}/config"
         body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers=self._headers_for(node, "POST", "/config", body),
-            method="POST",
-        )
-        try:
-            with _DIRECT_OPENER.open(req, timeout=timeout_sec) as resp:
-                data = read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES, deadline_sec=max(1.0, float(timeout_sec)))
-                if data.get("node_id") != node.id or data.get("updated") is not True:
-                    return {"node_id": node.id, "ok": False, "error": "Worker did not confirm this policy update."}
-                return {**data, "persisted": data.get("persisted") is True, "ok": True}
-        except urllib.error.HTTPError as exc:
-            raw = _read_http_error_body(exc, 4096)[:200]
-            return {"node_id": node.id, "ok": False, "error": f"HTTP {exc.code}: {raw}"}
-        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
-            return {"node_id": node.id, "ok": False, "error": str(exc)}
+        tried: set[tuple[str, int]] = set()
+        last_err = ""
+        for _attempt in range(2):
+            ctl_host, ctl_port, ctl_plane = self.transport.control_endpoint(node)
+            if (ctl_host, ctl_port) in tried:
+                break
+            tried.add((ctl_host, ctl_port))
+            url = f"http://{format_host_port(ctl_host, ctl_port)}/config"
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers=self._headers_for(node, "POST", "/config", body),
+                method="POST",
+            )
+            try:
+                with _DIRECT_OPENER.open(req, timeout=timeout_sec) as resp:
+                    data = read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES, deadline_sec=max(1.0, float(timeout_sec)))
+                    self.transport.record_probe(node.id, ctl_plane, True)
+                    if data.get("node_id") != node.id or data.get("updated") is not True:
+                        return {"node_id": node.id, "ok": False, "error": "Worker did not confirm this policy update."}
+                    return {**data, "persisted": data.get("persisted") is True, "ok": True}
+            except urllib.error.HTTPError as exc:
+                raw = _read_http_error_body(exc, 4096)[:200]
+                return {"node_id": node.id, "ok": False, "error": f"HTTP {exc.code}: {raw}"}
+            except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
+                last_err = str(exc)
+                self.transport.record_probe(node.id, ctl_plane, False, error=last_err)
+                next_h, next_p, _ = self.transport.control_endpoint(node)
+                if (next_h, next_p) in tried:
+                    break
+        return {"node_id": node.id, "ok": False, "error": last_err or "unreachable"}
 
     def push_config_to_all(
         self, node_ids: list[str] | None = None, timeout_sec: float = 3.0
@@ -2446,24 +2546,37 @@ class MasterController:
         return {"ok_count": ok_count, "persisted_count": persisted_count, "total": len(results), "results": results}
 
     def cancel_node_job(self, node_id: str, job_id: str) -> dict[str, Any]:
-        """Cancel a running job on a specific node."""
+        """Cancel a running job on a specific node via its active control plane."""
         with self.config_lock:
             node = self.config.get_node(node_id)
-        url = f"{node.base_url}/cancel"
         body = json.dumps({"job_id": job_id}).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=body, headers=self._headers_for(node, "POST", "/cancel", body), method="POST"
-        )
-        try:
-            with _DIRECT_OPENER.open(req, timeout=5.0) as resp:
-                return read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES, deadline_sec=5.0)
-        except urllib.error.HTTPError as exc:
-            raw = _read_http_error_body(exc, 4096)
+        tried: set[tuple[str, int]] = set()
+        last_err = ""
+        for _attempt in range(2):
+            ctl_host, ctl_port, ctl_plane = self.transport.control_endpoint(node)
+            if (ctl_host, ctl_port) in tried:
+                break
+            tried.add((ctl_host, ctl_port))
+            url = f"http://{format_host_port(ctl_host, ctl_port)}/cancel"
+            req = urllib.request.Request(
+                url, data=body, headers=self._headers_for(node, "POST", "/cancel", body), method="POST"
+            )
             try:
-                parsed = json.loads(raw)
-                data = parsed if isinstance(parsed, dict) else {"error": raw[:200]}
-            except (json.JSONDecodeError, RecursionError):
-                data = {"error": raw[:200]}
-            return {**data, "cancelled": False, "http_status": exc.code}
-        except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
-            return {"cancelled": False, "error": str(exc)}
+                with _DIRECT_OPENER.open(req, timeout=5.0) as resp:
+                    self.transport.record_probe(node.id, ctl_plane, True)
+                    return read_json_object_bounded(resp, _MAX_CTRL_RESP_BYTES, deadline_sec=5.0)
+            except urllib.error.HTTPError as exc:
+                raw = _read_http_error_body(exc, 4096)
+                try:
+                    parsed = json.loads(raw)
+                    data = parsed if isinstance(parsed, dict) else {"error": raw[:200]}
+                except (json.JSONDecodeError, RecursionError):
+                    data = {"error": raw[:200]}
+                return {**data, "cancelled": False, "http_status": exc.code}
+            except (urllib.error.URLError, http.client.HTTPException, socket.timeout, OSError, ValueError, OverflowError) as exc:
+                last_err = str(exc)
+                self.transport.record_probe(node.id, ctl_plane, False, error=last_err)
+                next_h, next_p, _ = self.transport.control_endpoint(node)
+                if (next_h, next_p) in tried:
+                    break
+        return {"cancelled": False, "error": last_err or "unreachable"}

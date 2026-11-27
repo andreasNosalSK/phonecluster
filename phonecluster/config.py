@@ -21,6 +21,7 @@ DEFAULT_WORKER_PORT = 8765
 DEFAULT_SSH_PORT = 8022
 DEFAULT_GATEWAY_PORT = 8888
 DEFAULT_CONFIG_PATH = Path("config/cluster.json")
+VALID_TRANSPORT_MODES: tuple[str, ...] = ("auto", "dual_plane", "usb_only", "wifi_only")
 
 
 def normalize_host(host: str) -> str:
@@ -278,10 +279,88 @@ class NodeConfig:
     notes: str = ""
     auth_token: str = ""  # Optional per-node least-privilege token (recommended for workers)
     adb: AdbNodeConfig | None = None
+    usb_host: str = ""  # Optional USB control-plane IP/host (e.g. 10.77.1.2 or 127.0.0.1)
+    wifi_host: str = ""  # Optional Wi-Fi/LAN data-plane IP/host (e.g. 192.168.1.201)
+    usb_worker_port: int = 0  # Optional USB worker port override (0 = inherit worker_port)
+    wifi_worker_port: int = 0  # Optional Wi-Fi worker port override (0 = inherit worker_port / adb remote)
+    usb_ssh_port: int = 0  # Optional USB SSH port override (0 = inherit ssh_port)
 
     @property
     def base_url(self) -> str:
         return f"http://{format_host_port(self.host, self.worker_port)}"
+
+    def base_url_for(self, host: str, port: int | None = None) -> str:
+        """Build a worker HTTP base URL for a specific plane host and port."""
+        eff_port = self.worker_port if port is None else int(port)
+        return f"http://{format_host_port(host, eff_port)}"
+
+    def is_usb_primary(self) -> bool:
+        """Return True if this node's primary `host` represents a USB transport endpoint."""
+        if self.adb is not None:
+            return True
+        tags = self.tags or []
+        return any(t in {"usb-hub", "usb-mode:rndis", "usb-mode:adb"} for t in tags)
+
+    def effective_usb_host(self) -> str:
+        """Return the configured USB control-plane host, or empty string if none."""
+        if self.usb_host:
+            return self.usb_host
+        return self.host if self.is_usb_primary() else ""
+
+    def effective_wifi_host(self) -> str:
+        """Return the configured Wi-Fi/LAN data-plane host, or empty string if none."""
+        if self.wifi_host:
+            return self.wifi_host
+        return self.host if not self.is_usb_primary() else ""
+
+    def effective_usb_worker_port(self) -> int:
+        """Return the worker HTTP port used over the USB control plane."""
+        return self.usb_worker_port if self.usb_worker_port > 0 else self.worker_port
+
+    def effective_wifi_worker_port(self) -> int:
+        """Return the worker HTTP port used over the Wi-Fi/LAN data plane."""
+        if self.wifi_worker_port > 0:
+            return self.wifi_worker_port
+        if self.adb is not None and is_loopback_or_unspecified_host(self.host):
+            return self.adb.remote_worker_port
+        return self.worker_port
+
+    def effective_usb_ssh_port(self) -> int:
+        """Return the SSH port used over the USB control plane."""
+        return self.usb_ssh_port if self.usb_ssh_port > 0 else self.ssh_port
+
+    def effective_wifi_ssh_port(self) -> int:
+        """Return the SSH port used over the Wi-Fi/LAN plane."""
+        if self.adb is not None and is_loopback_or_unspecified_host(self.host):
+            return self.adb.remote_ssh_port
+        return self.ssh_port
+
+    def plane_endpoint(self, plane: str) -> tuple[str, int]:
+        """Return `(host, worker_port)` for `'usb'` or `'wifi'`, or `('', 0)` if unconfigured."""
+        if plane == "usb":
+            h = self.effective_usb_host()
+            return (h, self.effective_usb_worker_port()) if h else ("", 0)
+        if plane == "wifi":
+            h = self.effective_wifi_host()
+            return (h, self.effective_wifi_worker_port()) if h else ("", 0)
+        raise ValueError(f"Unknown transport plane: {plane!r}")
+
+    def has_dual_plane(self) -> bool:
+        """Return True iff distinct USB and Wi-Fi endpoints are both configured for this node."""
+        uh, up = self.plane_endpoint("usb")
+        wh, wp = self.plane_endpoint("wifi")
+        if not uh or not wh:
+            return False
+        return (normalize_host(uh), int(up)) != (normalize_host(wh), int(wp))
+
+    def all_hosts(self) -> list[str]:
+        """Return deduplicated normalized hosts across primary, USB, and Wi-Fi endpoints."""
+        out: list[str] = []
+        for raw in (self.host, self.usb_host, self.wifi_host):
+            norm = normalize_host(raw)
+            if norm and norm not in out:
+                out.append(norm)
+        return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "NodeConfig":
@@ -328,6 +407,24 @@ class NodeConfig:
         if raw_tok is not None and not isinstance(raw_tok, str):
             raise ValueError(f"auth_token for node '{node_id}' must be a string")
         node_tok = _validate_auth_token(raw_tok or "", f"auth_token for node '{node_id}'", allow_empty=True)
+        # Optional Dual-Plane addresses (also accept friendly control_host / data_host aliases)
+        raw_usb = data.get("usb_host") if "usb_host" in data else data.get("control_host")
+        if raw_usb is not None and not isinstance(raw_usb, str):
+            raise ValueError(f"usb_host for node '{node_id}' must be a string")
+        usb_host = validate_host(raw_usb) if (raw_usb and raw_usb.strip()) else ""
+        raw_wifi = data.get("wifi_host") if "wifi_host" in data else data.get("data_host")
+        if raw_wifi is not None and not isinstance(raw_wifi, str):
+            raise ValueError(f"wifi_host for node '{node_id}' must be a string")
+        wifi_host = validate_host(raw_wifi) if (raw_wifi and raw_wifi.strip()) else ""
+        usb_w_port = _parse_int_field(data.get("usb_worker_port"), 0, f"usb_worker_port for '{node_id}'")
+        wifi_w_port = _parse_int_field(data.get("wifi_worker_port"), 0, f"wifi_worker_port for '{node_id}'")
+        usb_s_port = _parse_int_field(data.get("usb_ssh_port"), 0, f"usb_ssh_port for '{node_id}'")
+        if not (0 <= usb_w_port <= 65535):
+            raise ValueError(f"usb_worker_port must be 0..65535 for node '{node_id}'")
+        if not (0 <= wifi_w_port <= 65535):
+            raise ValueError(f"wifi_worker_port must be 0..65535 for node '{node_id}'")
+        if not (0 <= usb_s_port <= 65535):
+            raise ValueError(f"usb_ssh_port must be 0..65535 for node '{node_id}'")
         return cls(
             id=node_id,
             host=host,
@@ -343,6 +440,11 @@ class NodeConfig:
             notes=str(data.get("notes") or ""),
             auth_token=node_tok,
             adb=AdbNodeConfig.from_dict(data["adb"]) if data.get("adb") is not None else None,
+            usb_host=usb_host,
+            wifi_host=wifi_host,
+            usb_worker_port=usb_w_port,
+            wifi_worker_port=wifi_w_port,
+            usb_ssh_port=usb_s_port,
         )
 
 
@@ -584,6 +686,57 @@ class NetworkHardeningConfig:
 
 
 @dataclass
+class TransportConfig:
+    """Cluster-wide Dual-Plane communication (USB control + Wi-Fi data), failover, and auto-recovery config."""
+
+    mode: str = "auto"  # "auto" | "dual_plane" | "usb_only" | "wifi_only"
+    probe_interval_sec: int = 10
+    failover_threshold: int = 2
+    recovery_threshold: int = 2
+    probe_timeout_sec: float = 2.0
+    auto_failover: bool = True
+    auto_recover: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "TransportConfig":
+        if not isinstance(data, dict):
+            return cls()
+        raw_mode = data.get("mode")
+        if raw_mode is not None and not isinstance(raw_mode, str):
+            raise ValueError(f"transport.mode must be one of {', '.join(VALID_TRANSPORT_MODES)}")
+        mode = (raw_mode or "auto").strip().lower()
+        if mode not in VALID_TRANSPORT_MODES:
+            raise ValueError(f"transport.mode must be one of {', '.join(VALID_TRANSPORT_MODES)} (got '{mode}')")
+        probe_interval = _parse_int_field(data.get("probe_interval_sec"), 10, "transport.probe_interval_sec")
+        if not (1 <= probe_interval <= 300):
+            raise ValueError("transport.probe_interval_sec must be between 1 and 300")
+        fail_th = _parse_int_field(data.get("failover_threshold"), 2, "transport.failover_threshold")
+        if not (1 <= fail_th <= 20):
+            raise ValueError("transport.failover_threshold must be between 1 and 20")
+        rec_th = _parse_int_field(data.get("recovery_threshold"), 2, "transport.recovery_threshold")
+        if not (1 <= rec_th <= 20):
+            raise ValueError("transport.recovery_threshold must be between 1 and 20")
+        probe_to = _parse_float_field(data.get("probe_timeout_sec"), 2.0, "transport.probe_timeout_sec")
+        if not (0.2 <= probe_to <= 15.0):
+            raise ValueError("transport.probe_timeout_sec must be a finite number between 0.2 and 15.0")
+        raw_af = data.get("auto_failover")
+        if raw_af is not None and not isinstance(raw_af, bool):
+            raise ValueError("transport.auto_failover must be a boolean")
+        raw_ar = data.get("auto_recover")
+        if raw_ar is not None and not isinstance(raw_ar, bool):
+            raise ValueError("transport.auto_recover must be a boolean")
+        return cls(
+            mode=mode,
+            probe_interval_sec=probe_interval,
+            failover_threshold=fail_th,
+            recovery_threshold=rec_th,
+            probe_timeout_sec=probe_to,
+            auto_failover=True if raw_af is None else raw_af,
+            auto_recover=True if raw_ar is None else raw_ar,
+        )
+
+
+@dataclass
 class ClusterConfig:
     """Top-level PhoneCluster configuration."""
 
@@ -598,6 +751,7 @@ class ClusterConfig:
     dashboard_port: int = 8080
     dashboard_require_auth: bool = False
     custom_services: dict[str, str] = field(default_factory=dict)
+    transport: TransportConfig = field(default_factory=TransportConfig)
     _source: tuple[Path, str] | None = field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
@@ -621,6 +775,7 @@ class ClusterConfig:
         safety = SafetyConfig.from_dict(raw_safety if isinstance(raw_safety, dict) else {})
         gateway = GatewayConfig.from_dict(data.get("gateway"))
         network = NetworkHardeningConfig.from_dict(data.get("network"))
+        transport = TransportConfig.from_dict(data.get("transport"))
         raw_svcs = data.get("custom_services") or {}
         custom_services: dict[str, str] = {}
         if isinstance(raw_svcs, dict):
@@ -652,6 +807,7 @@ class ClusterConfig:
             dashboard_port=dash_port,
             dashboard_require_auth=bool(data.get("dashboard_require_auth", False)),
             custom_services=custom_services,
+            transport=transport,
         )
 
     def to_dict(self) -> dict[str, Any]:

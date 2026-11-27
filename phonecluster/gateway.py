@@ -197,9 +197,10 @@ def _is_local_no_proxy_host(host_val: str) -> bool:
 
 def _rndis_master_host_for_node(node: NodeConfig) -> str:
     """For an RNDIS USB-hub worker (`10.x.y.2` in a `/30`), return Master's `.1` gateway IP."""
-    if "usb-mode:rndis" not in node.tags:
+    is_rndis = "usb-mode:rndis" in (node.tags or []) or (bool(node.usb_host) and node.adb is None)
+    if not is_rndis:
         return ""
-    norm = normalize_host(node.host)
+    norm = normalize_host(node.effective_usb_host() or node.host)
     try:
         addr = ipaddress.IPv4Address(norm)
     except ValueError:
@@ -272,7 +273,8 @@ def build_worker_proxy_env(
 
     _add_no_proxy(m_host)
     for n in config.nodes:
-        _add_no_proxy(n.host)
+        for nh in n.all_hosts():
+            _add_no_proxy(nh)
     for curl in config.custom_services.values():
         try:
             parsed = urllib.parse.urlparse(curl)

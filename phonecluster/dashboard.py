@@ -42,6 +42,7 @@ from .config import (
     NetworkHardeningConfig,
     NodeConfig,
     SafetyConfig,
+    TransportConfig,
     format_host_port,
     generate_auth_token,
     is_loopback_or_unspecified_host,
@@ -57,7 +58,7 @@ from .config import (
 )
 from .discovery import detect_local_ip, discover_lan_nodes
 from .doctor import run_doctor
-from .gateway import GatewayManager
+from .gateway import GatewayManager, _rndis_master_host_for_node
 from .master import JobSpec, MasterController
 from .netguard import apply_security_profile, audit_cluster_network, infer_lan_subnet
 from .pairing import PairingManager
@@ -133,6 +134,19 @@ def _redact_unauthenticated_summary(summary: dict[str, Any]) -> dict[str, Any]:
                 nc["health"] = hc
             redacted_nodes.append(nc)
         out["nodes"] = redacted_nodes
+    raw_tr = summary.get("transport")
+    if isinstance(raw_tr, dict):
+        out["transport"] = {
+            "mode": raw_tr.get("mode", "auto"),
+            "dual_plane_nodes": raw_tr.get("dual_plane_nodes", 0),
+            "single_plane_nodes": raw_tr.get("single_plane_nodes", 0),
+            "failover_nodes": raw_tr.get("failover_nodes", 0),
+            "offline_nodes": raw_tr.get("offline_nodes", 0),
+            "auto_failover": raw_tr.get("auto_failover", True),
+            "auto_recover": raw_tr.get("auto_recover", True),
+            "failover_threshold": raw_tr.get("failover_threshold", 2),
+            "recovery_threshold": raw_tr.get("recovery_threshold", 2),
+        }
     return out
 
 
@@ -769,6 +783,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <button onclick="selectTab('workloads')">🌐 Service Mesh &amp; .cluster DNS</button>
         <button onclick="selectTab('network')">🛡️ Network &amp; Pi Guard</button>
         <button onclick="selectTab('setup')">📱 Pair New Phone</button>
+        <button id="overview-transport-pill" style="display:none" onclick="openTransportCard()"></button>
       </div>
 
       <div id="pool-strip" class="pool-strip" role="group" aria-label="Filter phones by Tier and Pool"></div>
@@ -781,6 +796,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           <option value="ready">Ready Only</option>
           <option value="attention">Warm / Offline / Quarantined</option>
           <option value="usb">USB Hub Only</option>
+          <option value="dual_plane">Dual-Plane Split Only</option>
         </select>
         <label class="sr-only" for="node-sort">Sort phones</label>
         <select id="node-sort" aria-label="Sort phones" onchange="onNodeFilterChange()">
@@ -1425,7 +1441,70 @@ pc usb-hub verify</pre>
 pc usb-hub setup --mode adb --write-config
 pc usb-hub serve
 # Mode 2 (Layer-3 /30 Subnets — Ubuntu Touch + Snap Docker Swarm):
-sudo bash scripts/07_usb_hub_router.sh setup-rndis</pre>
+sudo bash scripts/07_usb_hub_router.sh setup-rndis --dual-plane</pre>
+      </div>
+
+      <div id="transport-card" class="card">
+        <div class="row" style="justify-content:space-between; margin-bottom:6px;">
+          <h2 style="margin:0;">6. Dual-Plane Transport &amp; Automatic Failover (USB Control + Wi-Fi Data)</h2>
+          <div class="row" style="margin:0;">
+            <span id="tr-status-pill" class="pill neutral">AUTO</span>
+            <button id="btn-tr-probe" class="small primary" onclick="probeTransportNow()">Probe Both Planes Now</button>
+            <button id="btn-tr-recover" class="small" onclick="recoverTransportAll()">Recover All</button>
+          </div>
+        </div>
+        <p class="hint" style="margin-top:0;">Route low-latency control &amp; health checks over <strong>USB RNDIS / ADB</strong> while sending high-bandwidth workloads (<code class="mono">distcc</code>, <code class="mono">llama.cpp RPC</code>, OpenMPI, Docker Swarm, Service Mesh) over <strong>Wi-Fi</strong>. If either plane drops for <code class="mono">failover_threshold</code> probes, PhoneCluster automatically fails over and auto-recovers once healthy for <code class="mono">recovery_threshold</code> probes.</p>
+        <div id="tr-stats-chips" class="chips" style="margin-bottom:10px;"></div>
+
+        <div class="form-grid" style="margin-bottom:8px;">
+          <div class="field">
+            <label for="tr-mode">Communication Mode</label>
+            <select id="tr-mode">
+              <option value="dual_plane">Dual-Plane Split (USB Control + Wi-Fi Data)</option>
+              <option value="auto">Auto (Dual-Plane when configured, else single-host)</option>
+              <option value="usb_only">USB Only (Force Control &amp; Data over USB)</option>
+              <option value="wifi_only">Wi-Fi Only (Force Control &amp; Data over Wi-Fi)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="tr-probe-interval">Probe Interval (sec)</label>
+            <input id="tr-probe-interval" type="number" min="1" max="300" value="10" />
+          </div>
+          <div class="field">
+            <label for="tr-failover-th">Failover Threshold (failures)</label>
+            <input id="tr-failover-th" type="number" min="1" max="20" value="2" />
+          </div>
+          <div class="field">
+            <label for="tr-recovery-th">Recovery Threshold (healthy)</label>
+            <input id="tr-recovery-th" type="number" min="1" max="20" value="2" />
+          </div>
+          <div class="field">
+            <label for="tr-probe-timeout">Probe Timeout (sec)</label>
+            <input id="tr-probe-timeout" type="number" min="0.2" max="15" step="0.1" value="2.0" />
+          </div>
+        </div>
+
+        <div class="row" style="margin-bottom:10px;">
+          <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:5px;">
+            <input id="tr-auto-failover" type="checkbox" checked style="width:auto; padding:0;" /> Automatic Failover on Plane Drop
+          </label>
+          <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:5px;">
+            <input id="tr-auto-recover" type="checkbox" checked style="width:auto; padding:0;" /> Automatic Hysteresis Recovery back to Dual-Plane
+          </label>
+        </div>
+
+        <div class="row" style="margin-bottom:10px;">
+          <button id="btn-save-tr" class="primary small" onclick="saveTransportConfig()">Save Transport Policy</button>
+          <button class="small" onclick="loadTransportStatus()">Refresh Transport Status</button>
+          <span id="tr-unsaved-pill" class="pill warn" style="display:none">Unsaved edits</span>
+        </div>
+
+        <h3 style="margin:10px 0 6px;">Per-Phone Control &amp; Data Plane Health</h3>
+        <p class="hint" style="margin-top:0;">Tip: Edit any phone's <strong>USB Control Host</strong> &amp; <strong>Wi-Fi Data Host</strong> in Tab 1 → <em>Tier / Pool</em>, or run <code class="mono">pc transport set-node &lt;id&gt; --usb-host 10.77.1.2 --wifi-host 192.168.1.201</code>.</p>
+        <div id="tr-nodes-table" class="hint" style="margin-bottom:10px;">Unlock with Master token to inspect Dual-Plane transport status.</div>
+
+        <h3 style="margin:10px 0 6px;">Failover &amp; Auto-Recovery Event Log</h3>
+        <div id="tr-events-table" class="hint">No failover or recovery transitions recorded yet.</div>
       </div>
     </section>
   </main>
@@ -1447,6 +1526,7 @@ let doctorFilter = 'all';
 let lastGwEvents = [];
 let gwFormDirty = false;
 let hardFormDirty = false;
+let trFormDirty = false;
 const inFlightActions = new Set();
 const MAX_UPLOAD_BYTES = 1024 * 1024;
 const MAX_TERM_DOM_ENTRIES = 150;
@@ -1572,7 +1652,7 @@ function openNodeTierEditor(nodeId) {
   const cfgPool = String(n.configured_pool || 'auto');
   ed.style.display = 'block';
   ed.innerHTML = '<div class="row" style="justify-content:space-between; margin-bottom:8px;">'
-    + '<h3 style="margin:0;">Configure Tier, Pool &amp; Notes for <span class="mono">' + esc(n.id) + '</span> (' + esc(n.host) + ')</h3>'
+    + '<h3 style="margin:0;">Configure Tier, Pool &amp; Dual-Plane for <span class="mono">' + esc(n.id) + '</span> (' + esc(n.host) + ')</h3>'
     + '<button class="small ghost" onclick="closeNodeTierEditor()">✕ Close</button></div>'
     + '<div class="form-grid">'
     + '<div class="field"><label for="ed-tier">Tier Role</label><select id="ed-tier">'
@@ -1587,6 +1667,10 @@ function openNodeTierEditor(nodeId) {
     + '<input id="ed-conc" type="number" min="1" max="32" value="' + esc(n.max_concurrency || 2) + '" /></div>'
     + '<div class="field"><label for="ed-notes">Phone Label / Notes</label>'
     + '<input id="ed-notes" maxlength="240" value="' + esc(n.notes || '') + '" placeholder="e.g. Shelf 2 · USB Port 3" /></div>'
+    + '<div class="field"><label for="ed-usb-host">USB Control Host (optional Dual-Plane)</label>'
+    + '<input id="ed-usb-host" value="' + esc(n.usb_host || '') + '" placeholder="e.g. 10.77.1.2 (leave blank for single-plane)" /></div>'
+    + '<div class="field"><label for="ed-wifi-host">Wi-Fi Data Host (optional Dual-Plane)</label>'
+    + '<input id="ed-wifi-host" value="' + esc(n.wifi_host || '') + '" placeholder="e.g. 192.168.1.201 (leave blank for single-plane)" /></div>'
     + '</div>'
     + '<div class="row" style="margin:0;">'
     + '<button id="btn-save-node-tier" class="small primary" onclick="saveNodeTier(' + jsArg(n.id) + ')">Save Changes</button>'
@@ -1609,13 +1693,18 @@ async function saveNodeTier(nodeId) {
     const max_concurrency = Number(document.getElementById('ed-conc').value || 2);
     const notesEl = document.getElementById('ed-notes');
     const notes = notesEl ? notesEl.value.trim() : undefined;
+    const usbEl = document.getElementById('ed-usb-host');
+    const wifiEl = document.getElementById('ed-wifi-host');
     const payload = { id: nodeId, tier, pool, max_concurrency };
     if (notes !== undefined) payload.notes = notes;
+    if (usbEl) payload.usb_host = usbEl.value.trim();
+    if (wifiEl) payload.wifi_host = wifiEl.value.trim();
     const data = await authPost('/api/nodes/update', payload);
     if (data.error) { showToast('Update failed: ' + data.error, 'bad'); return; }
     closeNodeTierEditor();
     showPolicyResult('Saved tier ' + (tier || 'auto') + ' and pool ' + pool + ' for ' + nodeId + '.', data.pushed);
-    refreshLive();
+    refreshLive({ fresh: true });
+    if (document.getElementById('panel-network')?.classList.contains('active')) loadTransportStatus();
   });
 }
 
@@ -1960,6 +2049,18 @@ function initPreferences() {
       };
       el.addEventListener('input', markHardDirty);
       el.addEventListener('change', markHardDirty);
+    }
+  }
+  for (const id of ['tr-mode', 'tr-probe-interval', 'tr-failover-th', 'tr-recovery-th', 'tr-probe-timeout', 'tr-auto-failover', 'tr-auto-recover']) {
+    const el = document.getElementById(id);
+    if (el) {
+      const markTrDirty = () => {
+        trFormDirty = true;
+        const p = document.getElementById('tr-unsaved-pill');
+        if (p) p.style.display = 'inline-flex';
+      };
+      el.addEventListener('input', markTrDirty);
+      el.addEventListener('change', markTrDirty);
     }
   }
 
@@ -2370,6 +2471,22 @@ async function refreshLive(opts) {
     }
 
     renderPoolStrip(d);
+    const ovTr = document.getElementById('overview-transport-pill');
+    if (ovTr) {
+      const tSum = (d.transport && typeof d.transport === 'object') ? d.transport : null;
+      const dpCnt = Number(tSum?.dual_plane_nodes || 0);
+      const foCnt = Number(tSum?.failover_nodes || 0);
+      const tMode = String(tSum?.mode || 'auto');
+      if (dpCnt > 0 || tMode !== 'auto') {
+        ovTr.style.display = '';
+        ovTr.textContent = foCnt > 0
+          ? ('⚠ Transport: ' + foCnt + ' Failover (' + tMode.toUpperCase() + ')')
+          : ('⚡ Transport: ' + tMode.toUpperCase() + (dpCnt ? (' · ' + dpCnt + ' Dual-Plane') : ''));
+        ovTr.style.borderColor = foCnt > 0 ? 'var(--warn)' : 'var(--accent)';
+      } else {
+        ovTr.style.display = 'none';
+      }
+    }
     renderNodesGrid(live);
 
     const batWarnings = [];
@@ -2427,8 +2544,11 @@ function copyNodeSsh(nodeId) {
   if (!lastLive) return;
   const n = (lastLive.summary.nodes || []).find(x => x.id === nodeId);
   if (!n) return;
-  const port = safePort(n.ssh_port) || 8022;
-  const target = n.ssh_user ? (n.ssh_user + '@' + n.host) : n.host;
+  const tr = (n.transport && typeof n.transport === 'object') ? n.transport : null;
+  const host = (tr && tr.control_host) ? tr.control_host : n.host;
+  const isUsbCtl = tr && tr.control_plane === 'usb';
+  const port = safePort(isUsbCtl && n.usb_ssh_port ? n.usb_ssh_port : n.ssh_port) || 8022;
+  const target = n.ssh_user ? (n.ssh_user + '@' + host) : host;
   copyText('ssh -p ' + port + ' ' + target, 'Copied SSH command for ' + nodeId + '!');
 }
 
@@ -2468,11 +2588,12 @@ function renderNodesGrid(live) {
       if (statusFilter === 'ready' && !(n.online && n.ready_for_jobs && !n.quarantined)) return false;
       if (statusFilter === 'attention' && (n.online && n.ready_for_jobs && !n.quarantined)) return false;
       if (statusFilter === 'usb' && !_isUsbNode(n)) return false;
+      if (statusFilter === 'dual_plane' && !(n.transport && n.transport.has_dual_plane)) return false;
       if (searchQ) {
         const h = n.health || {};
         const svcsObj = (h.services && typeof h.services === 'object' && !Array.isArray(h.services)) ? h.services : {};
         const svcNames = Object.entries(svcsObj).filter(([, v]) => v).map(([k]) => k).join(' ');
-        const hay = [n.id, n.host, n.role, n.pool, n.notes, h.os_env, (n.tags || []).join(' '), svcNames].join(' ').toLowerCase();
+        const hay = [n.id, n.host, n.usb_host, n.wifi_host, n.role, n.pool, n.notes, h.os_env, (n.tags || []).join(' '), svcNames].join(' ').toLowerCase();
         if (!hay.includes(searchQ)) return false;
       }
       return true;
@@ -2608,9 +2729,28 @@ function renderNodesGrid(live) {
         ? '<span class="pill purple">MASTER</span>'
         : '<span class="pill neutral">WORKER</span>';
       const usbPill = isUsbNode ? ' <span class="pill accent">🔌 USB</span>' : '';
-      const hostDisp = (n.host === '127.0.0.1' && isUsbNode && safePort(n.worker_port))
+      const tr = (n.transport && typeof n.transport === 'object') ? n.transport : null;
+      let trPill = '';
+      if (tr && tr.has_dual_plane) {
+        if (tr.state === 'failover_usb_only') {
+          trPill = ' <span class="pill warn" title="Wi-Fi dropped — data failed over to USB">⚠ FAILOVER→USB</span>';
+        } else if (tr.state === 'failover_wifi_only') {
+          trPill = ' <span class="pill warn" title="USB dropped — control failed over to Wi-Fi">⚠ FAILOVER→WIFI</span>';
+        } else if (tr.state === 'forced_usb') {
+          trPill = ' <span class="pill accent">🔌 USB ONLY</span>';
+        } else if (tr.state === 'forced_wifi') {
+          trPill = ' <span class="pill accent">📶 WIFI ONLY</span>';
+        } else if (tr.state === 'dual_plane') {
+          trPill = ' <span class="pill ok" title="Dual-Plane Split active">⚡ CTL:USB · DATA:WIFI</span>';
+        }
+      }
+      let hostDisp = (n.host === '127.0.0.1' && isUsbNode && safePort(n.worker_port))
         ? ('usb:' + n.worker_port + ' (127.0.0.1)')
         : String(n.host || '');
+      if (tr && tr.has_dual_plane) {
+        hostDisp = 'CTL:' + (tr.control_plane || 'usb').toUpperCase() + ' ' + (tr.control_host || n.host)
+          + ' · DATA:' + (tr.data_plane || 'wifi').toUpperCase() + ' ' + (tr.data_host || n.host);
+      }
       const noteHtml = n.notes ? '<div class="node-note">' + esc(n.notes) + '</div>' : '';
 
       let actionsHtml = '<div class="node-actions">'
@@ -2630,7 +2770,7 @@ function renderNodesGrid(live) {
       card.className = cardCls;
       card.dataset.nodeId = n.id;
       card.innerHTML = '<div><div class="node-head">'
-        + '<div><div class="node-title">' + esc(n.id) + ' ' + rolePill + ' ' + tierPillHtml(n.tier, n.pool) + usbPill + '</div>'
+        + '<div><div class="node-title">' + esc(n.id) + ' ' + rolePill + ' ' + tierPillHtml(n.tier, n.pool) + usbPill + trPill + '</div>'
         + '<div class="node-meta mono">' + esc(hostDisp) + '</div>' + noteHtml + '</div>'
         + badge + '</div>' + bodyHtml + '</div>' + actionsHtml;
       grid.appendChild(card);
@@ -4242,6 +4382,7 @@ async function loadNetworkAudit() {
     setFwTab(activeFwTab);
     highlightActiveProfile();
     loadUsbHub();
+    loadTransportStatus();
   } catch (e) {
     if (nb) nb.innerHTML = '<p class="hint">Could not load network audit: ' + esc(e && e.message ? e.message : String(e)) + '</p>';
   }
@@ -4448,6 +4589,205 @@ async function toggleUsbWatchdog() {
     _renderUsbWatchdogBadge(data.watchdog);
     loadUsbHub({ preserveCommands: true });
     showToast(nextState ? 'USB Hub Auto-Heal Watchdog enabled!' : 'USB Hub Auto-Heal Watchdog stopped.', nextState ? 'ok' : 'neutral');
+  });
+}
+
+function openTransportCard() {
+  selectTab('network');
+  const card = document.getElementById('transport-card');
+  if (card && typeof card.scrollIntoView === 'function') {
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
+function _planeBadgeHtml(ph) {
+  if (!ph || !ph.configured) return '<span class="hint">—</span>';
+  const st = String(ph.status || 'unknown');
+  const cls = st === 'up' ? 'ok' : (st === 'down' ? 'bad' : 'neutral');
+  const lat = (ph.latency_ms != null) ? (' ' + esc(ph.latency_ms) + 'ms') : '';
+  const cnt = st === 'down' && Number(ph.consecutive_successes || 0) > 0
+    ? (' · rec ' + esc(ph.consecutive_successes))
+    : (st !== 'down' && Number(ph.consecutive_failures || 0) > 0 ? (' · fail ' + esc(ph.consecutive_failures)) : '');
+  const titleAttr = ph.last_error ? (' title="' + esc(ph.last_error) + '"') : '';
+  return '<span class="pill ' + cls + '"' + titleAttr + '>' + esc(st.toUpperCase()) + lat + cnt + '</span>'
+    + '<div class="hint mono" style="margin:2px 0 0;">' + esc(ph.host) + ':' + esc(ph.port) + '</div>';
+}
+
+function renderTransportPanel(d) {
+  if (!d || typeof d !== 'object') return;
+  const pill = document.getElementById('tr-status-pill');
+  const chips = document.getElementById('tr-stats-chips');
+  const ntbl = document.getElementById('tr-nodes-table');
+  const etbl = document.getElementById('tr-events-table');
+  const mode = String(d.mode || 'auto');
+  const foN = Number(d.failover_nodes || 0);
+  const dpN = Number(d.dual_plane_nodes || 0);
+  if (pill) {
+    pill.textContent = foN > 0 ? ('⚠ ' + mode.toUpperCase() + ' · ' + foN + ' FAILOVER') : mode.toUpperCase();
+    pill.className = 'pill ' + (foN > 0 ? 'warn' : (dpN > 0 ? 'ok' : 'neutral'));
+  }
+  if (chips) {
+    chips.innerHTML =
+      '<span class="pill ' + (dpN > 0 ? 'ok' : 'neutral') + '">Dual-Plane Nodes: ' + esc(dpN) + '</span>'
+      + '<span class="pill neutral">Single-Plane: ' + esc(d.single_plane_nodes || 0) + '</span>'
+      + '<span class="pill ' + (foN > 0 ? 'warn' : 'ok') + '">Active Failovers: ' + esc(foN) + '</span>'
+      + '<span class="pill ' + (Number(d.offline_nodes || 0) > 0 ? 'bad' : 'neutral') + '">Offline: ' + esc(d.offline_nodes || 0) + '</span>'
+      + '<span class="pill ' + (d.prober_running ? 'accent' : 'neutral') + '">Prober: ' + (d.prober_running ? ('ON (' + esc(d.probe_interval_sec) + 's)') : 'OFF') + '</span>';
+  }
+  if (!trFormDirty) {
+    const mEl = document.getElementById('tr-mode');
+    const ivEl = document.getElementById('tr-probe-interval');
+    const ftEl = document.getElementById('tr-failover-th');
+    const rtEl = document.getElementById('tr-recovery-th');
+    const toEl = document.getElementById('tr-probe-timeout');
+    const afEl = document.getElementById('tr-auto-failover');
+    const arEl = document.getElementById('tr-auto-recover');
+    if (mEl) mEl.value = mode;
+    if (ivEl) ivEl.value = d.probe_interval_sec ?? 10;
+    if (ftEl) ftEl.value = d.failover_threshold ?? 2;
+    if (rtEl) rtEl.value = d.recovery_threshold ?? 2;
+    if (toEl) toEl.value = d.probe_timeout_sec ?? 2.0;
+    if (afEl) afEl.checked = d.auto_failover !== false;
+    if (arEl) arEl.checked = d.auto_recover !== false;
+  }
+  const nodes = Array.isArray(d.nodes) ? d.nodes : [];
+  if (ntbl) {
+    if (!nodes.length) {
+      ntbl.innerHTML = '<p class="hint">No cluster nodes configured yet.</p>';
+    } else {
+      ntbl.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr>'
+        + '<th>Phone</th><th>State</th><th>Active Control</th><th>Active Data</th><th>USB Plane</th><th>Wi-Fi Plane</th><th>Controls</th>'
+        + '</tr></thead><tbody>'
+        + nodes.map(n => {
+            const st = String(n.state || 'unknown');
+            let stCls = 'neutral';
+            if (st === 'dual_plane') stCls = 'ok';
+            else if (st.startsWith('failover_')) stCls = 'warn';
+            else if (st === 'offline') stCls = 'bad';
+            else if (st.startsWith('forced_')) stCls = 'accent';
+            const stTxt = st.toUpperCase() + (n.manual_override ? (' · PIN:' + String(n.manual_override).toUpperCase()) : '');
+            let ctrlHtml = '<button class="small" onclick="probeTransportNow(' + jsArg(n.node_id) + ')">Probe</button>';
+            if (n.has_dual_plane) {
+              ctrlHtml += ' <button class="small" onclick="setNodeTransportOverride(' + jsArg(n.node_id) + ', \'usb\')" title="Pin control & data to USB">Pin USB</button>'
+                + ' <button class="small" onclick="setNodeTransportOverride(' + jsArg(n.node_id) + ', \'wifi\')" title="Pin control & data to Wi-Fi">Pin Wi-Fi</button>'
+                + ' <button class="small primary" onclick="setNodeTransportOverride(' + jsArg(n.node_id) + ', \'auto\')" title="Clear pin / restore Dual-Plane">Auto</button>';
+            }
+            return '<tr>'
+              + '<td><strong>' + esc(n.node_id) + '</strong>' + (n.has_dual_plane ? ' <span class="pill accent">2-Plane</span>' : '') + '</td>'
+              + '<td><span class="pill ' + stCls + '">' + esc(stTxt) + '</span></td>'
+              + '<td class="mono"><strong>' + esc(String(n.control_plane || '').toUpperCase()) + '</strong><div class="hint" style="margin:0;">' + esc(n.control_host) + ':' + esc(n.control_port) + '</div></td>'
+              + '<td class="mono"><strong>' + esc(String(n.data_plane || '').toUpperCase()) + '</strong><div class="hint" style="margin:0;">' + esc(n.data_host) + ':' + esc(n.data_port) + '</div></td>'
+              + '<td>' + _planeBadgeHtml(n.usb) + '</td>'
+              + '<td>' + _planeBadgeHtml(n.wifi) + '</td>'
+              + '<td style="white-space:nowrap;">' + ctrlHtml + '</td>'
+              + '</tr>';
+          }).join('')
+        + '</tbody></table></div>';
+    }
+  }
+  const events = Array.isArray(d.events) ? d.events : [];
+  if (etbl) {
+    if (!events.length) {
+      etbl.innerHTML = '<p class="hint">No failover or recovery transitions recorded yet.</p>';
+    } else {
+      etbl.innerHTML = '<div style="overflow-x:auto; max-height:220px;"><table><thead><tr>'
+        + '<th>Time</th><th>Phone</th><th>Event</th><th>Transition</th><th>Reason</th>'
+        + '</tr></thead><tbody>'
+        + events.slice(0, 20).map(ev => {
+            const k = String(ev.kind || '');
+            const kCls = k === 'recovery' || k === 'online' ? 'ok' : (k === 'failover' ? 'warn' : (k === 'offline' ? 'bad' : 'accent'));
+            const tsTxt = ev.ts ? new Date(Number(ev.ts) * 1000).toLocaleTimeString() : '-';
+            return '<tr><td class="mono">' + esc(tsTxt) + '</td>'
+              + '<td><strong>' + esc(ev.node_id) + '</strong></td>'
+              + '<td><span class="pill ' + kCls + '">' + esc(k.toUpperCase()) + '</span></td>'
+              + '<td class="mono">' + esc(ev.from_state) + ' → ' + esc(ev.to_state) + '</td>'
+              + '<td>' + esc(ev.reason || '') + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>';
+    }
+  }
+}
+
+async function loadTransportStatus() {
+  const ntbl = document.getElementById('tr-nodes-table');
+  if (!ntbl) return;
+  if (!getToken()) {
+    ntbl.innerHTML = '<p class="hint">Unlock with your Master token to manage Dual-Plane transport &amp; failover.</p>';
+    return;
+  }
+  try {
+    const r = await apiFetch('/api/transport', { timeoutMs: 15000 });
+    if (r.status === 401 || r.status === 429) {
+      const body = await readJsonSafe(r);
+      handleAuthFailure(r.status, body && body.retry_after_sec);
+      return;
+    }
+    const d = await readJsonSafe(r);
+    if (!r.ok || !d || d.error) {
+      ntbl.innerHTML = '<p class="hint">Could not load transport status: ' + esc((d && d.error) || ('HTTP ' + r.status)) + '</p>';
+      return;
+    }
+    renderTransportPanel(d);
+  } catch (e) {
+    ntbl.innerHTML = '<p class="hint">Transport status error: ' + esc(e && e.message ? e.message : String(e)) + '</p>';
+  }
+}
+
+async function saveTransportConfig() {
+  await withBusyAction('save-transport', 'btn-save-tr', 'Saving...', async () => {
+    const payload = {
+      mode: document.getElementById('tr-mode').value,
+      probe_interval_sec: Number(document.getElementById('tr-probe-interval').value),
+      failover_threshold: Number(document.getElementById('tr-failover-th').value),
+      recovery_threshold: Number(document.getElementById('tr-recovery-th').value),
+      probe_timeout_sec: Number(document.getElementById('tr-probe-timeout').value),
+      auto_failover: document.getElementById('tr-auto-failover').checked,
+      auto_recover: document.getElementById('tr-auto-recover').checked,
+    };
+    const data = await authPost('/api/transport/config', payload);
+    if (data.error) { showToast('Transport policy error: ' + data.error, 'bad'); return; }
+    trFormDirty = false;
+    const up = document.getElementById('tr-unsaved-pill');
+    if (up) up.style.display = 'none';
+    if (data.transport) renderTransportPanel(data.transport);
+    showToast('Saved Dual-Plane transport policy (' + String(payload.mode).toUpperCase() + ').', 'ok');
+    refreshLive({ fresh: true });
+  });
+}
+
+async function probeTransportNow(nodeId) {
+  await withBusyAction('probe-transport:' + (nodeId || 'all'), nodeId ? null : 'btn-tr-probe', 'Probing...', async () => {
+    const body = nodeId ? { node_id: nodeId } : {};
+    const data = await authPost('/api/transport/probe', body);
+    if (data.error) { showToast('Transport probe failed: ' + data.error, 'bad'); return; }
+    if (data.transport) renderTransportPanel(data.transport);
+    const foN = Number(data.transport?.failover_nodes || 0);
+    showToast(
+      (nodeId ? ('Probed ' + nodeId) : 'Dual-plane probe complete')
+      + (foN > 0 ? (' — ' + foN + ' node(s) in failover!') : ' — planes updated.'),
+      foN > 0 ? 'warn' : 'ok',
+    );
+    refreshLive({ fresh: true });
+  });
+}
+
+async function setNodeTransportOverride(nodeId, plane) {
+  await withBusyAction('tr-override:' + nodeId, null, '', async () => {
+    const data = await authPost('/api/transport/failover', { node_id: nodeId, plane });
+    if (data.error) { showToast('Override failed: ' + data.error, 'bad'); return; }
+    if (data.transport) renderTransportPanel(data.transport);
+    showToast(plane === 'auto' ? ('Restored auto Dual-Plane on ' + nodeId + '.') : ('Pinned ' + nodeId + ' to ' + plane.toUpperCase() + '.'), 'ok');
+    refreshLive({ fresh: true });
+  });
+}
+
+async function recoverTransportAll() {
+  await withBusyAction('tr-recover-all', 'btn-tr-recover', 'Recovering...', async () => {
+    const data = await authPost('/api/transport/failover', { action: 'recover' });
+    if (data.error) { showToast('Recovery failed: ' + data.error, 'bad'); return; }
+    if (data.transport) renderTransportPanel(data.transport);
+    showToast('Triggered Dual-Plane recovery probe across cluster.', 'ok');
+    refreshLive({ fresh: true });
   });
 }
 
@@ -4790,6 +5130,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         enable_pairing_beacon: bool = True,
         pairing_fail_delay_sec: float = 1.0,
         enable_usb_watchdog: bool = True,
+        enable_transport_prober: bool = True,
     ) -> None:
         self.controller = controller
         self.config_path = config_path
@@ -4834,6 +5175,8 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             and any(n.adb is not None for n in controller.config.nodes)
         ):
             self.start_usb_watchdog()
+        if enable_transport_prober:
+            controller.transport.start_background_prober()
 
     def invalidate_live(self) -> None:
         """Mark cached `/api/live` snapshot stale and wake the background sampler immediately."""
@@ -4958,6 +5301,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         try:
+            self.controller.transport.stop_background_prober()
             self.stop_usb_watchdog()
             self.pairing_manager.close_session()
             self.gateway_manager.stop()
@@ -5242,7 +5586,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def _check_host(self) -> bool:
         """Defend against browser DNS rebinding & duplicate-Host smuggling."""
         with self.server.controller.config_lock:
-            configured_hosts = {n.host for n in self.server.controller.config.nodes if n.host}
+            configured_hosts = {h for n in self.server.controller.config.nodes for h in n.all_hosts()}
         if not is_allowed_http_host(self.headers, extra_allowed_hosts=configured_hosts):
             self._send_json(
                 HTTPStatus.FORBIDDEN,
@@ -5324,6 +5668,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/network/audit",
             "/api/doctor",
             "/api/usb-hub",
+            "/api/transport",
             "/api/discover",
         }:
             # Always require Master auth for active local/LAN scans, audit logs & host path diagnostics
@@ -5331,6 +5676,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/gateway/status":
                 self._send_json(HTTPStatus.OK, self.server.gateway_manager.status())
+            elif path == "/api/transport":
+                self._send_json(HTTPStatus.OK, self.server.controller.transport.status())
             elif path == "/api/network/audit":
                 self._send_json(
                     HTTPStatus.OK,
@@ -5538,6 +5885,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "/api/usb-hub/setup",
             "/api/usb-hub/verify",
             "/api/usb-hub/watchdog",
+            "/api/transport/config",
+            "/api/transport/probe",
+            "/api/transport/failover",
             "/api/config/reload",
         }
         if path not in valid_paths:
@@ -6418,6 +6768,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             new_mc: int | None = None
             new_weight: float | None = None
             new_notes: str | None = None
+            new_usb_host: str | None = None
+            new_wifi_host: str | None = None
+            new_usb_wport: int | None = None
+            new_wifi_wport: int | None = None
+            new_usb_sport: int | None = None
             if "tier" in body:
                 try:
                     t_val = self._parse_int_arg(body["tier"])
@@ -6457,6 +6812,53 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     return
             if "notes" in body:
                 new_notes = _CTRL_CHARS_STRIP_RE.sub("", str(body["notes"] or "")).strip()[:240]
+            if "usb_host" in body:
+                raw_uh = body["usb_host"]
+                if raw_uh is not None and not isinstance(raw_uh, str):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "usb_host must be a string"})
+                    return
+                s_uh = (raw_uh or "").strip()
+                if s_uh:
+                    try:
+                        new_usb_host = validate_host(s_uh)
+                        if _is_endpoint_host_unsafe(new_usb_host, DEFAULT_WORKER_PORT):
+                            raise ValueError("usb_host cannot target link-local, metadata, multicast, or unspecified addresses")
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid usb_host: {exc}"})
+                        return
+                else:
+                    new_usb_host = ""
+            if "wifi_host" in body:
+                raw_wh = body["wifi_host"]
+                if raw_wh is not None and not isinstance(raw_wh, str):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "wifi_host must be a string"})
+                    return
+                s_wh = (raw_wh or "").strip()
+                if s_wh:
+                    try:
+                        new_wifi_host = validate_host(s_wh)
+                        if _is_endpoint_host_unsafe(new_wifi_host, DEFAULT_WORKER_PORT):
+                            raise ValueError("wifi_host cannot target link-local, metadata, multicast, or unspecified addresses")
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid wifi_host: {exc}"})
+                        return
+                else:
+                    new_wifi_host = ""
+            for fld_name in ("usb_worker_port", "wifi_worker_port", "usb_ssh_port"):
+                if fld_name in body:
+                    try:
+                        p_val = self._parse_int_arg(body[fld_name], 0)
+                        if not (0 <= p_val <= 65535):
+                            raise ValueError("must be between 0 and 65535")
+                    except (TypeError, ValueError, OverflowError):
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"{fld_name} must be an integer between 0 and 65535"})
+                        return
+                    if fld_name == "usb_worker_port":
+                        new_usb_wport = p_val
+                    elif fld_name == "wifi_worker_port":
+                        new_wifi_wport = p_val
+                    else:
+                        new_usb_sport = p_val
 
             with ctrl.config_lock:
                 target_node = next((n for n in ctrl.config.nodes if n.id == node_id), None)
@@ -6469,7 +6871,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     target_node.max_concurrency,
                     target_node.weight,
                     target_node.notes,
+                    target_node.usb_host,
+                    target_node.wifi_host,
+                    target_node.usb_worker_port,
+                    target_node.wifi_worker_port,
+                    target_node.usb_ssh_port,
                 )
+                prev_allowed_ips = list(ctrl.config.network.allowed_master_ips)
                 if new_tier is not None:
                     target_node.tier = new_tier
                 if new_pool is not None:
@@ -6480,6 +6888,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     target_node.weight = new_weight
                 if new_notes is not None:
                     target_node.notes = new_notes
+                if new_usb_host is not None:
+                    target_node.usb_host = new_usb_host
+                if new_wifi_host is not None:
+                    target_node.wifi_host = new_wifi_host
+                if new_usb_wport is not None:
+                    target_node.usb_worker_port = new_usb_wport
+                if new_wifi_wport is not None:
+                    target_node.wifi_worker_port = new_wifi_wport
+                if new_usb_sport is not None:
+                    target_node.usb_ssh_port = new_usb_sport
+                rndis_m = _rndis_master_host_for_node(target_node)
+                if rndis_m and rndis_m not in ctrl.config.network.allowed_master_ips:
+                    ctrl.config.network.allowed_master_ips.append(rndis_m)
 
                 def _rb_node_upd() -> None:
                     (
@@ -6488,7 +6909,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                         target_node.max_concurrency,
                         target_node.weight,
                         target_node.notes,
+                        target_node.usb_host,
+                        target_node.wifi_host,
+                        target_node.usb_worker_port,
+                        target_node.wifi_worker_port,
+                        target_node.usb_ssh_port,
                     ) = prev_node_fields
+                    ctrl.config.network.allowed_master_ips = prev_allowed_ips
 
                 if not self._save_config_or_rollback(_rb_node_upd):
                     return
@@ -6498,7 +6925,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "pool": target_node.pool,
                     "max_concurrency": target_node.max_concurrency,
                     "weight": target_node.weight,
+                    "usb_host": target_node.usb_host,
+                    "wifi_host": target_node.wifi_host,
+                    "usb_worker_port": target_node.usb_worker_port,
+                    "wifi_worker_port": target_node.wifi_worker_port,
+                    "usb_ssh_port": target_node.usb_ssh_port,
                 }
+            ctrl.transport.sync_nodes()
             pushed = ctrl.push_config_to_all(node_ids=[node_id])
             self._send_json(HTTPStatus.OK, {"node": updated_rec, "pushed": pushed})
 
@@ -6761,6 +7194,93 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 wd = self.server.stop_usb_watchdog()
             self._send_json(HTTPStatus.OK, {"watchdog": wd})
 
+        elif path == "/api/transport/config":
+            with ctrl.config_lock:
+                cur = ctrl.config.transport
+                merged = {
+                    "mode": body.get("mode", cur.mode),
+                    "probe_interval_sec": body.get("probe_interval_sec", cur.probe_interval_sec),
+                    "failover_threshold": body.get("failover_threshold", cur.failover_threshold),
+                    "recovery_threshold": body.get("recovery_threshold", cur.recovery_threshold),
+                    "probe_timeout_sec": body.get("probe_timeout_sec", cur.probe_timeout_sec),
+                    "auto_failover": body.get("auto_failover", cur.auto_failover),
+                    "auto_recover": body.get("auto_recover", cur.auto_recover),
+                }
+            try:
+                new_tcfg = TransportConfig.from_dict(merged)
+            except (TypeError, ValueError, OverflowError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            with ctrl.config_lock:
+                prev_tcfg = copy.deepcopy(ctrl.config.transport)
+                mode_changed = prev_tcfg.mode != new_tcfg.mode
+                ctrl.config.transport = new_tcfg
+
+                def _rb_tr() -> None:
+                    ctrl.config.transport = prev_tcfg
+
+                if not self._save_config_or_rollback(_rb_tr):
+                    return
+            if mode_changed:
+                t_stat = ctrl.transport.apply_mode(new_tcfg.mode)
+            else:
+                ctrl.transport.sync_nodes()
+                t_stat = ctrl.transport.status()
+            self._send_json(HTTPStatus.OK, {"transport": t_stat})
+
+        elif path == "/api/transport/probe":
+            raw_nid = body.get("node_id")
+            if raw_nid is not None and not isinstance(raw_nid, str):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "node_id must be a string"})
+                return
+            nid = (raw_nid or "").strip()
+            if nid:
+                try:
+                    node_stat = ctrl.transport.probe_node(nid)
+                except KeyError as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                    return
+                self.server.invalidate_live()
+                self._send_json(HTTPStatus.OK, {"node": node_stat, "transport": ctrl.transport.status()})
+            else:
+                t_stat = ctrl.transport.probe_all()
+                self.server.invalidate_live()
+                self._send_json(HTTPStatus.OK, {"transport": t_stat})
+
+        elif path == "/api/transport/failover":
+            action = str(body.get("action") or "").strip().lower()
+            raw_nid = body.get("node_id")
+            if raw_nid is not None and not isinstance(raw_nid, str):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "node_id must be a string"})
+                return
+            nid = (raw_nid or "").strip()
+            if action == "recover":
+                try:
+                    t_stat = ctrl.transport.trigger_recovery(nid or None)
+                except KeyError as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                    return
+                self.server.invalidate_live()
+                self._send_json(HTTPStatus.OK, {"transport": t_stat})
+                return
+            if not nid:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing node_id"})
+                return
+            raw_plane = body.get("plane")
+            if not isinstance(raw_plane, str) or raw_plane.strip().lower() not in {"usb", "wifi", "auto"}:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "plane must be 'usb', 'wifi', or 'auto'"})
+                return
+            try:
+                node_stat = ctrl.transport.force_failover(nid, raw_plane.strip().lower())
+            except KeyError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            self.server.invalidate_live()
+            self._send_json(HTTPStatus.OK, {"node": node_stat, "transport": ctrl.transport.status()})
+
         elif path == "/api/config/reload":
             if self.server.config_path is None:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Dashboard has no backing config_path to reload."})
@@ -6782,6 +7302,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     ctrl.gateway_port_override = None
                 node_count = len(fresh_cfg.nodes)
                 cluster_name = fresh_cfg.cluster_name
+            ctrl.transport.sync_nodes()
             self.server.invalidate_live()
             self._send_json(
                 HTTPStatus.OK,
@@ -6837,6 +7358,7 @@ def serve_dashboard(
     controller: MasterController,
     config_path: Path | None = None,
     enable_usb_watchdog: bool = True,
+    enable_transport_prober: bool = True,
 ) -> None:
     """Start the Master Phone's accessible btop Web Control Center."""
     server = DashboardHTTPServer(
@@ -6844,6 +7366,7 @@ def serve_dashboard(
         controller,
         config_path=config_path,
         enable_usb_watchdog=enable_usb_watchdog,
+        enable_transport_prober=enable_transport_prober,
     )
     stop_event = threading.Event()
     _start_background_sampler(server, stop_event, interval_sec=4.0)

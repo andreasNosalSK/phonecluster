@@ -353,20 +353,25 @@ def build_firewall_guides(config: ClusterConfig, host_info: dict[str, Any]) -> d
     worker_v6_ips: list[str] = []
     rndis_worker_v4_ips: list[str] = []
     for w in workers:
-        wh = normalize_host(w.host)
-        if not wh or is_loopback_or_unspecified_host(wh):
-            continue
-        try:
-            wa = ipaddress.ip_address(wh)
-            if isinstance(wa, ipaddress.IPv4Address):
-                if str(wa) not in worker_v4_ips:
-                    worker_v4_ips.append(str(wa))
-                if "usb-mode:rndis" in (w.tags or []) and str(wa) not in rndis_worker_v4_ips:
-                    rndis_worker_v4_ips.append(str(wa))
-            elif isinstance(wa, ipaddress.IPv6Address) and str(wa) not in worker_v6_ips:
-                worker_v6_ips.append(str(wa))
-        except ValueError:
-            continue
+        for raw_wh in w.all_hosts():
+            wh = normalize_host(raw_wh)
+            if not wh or is_loopback_or_unspecified_host(wh):
+                continue
+            try:
+                wa = ipaddress.ip_address(wh)
+                if isinstance(wa, ipaddress.IPv4Address):
+                    if str(wa) not in worker_v4_ips:
+                        worker_v4_ips.append(str(wa))
+                    is_rndis_addr = (
+                        "usb-mode:rndis" in (w.tags or [])
+                        or (bool(w.usb_host) and normalize_host(w.usb_host) == str(wa))
+                    )
+                    if is_rndis_addr and str(wa) not in rndis_worker_v4_ips:
+                        rndis_worker_v4_ips.append(str(wa))
+                elif isinstance(wa, ipaddress.IPv6Address) and str(wa) not in worker_v6_ips:
+                    worker_v6_ips.append(str(wa))
+            except ValueError:
+                continue
     worker_blocked_tcp = sorted(
         p for p in (set(ssh_ports) | {dash_port, master_worker_port, 80, 3000, 3632, 8767, 50052})
         if 1 <= p <= 65535 and p != gw_port and p != 53
@@ -898,6 +903,37 @@ def audit_cluster_network(
             "detail": "Master signs all worker requests with replay-proof HMAC-SHA256 (zero raw tokens on Wi-Fi; legacy Bearer fallback still allowed unless Lockdown is enabled).",
             "fix": "",
         })
+
+    # 9. Dual-Plane Transport (USB Control + Wi-Fi Data) posture
+    t_mgr = getattr(controller, "transport", None)
+    if t_mgr is not None:
+        t_stat = t_mgr.status(event_limit=5)
+        dp_cnt = int(t_stat.get("dual_plane_nodes") or 0)
+        fo_cnt = int(t_stat.get("failover_nodes") or 0)
+        t_mode = str(t_stat.get("mode") or "auto")
+        if dp_cnt > 0 or t_mode != "auto":
+            if fo_cnt > 0:
+                fo_ids = [r["node_id"] for r in (t_stat.get("nodes") or []) if r.get("failover_active")]
+                checks.append({
+                    "name": "Dual-Plane Transport & Failover",
+                    "status": "warn",
+                    "detail": f"Mode={t_mode}: {fo_cnt}/{dp_cnt} dual-plane node(s) currently in FAILOVER ({', '.join(fo_ids)}).",
+                    "fix": "Inspect USB cables or Wi-Fi signal in the Dual-Plane Transport card below and click 'Probe Both Planes Now'.",
+                })
+            elif dp_cnt > 0:
+                checks.append({
+                    "name": "Dual-Plane Transport & Failover",
+                    "status": "ok",
+                    "detail": f"Mode={t_mode}: {dp_cnt} phone(s) running Dual-Plane Split (USB control + Wi-Fi data, auto-failover={'ON' if t_stat.get('auto_failover') else 'OFF'}, auto-recover={'ON' if t_stat.get('auto_recover') else 'OFF'}).",
+                    "fix": "",
+                })
+            else:
+                checks.append({
+                    "name": "Dual-Plane Transport & Failover",
+                    "status": "info",
+                    "detail": f"Mode={t_mode} configured, but no node has both usb_host and wifi_host set yet.",
+                    "fix": "Set usb_host + wifi_host in Tab 1 -> Tier/Pool editor or run `pc transport set-node <id> --usb-host ... --wifi-host ...`.",
+                })
 
     grade = "Strong" if score >= 80 else ("Good" if score >= 55 else "Basic")
 

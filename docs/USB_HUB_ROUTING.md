@@ -122,3 +122,35 @@ Verify phone-to-phone communication directly over USB with Wi-Fi OFF:
 ```bash
 pc run --target usb1 "ping -c 2 10.77.2.2"
 ```
+
+---
+
+## Mode 3: Dual-Plane Split (USB Control + Wi-Fi Data) with Automatic Failover & Auto-Recovery
+
+Get the best of both worlds: **low-latency wired USB** (`10.77.<k>.2` RNDIS or ADB forward) for Master control, health checks, SSH, and job dispatch, while keeping **high-speed 5 GHz Wi-Fi** (`192.168.1.20x`) for heavy data workloads (`distcc`, `llama.cpp --rpc`, OpenMPI, Docker Swarm, and Cross-Tier Service Mesh)!
+
+### Setup (Master + Ubuntu Touch / Linux Phones)
+```bash
+# 1. On Master Host — configure /30 USB control subnets with loose rp_filter=2 for Dual-Plane:
+sudo bash scripts/07_usb_hub_router.sh setup-rndis --dual-plane
+
+# 2. On each Ubuntu Touch / Linux phone — configures USB control (/30) WITHOUT touching Wi-Fi default route:
+sudo bash ~/phonecluster/scripts/07_usb_hub_router.sh phone-setup 1 --dual-plane
+sudo bash ~/phonecluster/scripts/07_usb_hub_router.sh phone-setup 2 --dual-plane
+
+# 3. Pair USB control & Wi-Fi data endpoints in cluster.json and enable Dual-Plane mode:
+pc transport set-node node1 --usb-host 10.77.1.2 --wifi-host 192.168.1.201
+pc transport set-node node2 --usb-host 10.77.2.2 --wifi-host 192.168.1.202
+pc transport mode dual_plane
+
+# 4. Tune hysteresis thresholds & verify both planes:
+pc transport config --probe-interval 10 --failover-threshold 2 --recovery-threshold 2 --probe-timeout 2.0
+pc transport probe
+pc transport status
+```
+
+### How Hysteresis Failover & Auto-Recovery Work
+- **Normal (`dual_plane`):** Control (`GET /health`, `/exec`, `/jobs`, `/config`, `pc ssh`) flows over **USB**; Data workloads (`DISTCC_HOSTS`, `--rpc`, OpenMPI, Docker Swarm, Service Mesh URLs) flow over **Wi-Fi**.
+- **Wi-Fi drops (`failover_usb_only`):** After `failover_threshold` consecutive failed Wi-Fi probes (default `2`), data traffic fails over to **USB** automatically (no flapping on single dropped packets).
+- **USB drops (`failover_wifi_only`):** After `failover_threshold` consecutive failed USB probes, control traffic fails over to **Wi-Fi** automatically.
+- **Auto-Recovery (`dual_plane`):** Once the recovered plane passes `recovery_threshold` consecutive healthy probes (default `2`), PhoneCluster automatically restores **Dual-Plane Split** and logs the transition in **Tab 5 → 6. Dual-Plane Transport & Automatic Failover** (and `pc transport status` / `pc top`).

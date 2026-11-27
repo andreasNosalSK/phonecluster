@@ -99,8 +99,12 @@ Terminates a running job's entire process group (`SIGTERM` → `SIGKILL`):
 | `POST /api/jobs/cancel` | Bearer | Cancel a running job on a specific `node_id` |
 | `POST /api/workloads/action` | Bearer | Start/stop `distcc` or `llama-rpc` across all ready phones |
 | `POST /api/nodes/add` | Bearer | Add a discovered or manual worker phone (with optional `tier` & `pool`) into `config/cluster.json` |
-| `POST /api/nodes/update` | Bearer | Update a phone's `tier` (`0..3`), `pool`, `max_concurrency`, `weight`, or `notes` in `config/cluster.json` |
+| `POST /api/nodes/update` | Bearer | Update a phone's `tier` (`0..3`), `pool`, `max_concurrency`, `weight`, `notes`, or Dual-Plane `usb_host`/`wifi_host`/ports in `config/cluster.json` |
 | `POST /api/nodes/remove` | Bearer | Remove a worker phone from `config/cluster.json` (Master protected) |
+| `GET /api/transport` | Bearer | Live Dual-Plane transport mode, hysteresis thresholds, per-phone USB/Wi-Fi health & latency, and failover/recovery event log |
+| `POST /api/transport/config` | Bearer | Switch transport `mode` (`dual_plane`/`auto`/`usb_only`/`wifi_only`) and configure hysteresis thresholds (`probe_interval_sec`, `failover_threshold`, `recovery_threshold`, `probe_timeout_sec`, `auto_failover`, `auto_recover`) |
+| `POST /api/transport/probe` | Bearer | Actively probe both USB & Wi-Fi planes across all nodes (or one `node_id`) |
+| `POST /api/transport/failover` | Bearer | Pin a dual-plane node (`node_id`, `plane`: `usb`/`wifi`/`auto`) or trigger immediate recovery (`action: "recover"`) |
 | `GET /api/pair/hello` | Open Window | Public DH hello (`dh_pub`, `salt`, `session_id`, `fingerprint`) ONLY while a pairing window is open (`403` when closed) |
 | `POST /api/pair/complete` | Open Window | Completes 2048-bit DH + PIN mutual-proof handshake and returns Encrypt-then-MAC enrollment bundle (5-attempt lockout) |
 | `GET /api/pair/status` | Bearer | Returns active pairing window PIN, fingerprint, countdown, attempts left, and recently paired nodes |

@@ -835,10 +835,13 @@ def build_rndis_router_commands(
     nat_wan: bool = False,
     wan_iface: str = "",
     gateway_port: int = 8888,
+    dual_plane: bool = False,
 ) -> dict[str, Any]:
     """Build explicit, idempotent Linux host & phone commands for Layer-3 USB hub phone-to-phone routing."""
     cluster_cidr = str(plan.get("cluster_cidr") or f"{DEFAULT_USB_SUBNET_PREFIX}.0.0/16")
     gw_port = int(gateway_port) if 1 <= int(gateway_port) <= 65535 else 8888
+    rp_mode = 2 if dual_plane else 1
+    dp_flag = " --dual-plane" if dual_plane else ""
     nodes = list(plan.get("nodes") or [])
     host_cmds: list[str] = [
         "# 1. Enable kernel IPv4 forwarding so USB phones talk to each other through Master Host",
@@ -855,19 +858,20 @@ def build_rndis_router_commands(
             [
                 f"# Phone {idx} ({n['node_id']}, mac={n.get('mac') or 'unknown'}) on {iface}",
                 f"sudo nmcli dev set {iface} managed no 2>/dev/null || true",
-                f"sudo sysctl -w net.ipv6.conf.{iface}.disable_ipv6=1 net.ipv6.conf.{iface}.accept_ra=0 net.ipv4.conf.{iface}.rp_filter=1",
+                f"sudo sysctl -w net.ipv6.conf.{iface}.disable_ipv6=1 net.ipv6.conf.{iface}.accept_ra=0 net.ipv4.conf.{iface}.rp_filter={rp_mode}",
                 f"sudo ip addr flush dev {iface}",
                 f"sudo ip addr add {host_ip}/30 dev {iface}",
                 f"sudo ip link set {iface} up",
             ]
         )
+        route_suffix = " metric 200" if dual_plane else ""
         phone_cmds[str(n["node_id"])] = [
-            f"# Run on {n['node_id']} (Ubuntu Touch / Linux phone) — or run: bash scripts/07_usb_hub_router.sh phone-setup {idx}",
-            f"sudo bash ~/phonecluster/scripts/07_usb_hub_router.sh phone-setup {idx} --prefix {plan['subnet_prefix']}",
+            f"# Run on {n['node_id']} (Ubuntu Touch / Linux phone) — or run: bash scripts/07_usb_hub_router.sh phone-setup {idx}{dp_flag}",
+            f"sudo bash ~/phonecluster/scripts/07_usb_hub_router.sh phone-setup {idx} --prefix {plan['subnet_prefix']}{dp_flag}",
             f"# Equivalent manual commands (assigns {phone_ip}/30 and routes {cluster_cidr} via {host_ip}):",
             f"sudo ip addr flush dev rndis0 2>/dev/null || sudo ip addr flush dev usb0",
             f"sudo ip addr add {phone_ip}/30 dev rndis0 2>/dev/null || sudo ip addr add {phone_ip}/30 dev usb0",
-            f"sudo ip route replace {cluster_cidr} via {host_ip}",
+            f"sudo ip route replace {cluster_cidr} via {host_ip}{route_suffix}",
         ]
 
     host_cmds.extend(
@@ -936,8 +940,9 @@ def sync_usb_hub_into_config(
     *,
     default_tier: int = 0,
     default_pool: str = "auto",
+    preserve_wifi: bool = True,
 ) -> list[str]:
-    """Merge planned USB-hub worker nodes into `config` (preserving existing per-node tokens)."""
+    """Merge planned USB-hub worker nodes into `config` (preserving existing per-node tokens and Wi-Fi data hosts)."""
     mode = str(plan.get("mode") or "adb")
     updated_ids: list[str] = []
     by_id = {n.id: n for n in config.nodes}
@@ -965,7 +970,13 @@ def sync_usb_hub_into_config(
                 raise ValueError(f"USB plan cannot overwrite master node '{nid}'")
             if existing.adb is not None and (adb is None or existing.adb.serial != adb.serial):
                 raise ValueError(f"USB plan would reassign {nid} to another device")
+            # Preserve an existing LAN/Wi-Fi host as `wifi_host` for Dual-Plane Split when attaching USB
+            if preserve_wifi and not existing.wifi_host and not existing.is_usb_primary() and not is_loopback_or_unspecified_host(existing.host):
+                existing.wifi_host = existing.host
+                if existing.worker_port > 0 and existing.worker_port != w_port:
+                    existing.wifi_worker_port = existing.worker_port
             existing.host = host
+            existing.usb_host = host
             existing.worker_port = w_port
             existing.ssh_port = s_port
             existing.adb = adb
@@ -997,6 +1008,7 @@ def sync_usb_hub_into_config(
                 notes=f"USB 3.0 Hub worker ({mode})",
                 auth_token=secrets.token_urlsafe(32),
                 adb=adb,
+                usb_host=host,
             )
             config.nodes.append(node)
             by_id[nid] = node

@@ -501,6 +501,28 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                             f"{len(usb_nodes_cfg)} USB node(s) configured (ADB ready={topo.get('adb_ready_count', 0)}, USB-Net={topo.get('usb_net_count', 0)})",
                         )
                     )
+            # 5c. Dual-Plane Transport diagnostics
+            dp_nodes_cfg = [n for n in cfg.nodes if n.has_dual_plane()]
+            if dp_nodes_cfg or cfg.transport.mode != "auto":
+                if dp_nodes_cfg:
+                    checks.append(
+                        CheckResult(
+                            "Dual-Plane Transport",
+                            "ok",
+                            f"Mode={cfg.transport.mode} · {len(dp_nodes_cfg)} dual-plane node(s) "
+                            f"(failover={cfg.transport.failover_threshold}, recovery={cfg.transport.recovery_threshold}, "
+                            f"interval={cfg.transport.probe_interval_sec}s)",
+                        )
+                    )
+                else:
+                    checks.append(
+                        CheckResult(
+                            "Dual-Plane Transport",
+                            "warn",
+                            f"Transport mode is '{cfg.transport.mode}', but 0 nodes have both usb_host and wifi_host configured",
+                            "Pair dual-plane endpoints with `pc transport set-node <id> --usb-host <ip> --wifi-host <ip>` or switch mode to `auto`.",
+                        )
+                    )
         except Exception as exc:
             checks.append(
                 CheckResult(
@@ -569,6 +591,37 @@ def run_doctor(config_path: str | Path | None = None, check_remote: bool = True)
                     f"All {len(snaps)}/{len(snaps)} nodes online ({len(ready)} ready for jobs{q_suffix})",
                 )
             )
+
+        if cfg.nodes and any(n.has_dual_plane() for n in cfg.nodes):
+            t_stat = ctrl.transport.probe_all(dual_plane_only=True)
+            fo_nodes = [r["node_id"] for r in (t_stat.get("nodes") or []) if r.get("failover_active")]
+            off_dp = [r["node_id"] for r in (t_stat.get("nodes") or []) if r.get("has_dual_plane") and r.get("state") == "offline"]
+            if off_dp:
+                checks.append(
+                    CheckResult(
+                        "Dual-Plane Live Links",
+                        "fail",
+                        f"Both USB and Wi-Fi planes unreachable on: {', '.join(off_dp)}",
+                        "Check USB hub power/cables, Wi-Fi connectivity, and run `pc transport probe`.",
+                    )
+                )
+            elif fo_nodes:
+                checks.append(
+                    CheckResult(
+                        "Dual-Plane Live Links",
+                        "warn",
+                        f"Failover active on dual-plane node(s): {', '.join(fo_nodes)}",
+                        "Inspect USB RNDIS (`07_usb_hub_router.sh status`) and Wi-Fi link; run `pc transport status`.",
+                    )
+                )
+            else:
+                checks.append(
+                    CheckResult(
+                        "Dual-Plane Live Links",
+                        "ok",
+                        f"All {t_stat.get('dual_plane_nodes', 0)} dual-plane node(s) healthy on both USB control and Wi-Fi data planes",
+                    )
+                )
 
         # Battery swelling, PMIC hazard, low RAM, discharging power, and thermal safety check across online phones
         high_bat_nodes: list[str] = []

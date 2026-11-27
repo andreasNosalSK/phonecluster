@@ -25,6 +25,7 @@ from .bundled import bundled_script
 from .config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SSH_PORT,
+    VALID_TRANSPORT_MODES,
     config_revision,
     create_default_config,
     format_host_for_url,
@@ -40,7 +41,7 @@ from .config import (
 from .dashboard import serve_dashboard
 from .discovery import discover_lan_nodes
 from .doctor import run_doctor
-from .gateway import GatewayManager
+from .gateway import GatewayManager, _rndis_master_host_for_node
 from .master import JobOutcome, JobSpec, MasterController
 from .netguard import apply_security_profile, audit_cluster_network
 from .pairing import (
@@ -199,9 +200,16 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
     for n in summary["nodes"]:
         h = n["health"]
         tp_str = f"T{n.get('tier', 1)}:{n.get('pool', 'compute')}"
+        t_info = n.get("transport") if isinstance(n.get("transport"), dict) else {}
+        host_cell = n["host"]
+        if t_info.get("has_dual_plane"):
+            c_p = str(t_info.get("control_plane") or "usb").upper()
+            d_p = str(t_info.get("data_plane") or "wifi").upper()
+            fo_tag = " FO!" if t_info.get("failover_active") else ""
+            host_cell = f"{t_info.get('control_host', n['host'])} ({c_p}/{d_p}{fo_tag})"
         if not n["online"]:
             state_str = f"OFFLINE ({n['error'][:28]})"
-            rows.append([n["id"], n["role"], tp_str, n["host"], "-", state_str, "-", "-", "-", "-", "-"])
+            rows.append([n["id"], n["role"], tp_str, host_cell, "-", state_str, "-", "-", "-", "-", "-"])
             continue
         if n.get("quarantined"):
             state_str = "QUARANTINED"
@@ -234,7 +242,7 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
                 n["id"],
                 n["role"],
                 tp_str,
-                n["host"],
+                host_cell,
                 str(h.get("os_env", "-")),
                 state_str,
                 cpu_str,
@@ -243,6 +251,15 @@ def _render_status_once(ctrl: MasterController, as_json: bool) -> None:
                 temp_str,
                 svc_str,
             ]
+        )
+
+    t_sum = summary.get("transport") if isinstance(summary.get("transport"), dict) else {}
+    if t_sum.get("dual_plane_nodes") or (t_sum.get("mode") and t_sum.get("mode") != "auto"):
+        print(
+            f"Transport : {str(t_sum.get('mode', 'auto')).upper()} · "
+            f"Dual-Plane: {t_sum.get('dual_plane_nodes', 0)} · "
+            f"Failover: {t_sum.get('failover_nodes', 0)} · "
+            f"Hysteresis: fail={t_sum.get('failover_threshold', 2)} / rec={t_sum.get('recovery_threshold', 2)}"
         )
 
     print(
@@ -1521,15 +1538,223 @@ def _cmd_token(args: argparse.Namespace) -> int:
     return 0
 
 
+def _render_transport_table(stat: dict[str, Any]) -> None:
+    print(
+        f"Transport Mode     : {str(stat.get('mode', 'auto')).upper()} "
+        f"(auto_failover={'ON' if stat.get('auto_failover') else 'OFF'}, "
+        f"auto_recover={'ON' if stat.get('auto_recover') else 'OFF'})"
+    )
+    print(
+        f"Probe & Hysteresis : interval={stat.get('probe_interval_sec')}s · "
+        f"timeout={stat.get('probe_timeout_sec')}s · "
+        f"failover_threshold={stat.get('failover_threshold')} · "
+        f"recovery_threshold={stat.get('recovery_threshold')}"
+    )
+    print(
+        f"Fleet Summary      : {stat.get('dual_plane_nodes', 0)} dual-plane · "
+        f"{stat.get('single_plane_nodes', 0)} single-plane · "
+        f"{stat.get('failover_nodes', 0)} failover · "
+        f"{stat.get('offline_nodes', 0)} offline\n"
+    )
+    rows: list[list[str]] = []
+    for n in stat.get("nodes") or []:
+        usb = n.get("usb") or {}
+        wifi = n.get("wifi") or {}
+        usb_cell = (
+            f"{usb.get('host')}:{usb.get('port')} [{usb.get('status')}"
+            + (f" {usb.get('latency_ms')}ms" if usb.get("latency_ms") is not None else "")
+            + "]"
+            if usb.get("configured")
+            else "-"
+        )
+        wifi_cell = (
+            f"{wifi.get('host')}:{wifi.get('port')} [{wifi.get('status')}"
+            + (f" {wifi.get('latency_ms')}ms" if wifi.get("latency_ms") is not None else "")
+            + "]"
+            if wifi.get("configured")
+            else "-"
+        )
+        state_lbl = str(n.get("state") or "unknown").upper()
+        if n.get("manual_override"):
+            state_lbl += f" (PIN:{str(n['manual_override']).upper()})"
+        rows.append(
+            [
+                str(n.get("node_id", "?")),
+                state_lbl,
+                f"{str(n.get('control_plane', '-')).upper()} ({n.get('control_host', '-')})",
+                f"{str(n.get('data_plane', '-')).upper()} ({n.get('data_host', '-')})",
+                usb_cell,
+                wifi_cell,
+            ]
+        )
+    print(_fmt_table(["NODE", "STATE", "CONTROL PLANE", "DATA PLANE", "USB ENDPOINT", "WI-FI ENDPOINT"], rows))
+    events = stat.get("events") or []
+    if events:
+        print("\nRecent Failover / Recovery Events:")
+        for ev in events[:8]:
+            ts_s = time.strftime("%H:%M:%S", time.localtime(int(ev.get("ts", 0)))) if ev.get("ts") else "-"
+            print(
+                f"  [{ts_s}] {ev.get('node_id')} ({str(ev.get('kind', '')).upper()}): "
+                f"{ev.get('from_state')} -> {ev.get('to_state')} ({ev.get('reason', '')})"
+            )
+
+
+def _cmd_transport(args: argparse.Namespace) -> int:
+    cfg_path = resolve_config_path(args.config)
+    cfg = load_config(cfg_path)
+    ctrl = MasterController(cfg)
+    action = getattr(args, "transport_action", None) or "status"
+
+    if action == "status":
+        stat = ctrl.transport.status()
+        if getattr(args, "json", False):
+            print(json.dumps(stat, indent=2))
+        else:
+            _render_transport_table(stat)
+        return 0
+
+    if action == "probe":
+        nid = str(getattr(args, "node_id", "") or "").strip()
+        if nid:
+            try:
+                node_stat = ctrl.transport.probe_node(nid)
+            except KeyError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 2
+            stat = ctrl.transport.status()
+            if getattr(args, "json", False):
+                print(json.dumps({"node": node_stat, "transport": stat}, indent=2))
+            else:
+                _render_transport_table(stat)
+            return 0 if node_stat.get("state") != "offline" else 1
+        stat = ctrl.transport.probe_all()
+        if getattr(args, "json", False):
+            print(json.dumps(stat, indent=2))
+        else:
+            _render_transport_table(stat)
+        return 0 if int(stat.get("offline_nodes", 0)) == 0 else 1
+
+    if action == "mode":
+        new_mode = str(getattr(args, "mode_value", "") or "").strip().lower()
+        if new_mode not in VALID_TRANSPORT_MODES:
+            print(f"Error: mode must be one of {', '.join(VALID_TRANSPORT_MODES)}", file=sys.stderr)
+            return 2
+        with ctrl.config_lock:
+            ctrl.config.transport.mode = new_mode
+            if not getattr(args, "no_save", False):
+                save_config(ctrl.config, cfg_path)
+        stat = ctrl.transport.apply_mode(new_mode)
+        if getattr(args, "json", False):
+            print(json.dumps(stat, indent=2))
+        else:
+            saved_note = "" if getattr(args, "no_save", False) else f" (saved to {cfg_path})"
+            print(f"Switched cluster transport mode to '{new_mode}'{saved_note}.\n")
+            _render_transport_table(stat)
+        return 0
+
+    if action == "config":
+        with ctrl.config_lock:
+            tc = ctrl.config.transport
+            if getattr(args, "probe_interval", None) is not None:
+                val = int(args.probe_interval)
+                if not (1 <= val <= 300):
+                    print("Error: --probe-interval must be between 1 and 300", file=sys.stderr)
+                    return 2
+                tc.probe_interval_sec = val
+            if getattr(args, "failover_threshold", None) is not None:
+                val = int(args.failover_threshold)
+                if not (1 <= val <= 20):
+                    print("Error: --failover-threshold must be between 1 and 20", file=sys.stderr)
+                    return 2
+                tc.failover_threshold = val
+            if getattr(args, "recovery_threshold", None) is not None:
+                val = int(args.recovery_threshold)
+                if not (1 <= val <= 20):
+                    print("Error: --recovery-threshold must be between 1 and 20", file=sys.stderr)
+                    return 2
+                tc.recovery_threshold = val
+            if getattr(args, "probe_timeout", None) is not None:
+                fval = float(args.probe_timeout)
+                if not math.isfinite(fval) or not (0.2 <= fval <= 15.0):
+                    print("Error: --probe-timeout must be between 0.2 and 15.0", file=sys.stderr)
+                    return 2
+                tc.probe_timeout_sec = fval
+            if getattr(args, "auto_failover", None) in {"on", "off"}:
+                tc.auto_failover = args.auto_failover == "on"
+            if getattr(args, "auto_recover", None) in {"on", "off"}:
+                tc.auto_recover = args.auto_recover == "on"
+            save_config(ctrl.config, cfg_path)
+        ctrl.transport.sync_nodes()
+        stat = ctrl.transport.status()
+        if getattr(args, "json", False):
+            print(json.dumps(stat, indent=2))
+        else:
+            print(f"Saved transport policy to {cfg_path}.\n")
+            _render_transport_table(stat)
+        return 0
+
+    if action == "set-node":
+        nid = str(getattr(args, "node_id", "") or "").strip()
+        try:
+            with ctrl.config_lock:
+                node = ctrl.config.get_node(nid)
+                if getattr(args, "clear_usb", False):
+                    node.usb_host = ""
+                    node.usb_worker_port = 0
+                    node.usb_ssh_port = 0
+                elif getattr(args, "usb_host", None) is not None:
+                    raw_uh = str(args.usb_host).strip()
+                    node.usb_host = validate_host(raw_uh) if raw_uh else ""
+                if getattr(args, "clear_wifi", False):
+                    node.wifi_host = ""
+                    node.wifi_worker_port = 0
+                elif getattr(args, "wifi_host", None) is not None:
+                    raw_wh = str(args.wifi_host).strip()
+                    node.wifi_host = validate_host(raw_wh) if raw_wh else ""
+                for attr, arg_name in (
+                    ("usb_worker_port", "usb_worker_port"),
+                    ("wifi_worker_port", "wifi_worker_port"),
+                    ("usb_ssh_port", "usb_ssh_port"),
+                ):
+                    raw_p = getattr(args, arg_name, None)
+                    if raw_p is not None:
+                        pv = int(raw_p)
+                        if not (0 <= pv <= 65535):
+                            raise ValueError(f"--{arg_name.replace('_', '-')} must be between 0 and 65535")
+                        setattr(node, attr, pv)
+                # Ensure Master's RNDIS /30 .1 IP is allowlisted if this node now has an RNDIS USB plane
+                rndis_m = _rndis_master_host_for_node(node)
+                if rndis_m and rndis_m not in ctrl.config.network.allowed_master_ips:
+                    ctrl.config.network.allowed_master_ips.append(rndis_m)
+                save_config(ctrl.config, cfg_path)
+        except (KeyError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        ctrl.transport.sync_nodes()
+        stat = ctrl.transport.status()
+        if getattr(args, "json", False):
+            print(json.dumps(stat, indent=2))
+        else:
+            print(f"Updated dual-plane endpoints for '{nid}' in {cfg_path}.\n")
+            _render_transport_table(stat)
+        return 0
+
+    print(f"Unknown transport action: {action}", file=sys.stderr)
+    return 2
+
+
 def _cmd_ssh(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
+    ctrl = MasterController(cfg)
     try:
         node = cfg.get_node(args.node_id)
-    except KeyError as exc:
+        plane_opt = getattr(args, "plane", "auto") or "auto"
+        ssh_host, ssh_port, _plane = ctrl.transport.control_ssh_endpoint(node, plane_override=plane_opt)
+    except (KeyError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
-    target = f"{node.ssh_user}@{node.host}" if node.ssh_user else node.host
-    cmd = ["ssh", "-p", str(node.ssh_port), "--", target] + (args.remote_cmd or [])
+    target = f"{node.ssh_user}@{ssh_host}" if node.ssh_user else ssh_host
+    cmd = ["ssh", "-p", str(ssh_port), "--", target] + (args.remote_cmd or [])
     return subprocess.call(cmd)
 
 
@@ -1905,6 +2130,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ssh & copy
     p_ssh = sub.add_parser("ssh", help="Open an SSH session to a phone by node ID (e.g. `pc ssh node1`)")
     p_ssh.add_argument("node_id", help="Node ID from cluster.json")
+    p_ssh.add_argument("--plane", choices=["auto", "usb", "wifi"], default="auto", help="Transport plane to use (default: auto control plane)")
     p_ssh.add_argument("remote_cmd", nargs="*", help="Optional command to run over SSH")
     p_ssh.set_defaults(func=_cmd_ssh)
 
@@ -2036,6 +2262,41 @@ def build_parser() -> argparse.ArgumentParser:
     p_dk.add_argument("--timeout", type=float, default=15.0, help="Per-node command timeout in seconds")
     p_dk.add_argument("--json", action="store_true", help="Output raw JSON")
     p_dk.set_defaults(func=_cmd_docker)
+
+    # transport (Dual-Plane Split: USB Control + Wi-Fi Data, automatic failover & hysteresis recovery)
+    p_tr = sub.add_parser(
+        "transport",
+        help="Manage Dual-Plane communication (USB Control + Wi-Fi Data), failover thresholds, and active probes",
+    )
+    tr_sub = p_tr.add_subparsers(dest="transport_action")
+    p_tr_status = tr_sub.add_parser("status", help="Show Dual-Plane transport status, active control/data planes, and failover events")
+    p_tr_status.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_tr_mode = tr_sub.add_parser("mode", help="Switch cluster communication mode (dual_plane, auto, usb_only, wifi_only)")
+    p_tr_mode.add_argument("mode_value", choices=list(VALID_TRANSPORT_MODES), help="Target transport mode")
+    p_tr_mode.add_argument("--no-save", action="store_true", help="Preview mode change without saving to cluster.json")
+    p_tr_mode.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_tr_probe = tr_sub.add_parser("probe", help="Actively probe USB and Wi-Fi planes across all (or one) nodes")
+    p_tr_probe.add_argument("--node-id", default="", help="Optional single node ID to probe")
+    p_tr_probe.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_tr_cfg = tr_sub.add_parser("config", help="Update probe interval, failover/recovery hysteresis thresholds, and timeout")
+    p_tr_cfg.add_argument("--probe-interval", type=int, default=None, help="Probe interval in seconds (1..300)")
+    p_tr_cfg.add_argument("--failover-threshold", type=int, default=None, help="Consecutive failures to trigger failover (1..20)")
+    p_tr_cfg.add_argument("--recovery-threshold", type=int, default=None, help="Consecutive healthy probes to auto-recover (1..20)")
+    p_tr_cfg.add_argument("--probe-timeout", type=float, default=None, help="Per-plane probe timeout in seconds (0.2..15.0)")
+    p_tr_cfg.add_argument("--auto-failover", choices=["on", "off"], default=None, help="Enable or disable automatic failover")
+    p_tr_cfg.add_argument("--auto-recover", choices=["on", "off"], default=None, help="Enable or disable hysteresis auto-recovery")
+    p_tr_cfg.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_tr_node = tr_sub.add_parser("set-node", help="Configure Dual-Plane USB control & Wi-Fi data hosts for a node")
+    p_tr_node.add_argument("node_id", help="Node ID from cluster.json")
+    p_tr_node.add_argument("--usb-host", default=None, help="USB RNDIS or ADB control-plane IP/host (e.g. 10.77.1.2)")
+    p_tr_node.add_argument("--wifi-host", default=None, help="Wi-Fi/LAN data-plane IP/host (e.g. 192.168.1.201)")
+    p_tr_node.add_argument("--usb-worker-port", type=int, default=None, help="Optional USB worker port override (0 = inherit)")
+    p_tr_node.add_argument("--wifi-worker-port", type=int, default=None, help="Optional Wi-Fi worker port override (0 = inherit)")
+    p_tr_node.add_argument("--usb-ssh-port", type=int, default=None, help="Optional USB SSH port override (0 = inherit)")
+    p_tr_node.add_argument("--clear-usb", action="store_true", help="Clear dedicated usb_host override")
+    p_tr_node.add_argument("--clear-wifi", action="store_true", help="Clear dedicated wifi_host override")
+    p_tr_node.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_tr.set_defaults(func=_cmd_transport)
 
     # usb-hub (Zero-Wi-Fi powered USB 3.0 hub routing for 2-6+ phones)
     p_usb = sub.add_parser("usb-hub", help="Discover, configure, and verify zero-Wi-Fi USB 3.0 hub routing (ADB mesh or RNDIS /30 router)")
